@@ -19,11 +19,16 @@ const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.GMAIL_USER,       // nshkp16@gmail.com
-    pass: process.env.GMAIL_APP_PASS    // aaib kxbx kjyh gojm
+    pass: process.env.GMAIL_APP_PASS    // aaibkxbxkjyhgojm
   }
 });
 
 // -------------------- ROUTES --------------------
+
+// Root route for Render homepage
+app.get('/', (req, res) => {
+  res.send('Backend is running successfully!');
+});
 
 // 1. Create Client + Send Verification
 app.post('/create-client', async (req, res) => {
