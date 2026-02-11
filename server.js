@@ -4,9 +4,11 @@ import bodyParser from 'body-parser';
 import crypto from 'crypto';
 import { Pool } from 'pg';
 import nodemailer from 'nodemailer';
+import cors from 'cors';
 
 const app = express();
 app.use(bodyParser.json());
+app.use(cors()); // allow Netlify frontend to call backend
 
 // 🔹 Neon DB connection
 const pool = new Pool({
@@ -131,8 +133,16 @@ app.post('/assign-team', async (req, res) => {
   }
 });
 
+// -------------------- ERROR HANDLING --------------------
+app.use((err, req, res, next) => {
+  console.error('Unexpected error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 // -------------------- SERVER --------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 });
+
+export default app; // optional for testing
