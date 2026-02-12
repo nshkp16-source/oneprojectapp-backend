@@ -34,15 +34,37 @@ app.get('/', (req, res) => {
 
 // 1. Create Client + Send Verification
 app.post('/create-client', async (req, res) => {
-  const { company_name, company_email, representative_name, title, phone_number, password_hash } = req.body;
+  const {
+    company_name,
+    company_email,
+    representative_name,
+    title,
+    phone_number,
+    profile_picture,
+    password_hash
+  } = req.body;
 
   try {
-    await pool.query(
-      `INSERT INTO clients (company_name, company_email, representative_name, title, phone_number, password_hash, verified)
-       VALUES ($1, $2, $3, $4, $5, $6, false)
-       ON CONFLICT (company_email) DO NOTHING`,
-      [company_name, company_email, representative_name, title, phone_number, password_hash]
+    const result = await pool.query(
+      `INSERT INTO clients 
+       (company_name, company_email, representative_name, title, phone_number, profile_picture, password_hash, verified) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, false) 
+       ON CONFLICT (company_email) DO NOTHING 
+       RETURNING id`,
+      [
+        company_name,
+        company_email,
+        representative_name,
+        title,
+        phone_number,
+        profile_picture,
+        password_hash
+      ]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: "Client already exists." });
+    }
 
     const token = crypto.randomBytes(32).toString('hex');
     await pool.query(
@@ -61,7 +83,7 @@ app.post('/create-client', async (req, res) => {
 
     res.json({ success: true, message: 'Verification email sent via Gmail' });
   } catch (err) {
-    console.error(err);
+    console.error("Error creating client:", err);
     res.status(500).json({ error: 'Failed to create client' });
   }
 });
@@ -224,12 +246,12 @@ app.post('/send-verification', async (req, res) => {
                   (role === "consultant" || role === "contractor") ? "users" : "team_members";
     const emailField = role === "client" ? "company_email" : "email";
 
-    await pool.query(
+        await pool.query(
       `UPDATE ${table} SET password_hash=$1 WHERE ${emailField}=$2`,
       [password, email]
     );
 
-        res.json({ success: true, message: "Verification email sent." });
+    res.json({ success: true, message: "Verification email sent." });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
@@ -281,4 +303,3 @@ app.listen(PORT, () => {
 });
 
 export default app; // optional for testing
-
