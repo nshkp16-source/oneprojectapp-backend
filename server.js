@@ -21,55 +21,7 @@ const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.GMAIL_USER,       // nshkp16@gmail.com
-    pass: process.env.GMAIL_APP_PASS    // aaNSHUTI ✅ — let’s extend your `server.js` with the **finalize-account route** so it matches your Render + Neon setup. Here’s the updated code with the new route added:
-
----
-
-## 🔹 Updated `server.js` (with `/finalize-account`)
-
-```js
-// server.js
-import express from 'express';
-import bodyParser from 'body-parser';
-import crypto from 'crypto';
-import { Pool } from 'pg';
-import nodemailer from 'nodemailer';
-import cors from 'cors';
-
-const app = express();
-app.use(bodyParser.json());
-app.use(cors()); // allow Netlify frontend to call backend
-
-// 🔹 Neon DB connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // set this in Render
-  ssl: { rejectUnauthorized: false }
-});
-
-// 🔹 Gmail SMTP setup
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,       // nshkp16@gmail.com
     pass: process.env.GMAIL_APP_PASS    // aaibkxbxkjyhgojm
-  }
-});
-
-// -------------------- ROUTES --------------------
-
-// Root route for Render homepage
-app.get('/', (req, res) => {
-  res.send('Backend is running successfully!');
-});
-
-// 1. Create Client + Send Verification
-app.post('/create-client', async (req, res) => {
-  const { company_name, company_email, representative_name, title, phone_number, password_hash } = req.body;
-
-  try {
-    await pool.query(
-      `INSERT INTO clients (company_name, company_email, representative_name, title, phone_number, password_hash, verified)
-       VALUES ($1, $2, $3, $4, $ibkxbxkjyhgojm
   }
 });
 
@@ -104,65 +56,13 @@ app.post('/create-client', async (req, res) => {
       from: process.env.GMAIL_USER,
       to: company_email,
       subject: 'Verify your account',
-      html: `5, $6, false)
-       ON CONFLICT (company_email) DO NOTHING`,
-      [company_name, company_email, representative_name, title, phone_number, password_hash]
-    );
-
-    const token = crypto.randomBytes(32).toString('hex');
-    await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at)
-       VALUES ($1, $2, NOW() + interval '1 hour')`,
-      [company_email, token]
-    );
-
-    const verifyUrl = `https://oneprojectapp.netlify.app/verify?token=${token}`;
-    await transporter.sendMail({
-      from: process.env.GMAIL_USER,
-      to: company_email,
-      subject: 'Verify your account',
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
     });
 
     res.json({ success: true, message: 'Verification email sent via Gmail' });
   } catch (err) {
     console.error(err);
-    res.status(500).<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
-    });
-
-    res.json({ success: true, message: 'Verification email sent via Gmail' });
-  } catch (err) {
-    console.error(err);
     res.status(500).json({ error: 'Failed to create client' });
-  }
-});
-
-// 2. Verify Client
-app.get('/verify', async (req, res) => {
-  const { token } = req.query;
-
-  try {
-    const result = await pool.query(
-      `SELECT email FROM email_tokens WHERE token=$1 AND expires_at > NOW()`,
-      [token]
-    );
-
-    if (result.rows.length === 0) {
-      return res.redirect('/verify-failed.html');
-    }
-
-    const email = result.rows[0].email;
-    await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [email]);
-
-    res.redirect('/verify-success.html');
-  } catch (err) {
-    console.error(err);
-    res.redirect('/verify-failed.html');
-  }
-});
-
-// 3. Create Project
-app.post('/createjson({ error: 'Failed to create client' });
   }
 });
 
@@ -202,19 +102,7 @@ app.post('/create-project', async (req, res) => {
 
     const client_id = client.rows[0].id;
     const project = await pool.query(
-      `INSERT INTO-project', async (req, res) => {
-  const { name, location, contract_reference, client_email } = req.body;
-
-  try {
-    const client = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [client_email]);
-    if (client.rows.length === 0) {
-      return res.status(400).json({ error: 'Client not found' });
-    }
-
-    const client_id = client.rows[0].id;
-    const project = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
- projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1, $2, $3, $4, NOW())
        RETURNING id`,
       [name, location, contract_reference, client_id]
@@ -229,21 +117,7 @@ app.post('/create-project', async (req, res) => {
 
 // 4. Assign Team Members
 app.post('/assign-team', async (req, res) => {
-  const       VALUES ($1, $2, $3, $4, NOW())
-       RETURNING id`,
-      [name, location, contract_reference, client_id]
-    );
-
-    res.json({ success: true, project_id: project.rows[0].id, message: 'Project created' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to create project' });
-  }
-});
-
-// 4. Assign Team Members
-app.post('/assign-team', async (req, res) => {
-  const { project_id, members { project_id, members } = req.body;
+  const { project_id, members } = req.body;
 
   try {
     for (const m of members) {
@@ -257,15 +131,7 @@ app.post('/assign-team', async (req, res) => {
     res.json({ success: true, message: 'Team members assigned' });
   } catch (err) {
     console.error(err);
-    res.status(500). } = req.body;
-
-  try {
-    for (const m of members) {
-      await pool.query(
-        `INSERT INTO team_members (name, position, task, email, project_id)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (email, project_id) DO NOTHING`,
-       json({ error: 'Failed to assign team members' });
+    res.status(500).json({ error: 'Failed to assign team members' });
   }
 });
 
@@ -278,13 +144,9 @@ app.post('/finalize-account', async (req, res) => {
   }
 
   try {
-    // Mark client as finalized
     await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [client_email]);
-
-    // Mark project as finalized (optional flag, here just confirming project exists)
     await pool.query(`UPDATE projects SET contract_reference = contract_reference WHERE id=$1`, [project_id]);
 
-    // Insert team members if provided
     if (Array.isArray(team_members) && team_members.length > 0) {
       for (const member of team_members) {
         await pool.query(
@@ -324,7 +186,6 @@ app.post('/verify-login', async (req, res) => {
 
     const user = result.rows[0];
     if (!user.password_hash) {
-      // First login case → redirect to first-login.html
       return res.json({ success: false, firstLogin: true });
     }
 
@@ -359,14 +220,16 @@ app.post('/send-verification', async (req, res) => {
       html: `<p>Click <a href="${verifyUrl}">here</a> to confirm and set your password.</p>`
     });
 
-    // Temporarily store password until token is confirmed
+    const table = role === "client" ? "clients" :
+                  (role === "consultant" || role === "contractor") ? "users" : "team_members";
+    const emailField = role === "client" ? "company_email" : "email";
+
     await pool.query(
-      `UPDATE ${role === "client" ? "clients" : role === "consultant" || role === "contractor" ? "users" : "team_members"}
-       SET password_hash=$1 WHERE ${role === "client" ? "company_email" : "email"}=$2`,
+      `UPDATE ${table} SET password_hash=$1 WHERE ${emailField}=$2`,
       [password, email]
     );
 
-    res.json({ success: true, message: "Verification email sent." });
+        res.json({ success: true, message: "Verification email sent." });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
@@ -418,3 +281,4 @@ app.listen(PORT, () => {
 });
 
 export default app; // optional for testing
+
