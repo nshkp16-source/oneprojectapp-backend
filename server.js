@@ -34,9 +34,13 @@ app.get('/', (req, res) => {
 
 // 1. Create Client (verification only, no DB insert yet)
 app.post('/create-client', async (req, res) => {
-  const { company_email } = req.body;
+  const { company_email } = req.body;  // <-- match frontend field
 
   try {
+    if (!company_email) {
+      return res.status(400).json({ error: "Company email is required." });
+    }
+
     const token = crypto.randomBytes(32).toString('hex');
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at)
@@ -73,10 +77,15 @@ app.get('/verify', async (req, res) => {
       return res.redirect('/verify-failed.html');
     }
 
-    // Mark verified in frontend/localStorage, not DB yet
+    const company_email = result.rows[0].email;
+
+    // ✅ Save verified email in localStorage via frontend
+    // (frontend verify-success.html already sets account.verified = true)
+    console.log(`Verified client email: ${company_email}`);
+
     res.redirect('/verify-success.html');
   } catch (err) {
-    console.error(err);
+    console.error("Verification error:", err);
     res.redirect('/verify-failed.html');
   }
 });
