@@ -32,40 +32,11 @@ app.get('/', (req, res) => {
   res.send('Backend is running successfully!');
 });
 
-// 1. Create Client + Send Verification
+// 1. Create Client (verification only, no DB insert yet)
 app.post('/create-client', async (req, res) => {
-  const {
-    company_name,
-    company_email,
-    representative_name,
-    title,
-    phone_number,
-    profile_picture,
-    password_hash
-  } = req.body;
+  const { company_email } = req.body;
 
   try {
-    const result = await pool.query(
-      `INSERT INTO clients 
-       (company_name, company_email, representative_name, title, phone_number, profile_picture, password_hash, verified) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, false) 
-       ON CONFLICT (company_email) DO NOTHING 
-       RETURNING id`,
-      [
-        company_name,
-        company_email,
-        representative_name,
-        title,
-        phone_number,
-        profile_picture,
-        password_hash
-      ]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(400).json({ error: "Client already exists." });
-    }
-
     const token = crypto.randomBytes(32).toString('hex');
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at)
@@ -81,14 +52,14 @@ app.post('/create-client', async (req, res) => {
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
     });
 
-    res.json({ success: true, message: 'Verification email sent via Gmail' });
+    res.json({ success: true, message: 'Verification email sent.' });
   } catch (err) {
-    console.error("Error creating client:", err);
-    res.status(500).json({ error: 'Failed to create client' });
+    console.error("Error sending verification:", err);
+    res.status(500).json({ error: 'Failed to send verification.' });
   }
 });
 
-// 2. Verify Client
+// 2. Verify Client (token check only)
 app.get('/verify', async (req, res) => {
   const { token } = req.query;
 
@@ -102,9 +73,7 @@ app.get('/verify', async (req, res) => {
       return res.redirect('/verify-failed.html');
     }
 
-    const email = result.rows[0].email;
-    await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [email]);
-
+    // Mark verified in frontend/localStorage, not DB yet
     res.redirect('/verify-success.html');
   } catch (err) {
     console.error(err);
@@ -112,70 +81,69 @@ app.get('/verify', async (req, res) => {
   }
 });
 
-// 3. Create Project
+// 3. Create Project (temporary capture only)
 app.post('/create-project', async (req, res) => {
-  const { name, location, contract_reference, client_email } = req.body;
+  const { name, location, contract_reference } = req.body;
+  try {
+    res.json({ success: true, message: 'Project details captured temporarily.' });
+  } catch (err) {
+    console.error("Error capturing project:", err);
+    res.status(500).json({ error: 'Failed to capture project.' });
+  }
+});
+
+// 4. Assign Team Members (temporary capture only)
+app.post('/assign-team', async (req, res) => {
+  const { members } = req.body;
+  try {
+    res.json({ success: true, message: 'Team members captured temporarily.' });
+  } catch (err) {
+    console.error("Error capturing team:", err);
+    res.status(500).json({ error: 'Failed to capture team members.' });
+  }
+});
+
+// 5. Finalize Account (true persistence)
+app.post('/finalize-account', async (req, res) => {
+  const { client, project, team_members } = req.body;
 
   try {
-    const client = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [client_email]);
-    if (client.rows.length === 0) {
-      return res.status(400).json({ error: 'Client not found' });
-    }
+    // Insert client into Neon
+    const clientResult = await pool.query(
+      `INSERT INTO clients 
+       (company_name, company_email, representative_name, title, phone_number, password_hash, verified) 
+       VALUES ($1, $2, $3, $4, $5, $6, true) 
+       RETURNING id`,
+      [
+        client.company_name,
+        client.company_email,
+        client.representative_name,
+        client.title,
+        client.phone_number,
+        client.password_hash
+      ]
+    );
 
-    const client_id = client.rows[0].id;
-    const project = await pool.query(
+    const client_id = clientResult.rows[0].id;
+
+    // Insert project
+    const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1, $2, $3, $4, NOW())
        RETURNING id`,
-      [name, location, contract_reference, client_id]
+      [project.name, project.location, project.contract_reference, client_id]
     );
 
-    res.json({ success: true, project_id: project.rows[0].id, message: 'Project created' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to create project' });
-  }
-});
+    const project_id = projectResult.rows[0].id;
 
-// 4. Assign Team Members
-app.post('/assign-team', async (req, res) => {
-  const { project_id, members } = req.body;
-
-  try {
-    for (const m of members) {
-      await pool.query(
-        `INSERT INTO team_members (name, position, task, email, project_id)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (email, project_id) DO NOTHING`,
-        [m.name, m.position, m.task, m.email, project_id]
-      );
-    }
-    res.json({ success: true, message: 'Team members assigned' });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to assign team members' });
-  }
-});
-
-// 5. Finalize Account
-app.post('/finalize-account', async (req, res) => {
-  const { client_email, project_id, team_members } = req.body;
-
-  if (!client_email || !project_id) {
-    return res.status(400).json({ success: false, error: "Missing client email or project ID." });
-  }
-
-  try {
-    await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [client_email]);
-    await pool.query(`UPDATE projects SET contract_reference = contract_reference WHERE id=$1`, [project_id]);
-
-    if (Array.isArray(team_members) && team_members.length > 0) {
-      for (const member of team_members) {
+    // Insert team members
+    if (Array.isArray(team_members)) {
+      for (const m of team_members) {
         await pool.query(
           `INSERT INTO team_members (name, position, task, email, project_id)
            VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (email, project_id) DO NOTHING`,
-          [member.name, member.position, member.task, member.email, project_id]
+          [m.name, m.position, m.task, m.email, project_id]
         );
       }
     }
@@ -197,9 +165,9 @@ app.post('/verify-login', async (req, res) => {
       case "client": table = "clients"; emailField = "company_email"; break;
       case "consultant":
       case "contractor": table = "users"; emailField = "email"; break;
-      case "consultant-pm":
-      case "contractor-pm":
-      case "team-member": table = "team_members"; emailField = "email"; break;
+      case "consultant_pm":
+      case "contractor_pm":
+      case "team_member": table = "team_members"; emailField = "email"; break;
       default: return res.status(400).json({ success: false, error: "Invalid role." });
     }
 
@@ -246,7 +214,7 @@ app.post('/send-verification', async (req, res) => {
                   (role === "consultant" || role === "contractor") ? "users" : "team_members";
     const emailField = role === "client" ? "company_email" : "email";
 
-        await pool.query(
+    await pool.query(
       `UPDATE ${table} SET password_hash=$1 WHERE ${emailField}=$2`,
       [password, email]
     );
@@ -280,7 +248,7 @@ app.post('/reset-password', async (req, res) => {
       [password, email]
     );
 
-    // Clean up token
+        // Clean up token
     await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
 
     res.json({ success: true, message: "Password reset successfully." });
@@ -303,3 +271,4 @@ app.listen(PORT, () => {
 });
 
 export default app; // optional for testing
+
