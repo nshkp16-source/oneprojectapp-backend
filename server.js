@@ -264,6 +264,22 @@ app.post('/reset-password', async (req, res) => {
   }
 });
 
+// 🔹 SMTP test route
+app.get('/test-smtp', async (req, res) => {
+  try {
+    await transporter.sendMail({
+      from: process.env.GMAIL_USER,
+      to: "skyprincenkp16@gmail.com", // use your test email
+      subject: "SMTP Test",
+      text: "This is a test email from OneProjectApp backend."
+    });
+    res.send("SMTP test email sent successfully.");
+  } catch (err) {
+    console.error("SMTP test error:", err);
+    res.status(500).send("SMTP test failed.");
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
