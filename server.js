@@ -19,7 +19,9 @@ const pool = new Pool({
 
 // 🔹 Gmail SMTP setup
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: "smtp.gmail.com",
+  port: 465,            // SSL port
+  secure: true,         // true for port 465
   auth: {
     user: process.env.GMAIL_USER,       // nshkp16@gmail.com
     pass: process.env.GMAIL_APP_PASS    // dqzywummxnadvnns
@@ -273,5 +275,14 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 });
+
+// 🔹 Keep-alive ping to prevent Render free tier sleep
+import fetch from "node-fetch";
+
+setInterval(() => {
+  fetch("https://oneprojectapp-backend.onrender.com/")
+    .then(res => console.log("Keep-alive ping:", res.status))
+    .catch(err => console.error("Keep-alive error:", err));
+}, 14 * 60 * 1000); // every 14 minutes
 
 export default app; // optional for testing
