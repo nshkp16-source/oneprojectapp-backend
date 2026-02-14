@@ -1,13 +1,14 @@
 // server.js
 import express from 'express';
-import bodyParser from 'body-parser';
 import crypto from 'crypto';
 import { Pool } from 'pg';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 
 const app = express();
-app.use(bodyParser.json());
+
+// ✅ Built-in JSON parser (replaces body-parser)
+app.use(express.json());
 app.use(cors()); // allow Netlify frontend to call backend
 
 // 🔹 Neon DB connection
@@ -20,8 +21,8 @@ const pool = new Pool({
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.GMAIL_USER,       // nshkp16@gmail.com
-    pass: process.env.GMAIL_APP_PASS    // aaibkxbxkjyhgojm
+    user: process.env.GMAIL_USER,       // e.g. nshkp16@gmail.com
+    pass: process.env.GMAIL_APP_PASS    // your Gmail App Password
   }
 });
 
@@ -34,7 +35,7 @@ app.get('/', (req, res) => {
 
 // 1. Create Client (verification only, no DB insert yet)
 app.post('/create-client', async (req, res) => {
-  const { company_email } = req.body; 
+  const { company_email } = req.body;
 
   try {
     if (!company_email) {
@@ -78,9 +79,6 @@ app.get('/verify', async (req, res) => {
     }
 
     const company_email = result.rows[0].email;
-
-    // ✅ Save verified email in localStorage via frontend
-    // (frontend verify-success.html already sets account.verified = true)
     console.log(`Verified client email: ${company_email}`);
 
     res.redirect('/verify-success.html');
@@ -117,7 +115,6 @@ app.post('/finalize-account', async (req, res) => {
   const { client, project, team_members } = req.body;
 
   try {
-    // Insert client into Neon
     const clientResult = await pool.query(
       `INSERT INTO clients 
        (company_name, company_email, representative_name, title, phone_number, password_hash, verified) 
@@ -135,7 +132,6 @@ app.post('/finalize-account', async (req, res) => {
 
     const client_id = clientResult.rows[0].id;
 
-    // Insert project
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1, $2, $3, $4, NOW())
@@ -145,7 +141,6 @@ app.post('/finalize-account', async (req, res) => {
 
     const project_id = projectResult.rows[0].id;
 
-    // Insert team members
     if (Array.isArray(team_members)) {
       for (const m of team_members) {
         await pool.query(
@@ -257,12 +252,12 @@ app.post('/reset-password', async (req, res) => {
       [password, email]
     );
 
-        // Clean up token
+    // ✅ Clean up token after successful reset
     await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
 
     res.json({ success: true, message: "Password reset successfully." });
   } catch (err) {
-    console.error(err);
+    console.error("Reset password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
   }
 });
@@ -280,4 +275,3 @@ app.listen(PORT, () => {
 });
 
 export default app; // optional for testing
-
