@@ -17,16 +17,14 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// 🔹 Gmail SMTP setup
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,            // SSL port
-  secure: true,         // true for port 465
-  auth: {
-    user: process.env.GMAIL_USER,       // nshkp16@gmail.com
-    pass: process.env.GMAIL_APP_PASS    // dqzywummxnadvnns
-  }
-});
+import nodemailerSendgrid from 'nodemailer-sendgrid';
+
+// 🔹 SendGrid setup
+const transporter = nodemailer.createTransport(
+  nodemailerSendgrid({
+    apiKey: process.env.SENDGRID_API_KEY
+  })
+);
 
 // -------------------- ROUTES --------------------
 
@@ -261,22 +259,6 @@ app.post('/reset-password', async (req, res) => {
   } catch (err) {
     console.error("Reset password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
-  }
-});
-
-// 🔹 SMTP test route
-app.get('/test-smtp', async (req, res) => {
-  try {
-    await transporter.sendMail({
-      from: process.env.GMAIL_USER,
-      to: "skyprincenkp16@gmail.com", // use your test email
-      subject: "SMTP Test",
-      text: "This is a test email from OneProjectApp backend."
-    });
-    res.send("SMTP test email sent successfully.");
-  } catch (err) {
-    console.error("SMTP test error:", err);
-    res.status(500).send("SMTP test failed.");
   }
 });
 
