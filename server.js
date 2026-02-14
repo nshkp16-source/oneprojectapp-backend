@@ -4,10 +4,12 @@ import crypto from 'crypto';
 import { Pool } from 'pg';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
+import nodemailerSendgrid from 'nodemailer-sendgrid';
+import fetch from "node-fetch";
 
 const app = express();
 
-// ✅ Built-in JSON parser (replaces body-parser)
+// ✅ Built-in JSON parser
 app.use(express.json());
 app.use(cors()); // allow Netlify frontend to call backend
 
@@ -16,8 +18,6 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL, // set this in Render
   ssl: { rejectUnauthorized: false }
 });
-
-import nodemailerSendgrid from 'nodemailer-sendgrid';
 
 // 🔹 SendGrid setup
 const transporter = nodemailer.createTransport(
@@ -28,12 +28,12 @@ const transporter = nodemailer.createTransport(
 
 // -------------------- ROUTES --------------------
 
-// Root route for Render homepage
+// Root route
 app.get('/', (req, res) => {
   res.send('Backend is running successfully!');
 });
 
-// 1. Create Client (verification only, no DB insert yet)
+// 1. Create Client (verification only)
 app.post('/create-client', async (req, res) => {
   const { company_email } = req.body;
 
@@ -51,9 +51,10 @@ app.post('/create-client', async (req, res) => {
 
     const verifyUrl = `https://oneprojectapp.netlify.app/verify?token=${token}`;
     await transporter.sendMail({
-      from: process.env.GMAIL_USER,
+      from: "skyprincenkp16@gmail.com", // must match verified sender
       to: company_email,
-      subject: 'Verify your account',
+      subject: "Verify your OneProjectApp account",
+      text: "Click the link to verify your account...",
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
     });
 
@@ -64,7 +65,7 @@ app.post('/create-client', async (req, res) => {
   }
 });
 
-// 2. Verify Client (token check only)
+// 2. Verify Client
 app.get('/verify', async (req, res) => {
   const { token } = req.query;
 
@@ -88,7 +89,7 @@ app.get('/verify', async (req, res) => {
   }
 });
 
-// 3. Create Project (temporary capture only)
+// 3. Create Project
 app.post('/create-project', async (req, res) => {
   const { name, location, contract_reference } = req.body;
   try {
@@ -99,7 +100,7 @@ app.post('/create-project', async (req, res) => {
   }
 });
 
-// 4. Assign Team Members (temporary capture only)
+// 4. Assign Team Members
 app.post('/assign-team', async (req, res) => {
   const { members } = req.body;
   try {
@@ -110,7 +111,7 @@ app.post('/assign-team', async (req, res) => {
   }
 });
 
-// 5. Finalize Account (true persistence)
+// 5. Finalize Account
 app.post('/finalize-account', async (req, res) => {
   const { client, project, team_members } = req.body;
 
@@ -208,9 +209,10 @@ app.post('/send-verification', async (req, res) => {
 
     const verifyUrl = `https://oneprojectapp.netlify.app/reset-password.html?token=${token}`;
     await transporter.sendMail({
-      from: process.env.GMAIL_USER,
+      from: "skyprincekp16@gmail.com", // must match verified sender
       to: email,
       subject: 'Set your password',
+      text: "Click the link to set your password...",
       html: `<p>Click <a href="${verifyUrl}">here</a> to confirm and set your password.</p>`
     });
 
@@ -275,8 +277,6 @@ app.listen(PORT, () => {
 });
 
 // 🔹 Keep-alive ping to prevent Render free tier sleep
-import fetch from "node-fetch";
-
 setInterval(() => {
   fetch("https://oneprojectapp-backend.onrender.com/")
     .then(res => console.log("Keep-alive ping:", res.status))
