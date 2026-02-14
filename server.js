@@ -21,8 +21,8 @@ const pool = new Pool({
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.GMAIL_USER,       // e.g. nshkp16@gmail.com
-    pass: process.env.GMAIL_APP_PASS    // your Gmail App Password
+    user: process.env.GMAIL_USER,       // nshkp16@gmail.com
+    pass: process.env.GMAIL_APP_PASS    // dqzywummxnadvnns
   }
 });
 
