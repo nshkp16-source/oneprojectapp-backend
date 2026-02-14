@@ -34,7 +34,7 @@ app.get('/', (req, res) => {
 
 // 1. Create Client (verification only, no DB insert yet)
 app.post('/create-client', async (req, res) => {
-  const { company_email } = req.body;  // <-- match frontend field
+  const { company_email } = req.body; 
 
   try {
     if (!company_email) {
