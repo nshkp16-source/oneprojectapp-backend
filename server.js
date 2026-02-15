@@ -51,7 +51,7 @@ app.post('/create-client', async (req, res) => {
 
     const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
     await transporter.sendMail({
-      from: "skyprincekp16@gmail.com", // must match verified sender
+      from: "skyprincenkp16@gmail.com", // must match verified sender
       to: company_email,
       subject: "Verify your OneProjectApp account",
       text: "Click the link to verify your account...",
