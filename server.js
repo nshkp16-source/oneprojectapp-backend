@@ -54,7 +54,6 @@ app.post('/create-client', async (req, res) => {
       from: "skyprincenkp16@gmail.com", // must match verified sender
       to: company_email,
       subject: "Verify your OneProjectApp account",
-      text: "Click the link to verify your account...",
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
     });
 
@@ -71,7 +70,7 @@ app.get('/verify', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT email FROM email_tokens WHERE token=$1 AND expires_at > NOW()`,
+      `SELECT email, pending_password FROM email_tokens WHERE token=$1 AND expires_at > NOW()`,
       [token]
     );
 
@@ -79,10 +78,36 @@ app.get('/verify', async (req, res) => {
       return res.redirect('/verify-failed.html');
     }
 
-    const email = result.rows[0].email;
+    const { email, pending_password } = result.rows[0];
     console.log(`Verified email: ${email}`);
 
     if (flow === "reset") {
+      // ✅ Save password only after link click
+      if (pending_password) {
+        // Determine table based on role
+        const roleResult = await pool.query(
+          `SELECT role FROM users WHERE email=$1
+           UNION SELECT 'client' as role FROM clients WHERE company_email=$1
+           UNION SELECT 'team_member' as role FROM team_members WHERE email=$1`,
+          [email]
+        );
+
+        if (roleResult.rows.length > 0) {
+          const role = roleResult.rows[0].role;
+          const table = role === "client" ? "clients" :
+                        (role === "consultant" || role === "contractor") ? "users" : "team_members";
+          const emailField = role === "client" ? "company_email" : "email";
+
+          await pool.query(
+            `UPDATE ${table} SET password_hash=$1 WHERE ${emailField}=$2`,
+            [pending_password, email]
+          );
+        }
+      }
+
+      // ✅ Clean up token after successful reset
+      await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+
       return res.redirect('/reset-password.html?token=' + token);
     } else {
       return res.redirect('/verify-success.html');
@@ -199,16 +224,16 @@ app.post('/verify-login', async (req, res) => {
   }
 });
 
-// 7. First Login (send verification)
+// 7. First Login (send verification, store pending password)
 app.post('/send-verification', async (req, res) => {
   const { email, role, password } = req.body;
 
   try {
     const token = crypto.randomBytes(32).toString('hex');
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at)
-       VALUES ($1, $2, NOW() + interval '1 hour')`,
-      [email, token]
+      `INSERT INTO email_tokens (email, token, expires_at, pending_password)
+       VALUES ($1, $2, NOW() + interval '1 hour', $3)`,
+      [email, token, password]
     );
 
     const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}&flow=reset`;
@@ -216,20 +241,10 @@ app.post('/send-verification', async (req, res) => {
       from: "skyprincenkp16@gmail.com", // must match verified sender
       to: email,
       subject: 'Set your password',
-      text: "Click the link to set your password...",
       html: `<p>Click <a href="${verifyUrl}">here</a> to confirm and set your password.</p>`
     });
 
-    const table = role === "client" ? "clients" :
-                  (role === "consultant" || role === "contractor") ? "users" : "team_members";
-    const emailField = role === "client" ? "company_email" : "email";
-
-    await pool.query(
-      `UPDATE ${table} SET password_hash=$1 WHERE ${emailField}=$2`,
-      [password, email]
-    );
-
-    res.json({ success: true, message: "Verification email sent." });
+        res.json({ success: true, message: "Verification email sent." });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
@@ -286,10 +301,9 @@ app.post('/resend-verification', async (req, res) => {
 
     const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
     await transporter.sendMail({
-      from: "skyprincekp16@gmail.com",
+      from: "skyprincenkp16@gmail.com",
       to: email,
       subject: "Resend Verification - OneProjectApp",
-      text: "Click the link to verify your account...",
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
     });
 
