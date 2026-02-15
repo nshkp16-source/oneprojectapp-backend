@@ -49,9 +49,9 @@ app.post('/create-client', async (req, res) => {
       [company_email, token]
     );
 
-    const verifyUrl = `https://oneprojectapp.netlify.app/verify?token=${token}`;
+    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
     await transporter.sendMail({
-      from: "skyprincenkp16@gmail.com", // must match verified sender
+      from: "skyprincekp16@gmail.com", // must match verified sender
       to: company_email,
       subject: "Verify your OneProjectApp account",
       text: "Click the link to verify your account...",
@@ -65,9 +65,9 @@ app.post('/create-client', async (req, res) => {
   }
 });
 
-// 2. Verify Client
+// 2. Verify Client (handles normal + reset flows)
 app.get('/verify', async (req, res) => {
-  const { token } = req.query;
+  const { token, flow } = req.query;
 
   try {
     const result = await pool.query(
@@ -79,10 +79,14 @@ app.get('/verify', async (req, res) => {
       return res.redirect('/verify-failed.html');
     }
 
-    const company_email = result.rows[0].email;
-    console.log(`Verified client email: ${company_email}`);
+    const email = result.rows[0].email;
+    console.log(`Verified email: ${email}`);
 
-    res.redirect('/verify-success.html');
+    if (flow === "reset") {
+      return res.redirect('/reset-password.html?token=' + token);
+    } else {
+      return res.redirect('/verify-success.html');
+    }
   } catch (err) {
     console.error("Verification error:", err);
     res.redirect('/verify-failed.html');
@@ -207,9 +211,9 @@ app.post('/send-verification', async (req, res) => {
       [email, token]
     );
 
-    const verifyUrl = `https://oneprojectapp.netlify.app/reset-password.html?token=${token}`;
+    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}&flow=reset`;
     await transporter.sendMail({
-      from: "skyprincekp16@gmail.com", // must match verified sender
+      from: "skyprincenkp16@gmail.com", // must match verified sender
       to: email,
       subject: 'Set your password',
       text: "Click the link to set your password...",
@@ -261,6 +265,38 @@ app.post('/reset-password', async (req, res) => {
   } catch (err) {
     console.error("Reset password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
+  }
+});
+
+// 9. Resend Verification (max 2 attempts, then redirect to verify-failed.html)
+app.post('/resend-verification', async (req, res) => {
+  const { email, resendCount } = req.body;
+
+  try {
+    if (resendCount >= 2) {
+      return res.json({ success: false, redirect: "/verify-failed.html" });
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at)
+       VALUES ($1, $2, NOW() + interval '1 hour')`,
+      [email, token]
+    );
+
+    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
+    await transporter.sendMail({
+      from: "skyprincekp16@gmail.com",
+      to: email,
+      subject: "Resend Verification - OneProjectApp",
+      text: "Click the link to verify your account...",
+      html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
+    });
+
+    res.json({ success: true, message: "Verification email resent." });
+  } catch (err) {
+    console.error("Resend error:", err);
+    res.status(500).json({ error: "Failed to resend verification." });
   }
 });
 
