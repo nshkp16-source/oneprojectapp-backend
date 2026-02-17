@@ -74,7 +74,7 @@ app.get('/verify', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.redirect('/verify-failed.html');
+      return res.redirect('https://oneprojectapp.netlify.app/verify-success.html');
     }
 
     const { email, expires_at, attempts } = result.rows[0];
@@ -84,7 +84,7 @@ app.get('/verify', async (req, res) => {
     }
 
     if (attempts >= 2) {
-      return res.redirect('/verify-failed.html');
+      return res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
     }
 
     await pool.query(
@@ -98,7 +98,7 @@ app.get('/verify', async (req, res) => {
     return res.redirect('/verify-success.html');
   } catch (err) {
     console.error("Verification error:", err.message);
-    return res.redirect('/verify-failed.html');
+    res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
   }
 });
 
@@ -112,7 +112,7 @@ app.post('/resend-verification', async (req, res) => {
     );
 
     if (check.rows.length > 0 && check.rows[0].attempts >= 2) {
-      return res.json({ success: false, redirect: "/verify-failed.html" });
+      return res.json({ success: false, redirect: "https://oneprojectapp.netlify.app/verify-failed.html" });
     }
 
     const token = crypto.randomBytes(32).toString('hex');
@@ -126,7 +126,7 @@ app.post('/resend-verification', async (req, res) => {
 
     const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
     await transporter.sendMail({
-      from: process.env.SENDGRID_VERIFIED_SENDER,
+      from: "skyprincenkp16@gmail.com",
       to: email,
       subject: "Resend Verification - OneProjectApp",
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
