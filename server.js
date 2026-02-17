@@ -304,6 +304,28 @@ app.post('/reset-password', async (req, res) => {
   }
 });
 
+// Check verification status
+app.post("/check-verification", async (req, res) => {
+  const { email } = req.body;
+  try {
+    const { data, error } = await supabase
+      .from("clients")
+      .select("verified")
+      .eq("company_email", email)
+      .single();
+
+    if (error) {
+      console.error("Check verification error:", error);
+      return res.json({ verified: false });
+    }
+
+    return res.json({ verified: data?.verified || false });
+  } catch (err) {
+    console.error("Server error:", err);
+    return res.json({ verified: false });
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
