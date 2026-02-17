@@ -59,18 +59,17 @@ app.post('/create-client', async (req, res) => {
 
     res.json({ success: true, message: 'Verification email sent.' });
   } catch (err) {
-    console.error("Error sending verification:", err);
+    console.error("Error sending verification:", err.stack);
     res.status(500).json({ error: 'Failed to send verification.' });
   }
 });
 
-// 2. Verify Client (handles normal + reset flows)
+// 2. Verify Client
 app.get('/verify', async (req, res) => {
-  const { token, flow } = req.query;
-
+  const { token } = req.query;
   try {
     const result = await pool.query(
-      `SELECT email, pending_password FROM email_tokens WHERE token=$1 AND expires_at > NOW()`,
+      `SELECT email, expires_at, attempts FROM email_tokens WHERE token=$1`,
       [token]
     );
 
@@ -78,43 +77,65 @@ app.get('/verify', async (req, res) => {
       return res.redirect('/verify-failed.html');
     }
 
-    const { email, pending_password } = result.rows[0];
-    console.log(`Verified email: ${email}`);
+    const { email, expires_at, attempts } = result.rows[0];
 
-    if (flow === "reset") {
-      // ✅ Save password only after link click
-      if (pending_password) {
-        // Determine table based on role
-        const roleResult = await pool.query(
-          `SELECT role FROM users WHERE email=$1
-           UNION SELECT 'client' as role FROM clients WHERE company_email=$1
-           UNION SELECT 'team_member' as role FROM team_members WHERE email=$1`,
-          [email]
-        );
-
-        if (roleResult.rows.length > 0) {
-          const role = roleResult.rows[0].role;
-          const table = role === "client" ? "clients" :
-                        (role === "consultant" || role === "contractor") ? "users" : "team_members";
-          const emailField = role === "client" ? "company_email" : "email";
-
-          await pool.query(
-            `UPDATE ${table} SET password_hash=$1 WHERE ${emailField}=$2`,
-            [pending_password, email]
-          );
-        }
-      }
-
-      // ✅ Clean up token after successful reset
-      await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
-
-      return res.redirect('/reset-password.html?token=' + token);
-    } else {
-      return res.redirect('/verify-success.html');
+    if (new Date() > expires_at) {
+      return res.redirect('/verify-failed.html');
     }
+
+    if (attempts >= 2) {
+      return res.redirect('/verify-failed.html');
+    }
+
+    await pool.query(
+      `UPDATE clients SET verified=true WHERE company_email=$1`,
+      [email]
+    );
+
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+
+    console.log("Verified email:", email);
+    return res.redirect('/verify-success.html');
   } catch (err) {
-    console.error("Verification error:", err);
-    res.redirect('/verify-failed.html');
+    console.error("Verification error:", err.message);
+    return res.redirect('/verify-failed.html');
+  }
+});
+
+// 9. Resend Verification (max 2 attempts)
+app.post('/resend-verification', async (req, res) => {
+  const { email } = req.body;
+  try {
+    const check = await pool.query(
+      `SELECT attempts FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
+      [email]
+    );
+
+    if (check.rows.length > 0 && check.rows[0].attempts >= 2) {
+      return res.json({ success: false, redirect: "/verify-failed.html" });
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const newAttempts = check.rows.length ? check.rows[0].attempts + 1 : 1;
+
+    await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, attempts)
+       VALUES ($1, $2, NOW() + interval '1 hour', $3)`,
+      [email, token, newAttempts]
+    );
+
+    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
+    await transporter.sendMail({
+      from: process.env.SENDGRID_VERIFIED_SENDER,
+      to: email,
+      subject: "Resend Verification - OneProjectApp",
+      html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
+    });
+
+    res.json({ success: true, message: "Verification email resent." });
+  } catch (err) {
+    console.error("Resend error:", err.message);
+    res.status(500).json({ error: "Failed to resend verification." });
   }
 });
 
@@ -280,37 +301,6 @@ app.post('/reset-password', async (req, res) => {
   } catch (err) {
     console.error("Reset password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
-  }
-});
-
-// 9. Resend Verification (max 2 attempts, then redirect to verify-failed.html)
-app.post('/resend-verification', async (req, res) => {
-  const { email, resendCount } = req.body;
-
-  try {
-    if (resendCount >= 2) {
-      return res.json({ success: false, redirect: "/verify-failed.html" });
-    }
-
-    const token = crypto.randomBytes(32).toString('hex');
-    await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at)
-       VALUES ($1, $2, NOW() + interval '1 hour')`,
-      [email, token]
-    );
-
-    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
-    await transporter.sendMail({
-      from: "skyprincenkp16@gmail.com",
-      to: email,
-      subject: "Resend Verification - OneProjectApp",
-      html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
-    });
-
-    res.json({ success: true, message: "Verification email resent." });
-  } catch (err) {
-    console.error("Resend error:", err);
-    res.status(500).json({ error: "Failed to resend verification." });
   }
 });
 
