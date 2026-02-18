@@ -64,6 +64,7 @@ app.post('/create-client', async (req, res) => {
   }
 });
 
+// 2. Verify Client
 app.get('/verify', async (req, res) => {
   const { token } = req.query;
   try {
@@ -329,6 +330,27 @@ app.post("/sendgrid-events", async (req, res) => {
     }
   }
   res.status(200).send("OK");
+});
+
+// 10. Check verification status (for pending-verification polling)
+app.post("/check-verification", async (req, res) => {
+  const { email } = req.body;
+  try {
+    const result = await pool.query(
+      `SELECT verified FROM clients WHERE company_email=$1`,
+      [email]
+    );
+    if (result.rows.length === 0) {
+      return res.json({ verified: "failed" }); // no client found
+    }
+    if (result.rows[0].verified === true) {
+      return res.json({ verified: true }); // success
+    }
+    return res.json({ verified: false }); // still pending
+  } catch (err) {
+    console.error("Check verification error:", err);
+    return res.json({ verified: "failed" });
+  }
 });
 
 // -------------------- ERROR HANDLING --------------------
