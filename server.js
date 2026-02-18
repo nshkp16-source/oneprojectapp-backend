@@ -38,14 +38,14 @@ app.post('/create-client', async (req, res) => {
   const { company_email } = req.body;
 
   try {
-    if (!company_email) {
-      return res.status(400).json({ error: "Company email is required." });
+    if (!company_email || !company_email.includes("@") || !company_email.includes(".")) {
+      return res.status(400).json({ error: "Invalid email address." });
     }
 
     const token = crypto.randomBytes(32).toString('hex');
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at)
-       VALUES ($1, $2, NOW() + interval '1 hour')`,
+      `INSERT INTO email_tokens (email, token, expires_at, attempts)
+       VALUES ($1, $2, NOW() + interval '1 hour', 0)`,
       [company_email, token]
     );
 
@@ -74,28 +74,30 @@ app.get('/verify', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.redirect('https://oneprojectapp.netlify.app/verify-success.html');
+      return res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
     }
 
     const { email, expires_at, attempts } = result.rows[0];
 
-    if (new Date() > expires_at) {
-      return res.redirect('/verify-failed.html');
-    }
-
-    if (attempts >= 2) {
+    // Invalid email format → fail
+    if (!email.includes("@") || !email.includes(".")) {
       return res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
     }
 
+    // Expired or too many attempts → let pending page handle
+    if (new Date() > expires_at || attempts >= 2) {
+      return res.redirect('https://oneprojectapp.netlify.app/pending-verification.html');
+    }
+
+    // Mark verified
     await pool.query(
       `UPDATE clients SET verified=true WHERE company_email=$1`,
       [email]
     );
-
     await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
 
     console.log("Verified email:", email);
-    return res.redirect('/verify-success.html');
+    return res.redirect('https://oneprojectapp.netlify.app/verify-success.html');
   } catch (err) {
     console.error("Verification error:", err.message);
     res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
@@ -238,7 +240,7 @@ app.post('/verify-login', async (req, res) => {
       return res.json({ success: false, error: "Incorrect password." });
     }
 
-    res.json({ success: true });
+        res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Server error." });
@@ -265,7 +267,7 @@ app.post('/send-verification', async (req, res) => {
       html: `<p>Click <a href="${verifyUrl}">here</a> to confirm and set your password.</p>`
     });
 
-        res.json({ success: true, message: "Verification email sent." });
+    res.json({ success: true, message: "Verification email sent." });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
@@ -304,26 +306,37 @@ app.post('/reset-password', async (req, res) => {
   }
 });
 
-// Check verification status
+// 10. Check verification status (for pending-verification polling)
 app.post("/check-verification", async (req, res) => {
   const { email } = req.body;
   try {
-    const { data, error } = await supabase
-      .from("clients")
-      .select("verified")
-      .eq("company_email", email)
-      .single();
-
-    if (error) {
-      console.error("Check verification error:", error);
+    const result = await pool.query(
+      `SELECT verified FROM clients WHERE company_email=$1`,
+      [email]
+    );
+    if (result.rows.length === 0) {
       return res.json({ verified: false });
     }
-
-    return res.json({ verified: data?.verified || false });
+    return res.json({ verified: result.rows[0].verified });
   } catch (err) {
-    console.error("Server error:", err);
+    console.error("Check verification error:", err);
     return res.json({ verified: false });
   }
+});
+
+// 11. SendGrid Event Webhook (detect bounced/invalid emails)
+app.post("/sendgrid-events", async (req, res) => {
+  const events = req.body;
+  for (const e of events) {
+    if (e.event === "bounce" || e.event === "dropped" || e.event === "blocked") {
+      console.log("Email failed:", e.email);
+      await pool.query(
+        `UPDATE clients SET verified=false WHERE company_email=$1`,
+        [e.email]
+      );
+    }
+  }
+  res.status(200).send("OK");
 });
 
 // -------------------- ERROR HANDLING --------------------
