@@ -64,7 +64,6 @@ app.post('/create-client', async (req, res) => {
   }
 });
 
-// 2. Verify Client
 app.get('/verify', async (req, res) => {
   const { token } = req.query;
   try {
@@ -74,22 +73,15 @@ app.get('/verify', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
+      return res.json({ verified: "failed" });
     }
 
     const { email, expires_at, attempts } = result.rows[0];
 
-    // Invalid email format → fail
-    if (!email.includes("@") || !email.includes(".")) {
-      return res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
-    }
-
-    // Expired or too many attempts → let pending page handle
     if (new Date() > expires_at || attempts >= 2) {
-      return res.redirect('https://oneprojectapp.netlify.app/pending-verification.html');
+      return res.json({ verified: "failed" });
     }
 
-    // Mark verified
     await pool.query(
       `UPDATE clients SET verified=true WHERE company_email=$1`,
       [email]
@@ -97,10 +89,10 @@ app.get('/verify', async (req, res) => {
     await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
 
     console.log("Verified email:", email);
-    return res.redirect('https://oneprojectapp.netlify.app/verify-success.html');
+    return res.json({ verified: true });
   } catch (err) {
     console.error("Verification error:", err.message);
-    res.redirect('https://oneprojectapp.netlify.app/verify-failed.html');
+    res.json({ verified: "failed" });
   }
 });
 
