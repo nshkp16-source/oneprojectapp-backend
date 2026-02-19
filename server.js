@@ -6,16 +6,16 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import nodemailerSendgrid from 'nodemailer-sendgrid';
 import fetch from "node-fetch";
+import { v4 as uuidv4 } from 'uuid';
 
 const app = express();
 
-// ✅ Built-in JSON parser
 app.use(express.json());
-app.use(cors()); // allow Netlify frontend to call backend
+app.use(cors());
 
 // 🔹 Neon DB connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // set this in Render
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
@@ -43,21 +43,23 @@ app.post('/create-client', async (req, res) => {
     }
 
     const token = crypto.randomBytes(32).toString('hex');
+    const sessionId = uuidv4();
+
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts)
-       VALUES ($1, $2, NOW() + interval '1 hour', 0)`,
-      [company_email, token]
+      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
+       VALUES ($1, $2, NOW() + interval '1 hour', 0, $3, false)`,
+      [company_email, token, sessionId]
     );
 
     const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
     await transporter.sendMail({
-      from: "skyprincenkp16@gmail.com", // must match verified sender
+      from: "skyprincenkp16@gmail.com",
       to: company_email,
       subject: "Verify your OneProjectApp account",
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
     });
 
-    res.json({ success: true, message: 'Verification email sent.' });
+    res.json({ success: true, message: 'Verification email sent.', sessionId });
   } catch (err) {
     console.error("Error sending verification:", err.stack);
     res.status(500).json({ error: 'Failed to send verification.' });
@@ -69,7 +71,7 @@ app.get('/verify', async (req, res) => {
   const { token } = req.query;
   try {
     const result = await pool.query(
-      `SELECT email, expires_at, attempts FROM email_tokens WHERE token=$1`,
+      `SELECT email, session_id, expires_at, attempts FROM email_tokens WHERE token=$1`,
       [token]
     );
 
@@ -77,20 +79,17 @@ app.get('/verify', async (req, res) => {
       return res.json({ verified: "failed" });
     }
 
-    const { email, expires_at, attempts } = result.rows[0];
+    const { email, session_id, expires_at, attempts } = result.rows[0];
 
     if (new Date() > expires_at || attempts >= 2) {
       return res.json({ verified: "failed" });
     }
 
-    await pool.query(
-      `UPDATE clients SET verified=true WHERE company_email=$1`,
-      [email]
-    );
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+    await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [email]);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE token=$1`, [token]);
 
     console.log("Verified email:", email);
-    return res.json({ verified: true });
+    return res.json({ verified: true, sessionId: session_id });
   } catch (err) {
     console.error("Verification error:", err.message);
     res.json({ verified: "failed" });
@@ -102,7 +101,7 @@ app.post('/resend-verification', async (req, res) => {
   const { email } = req.body;
   try {
     const check = await pool.query(
-      `SELECT attempts FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
+      `SELECT attempts, session_id FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
       [email]
     );
 
@@ -112,11 +111,12 @@ app.post('/resend-verification', async (req, res) => {
 
     const token = crypto.randomBytes(32).toString('hex');
     const newAttempts = check.rows.length ? check.rows[0].attempts + 1 : 1;
+    const sessionId = check.rows.length ? check.rows[0].session_id : uuidv4();
 
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts)
-       VALUES ($1, $2, NOW() + interval '1 hour', $3)`,
-      [email, token, newAttempts]
+      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
+       VALUES ($1, $2, NOW() + interval '1 hour', $3, $4, false)`,
+      [email, token, newAttempts, sessionId]
     );
 
     const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
@@ -127,7 +127,7 @@ app.post('/resend-verification', async (req, res) => {
       html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
     });
 
-    res.json({ success: true, message: "Verification email resent." });
+    res.json({ success: true, message: "Verification email resent.", sessionId });
   } catch (err) {
     console.error("Resend error:", err.message);
     res.status(500).json({ error: "Failed to resend verification." });
@@ -246,21 +246,23 @@ app.post('/send-verification', async (req, res) => {
 
   try {
     const token = crypto.randomBytes(32).toString('hex');
+    const sessionId = uuidv4();
+
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, pending_password)
-       VALUES ($1, $2, NOW() + interval '1 hour', $3)`,
-      [email, token, password]
+      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified)
+       VALUES ($1, $2, NOW() + interval '1 hour', $3, $4, false)`,
+      [email, token, password, sessionId]
     );
 
     const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}&flow=reset`;
     await transporter.sendMail({
-      from: "skyprincenkp16@gmail.com", // must match verified sender
+      from: "skyprincenkp16@gmail.com",
       to: email,
       subject: 'Set your password',
       html: `<p>Click <a href="${verifyUrl}">here</a> to confirm and set your password.</p>`
     });
 
-    res.json({ success: true, message: "Verification email sent." });
+    res.json({ success: true, message: "Verification email sent.", sessionId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
@@ -289,31 +291,12 @@ app.post('/reset-password', async (req, res) => {
       [password, email]
     );
 
-    // ✅ Clean up token after successful reset
     await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
 
     res.json({ success: true, message: "Password reset successfully." });
   } catch (err) {
     console.error("Reset password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
-  }
-});
-
-// 10. Check verification status (for pending-verification polling)
-app.post("/check-verification", async (req, res) => {
-  const { email } = req.body;
-  try {
-    const result = await pool.query(
-      `SELECT verified FROM clients WHERE company_email=$1`,
-      [email]
-    );
-    if (result.rows.length === 0) {
-      return res.json({ verified: false });
-    }
-    return res.json({ verified: result.rows[0].verified });
-  } catch (err) {
-    console.error("Check verification error:", err);
-    return res.json({ verified: false });
   }
 });
 
@@ -332,27 +315,6 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 10. Check verification status (for pending-verification polling)
-app.post("/check-verification", async (req, res) => {
-  const { email } = req.body;
-  try {
-    const result = await pool.query(
-      `SELECT verified FROM clients WHERE company_email=$1`,
-      [email]
-    );
-    if (result.rows.length === 0) {
-      return res.json({ verified: "failed" }); // no client found
-    }
-    if (result.rows[0].verified === true) {
-      return res.json({ verified: true }); // success
-    }
-    return res.json({ verified: false }); // still pending
-  } catch (err) {
-    console.error("Check verification error:", err);
-    return res.json({ verified: "failed" });
-  }
-});
-
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
@@ -365,11 +327,11 @@ app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 });
 
-// 🔹 Keep-alive ping to prevent Render free tier sleep
+// 🔹 Keep-alive ping
 setInterval(() => {
   fetch("https://oneprojectapp-backend.onrender.com/")
     .then(res => console.log("Keep-alive ping:", res.status))
     .catch(err => console.error("Keep-alive error:", err));
-}, 14 * 60 * 1000); // every 14 minutes
+}, 14 * 60 * 1000);
 
-export default app; // optional for testing
+export default app;
