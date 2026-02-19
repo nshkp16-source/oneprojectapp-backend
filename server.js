@@ -6,7 +6,8 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import nodemailerSendgrid from 'nodemailer-sendgrid';
 import fetch from "node-fetch";
-import { v4 as uuidv4 } from 'uuid';
+import pkg from 'uuid';
+const { v4: uuidv4 } = pkg;
 
 const app = express();
 
