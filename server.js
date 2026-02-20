@@ -158,9 +158,10 @@ app.post('/assign-team', async (req, res) => {
 
 // 5. Finalize Account
 app.post('/finalize-account', async (req, res) => {
-  const { client, project, team_members } = req.body;
+  const { client, project, contractor, consultant, team_members } = req.body;
 
   try {
+    // Insert Client
     const clientResult = await pool.query(
       `INSERT INTO clients 
        (company_name, company_email, representative_name, title, phone_number, password_hash, verified) 
@@ -175,25 +176,59 @@ app.post('/finalize-account', async (req, res) => {
         client.password_hash
       ]
     );
-
     const client_id = clientResult.rows[0].id;
 
+    // Insert Project
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1, $2, $3, $4, NOW())
        RETURNING id`,
       [project.name, project.location, project.contract_reference, client_id]
     );
-
     const project_id = projectResult.rows[0].id;
 
+    // Insert Contractor
+    if (contractor?.email) {
+      await pool.query(
+        `INSERT INTO users (role, company_name, email, representative_name, title, phone_number, project_id, created_at)
+         VALUES ('Contractor', $1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (email, project_id) DO NOTHING`,
+        [
+          contractor.company,
+          contractor.email,
+          contractor.repName,
+          contractor.repTitle,
+          contractor.tel,
+          project_id
+        ]
+      );
+    }
+
+    // Insert Consultant
+    if (consultant?.email) {
+      await pool.query(
+        `INSERT INTO users (role, company_name, email, representative_name, title, phone_number, project_id, created_at)
+         VALUES ('Consultant', $1, $2, $3, $4, $5, $6, NOW())
+         ON CONFLICT (email, project_id) DO NOTHING`,
+        [
+          consultant.company,
+          consultant.email,
+          consultant.repName,
+          consultant.repTitle,
+          consultant.tel,
+          project_id
+        ]
+      );
+    }
+
+    // Insert Team Members
     if (Array.isArray(team_members)) {
       for (const m of team_members) {
         await pool.query(
-          `INSERT INTO team_members (name, position, task, email, project_id)
-           VALUES ($1, $2, $3, $4, $5)
+          `INSERT INTO users (role, email, representative_name, title, project_id, created_at)
+           VALUES ('Team Member', $1, $2, $3, $4, NOW())
            ON CONFLICT (email, project_id) DO NOTHING`,
-          [m.name, m.position, m.task, m.email, project_id]
+          [m.email, m.name, m.position, project_id]
         );
       }
     }
