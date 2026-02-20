@@ -34,70 +34,69 @@ app.get('/', (req, res) => {
   res.send('Backend is running successfully!');
 });
 
-// 1. Create Client (verification only)
+// 1. Create Client (send numeric code)
 app.post('/create-client', async (req, res) => {
-  const { company_email } = req.body;
+  const { company_name, company_email, representative_name, phone_number, password_hash } = req.body;
 
   try {
     if (!company_email || !company_email.includes("@") || !company_email.includes(".")) {
       return res.status(400).json({ error: "Invalid email address." });
     }
 
-    const token = crypto.randomBytes(32).toString('hex');
+    // Generate 6-digit numeric code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
-       VALUES ($1, $2, NOW() + interval '1 hour', 0, $3, false)`,
-      [company_email, token, sessionId]
+       VALUES ($1, $2, NOW() + interval '3 minutes', 0, $3, false)`,
+      [company_email, code, sessionId]
     );
 
-    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
+    // Send code via email
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: company_email,
-      subject: "Verify your OneProjectApp account",
-      html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
+      subject: "Your OneProjectApp Verification Code",
+      html: `<p>Your verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
     });
 
-    res.json({ success: true, message: 'Verification email sent.', sessionId });
+    res.json({ success: true, message: 'Verification code sent.', sessionId });
   } catch (err) {
     console.error("Error sending verification:", err.stack);
     res.status(500).json({ error: 'Failed to send verification.' });
   }
 });
 
-// 2. Verify Client
-app.get('/verify', async (req, res) => {
-  const { token } = req.query;
+// 2. Verify Client Code
+app.post('/verify-code', async (req, res) => {
+  const { email, sessionId, code } = req.body;
+
   try {
     const result = await pool.query(
-      `SELECT email, session_id, expires_at, attempts FROM email_tokens WHERE token=$1`,
-      [token]
+      `SELECT * FROM email_tokens 
+       WHERE email=$1 AND session_id=$2 AND token=$3 AND expires_at > NOW() AND verified=false`,
+      [email, sessionId, code]
     );
 
     if (result.rows.length === 0) {
-      return res.json({ verified: "failed" });
+      return res.json({ verified: false });
     }
 
-    const { email, session_id, expires_at, attempts } = result.rows[0];
-
-    if (new Date() > expires_at || attempts >= 2) {
-      return res.json({ verified: "failed" });
-    }
-
+    // Mark verified
     await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [email]);
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE token=$1`, [token]);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE email=$1 AND session_id=$2`, [email, sessionId]);
 
     console.log("Verified email:", email);
-    return res.json({ verified: true, sessionId: session_id });
+    return res.json({ verified: true });
   } catch (err) {
     console.error("Verification error:", err.message);
-    res.json({ verified: "failed" });
+    res.json({ verified: false });
   }
 });
 
-// 9. Resend Verification (max 2 attempts)
+// 9. Resend Verification (max 2 attempts, numeric code)
 app.post('/resend-verification', async (req, res) => {
   const { email } = req.body;
   try {
@@ -110,25 +109,25 @@ app.post('/resend-verification', async (req, res) => {
       return res.json({ success: false, redirect: "https://oneprojectapp.netlify.app/verify-failed.html" });
     }
 
-    const token = crypto.randomBytes(32).toString('hex');
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
     const newAttempts = check.rows.length ? check.rows[0].attempts + 1 : 1;
     const sessionId = check.rows.length ? check.rows[0].session_id : uuidv4();
 
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
-       VALUES ($1, $2, NOW() + interval '1 hour', $3, $4, false)`,
-      [email, token, newAttempts, sessionId]
+       VALUES ($1, $2, NOW() + interval '3 minutes', $3, $4, false)`,
+      [email, code, newAttempts, sessionId]
     );
 
-    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}`;
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
-      subject: "Resend Verification - OneProjectApp",
-      html: `<p>Click <a href="${verifyUrl}">here</a> to verify your account.</p>`
+      subject: "Resend Verification Code - OneProjectApp",
+      html: `<p>Your new verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
     });
 
-    res.json({ success: true, message: "Verification email resent.", sessionId });
+    res.json({ success: true, message: "Verification code resent.", sessionId });
   } catch (err) {
     console.error("Resend error:", err.message);
     res.status(500).json({ error: "Failed to resend verification." });
@@ -230,11 +229,11 @@ app.post('/verify-login', async (req, res) => {
       return res.json({ success: false, firstLogin: true });
     }
 
-    if (user.password_hash !== password) {
+        if (user.password_hash !== password) {
       return res.json({ success: false, error: "Incorrect password." });
     }
 
-        res.json({ success: true });
+    res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Server error." });
@@ -246,24 +245,25 @@ app.post('/send-verification', async (req, res) => {
   const { email, role, password } = req.body;
 
   try {
-    const token = crypto.randomBytes(32).toString('hex');
+    // Generate 6-digit numeric code for first login verification
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified)
-       VALUES ($1, $2, NOW() + interval '1 hour', $3, $4, false)`,
-      [email, token, password, sessionId]
+       VALUES ($1, $2, NOW() + interval '3 minutes', $3, $4, false)`,
+      [email, code, password, sessionId]
     );
 
-    const verifyUrl = `https://oneprojectapp-backend.onrender.com/verify?token=${token}&flow=reset`;
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
-      subject: 'Set your password',
-      html: `<p>Click <a href="${verifyUrl}">here</a> to confirm and set your password.</p>`
+      subject: 'Set your password - OneProjectApp',
+      html: `<p>Your verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
     });
 
-    res.json({ success: true, message: "Verification email sent.", sessionId });
+    res.json({ success: true, message: "Verification code sent.", sessionId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
@@ -280,7 +280,7 @@ app.post('/reset-password', async (req, res) => {
       [email, token]
     );
     if (tokenCheck.rows.length === 0) {
-      return res.json({ success: false, error: "Invalid or expired token." });
+      return res.json({ success: false, error: "Invalid or expired code." });
     }
 
     const table = role === "client" ? "clients" :
@@ -336,3 +336,4 @@ setInterval(() => {
 }, 14 * 60 * 1000);
 
 export default app;
+
