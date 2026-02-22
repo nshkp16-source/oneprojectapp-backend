@@ -34,38 +34,17 @@ app.get('/', (req, res) => {
   res.send('Backend is running successfully!');
 });
 
-// 1. Create Client (send numeric code)
+// 1. Create Client (legacy, not used in new flow)
 app.post('/create-client', async (req, res) => {
-  const { company_name, company_email, representative_name, phone_number, password_hash } = req.body;
-
+  const { company_email } = req.body;
   try {
-    if (!company_email || !company_email.includes("@") || !company_email.includes(".")) {
+    if (!company_email || !company_email.includes("@")) {
       return res.status(400).json({ error: "Invalid email address." });
     }
-
-    // Generate 6-digit numeric code
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const sessionId = uuidv4();
-
-    await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
-       VALUES ($1, $2, NOW() + interval '3 minutes', 0, $3, false)`,
-      [company_email, code, sessionId]
-    );
-
-    // Send code via email
-    await transporter.sendMail({
-      from: "skyprincenkp16@gmail.com",
-      to: company_email,
-      subject: "Your OneProjectApp Verification Code",
-      html: `<p>Your verification code is: <b>${code}</b></p>
-             <p>This code will expire in 3 minutes.</p>`
-    });
-
-    res.json({ success: true, message: 'Verification code sent.', sessionId });
+    res.json({ success: true, message: "Client creation is staged at finalize." });
   } catch (err) {
-    console.error("Error sending verification:", err.stack);
-    res.status(500).json({ error: 'Failed to send verification.' });
+    console.error("Error:", err.stack);
+    res.status(500).json({ error: 'Failed.' });
   }
 });
 
@@ -88,6 +67,9 @@ app.post('/verify-code', async (req, res) => {
     await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [email]);
     await pool.query(`UPDATE email_tokens SET verified=true WHERE email=$1 AND session_id=$2`, [email, sessionId]);
 
+    // Optionally activate project/users/team if you added verified column
+    // await pool.query(`UPDATE projects SET verified=true WHERE client_id=(SELECT id FROM clients WHERE company_email=$1)`, [email]);
+
     console.log("Verified email:", email);
     return res.json({ verified: true });
   } catch (err) {
@@ -96,7 +78,7 @@ app.post('/verify-code', async (req, res) => {
   }
 });
 
-// 9. Resend Verification (max 2 attempts, numeric code)
+// 9. Resend Verification
 app.post('/resend-verification', async (req, res) => {
   const { email } = req.body;
   try {
@@ -134,66 +116,53 @@ app.post('/resend-verification', async (req, res) => {
   }
 });
 
-// 3. Create Project
+// 3. Create Project (staged only)
 app.post('/create-project', async (req, res) => {
-  const { name, location, contract_reference } = req.body;
-  try {
-    res.json({ success: true, message: 'Project details captured temporarily.' });
-  } catch (err) {
-    console.error("Error capturing project:", err);
-    res.status(500).json({ error: 'Failed to capture project.' });
-  }
+  res.json({ success: true, message: 'Project details captured temporarily.' });
 });
 
-// 4. Assign Team Members
+// 4. Assign Team Members (staged only)
 app.post('/assign-team', async (req, res) => {
-  const { members } = req.body;
-  try {
-    res.json({ success: true, message: 'Team members captured temporarily.' });
-  } catch (err) {
-    console.error("Error capturing team:", err);
-    res.status(500).json({ error: 'Failed to capture team members.' });
-  }
+  res.json({ success: true, message: 'Team members captured temporarily.' });
 });
 
-// Finalize Account (single insert point)
+// 5. Finalize Account (staged insert + send verification)
 app.post('/finalize-account', async (req, res) => {
   const { client, project, contractor, consultant, team_members } = req.body;
 
-  const clientQuery = `
-    INSERT INTO clients 
-    (company_name, company_email, representative_name, title, phone_number, password_hash, verified, created_at) 
-    VALUES ($1, $2, $3, $4, $5, $6, true, NOW()) 
-    ON CONFLICT (company_email) DO UPDATE SET verified = true
-    RETURNING id;
-  `;
-
-  const projectQuery = `
-    INSERT INTO projects (name, location, contract_reference, client_id, created_at)
-    VALUES ($1, $2, $3, $4, NOW())
-    ON CONFLICT (name, client_id) DO NOTHING
-    RETURNING id;
-  `;
-
   try {
-    // Insert Client
-    const clientResult = await pool.query(clientQuery, [
-      client.company_name,
-      client.company_email,
-      client.representative_name,
-      client.title,
-      client.phone_number,
-      client.password_hash
-    ]);
+    // Insert Client with verified=false
+    const clientResult = await pool.query(
+      `INSERT INTO clients 
+       (company_name, company_email, representative_name, title, phone_number, password_hash, verified, created_at) 
+       VALUES ($1, $2, $3, $4, $5, $6, false, NOW()) 
+       ON CONFLICT (company_email) DO UPDATE SET 
+         company_name = EXCLUDED.company_name,
+         representative_name = EXCLUDED.representative_name,
+         title = EXCLUDED.title,
+         phone_number = EXCLUDED.phone_number,
+         password_hash = EXCLUDED.password_hash,
+         verified = false
+       RETURNING id;`,
+      [
+        client.company_name,
+        client.company_email,
+        client.representative_name,
+        client.title,
+        client.phone_number,
+        client.password_hash
+      ]
+    );
     const client_id = clientResult.rows[0].id;
 
     // Insert Project
-    const projectResult = await pool.query(projectQuery, [
-      project.name,
-      project.location,
-      project.contract_reference,
-      client_id
-    ]);
+    const projectResult = await pool.query(
+      `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (name, client_id) DO NOTHING
+       RETURNING id;`,
+      [project.name, project.location, project.contract_reference, client_id]
+    );
     const project_id = projectResult.rows[0]?.id;
 
     // Insert Contractor
@@ -242,13 +211,30 @@ app.post('/finalize-account', async (req, res) => {
       }
     }
 
-    res.json({ success: true, message: "Account finalized successfully." });
+    // Generate verification code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
+       VALUES ($1, $2, NOW() + interval '3 minutes', 0, $3, false)`,
+      [client.company_email, code, sessionId]
+    );
+
+    // Send verification email
+    await transporter.sendMail({
+      from: "skyprincenkp16@gmail.com",
+      to: client.company_email,
+      subject: "Verify your OneProjectApp account",
+      html: `<p>Your verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+
+    res.json({ success: true, message: "Verification email sent.", sessionId });
   } catch (err) {
     console.error("Finalize error:", err);
     res.status(500).json({ success: false, error: "Server error finalizing account." });
   }
-});
-
 // 6. Verify Login
 app.post('/verify-login', async (req, res) => {
   const { role, email, password } = req.body;
@@ -269,11 +255,17 @@ app.post('/verify-login', async (req, res) => {
     if (result.rows.length === 0) return res.json({ success: false, error: "User not found." });
 
     const user = result.rows[0];
+
+    // 🔹 Block login if not verified
+    if (!user.verified) {
+      return res.json({ success: false, error: "Account not verified yet." });
+    }
+
     if (!user.password_hash) {
       return res.json({ success: false, firstLogin: true });
     }
 
-        if (user.password_hash !== password) {
+    if (user.password_hash !== password) {
       return res.json({ success: false, error: "Incorrect password." });
     }
 
@@ -380,4 +372,3 @@ setInterval(() => {
 }, 14 * 60 * 1000);
 
 export default app;
-
