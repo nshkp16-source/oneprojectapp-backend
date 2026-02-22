@@ -156,36 +156,45 @@ app.post('/assign-team', async (req, res) => {
   }
 });
 
-// 5. Finalize Account
+// Finalize Account (single insert point)
 app.post('/finalize-account', async (req, res) => {
   const { client, project, contractor, consultant, team_members } = req.body;
 
+  const clientQuery = `
+    INSERT INTO clients 
+    (company_name, company_email, representative_name, title, phone_number, password_hash, verified, created_at) 
+    VALUES ($1, $2, $3, $4, $5, $6, true, NOW()) 
+    ON CONFLICT (company_email) DO UPDATE SET verified = true
+    RETURNING id;
+  `;
+
+  const projectQuery = `
+    INSERT INTO projects (name, location, contract_reference, client_id, created_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    ON CONFLICT (name, client_id) DO NOTHING
+    RETURNING id;
+  `;
+
   try {
     // Insert Client
-    const clientResult = await pool.query(
-      `INSERT INTO clients 
-       (company_name, company_email, representative_name, title, phone_number, password_hash, verified) 
-       VALUES ($1, $2, $3, $4, $5, $6, true) 
-       RETURNING id`,
-      [
-        client.company_name,
-        client.company_email,
-        client.representative_name,
-        client.title,
-        client.phone_number,
-        client.password_hash
-      ]
-    );
+    const clientResult = await pool.query(clientQuery, [
+      client.company_name,
+      client.company_email,
+      client.representative_name,
+      client.title,
+      client.phone_number,
+      client.password_hash
+    ]);
     const client_id = clientResult.rows[0].id;
 
     // Insert Project
-    const projectResult = await pool.query(
-      `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
-       VALUES ($1, $2, $3, $4, NOW())
-       RETURNING id`,
-      [project.name, project.location, project.contract_reference, client_id]
-    );
-    const project_id = projectResult.rows[0].id;
+    const projectResult = await pool.query(projectQuery, [
+      project.name,
+      project.location,
+      project.contract_reference,
+      client_id
+    ]);
+    const project_id = projectResult.rows[0]?.id;
 
     // Insert Contractor
     if (contractor?.email) {
