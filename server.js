@@ -48,11 +48,12 @@ app.post('/create-client', async (req, res) => {
   }
 });
 
-// 2. Verify Client Code
+// 2. Verify Client Code (activate staged data)
 app.post('/verify-code', async (req, res) => {
   const { email, sessionId, code } = req.body;
 
   try {
+    // Check token validity
     const result = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND session_id=$2 AND token=$3 AND expires_at > NOW() AND verified=false`,
@@ -63,14 +64,41 @@ app.post('/verify-code', async (req, res) => {
       return res.json({ verified: false });
     }
 
-    // Mark verified
+    // ✅ Flip client to verified
     await pool.query(`UPDATE clients SET verified=true WHERE company_email=$1`, [email]);
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE email=$1 AND session_id=$2`, [email, sessionId]);
 
-    // Optionally activate project/users/team if you added verified column
-    // await pool.query(`UPDATE projects SET verified=true WHERE client_id=(SELECT id FROM clients WHERE company_email=$1)`, [email]);
+    // ✅ Flip project(s) linked to client to verified
+    await pool.query(`
+      UPDATE projects SET verified=true 
+      WHERE client_id=(SELECT id FROM clients WHERE company_email=$1)`,
+      [email]
+    );
 
-    console.log("Verified email:", email);
+    // ✅ Flip users (contractors, consultants, team members) linked to those projects
+    await pool.query(`
+      UPDATE users SET verified=true 
+      WHERE project_id IN (
+        SELECT id FROM projects WHERE client_id=(SELECT id FROM clients WHERE company_email=$1)
+      )`,
+      [email]
+    );
+
+    // ✅ Flip team_members if you have a separate table
+    await pool.query(`
+      UPDATE team_members SET verified=true 
+      WHERE project_id IN (
+        SELECT id FROM projects WHERE client_id=(SELECT id FROM clients WHERE company_email=$1)
+      )`,
+      [email]
+    );
+
+    // ✅ Mark token as used
+    await pool.query(
+      `UPDATE email_tokens SET verified=true WHERE email=$1 AND session_id=$2`,
+      [email, sessionId]
+    );
+
+    console.log("Verified email and activated records:", email);
     return res.json({ verified: true });
   } catch (err) {
     console.error("Verification error:", err.message);
