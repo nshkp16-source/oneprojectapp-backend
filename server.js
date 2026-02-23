@@ -159,7 +159,7 @@ app.post('/finalize-account', async (req, res) => {
   const { client, project, contractor, consultant, team_members } = req.body;
 
   try {
-    // Insert Client with verified=false
+    // Insert or update Client
     const clientResult = await pool.query(
       `INSERT INTO clients 
        (company_name, company_email, representative_name, title, phone_number, password_hash, verified, created_at) 
@@ -183,7 +183,7 @@ app.post('/finalize-account', async (req, res) => {
     );
     const client_id = clientResult.rows[0].id;
 
-    // Insert Project
+    // Insert Project or fetch existing
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1, $2, $3, $4, NOW())
@@ -191,51 +191,45 @@ app.post('/finalize-account', async (req, res) => {
        RETURNING id;`,
       [project.name, project.location, project.contract_reference, client_id]
     );
-    const project_id = projectResult.rows[0]?.id;
 
-    // Insert Contractor
-    if (contractor?.email) {
+    let project_id = projectResult.rows[0]?.id;
+    if (!project_id) {
+      const existingProject = await pool.query(
+        `SELECT id FROM projects WHERE name=$1 AND client_id=$2`,
+        [project.name, client_id]
+      );
+      project_id = existingProject.rows[0].id;
+    }
+
+    // Helper: insert user if not exists, then link to project
+    async function addUserToProject(user) {
+      if (!user?.email) return;
+
+      const userResult = await pool.query(
+        `INSERT INTO users (email, representative_name, title, phone_number, created_at, verified)
+         VALUES ($1, $2, $3, $4, NOW(), false)
+         ON CONFLICT (email) DO NOTHING
+         RETURNING id;`,
+        [user.email, user.repName || user.name, user.repTitle || user.position, user.tel || null]
+      );
+
+      const user_id = userResult.rows[0]?.id ||
+        (await pool.query(`SELECT id FROM users WHERE email=$1`, [user.email])).rows[0].id;
+
       await pool.query(
-        `INSERT INTO users (role, company_name, email, representative_name, title, phone_number, project_id, created_at)
-         VALUES ('Contractor', $1, $2, $3, $4, $5, $6, NOW())
-         ON CONFLICT (email, project_id) DO NOTHING`,
-        [
-          contractor.company,
-          contractor.email,
-          contractor.repName,
-          contractor.repTitle,
-          contractor.tel,
-          project_id
-        ]
+        `INSERT INTO user_projects (user_id, project_id, created_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (user_id, project_id) DO NOTHING;`,
+        [user_id, project_id]
       );
     }
 
-    // Insert Consultant
-    if (consultant?.email) {
-      await pool.query(
-        `INSERT INTO users (role, company_name, email, representative_name, title, phone_number, project_id, created_at)
-         VALUES ('Consultant', $1, $2, $3, $4, $5, $6, NOW())
-         ON CONFLICT (email, project_id) DO NOTHING`,
-        [
-          consultant.company,
-          consultant.email,
-          consultant.repName,
-          consultant.repTitle,
-          consultant.tel,
-          project_id
-        ]
-      );
-    }
-
-    // Insert Team Members
+    // Add contractor, consultant, team members
+    await addUserToProject(contractor);
+    await addUserToProject(consultant);
     if (Array.isArray(team_members)) {
       for (const m of team_members) {
-        await pool.query(
-          `INSERT INTO users (role, email, representative_name, title, project_id, created_at)
-           VALUES ('Team Member', $1, $2, $3, $4, NOW())
-           ON CONFLICT (email, project_id) DO NOTHING`,
-          [m.email, m.name, m.position, project_id]
-        );
+        await addUserToProject(m);
       }
     }
 
@@ -244,12 +238,11 @@ app.post('/finalize-account', async (req, res) => {
     const sessionId = uuidv4();
 
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
-       VALUES ($1, $2, NOW() + interval '3 minutes', 0, $3, false)`,
+      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified, reset_flow)
+       VALUES ($1, $2, NOW() + interval '3 minutes', 0, $3, false, false)`,
       [client.company_email, code, sessionId]
     );
 
-    // Send verification email
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: client.company_email,
@@ -263,20 +256,22 @@ app.post('/finalize-account', async (req, res) => {
     console.error("Finalize error:", err);
     res.status(500).json({ success: false, error: "Server error finalizing account." });
   }
+});
+
 // 6. Verify Login
 app.post('/verify-login', async (req, res) => {
   const { role, email, password } = req.body;
 
   try {
     let table, emailField;
-    switch (role) {
-      case "client": table = "clients"; emailField = "company_email"; break;
-      case "consultant":
-      case "contractor": table = "users"; emailField = "email"; break;
-      case "consultant_pm":
-      case "contractor_pm":
-      case "team_member": table = "team_members"; emailField = "email"; break;
-      default: return res.status(400).json({ success: false, error: "Invalid role." });
+    if (role === "client") {
+      table = "clients";
+      emailField = "company_email";
+    } else if (["consultant", "contractor", "consultant_pm", "contractor_pm", "team_member"].includes(role)) {
+      table = "users";
+      emailField = "email";
+    } else {
+      return res.status(400).json({ success: false, error: "Invalid role." });
     }
 
     const result = await pool.query(`SELECT * FROM ${table} WHERE ${emailField}=$1`, [email]);
@@ -284,7 +279,6 @@ app.post('/verify-login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // 🔹 Block login if not verified
     if (!user.verified) {
       return res.json({ success: false, error: "Account not verified yet." });
     }
@@ -297,9 +291,22 @@ app.post('/verify-login', async (req, res) => {
       return res.json({ success: false, error: "Incorrect password." });
     }
 
-    res.json({ success: true });
+    let projects = [];
+    if (table === "users") {
+      const projectsResult = await pool.query(
+        `SELECT p.id, p.name, c.company_name
+         FROM user_projects up
+         JOIN projects p ON up.project_id = p.id
+         JOIN clients c ON p.client_id = c.id
+         WHERE up.user_id = $1`,
+        [user.id]
+      );
+      projects = projectsResult.rows;
+    }
+
+    res.json({ success: true, projects });
   } catch (err) {
-    console.error(err);
+    console.error("Verify login error:", err);
     res.status(500).json({ success: false, error: "Server error." });
   }
 });
@@ -309,13 +316,12 @@ app.post('/send-verification', async (req, res) => {
   const { email, role, password } = req.body;
 
   try {
-    // Generate 6-digit numeric code for first login verification
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified)
-       VALUES ($1, $2, NOW() + interval '3 minutes', $3, $4, false)`,
+      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
+       VALUES ($1, $2, NOW() + interval '3 minutes', $3, $4, false, false)`,
       [email, code, password, sessionId]
     );
 
@@ -329,39 +335,82 @@ app.post('/send-verification', async (req, res) => {
 
     res.json({ success: true, message: "Verification code sent.", sessionId });
   } catch (err) {
-    console.error(err);
+    console.error("Send verification error:", err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
   }
 });
 
-// 8. Reset Password
-app.post('/reset-password', async (req, res) => {
-  const { email, role, token, password } = req.body;
+// Verify code and finalize first login OR reset password
+app.post('/verify-code', async (req, res) => {
+  const { email, token } = req.body;
 
   try {
     const tokenCheck = await pool.query(
-      `SELECT * FROM email_tokens WHERE email=$1 AND token=$2 AND expires_at > NOW()`,
+      `SELECT * FROM email_tokens WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false`,
       [email, token]
     );
+
     if (tokenCheck.rows.length === 0) {
       return res.json({ success: false, error: "Invalid or expired code." });
     }
 
-    const table = role === "client" ? "clients" :
-                  (role === "consultant" || role === "contractor") ? "users" : "team_members";
-    const emailField = role === "client" ? "company_email" : "email";
+    const pendingPassword = tokenCheck.rows[0].pending_password;
+    const isReset = tokenCheck.rows[0].reset_flow === true;
 
+    const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
+    if (clientResult.rows.length > 0) {
+      await pool.query(
+        `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
+        [pendingPassword, email]
+      );
+    } else {
+      await pool.query(
+        `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
+        [pendingPassword, email]
+      );
+    }
+
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
+
+    if (isReset) {
+      res.json({ success: true, message: "Password reset successfully." });
+    } else {
+      res.json({ success: true, message: "Account verified and password set." });
+    }
+  } catch (err) {
+    console.error("Verify code error:", err);
+    res.status(500).json({ success: false, error: "Failed to verify code." });
+  }
+});
+
+// Reset Password (initiate reset by sending verification code)
+app.post('/reset-password', async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    // Store token with pending password and mark as reset flow
     await pool.query(
-      `UPDATE ${table} SET password_hash=$1 WHERE ${emailField}=$2`,
-      [password, email]
+      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
+       VALUES ($1, $2, NOW() + interval '3 minutes', $3, $4, false, true)`,
+      [email, code, password, sessionId]
     );
 
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+    // Send verification email
+    await transporter.sendMail({
+      from: "skyprincenkp16@gmail.com",
+      to: email,
+      subject: 'Reset your password - OneProjectApp',
+      html: `<p>Your password reset code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
 
-    res.json({ success: true, message: "Password reset successfully." });
+    res.json({ success: true, message: "Reset code sent.", sessionId });
   } catch (err) {
     console.error("Reset password error:", err);
-    res.status(500).json({ success: false, error: "Failed to reset password." });
+    res.status(500).json({ success: false, error: "Failed to send reset code." });
   }
 });
 
