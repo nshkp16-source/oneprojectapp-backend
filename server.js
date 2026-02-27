@@ -68,21 +68,23 @@ app.post("/verify-code", async (req, res) => {
 
     const hashedPassword = client.password_hash ? await bcrypt.hash(client.password_hash, 10) : null;
 
+    // Insert client
     const clientResult = await pool.query(
-      `INSERT INTO clients (company_name, company_email, representative_name, title, phone_number, password_hash, verified, created_at) 
+      `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at) 
        VALUES ($1,$2,$3,$4,$5,$6,true,NOW())
        ON CONFLICT (company_email) DO UPDATE SET 
          company_name=EXCLUDED.company_name,
-         representative_name=EXCLUDED.representative_name,
+         representative=EXCLUDED.representative,
          title=EXCLUDED.title,
-         phone_number=EXCLUDED.phone_number,
+         telephone=EXCLUDED.telephone,
          password_hash=EXCLUDED.password_hash,
          verified=true
        RETURNING id;`,
-      [client.company_name, client.company_email, client.representative_name, client.title, client.phone_number, hashedPassword]
+      [client.company_name, client.company_email, client.representative, client.title, client.telephone, hashedPassword]
     );
     const client_id = clientResult.rows[0].id;
 
+    // Insert project
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at, verified)
        VALUES ($1,$2,$3,$4,NOW(),true)
@@ -93,18 +95,20 @@ app.post("/verify-code", async (req, res) => {
       `SELECT id FROM projects WHERE name=$1 AND client_id=$2`, [project.name, client_id]
     )).rows[0].id;
 
-    async function addUser(user) {
+    // Helper for contractor/consultant
+    async function addUser(user, role) {
       if (!user?.email) return;
       const userResult = await pool.query(
-        `INSERT INTO users (email, representative_name, title, phone_number, created_at, verified, project_id)
-         VALUES ($1,$2,$3,$4,NOW(),true,$5)
-         ON CONFLICT (email) DO UPDATE SET 
-           representative_name=EXCLUDED.representative_name,
+        `INSERT INTO users (role, company_name, email, representative, title, telephone, created_at, verified, project_id)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW(),true,$7)
+         ON CONFLICT (email, project_id) DO UPDATE SET 
+           company_name=EXCLUDED.company_name,
+           representative=EXCLUDED.representative,
            title=EXCLUDED.title,
-           phone_number=EXCLUDED.phone_number,
+           telephone=EXCLUDED.telephone,
            verified=true
          RETURNING id;`,
-        [user.email, user.repName || user.name, user.repTitle || user.position, user.tel || null, project_id]
+        [role, user.company, user.email, user.representative, user.title, user.telephone, project_id]
       );
       const user_id = userResult.rows[0].id;
       await pool.query(
@@ -113,9 +117,25 @@ app.post("/verify-code", async (req, res) => {
         [user_id, project_id]
       );
     }
-    await addUser(contractor);
-    await addUser(consultant);
-    if (Array.isArray(team_members)) for (const m of team_members) await addUser(m);
+
+    await addUser(contractor, "Contractor");
+    await addUser(consultant, "Consultant");
+
+    // Insert team members
+    if (Array.isArray(team_members)) {
+      for (const m of team_members) {
+        await pool.query(
+          `INSERT INTO team_members (name, position, task, email, project_id, created_at, verified)
+           VALUES ($1,$2,$3,$4,$5,NOW(),true)
+           ON CONFLICT (email, project_id) DO UPDATE SET
+             name=EXCLUDED.name,
+             position=EXCLUDED.position,
+             task=EXCLUDED.task,
+             verified=true`,
+          [m.name, m.position, m.task, m.email, project_id]
+        );
+      }
+    }
 
     await pool.query(`UPDATE email_tokens SET verified=true WHERE email=$1 AND session_id=$2`, [email, sessionId]);
 
@@ -266,7 +286,63 @@ app.post('/reset-password', async (req, res) => {
   }
 });
 
-// 7. SendGrid Event Webhook (detect bounced/invalid emails)
+// 7. Login route
+app.post("/login", async (req, res) => {
+  const { email, password, role } = req.body;
+  try {
+    // Find user by email + role
+    const result = await pool.query(
+      `SELECT id, email, password_hash, role, verified, project_id 
+       FROM users 
+       WHERE email=$1 AND role=$2`,
+      [email, role]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: "Invalid email or role." });
+    }
+
+    const user = result.rows[0];
+
+    // Check if account is verified
+    if (!user.verified) {
+      return res.status(403).json({ success: false, error: "Account not verified." });
+    }
+
+    // Compare password with stored hash
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      return res.status(401).json({ success: false, error: "Incorrect password." });
+    }
+
+    // Generate session token
+    const sessionId = uuidv4();
+
+    // Optionally store session in email_tokens or a sessions table
+    await pool.query(
+      `INSERT INTO email_tokens (id, email, token, expires_at, session_id, verified) 
+       VALUES ($1,$2,$3,NOW() + interval '1 hour',$4,true)`,
+      [uuidv4(), email, sessionId, sessionId]
+    );
+
+    res.json({
+      success: true,
+      message: "Login successful.",
+      sessionId,
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        project_id: user.project_id
+      }
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ success: false, error: "Server error during login." });
+  }
+});
+
+// 8. SendGrid Event Webhook (detect bounced/invalid emails)
 app.post("/sendgrid-events", async (req, res) => {
   const events = req.body;
   for (const e of events) {
@@ -285,6 +361,37 @@ app.post("/sendgrid-events", async (req, res) => {
     }
   }
   res.status(200).send("OK");
+});
+
+// 9. Check Email Exists (for forgot password flow)
+app.post("/check-email", async (req, res) => {
+  const { email, role } = req.body;
+  try {
+    let result;
+
+    if (role === "client") {
+      // Check in clients table
+      result = await pool.query(
+        `SELECT id FROM clients WHERE company_email=$1`,
+        [email]
+      );
+    } else {
+      // Check in users table for given role
+      result = await pool.query(
+        `SELECT id FROM users WHERE email=$1 AND role=$2`,
+        [email, role]
+      );
+    }
+
+    if (result.rows.length > 0) {
+      res.json({ exists: true });
+    } else {
+      res.json({ exists: false });
+    }
+  } catch (err) {
+    console.error("Check email error:", err);
+    res.status(500).json({ success: false, error: "Server error checking email." });
+  }
 });
 
 // -------------------- ERROR HANDLING --------------------
