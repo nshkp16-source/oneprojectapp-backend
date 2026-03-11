@@ -58,13 +58,15 @@ app.post("/finalize-account", async (req, res) => {
 
 // 2. Verify Code (commit staged data)
 app.post("/verify-code", async (req, res) => {
-  const { email, sessionId, code, client, project, contractor, consultant, team_members } = req.body;
+  const { email, sessionId, code, client, project, contractor, consultant } = req.body;
   try {
     const result = await pool.query(
       `SELECT * FROM email_tokens WHERE email=$1 AND session_id=$2 AND token=$3 AND expires_at > NOW() AND verified=false`,
       [email, sessionId, code]
     );
-    if (result.rows.length === 0) return res.json({ success: false, verified: false, error: "Invalid or expired code." });
+    if (result.rows.length === 0) {
+      return res.json({ success: false, verified: false, error: "Invalid or expired code." });
+    }
 
     const hashedPassword = client.password_hash ? await bcrypt.hash(client.password_hash, 10) : null;
 
@@ -121,21 +123,7 @@ app.post("/verify-code", async (req, res) => {
     await addUser(contractor, "Contractor");
     await addUser(consultant, "Consultant");
 
-    // Insert team members
-    if (Array.isArray(team_members)) {
-      for (const m of team_members) {
-        await pool.query(
-          `INSERT INTO team_members (name, position, task, email, project_id, created_at, verified)
-           VALUES ($1,$2,$3,$4,$5,NOW(),true)
-           ON CONFLICT (email, project_id) DO UPDATE SET
-             name=EXCLUDED.name,
-             position=EXCLUDED.position,
-             task=EXCLUDED.task,
-             verified=true`,
-          [m.name, m.position, m.task, m.email, project_id]
-        );
-      }
-    }
+    // ✅ Removed team_members logic
 
     await pool.query(`UPDATE email_tokens SET verified=true WHERE email=$1 AND session_id=$2`, [email, sessionId]);
 
@@ -155,7 +143,6 @@ app.post("/resend-verification", async (req, res) => {
       [email]
     );
     if (check.rows.length > 0 && check.rows[0].attempts >= 2) {
-      await pool.query(`DELETE FROM team_members WHERE project_id IN (SELECT id FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false))`, [email]);
       await pool.query(`DELETE FROM users WHERE project_id IN (SELECT id FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false))`, [email]);
       await pool.query(`DELETE FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false)`, [email]);
       await pool.query(`DELETE FROM clients WHERE company_email=$1 AND verified=false`, [email]);
@@ -209,7 +196,7 @@ app.post("/send-verification", async (req, res) => {
     });
 
     res.json({ success: true, message: "Verification code sent.", sessionId });
-  } catch (err) {
+    } catch (err) {
     console.error("Send verification error:", err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
   }
@@ -290,7 +277,6 @@ app.post('/reset-password', async (req, res) => {
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
-    // Find user by email + role
     const result = await pool.query(
       `SELECT id, email, password_hash, role, verified, project_id 
        FROM users 
@@ -304,21 +290,17 @@ app.post("/login", async (req, res) => {
 
     const user = result.rows[0];
 
-    // Check if account is verified
     if (!user.verified) {
       return res.status(403).json({ success: false, error: "Account not verified." });
     }
 
-    // Compare password with stored hash
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
       return res.status(401).json({ success: false, error: "Incorrect password." });
     }
 
-    // Generate session token
     const sessionId = uuidv4();
 
-    // Optionally store session in email_tokens or a sessions table
     await pool.query(
       `INSERT INTO email_tokens (id, email, token, expires_at, session_id, verified) 
        VALUES ($1,$2,$3,NOW() + interval '1 hour',$4,true)`,
@@ -342,7 +324,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// 8. SendGrid Event Webhook (detect bounced/invalid emails)
+// 8. SendGrid Event Webhook
 app.post("/sendgrid-events", async (req, res) => {
   const events = req.body;
   for (const e of events) {
@@ -363,31 +345,18 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 9. Check Email Exists (for forgot password flow)
+// 9. Check Email Exists
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
     let result;
-
     if (role === "client") {
-      // Check in clients table
-      result = await pool.query(
-        `SELECT id FROM clients WHERE company_email=$1`,
-        [email]
-      );
+      result = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     } else {
-      // Check in users table for given role
-      result = await pool.query(
-        `SELECT id FROM users WHERE email=$1 AND role=$2`,
-        [email, role]
-      );
+      result = await pool.query(`SELECT id FROM users WHERE email=$1 AND role=$2`, [email, role]);
     }
 
-    if (result.rows.length > 0) {
-      res.json({ exists: true });
-    } else {
-      res.json({ exists: false });
-    }
+    res.json({ exists: result.rows.length > 0 });
   } catch (err) {
     console.error("Check email error:", err);
     res.status(500).json({ success: false, error: "Server error checking email." });
@@ -406,7 +375,7 @@ app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 });
 
-// 🔹 Keep-alive ping (Render auto-sleep prevention)
+// 🔹 Keep-alive ping
 setInterval(() => {
   fetch("https://oneprojectapp-backend.onrender.com/")
     .then(res => console.log("Keep-alive ping:", res.status))
