@@ -64,7 +64,7 @@ app.post("/verify-code", async (req, res) => {
     const result = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false
-       ORDER BY created_at DESC
+       ORDER BY expires_at DESC
        LIMIT 1`,
       [email, code]
     );
@@ -147,7 +147,7 @@ app.post("/resend-verification", async (req, res) => {
 
     // Check latest token attempts (after cleanup, may be empty)
     const check = await pool.query(
-      `SELECT attempts, session_id FROM email_tokens WHERE email=$1 ORDER BY created_at DESC LIMIT 1`,
+      `SELECT attempts, session_id FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
       [email]
     );
 
@@ -225,7 +225,7 @@ app.post('/verify-password-code', async (req, res) => {
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=false
-       ORDER BY created_at DESC
+       ORDER BY expires_at DESC
        LIMIT 1`,
       [email, token]
     );
@@ -297,7 +297,7 @@ app.post('/verify-reset-code', async (req, res) => {
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=true
-       ORDER BY created_at DESC
+       ORDER BY expires_at DESC
        LIMIT 1`,
       [email, token]
     );
