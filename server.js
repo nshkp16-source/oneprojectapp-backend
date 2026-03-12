@@ -58,12 +58,17 @@ app.post("/finalize-account", async (req, res) => {
 
 // 2. Verify Code (commit staged data)
 app.post("/verify-code", async (req, res) => {
-  const { email, sessionId, code, client, project, contractor, consultant } = req.body;
+  const { email, code, client, project, contractor, consultant } = req.body;
   try {
+    // Always check latest valid token for this email
     const result = await pool.query(
-      `SELECT * FROM email_tokens WHERE email=$1 AND session_id=$2 AND token=$3 AND expires_at > NOW() AND verified=false`,
-      [email, sessionId, code]
+      `SELECT * FROM email_tokens 
+       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [email, code]
     );
+
     if (result.rows.length === 0) {
       return res.json({ success: false, verified: false, error: "Invalid or expired code." });
     }
@@ -123,9 +128,8 @@ app.post("/verify-code", async (req, res) => {
     await addUser(contractor, "Contractor");
     await addUser(consultant, "Consultant");
 
-    // ✅ Removed team_members logic
-
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE email=$1 AND session_id=$2`, [email, sessionId]);
+    // ✅ Mark token as verified
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [result.rows[0].id]);
 
     return res.json({ success: true, verified: true, message: "Account verified and data committed." });
   } catch (err) {
@@ -138,10 +142,14 @@ app.post("/verify-code", async (req, res) => {
 app.post("/resend-verification", async (req, res) => {
   const { email } = req.body;
   try {
+    // Delete old unverified tokens for this email
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND verified=false`, [email]);
+
     const check = await pool.query(
-      `SELECT attempts, session_id FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
+      `SELECT attempts, session_id FROM email_tokens WHERE email=$1 ORDER BY created_at DESC LIMIT 1`,
       [email]
     );
+
     if (check.rows.length > 0 && check.rows[0].attempts >= 2) {
       await pool.query(`DELETE FROM users WHERE project_id IN (SELECT id FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false))`, [email]);
       await pool.query(`DELETE FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false)`, [email]);
@@ -196,28 +204,33 @@ app.post("/send-verification", async (req, res) => {
     });
 
     res.json({ success: true, message: "Verification code sent.", sessionId });
-    } catch (err) {
+  } catch (err) {
     console.error("Send verification error:", err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
   }
 });
 
-// 5. Verify code and finalize first login OR reset password
+// 5. Verify code and finalize first login
 app.post('/verify-password-code', async (req, res) => {
   const { email, token } = req.body;
   try {
+    // Always check latest valid token for this email
     const tokenCheck = await pool.query(
-      `SELECT * FROM email_tokens WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false`,
+      `SELECT * FROM email_tokens 
+       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=false
+       ORDER BY created_at DESC
+       LIMIT 1`,
       [email, token]
     );
+
     if (tokenCheck.rows.length === 0) {
       return res.json({ success: false, error: "Invalid or expired code." });
     }
 
     const pendingPassword = tokenCheck.rows[0].pending_password;
-    const isReset = tokenCheck.rows[0].reset_flow === true;
     const hashedPassword = await bcrypt.hash(pendingPassword, 10);
 
+    // Update client or user depending on role
     const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     if (clientResult.rows.length > 0) {
       await pool.query(
@@ -233,11 +246,7 @@ app.post('/verify-password-code', async (req, res) => {
 
     await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
 
-    if (isReset) {
-      res.json({ success: true, message: "Password reset successfully." });
-    } else {
-      res.json({ success: true, message: "Account verified and password set." });
-    }
+    res.json({ success: true, message: "Account verified and password set." });
   } catch (err) {
     console.error("Verify password code error:", err);
     res.status(500).json({ success: false, error: "Failed to verify code." });
@@ -273,7 +282,49 @@ app.post('/reset-password', async (req, res) => {
   }
 });
 
-// 7. Login route
+// 7. Verify reset password code
+app.post('/verify-reset-code', async (req, res) => {
+  const { email, token } = req.body;
+  try {
+    // Always check latest valid reset token for this email
+    const tokenCheck = await pool.query(
+      `SELECT * FROM email_tokens 
+       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=true
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [email, token]
+    );
+
+    if (tokenCheck.rows.length === 0) {
+      return res.json({ success: false, error: "Invalid or expired code." });
+    }
+
+    const pendingPassword = tokenCheck.rows[0].pending_password;
+    const hashedPassword = await bcrypt.hash(pendingPassword, 10);
+
+    const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
+    if (clientResult.rows.length > 0) {
+      await pool.query(
+        `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
+        [hashedPassword, email]
+      );
+    } else {
+      await pool.query(
+        `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
+        [hashedPassword, email]
+      );
+    }
+
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
+
+    res.json({ success: true, message: "Password reset successfully." });
+  } catch (err) {
+    console.error("Verify reset code error:", err);
+    res.status(500).json({ success: false, error: "Failed to verify reset code." });
+  }
+});
+
+// 8. Login route
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -324,7 +375,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// 8. SendGrid Event Webhook
+// 9. SendGrid Event Webhook
 app.post("/sendgrid-events", async (req, res) => {
   const events = req.body;
   for (const e of events) {
@@ -345,7 +396,7 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 9. Check Email Exists
+// 10. Check Email Exists
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
@@ -360,6 +411,27 @@ app.post("/check-email", async (req, res) => {
   } catch (err) {
     console.error("Check email error:", err);
     res.status(500).json({ success: false, error: "Server error checking email." });
+  }
+});
+
+// 10. Cleanup expired tokens
+app.post("/cleanup-tokens", async (req, res) => {
+  try {
+    // Delete all tokens that are expired (past expires_at) and not yet verified
+    const result = await pool.query(
+      `DELETE FROM email_tokens 
+       WHERE expires_at < NOW() 
+       AND verified=false`
+    );
+
+    res.json({
+      success: true,
+      message: `Expired tokens cleaned up.`,
+      deletedCount: result.rowCount
+    });
+  } catch (err) {
+    console.error("Cleanup error:", err.message);
+    res.status(500).json({ success: false, error: "Failed to cleanup tokens." });
   }
 });
 
