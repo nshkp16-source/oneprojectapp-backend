@@ -145,21 +145,28 @@ app.post("/resend-verification", async (req, res) => {
     // Delete old unverified tokens for this email
     await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND verified=false`, [email]);
 
+    // Check latest token attempts (after cleanup, may be empty)
     const check = await pool.query(
       `SELECT attempts, session_id FROM email_tokens WHERE email=$1 ORDER BY created_at DESC LIMIT 1`,
       [email]
     );
 
-    if (check.rows.length > 0 && check.rows[0].attempts >= 2) {
-      await pool.query(`DELETE FROM users WHERE project_id IN (SELECT id FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false))`, [email]);
-      await pool.query(`DELETE FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false)`, [email]);
-      await pool.query(`DELETE FROM clients WHERE company_email=$1 AND verified=false`, [email]);
-      return res.json({ success: false, error: "Resend attempts exceeded. Please restart account creation." });
+    let newAttempts = 1;
+    let sessionId = uuidv4();
+
+    if (check.rows.length > 0) {
+      if (check.rows[0].attempts >= 2) {
+        // Too many resends → cleanup client/project
+        await pool.query(`DELETE FROM users WHERE project_id IN (SELECT id FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false))`, [email]);
+        await pool.query(`DELETE FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false)`, [email]);
+        await pool.query(`DELETE FROM clients WHERE company_email=$1 AND verified=false`, [email]);
+        return res.json({ success: false, error: "Resend attempts exceeded. Please restart account creation." });
+      }
+      newAttempts = check.rows[0].attempts + 1;
+      sessionId = check.rows[0].session_id || uuidv4();
     }
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const newAttempts = check.rows.length ? check.rows[0].attempts + 1 : 1;
-    const sessionId = check.rows.length ? check.rows[0].session_id : uuidv4();
 
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
@@ -414,10 +421,9 @@ app.post("/check-email", async (req, res) => {
   }
 });
 
-// 10. Cleanup expired tokens
+// 11. Cleanup expired tokens
 app.post("/cleanup-tokens", async (req, res) => {
   try {
-    // Delete all tokens that are expired (past expires_at) and not yet verified
     const result = await pool.query(
       `DELETE FROM email_tokens 
        WHERE expires_at < NOW() 
