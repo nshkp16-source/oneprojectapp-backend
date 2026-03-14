@@ -335,12 +335,25 @@ app.post('/verify-reset-code', async (req, res) => {
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
-    const result = await pool.query(
-      `SELECT id, email, password_hash, role, verified, project_id 
-       FROM users 
-       WHERE email=$1 AND role=$2`,
-      [email, role]
-    );
+    let result;
+
+    if (role === "Client") {
+      // Check clients table
+      result = await pool.query(
+        `SELECT id, company_email AS email, password_hash, 'Client' AS role, verified 
+         FROM clients 
+         WHERE company_email=$1`,
+        [email]
+      );
+    } else {
+      // Check users table
+      result = await pool.query(
+        `SELECT id, email, password_hash, role, verified, project_id 
+         FROM users 
+         WHERE email=$1 AND role=$2`,
+        [email, role]
+      );
+    }
 
     if (result.rows.length === 0) {
       return res.status(401).json({ success: false, error: "Invalid email or role." });
@@ -359,22 +372,11 @@ app.post("/login", async (req, res) => {
 
     const sessionId = uuidv4();
 
-    await pool.query(
-      `INSERT INTO email_tokens (id, email, token, expires_at, session_id, verified) 
-       VALUES ($1,$2,$3,NOW() + interval '1 hour',$4,true)`,
-      [uuidv4(), email, sessionId, sessionId]
-    );
-
     res.json({
       success: true,
       message: "Login successful.",
       sessionId,
-      user: {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        project_id: user.project_id
-      }
+      user
     });
   } catch (err) {
     console.error("Login error:", err);
