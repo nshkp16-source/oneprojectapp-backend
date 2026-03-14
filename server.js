@@ -194,12 +194,12 @@ app.post("/send-verification", async (req, res) => {
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
-    const hashedPassword = await bcrypt.hash(password, 10);
 
+    // Store raw password, not hashed
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,false)`,
-      [email, code, hashedPassword, sessionId]
+      [email, code, password, sessionId]
     );
 
     await transporter.sendMail({
@@ -221,7 +221,6 @@ app.post("/send-verification", async (req, res) => {
 app.post('/verify-password-code', async (req, res) => {
   const { email, token } = req.body;
   try {
-    // Always check latest valid token for this email
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=false
@@ -237,7 +236,6 @@ app.post('/verify-password-code', async (req, res) => {
     const pendingPassword = tokenCheck.rows[0].pending_password;
     const hashedPassword = await bcrypt.hash(pendingPassword, 10);
 
-    // Update client or user depending on role
     const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     if (clientResult.rows.length > 0) {
       await pool.query(
@@ -266,12 +264,12 @@ app.post('/reset-password', async (req, res) => {
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
-    const hashedPassword = await bcrypt.hash(password, 10);
 
+    // Store raw password, not hashed
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,true)`,
-      [email, code, hashedPassword, sessionId]
+      [email, code, password, sessionId]
     );
 
     await transporter.sendMail({
@@ -293,7 +291,6 @@ app.post('/reset-password', async (req, res) => {
 app.post('/verify-reset-code', async (req, res) => {
   const { email, token } = req.body;
   try {
-    // Always check latest valid reset token for this email
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=true
@@ -338,7 +335,6 @@ app.post("/login", async (req, res) => {
     let result;
 
     if (role === "Client") {
-      // Check clients table
       result = await pool.query(
         `SELECT id, company_email AS email, password_hash, 'Client' AS role, verified 
          FROM clients 
@@ -346,7 +342,6 @@ app.post("/login", async (req, res) => {
         [email]
       );
     } else {
-      // Check users table
       result = await pool.query(
         `SELECT id, email, password_hash, role, verified, project_id 
          FROM users 
@@ -405,12 +400,12 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 10. Check Email Exists
+// 10. Check Email Exists (fix role casing)
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
     let result;
-    if (role === "client") {
+    if (role === "Client") {
       result = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     } else {
       result = await pool.query(`SELECT id FROM users WHERE email=$1 AND role=$2`, [email, role]);
@@ -423,7 +418,7 @@ app.post("/check-email", async (req, res) => {
   }
 });
 
-// 11. Cleanup expired tokens
+// 11. Cleanup expired tokens (manual trigger)
 app.post("/cleanup-tokens", async (req, res) => {
   try {
     const result = await pool.query(
@@ -442,6 +437,22 @@ app.post("/cleanup-tokens", async (req, res) => {
     res.status(500).json({ success: false, error: "Failed to cleanup tokens." });
   }
 });
+
+// 🔹 Automatic cleanup every 3 minutes
+setInterval(async () => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM email_tokens 
+       WHERE expires_at < NOW() 
+       AND verified=false`
+    );
+    if (result.rowCount > 0) {
+      console.log(`Scheduled cleanup: ${result.rowCount} expired tokens deleted.`);
+    }
+  } catch (err) {
+    console.error("Scheduled cleanup error:", err.message);
+  }
+}, 3 * 60 * 1000); // 3 minutes in milliseconds
 
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
