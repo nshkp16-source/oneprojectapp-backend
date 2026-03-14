@@ -217,6 +217,44 @@ app.post("/send-verification", async (req, res) => {
   }
 });
 
+// b. Resend verification code (first login)
+app.post("/resend-verification", async (req, res) => {
+  const { email } = req.body;
+  try {
+    // 🔹 Clean up old unverified tokens for this email
+    await pool.query(
+      `DELETE FROM email_tokens 
+       WHERE email=$1 AND verified=false AND reset_flow=false`,
+      [email]
+    );
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    // Re-insert new token (no password change here, password already staged)
+    await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',
+               (SELECT pending_password FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1),
+               $3,false,false)`,
+      [email, code, sessionId]
+    );
+
+    await transporter.sendMail({
+      from: "skyprincenkp16@gmail.com",
+      to: email,
+      subject: "Resend verification - OneProjectApp",
+      html: `<p>Your new verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+
+    res.json({ success: true, message: "New verification code sent.", sessionId });
+  } catch (err) {
+    console.error("Resend verification error:", err);
+    res.status(500).json({ success: false, error: "Failed to resend verification." });
+  }
+});
+
 // 5. Verify code and finalize first login
 app.post('/verify-password-code', async (req, res) => {
   const { email, token } = req.body;
