@@ -328,7 +328,7 @@ app.post('/verify-reset-code', async (req, res) => {
   }
 });
 
-// 8. Login route
+// 8. Login route (with first-login detection)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -355,6 +355,15 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+
+    // 🔹 First login detection
+    if (!user.password_hash) {
+      return res.json({
+        success: false,
+        firstLogin: true,
+        message: "No password set. Please complete first login."
+      });
+    }
 
     if (!user.verified) {
       return res.status(403).json({ success: false, error: "Account not verified." });
