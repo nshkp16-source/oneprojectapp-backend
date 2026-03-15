@@ -366,7 +366,7 @@ app.post('/verify-reset-code', async (req, res) => {
   }
 });
 
-// 8. Login route (with first-login detection)
+// 8. Login route (with strict first-login detection)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -388,14 +388,15 @@ app.post("/login", async (req, res) => {
       );
     }
 
+    // 🔹 No user found at all
     if (result.rows.length === 0) {
       return res.status(401).json({ success: false, error: "Invalid email or role." });
     }
 
     const user = result.rows[0];
 
-    // 🔹 First login detection
-    if (!user.password_hash) {
+    // 🔹 First login detection: user exists but no password set yet
+    if (user.password_hash === null || user.password_hash === "") {
       return res.json({
         success: false,
         firstLogin: true,
@@ -403,17 +404,19 @@ app.post("/login", async (req, res) => {
       });
     }
 
+    // 🔹 Verified check
     if (!user.verified) {
       return res.status(403).json({ success: false, error: "Account not verified." });
     }
 
+    // 🔹 Password check
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
       return res.status(401).json({ success: false, error: "Incorrect password." });
     }
 
+    // 🔹 Success: issue session
     const sessionId = uuidv4();
-
     res.json({
       success: true,
       message: "Login successful.",
