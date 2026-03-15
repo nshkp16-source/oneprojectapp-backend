@@ -195,7 +195,7 @@ app.post("/send-verification", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert token immediately
+    // Insert and return the row immediately
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
@@ -205,7 +205,6 @@ app.post("/send-verification", async (req, res) => {
 
     console.log("Inserted token:", insertResult.rows[0]);
 
-    // Send mail immediately after insert
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -222,11 +221,10 @@ app.post("/send-verification", async (req, res) => {
   }
 });
 
-// b. Resend verification code
+// 5. Resend verification code
 app.post("/resend-verification", async (req, res) => {
   const { email } = req.body;
   try {
-    // Delete old unverified tokens for this email
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -261,7 +259,7 @@ app.post("/resend-verification", async (req, res) => {
   }
 });
 
-// 5. Verify code only (no password commit here)
+// 6. Verify code only (no password commit here)
 app.post('/verify-password-code', async (req, res) => {
   const { email, token } = req.body;
   try {
@@ -291,7 +289,7 @@ app.post('/verify-password-code', async (req, res) => {
   }
 });
 
-// 6. Set password after verification
+// 7. Set password after verification
 app.post("/set-password", async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -321,21 +319,19 @@ app.post("/set-password", async (req, res) => {
   }
 });
 
-// 6. Reset Password (initiate reset by sending verification code)
+// 8. Reset Password (initiate reset by sending verification code)
 app.post('/reset-password', async (req, res) => {
   const { email, password } = req.body;
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    const insertResult = await pool.query(
+    // Store raw password, not hashed
+    await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,true)
-       RETURNING *`,
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,true)`,
       [email, code, password, sessionId]
     );
-
-    console.log("Inserted reset token:", insertResult.rows[0]);
 
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
@@ -345,7 +341,6 @@ app.post('/reset-password', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    console.log("Reset password code sent:", code, "to", email);
     res.json({ success: true, message: "Reset code sent.", sessionId });
   } catch (err) {
     console.error("Reset password error:", err);
@@ -353,7 +348,7 @@ app.post('/reset-password', async (req, res) => {
   }
 });
 
-// 7. Verify reset password code
+// 9. Verify reset password code
 app.post('/verify-reset-code', async (req, res) => {
   const { email, token } = req.body;
   try {
@@ -394,7 +389,7 @@ app.post('/verify-reset-code', async (req, res) => {
   }
 });
 
-// 8. Login route (with strict first-login detection)
+// 10. Login route (with strict first-login detection)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -457,7 +452,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// 9. SendGrid Event Webhook
+// 11. SendGrid Event Webhook
 app.post("/sendgrid-events", async (req, res) => {
   const events = req.body;
   for (const e of events) {
@@ -478,7 +473,7 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 10. Check Email Exists (fix role casing)
+// 12. Check Email Exists (fix role casing)
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
@@ -496,7 +491,7 @@ app.post("/check-email", async (req, res) => {
   }
 });
 
-// 11. Cleanup expired tokens (manual trigger)
+// 13. Cleanup expired tokens (manual trigger)
 app.post("/cleanup-tokens", async (req, res) => {
   try {
     const result = await pool.query(
