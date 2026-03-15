@@ -195,12 +195,17 @@ app.post("/send-verification", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    await pool.query(
+    // Insert token immediately
+    const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)`,
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
+       RETURNING *`,
       [email, code, sessionId]
     );
 
+    console.log("Inserted token:", insertResult.rows[0]);
+
+    // Send mail immediately after insert
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -209,6 +214,7 @@ app.post("/send-verification", async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    console.log("Verification code sent:", code, "to", email);
     res.json({ success: true, message: "Verification code sent.", sessionId });
   } catch (err) {
     console.error("Send verification error:", err);
@@ -220,6 +226,7 @@ app.post("/send-verification", async (req, res) => {
 app.post("/resend-verification", async (req, res) => {
   const { email } = req.body;
   try {
+    // Delete old unverified tokens for this email
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -229,11 +236,14 @@ app.post("/resend-verification", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    await pool.query(
+    const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)`,
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
+       RETURNING *`,
       [email, code, sessionId]
     );
+
+    console.log("Inserted new token:", insertResult.rows[0]);
 
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
@@ -243,6 +253,7 @@ app.post("/resend-verification", async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    console.log("Resent verification code:", code, "to", email);
     res.json({ success: true, message: "New verification code sent.", sessionId });
   } catch (err) {
     console.error("Resend verification error:", err);
@@ -254,12 +265,18 @@ app.post("/resend-verification", async (req, res) => {
 app.post('/verify-password-code', async (req, res) => {
   const { email, token } = req.body;
   try {
+    console.log("Verifying code:", token, "for email:", email);
+
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
-       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=false
+       WHERE email=$1 AND token=$2 
+       AND expires_at > NOW() 
+       AND verified=false AND reset_flow=false
        ORDER BY expires_at DESC LIMIT 1`,
       [email, token]
     );
+
+    console.log("DB result:", tokenCheck.rows);
 
     if (tokenCheck.rows.length === 0) {
       return res.json({ success: false, error: "Invalid or expired code." });
@@ -278,6 +295,8 @@ app.post('/verify-password-code', async (req, res) => {
 app.post("/set-password", async (req, res) => {
   const { email, password } = req.body;
   try {
+    console.log("Setting password for:", email);
+
     const hash = await bcrypt.hash(password, 10);
 
     const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
@@ -286,11 +305,13 @@ app.post("/set-password", async (req, res) => {
         `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
         [hash, email]
       );
+      console.log("Password set for client:", email);
     } else {
       await pool.query(
         `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
         [hash, email]
       );
+      console.log("Password set for user:", email);
     }
 
     res.json({ success: true, message: "Password set successfully." });
@@ -307,12 +328,14 @@ app.post('/reset-password', async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Store raw password, not hashed
-    await pool.query(
+    const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,true)`,
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,true)
+       RETURNING *`,
       [email, code, password, sessionId]
     );
+
+    console.log("Inserted reset token:", insertResult.rows[0]);
 
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
@@ -322,6 +345,7 @@ app.post('/reset-password', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    console.log("Reset password code sent:", code, "to", email);
     res.json({ success: true, message: "Reset code sent.", sessionId });
   } catch (err) {
     console.error("Reset password error:", err);
