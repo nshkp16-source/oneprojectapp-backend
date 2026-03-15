@@ -188,18 +188,17 @@ app.post("/resend-verification", async (req, res) => {
   }
 });
 
-// 4. First Login (send verification, store pending password)
+// 4. First Login (send verification code only)
 app.post("/send-verification", async (req, res) => {
-  const { email, password } = req.body;
+  const { email } = req.body;
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Store raw password, not hashed
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,false)`,
-      [email, code, password, sessionId]
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)`,
+      [email, code, sessionId]
     );
 
     await transporter.sendMail({
@@ -217,11 +216,10 @@ app.post("/send-verification", async (req, res) => {
   }
 });
 
-// b. Resend verification code (first login)
+// b. Resend verification code
 app.post("/resend-verification", async (req, res) => {
   const { email } = req.body;
   try {
-    // 🔹 Clean up old unverified tokens for this email
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -231,12 +229,9 @@ app.post("/resend-verification", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Re-insert new token (no password change here, password already staged)
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',
-               (SELECT pending_password FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1),
-               $3,false,false)`,
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)`,
       [email, code, sessionId]
     );
 
@@ -255,15 +250,14 @@ app.post("/resend-verification", async (req, res) => {
   }
 });
 
-// 5. Verify code and finalize first login
+// 5. Verify code only (no password commit here)
 app.post('/verify-password-code', async (req, res) => {
   const { email, token } = req.body;
   try {
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=false
-       ORDER BY expires_at DESC
-       LIMIT 1`,
+       ORDER BY expires_at DESC LIMIT 1`,
       [email, token]
     );
 
@@ -271,28 +265,38 @@ app.post('/verify-password-code', async (req, res) => {
       return res.json({ success: false, error: "Invalid or expired code." });
     }
 
-    const pendingPassword = tokenCheck.rows[0].pending_password;
-    const hashedPassword = await bcrypt.hash(pendingPassword, 10);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
+
+    res.json({ success: true, message: "Code verified. You may now set your password." });
+  } catch (err) {
+    console.error("Verify password code error:", err);
+    res.status(500).json({ success: false, error: "Failed to verify code." });
+  }
+});
+
+// 6. Set password after verification
+app.post("/set-password", async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const hash = await bcrypt.hash(password, 10);
 
     const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     if (clientResult.rows.length > 0) {
       await pool.query(
         `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
-        [hashedPassword, email]
+        [hash, email]
       );
     } else {
       await pool.query(
         `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
-        [hashedPassword, email]
+        [hash, email]
       );
     }
 
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
-
-    res.json({ success: true, message: "Account verified and password set." });
+    res.json({ success: true, message: "Password set successfully." });
   } catch (err) {
-    console.error("Verify password code error:", err);
-    res.status(500).json({ success: false, error: "Failed to verify code." });
+    console.error("Set password error:", err);
+    res.status(500).json({ success: false, error: "Failed to set password." });
   }
 });
 
