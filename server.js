@@ -383,7 +383,7 @@ app.post("/login", async (req, res) => {
       result = await pool.query(
         `SELECT id, email, password_hash, role, verified, project_id 
          FROM users 
-         WHERE email=$1 AND role=$2`,
+         WHERE email=$1 AND LOWER(role)=LOWER($2)`,
         [email, role]
       );
     }
@@ -396,7 +396,7 @@ app.post("/login", async (req, res) => {
     const user = result.rows[0];
 
     // 🔹 First login detection: user exists but no password set yet
-    if (user.password_hash === null || user.password_hash === "") {
+    if (!user.password_hash || user.password_hash.trim() === "") {
       return res.json({
         success: false,
         firstLogin: true,
