@@ -339,8 +339,6 @@ app.post('/reset-send', async (req, res) => {
       [email, code, sessionId]
     );
 
-    console.log("Inserted reset token:", insertResult.rows[0]);
-
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -349,7 +347,12 @@ app.post('/reset-send', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    res.json({ success: true, message: "Reset code sent.", sessionId });
+    res.json({
+      success: true,
+      message: "Reset code sent.",
+      sessionId,
+      expiresAt: insertResult.rows[0].expires_at // ✅ return expiry timestamp
+    });
   } catch (err) {
     console.error("Reset password error:", err);
     res.status(500).json({ success: false, error: "Failed to send reset code." });
@@ -360,7 +363,6 @@ app.post('/reset-send', async (req, res) => {
 app.post('/reset-resend', async (req, res) => {
   const { email } = req.body;
   try {
-    // Clean up old unverified reset tokens
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=true`,
@@ -377,8 +379,6 @@ app.post('/reset-resend', async (req, res) => {
       [email, code, sessionId]
     );
 
-    console.log("Inserted new reset token:", insertResult.rows[0]);
-
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -387,7 +387,12 @@ app.post('/reset-resend', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    res.json({ success: true, message: "New reset code sent.", sessionId });
+    res.json({
+      success: true,
+      message: "New reset code sent.",
+      sessionId,
+      expiresAt: insertResult.rows[0].expires_at // ✅ return expiry timestamp
+    });
   } catch (err) {
     console.error("Resend reset error:", err);
     res.status(500).json({ success: false, error: "Failed to resend reset code." });
@@ -401,8 +406,7 @@ app.post('/reset-verify', async (req, res) => {
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=true
-       ORDER BY expires_at DESC
-       LIMIT 1`,
+       ORDER BY expires_at DESC LIMIT 1`,
       [email, token]
     );
 
@@ -410,7 +414,6 @@ app.post('/reset-verify', async (req, res) => {
       return res.json({ success: false, error: "Invalid or expired code." });
     }
 
-    // Mark token verified
     await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
 
     res.json({ success: true, message: "Code verified. You may now set your new password." });
@@ -428,14 +431,12 @@ app.post('/reset-set-password', async (req, res) => {
 
     const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     if (clientResult.rows.length > 0) {
-      // ✅ Replace existing password with new one
       await pool.query(
         `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
         [hash, email]
       );
       console.log("Password reset for client:", email);
     } else {
-      // ✅ Replace existing password with new one
       await pool.query(
         `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
         [hash, email]
