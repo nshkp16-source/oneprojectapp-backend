@@ -195,7 +195,7 @@ app.post("/send-verification", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert and return the row immediately
+    // Insert and confirm row
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
@@ -213,7 +213,6 @@ app.post("/send-verification", async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    console.log("Verification code sent:", code, "to", email);
     res.json({ success: true, message: "Verification code sent.", sessionId });
   } catch (err) {
     console.error("Send verification error:", err);
@@ -221,10 +220,11 @@ app.post("/send-verification", async (req, res) => {
   }
 });
 
-// 5. Resend verification code
+// 5. Resend verification code (first login)
 app.post("/resend-verification", async (req, res) => {
   const { email } = req.body;
   try {
+    // Clean up old unverified tokens
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -251,7 +251,6 @@ app.post("/resend-verification", async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    console.log("Resent verification code:", code, "to", email);
     res.json({ success: true, message: "New verification code sent.", sessionId });
   } catch (err) {
     console.error("Resend verification error:", err);
