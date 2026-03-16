@@ -319,24 +319,27 @@ app.post("/set-password", async (req, res) => {
 });
 
 // 8. Reset Password (initiate reset by sending verification code)
-app.post('/reset-password', async (req, res) => {
-  const { email, password } = req.body;
+app.post('/reset-send', async (req, res) => {
+  const { email } = req.body;
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Store raw password, not hashed
-    await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, pending_password, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,true)`,
-      [email, code, password, sessionId]
+    // Insert token only, no password yet
+    const insertResult = await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
+       RETURNING *`,
+      [email, code, sessionId]
     );
+
+    console.log("Inserted reset token:", insertResult.rows[0]);
 
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
       subject: 'Reset your password - OneProjectApp',
-      html: `<p>Your password reset code is: <b>${code}</b></p>
+      html: `<p>Your reset code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
 
@@ -348,7 +351,7 @@ app.post('/reset-password', async (req, res) => {
 });
 
 // 9. Verify reset password code
-app.post('/verify-reset-code', async (req, res) => {
+app.post('/reset-verify', async (req, res) => {
   const { email, token } = req.body;
   try {
     const tokenCheck = await pool.query(
@@ -363,32 +366,45 @@ app.post('/verify-reset-code', async (req, res) => {
       return res.json({ success: false, error: "Invalid or expired code." });
     }
 
-    const pendingPassword = tokenCheck.rows[0].pending_password;
-    const hashedPassword = await bcrypt.hash(pendingPassword, 10);
-
-    const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
-    if (clientResult.rows.length > 0) {
-      await pool.query(
-        `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
-        [hashedPassword, email]
-      );
-    } else {
-      await pool.query(
-        `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
-        [hashedPassword, email]
-      );
-    }
-
+    // Mark token verified
     await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
 
-    res.json({ success: true, message: "Password reset successfully." });
+    res.json({ success: true, message: "Code verified. You may now set your new password." });
   } catch (err) {
     console.error("Verify reset code error:", err);
     res.status(500).json({ success: false, error: "Failed to verify reset code." });
   }
 });
 
-// 10. Login route (with strict first-login detection)
+// 10. Save new password after verification
+app.post('/reset-set-password', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const hash = await bcrypt.hash(password, 10);
+
+    const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
+    if (clientResult.rows.length > 0) {
+      await pool.query(
+        `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
+        [hash, email]
+      );
+      console.log("Password reset for client:", email);
+    } else {
+      await pool.query(
+        `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
+        [hash, email]
+      );
+      console.log("Password reset for user:", email);
+    }
+
+    res.json({ success: true, message: "Password reset successfully." });
+  } catch (err) {
+    console.error("Reset set password error:", err);
+    res.status(500).json({ success: false, error: "Failed to reset password." });
+  }
+});
+
+// 11. Login route (with strict first-login detection)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -451,7 +467,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// 11. SendGrid Event Webhook
+// 12. SendGrid Event Webhook
 app.post("/sendgrid-events", async (req, res) => {
   const events = req.body;
   for (const e of events) {
@@ -472,7 +488,7 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 12. Check Email Exists (fix role casing)
+// 13. Check Email Exists (fix role casing)
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
@@ -490,7 +506,7 @@ app.post("/check-email", async (req, res) => {
   }
 });
 
-// 13. Cleanup expired tokens (manual trigger)
+// 14. Cleanup expired tokens (manual trigger)
 app.post("/cleanup-tokens", async (req, res) => {
   try {
     const result = await pool.query(
