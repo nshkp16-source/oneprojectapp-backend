@@ -318,14 +318,20 @@ app.post("/set-password", async (req, res) => {
   }
 });
 
-// 8. Reset Password (initiate reset by sending verification code)
+// 8. Reset Password (send verification code)
 app.post('/reset-send', async (req, res) => {
   const { email } = req.body;
   try {
+    // Clean up old unverified reset tokens
+    await pool.query(
+      `DELETE FROM email_tokens 
+       WHERE email=$1 AND verified=false AND reset_flow=true`,
+      [email]
+    );
+
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert token only, no password yet
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
@@ -350,7 +356,45 @@ app.post('/reset-send', async (req, res) => {
   }
 });
 
-// 9. Verify reset password code
+// 9. Resend reset code
+app.post('/reset-resend', async (req, res) => {
+  const { email } = req.body;
+  try {
+    // Clean up old unverified reset tokens
+    await pool.query(
+      `DELETE FROM email_tokens 
+       WHERE email=$1 AND verified=false AND reset_flow=true`,
+      [email]
+    );
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    const insertResult = await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
+       RETURNING *`,
+      [email, code, sessionId]
+    );
+
+    console.log("Inserted new reset token:", insertResult.rows[0]);
+
+    await transporter.sendMail({
+      from: "skyprincenkp16@gmail.com",
+      to: email,
+      subject: "Resend reset code - OneProjectApp",
+      html: `<p>Your new reset code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+
+    res.json({ success: true, message: "New reset code sent.", sessionId });
+  } catch (err) {
+    console.error("Resend reset error:", err);
+    res.status(500).json({ success: false, error: "Failed to resend reset code." });
+  }
+});
+
+// 10. Verify reset password code
 app.post('/reset-verify', async (req, res) => {
   const { email, token } = req.body;
   try {
@@ -376,7 +420,7 @@ app.post('/reset-verify', async (req, res) => {
   }
 });
 
-// 10. Save new password after verification
+// 11. Save new password after verification
 app.post('/reset-set-password', async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -384,12 +428,14 @@ app.post('/reset-set-password', async (req, res) => {
 
     const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     if (clientResult.rows.length > 0) {
+      // ✅ Replace existing password with new one
       await pool.query(
         `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
         [hash, email]
       );
       console.log("Password reset for client:", email);
     } else {
+      // ✅ Replace existing password with new one
       await pool.query(
         `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
         [hash, email]
@@ -401,69 +447,6 @@ app.post('/reset-set-password', async (req, res) => {
   } catch (err) {
     console.error("Reset set password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
-  }
-});
-
-// 11. Login route (with strict first-login detection)
-app.post("/login", async (req, res) => {
-  const { email, password, role } = req.body;
-  try {
-    let result;
-
-    if (role === "Client") {
-      result = await pool.query(
-        `SELECT id, company_email AS email, password_hash, 'Client' AS role, verified 
-         FROM clients 
-         WHERE company_email=$1`,
-        [email]
-      );
-    } else {
-      result = await pool.query(
-        `SELECT id, email, password_hash, role, verified, project_id 
-         FROM users 
-         WHERE email=$1 AND LOWER(role)=LOWER($2)`,
-        [email, role]
-      );
-    }
-
-    // 🔹 No user found at all
-    if (result.rows.length === 0) {
-      return res.status(401).json({ success: false, error: "Invalid email or role." });
-    }
-
-    const user = result.rows[0];
-
-    // 🔹 First login detection: user exists but no password set yet
-    if (!user.password_hash || user.password_hash.trim() === "") {
-      return res.json({
-        success: false,
-        firstLogin: true,
-        message: "No password set. Please complete first login."
-      });
-    }
-
-    // 🔹 Verified check
-    if (!user.verified) {
-      return res.status(403).json({ success: false, error: "Account not verified." });
-    }
-
-    // 🔹 Password check
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) {
-      return res.status(401).json({ success: false, error: "Incorrect password." });
-    }
-
-    // 🔹 Success: issue session
-    const sessionId = uuidv4();
-    res.json({
-      success: true,
-      message: "Login successful.",
-      sessionId,
-      user
-    });
-  } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ success: false, error: "Server error during login." });
   }
 });
 
