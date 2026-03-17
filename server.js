@@ -500,7 +500,76 @@ app.post('/reset-set-password', async (req, res) => {
   }
 });
 
-// 12. SendGrid Event Webhook
+// 12. Login route (Client + Non-Client users)
+app.post("/login", async (req, res) => {
+  const { email, password, role } = req.body;
+  try {
+    let result;
+
+    // 🔹 Check Client table
+    if (role === "Client") {
+      result = await pool.query(
+        `SELECT id, company_name, company_email, representative, title, telephone, password_hash, verified 
+         FROM clients WHERE company_email=$1`,
+        [email]
+      );
+    } else {
+      // 🔹 Check Users table for non-client roles
+      result = await pool.query(
+        `SELECT id, role, company_name, email, representative, title, telephone, password_hash, verified, project_id 
+         FROM users WHERE email=$1 AND role=$2`,
+        [email, role]
+      );
+    }
+
+    // 🔹 Account not found
+    if (result.rows.length === 0) {
+      return res.json({ success: false, error: "Account not found." });
+    }
+
+    const user = result.rows[0];
+
+    // 🔹 Guardrail: no password yet → must follow first-login
+    if (!user.password_hash) {
+      return res.json({
+        success: false,
+        error: "No password set yet. Follow the top first login guideline."
+      });
+    }
+
+    // 🔹 Compare password
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      return res.json({ success: false, error: "Invalid password." });
+    }
+
+    // 🔹 Check verified status
+    if (!user.verified) {
+      return res.json({ success: false, error: "Account not verified. Please check your email." });
+    }
+
+    // 🔹 Success response
+    res.json({
+      success: true,
+      message: "Login successful.",
+      role: role,
+      userDetails: {
+        id: user.id,
+        email: role === "Client" ? user.company_email : user.email,
+        company_name: user.company_name,
+        representative: user.representative,
+        title: user.title,
+        telephone: user.telephone,
+        project_id: user.project_id || null
+      }
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ success: false, error: "Server error logging in." });
+  }
+});
+
+// 13. SendGrid Event Webhook
 app.post("/sendgrid-events", async (req, res) => {
   const events = req.body;
   for (const e of events) {
@@ -521,7 +590,7 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 13. Check Email Exists (fix role casing)
+// 14. Check Email Exists (fix role casing)
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
@@ -539,7 +608,7 @@ app.post("/check-email", async (req, res) => {
   }
 });
 
-// 14. Cleanup expired tokens (manual trigger)
+// 15. Cleanup expired tokens (manual trigger)
 app.post("/cleanup-tokens", async (req, res) => {
   try {
     const result = await pool.query(
