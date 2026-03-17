@@ -500,7 +500,7 @@ app.post('/reset-set-password', async (req, res) => {
   }
 });
 
-// 12. Login route (Client + Non-Client users)
+// 12. LOGIN route (Client + Non-Client users)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
