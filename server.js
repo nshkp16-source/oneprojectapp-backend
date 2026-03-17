@@ -189,13 +189,13 @@ app.post("/resend-verification", async (req, res) => {
 });
 
 // 4. First Login (send verification code only)
-app.post("/send-verification", async (req, res) => {
+app.post("/firstlogin-send", async (req, res) => {
   const { email } = req.body;
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert and confirm row
+    // Insert and confirm row (reset_flow=false for first login)
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
@@ -215,16 +215,16 @@ app.post("/send-verification", async (req, res) => {
 
     res.json({ success: true, message: "Verification code sent.", sessionId });
   } catch (err) {
-    console.error("Send verification error:", err);
+    console.error("First login send error:", err);
     res.status(500).json({ success: false, error: "Failed to send verification." });
   }
 });
 
 // 5. Resend verification code (first login)
-app.post("/resend-verification", async (req, res) => {
+app.post("/firstlogin-resend", async (req, res) => {
   const { email } = req.body;
   try {
-    // Clean up old unverified tokens
+    // Clean up only old first-login tokens (reset_flow=false)
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -253,7 +253,7 @@ app.post("/resend-verification", async (req, res) => {
 
     res.json({ success: true, message: "New verification code sent.", sessionId });
   } catch (err) {
-    console.error("Resend verification error:", err);
+    console.error("First login resend error:", err);
     res.status(500).json({ success: false, error: "Failed to resend verification." });
   }
 });
