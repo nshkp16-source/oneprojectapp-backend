@@ -322,13 +322,35 @@ app.post("/set-password", async (req, res) => {
 app.post('/reset-send', async (req, res) => {
   const { email } = req.body;
   try {
-    // Clean up old unverified reset tokens
-    await pool.query(
-      `DELETE FROM email_tokens 
-       WHERE email=$1 AND verified=false AND reset_flow=true`,
+    // 1. Check if user has an existing password
+    const clientResult = await pool.query(
+      `SELECT password_hash FROM clients WHERE company_email=$1`,
+      [email]
+    );
+    const userResult = await pool.query(
+      `SELECT password_hash FROM users WHERE email=$1`,
       [email]
     );
 
+    let passwordHash = null;
+    if (clientResult.rows.length > 0) {
+      passwordHash = clientResult.rows[0].password_hash;
+    } else if (userResult.rows.length > 0) {
+      passwordHash = userResult.rows[0].password_hash;
+    }
+
+    // 2. If no password exists, block reset flow
+    if (!passwordHash) {
+      return res.json({
+        success: false,
+        error: "This account has no password yet. Please follow the first‑login flow to set your password."
+      });
+    }
+
+    // 3. Delete any existing token for this email
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+
+    // 4. Create new token
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
@@ -339,6 +361,7 @@ app.post('/reset-send', async (req, res) => {
       [email, code, sessionId]
     );
 
+    // 5. Send email immediately
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -347,11 +370,12 @@ app.post('/reset-send', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    // 6. Return success + expiry timestamp
     res.json({
       success: true,
       message: "Reset code sent.",
       sessionId,
-      expiresAt: insertResult.rows[0].expires_at // ✅ return expiry timestamp
+      expiresAt: insertResult.rows[0].expires_at
     });
   } catch (err) {
     console.error("Reset password error:", err);
@@ -363,12 +387,35 @@ app.post('/reset-send', async (req, res) => {
 app.post('/reset-resend', async (req, res) => {
   const { email } = req.body;
   try {
-    await pool.query(
-      `DELETE FROM email_tokens 
-       WHERE email=$1 AND verified=false AND reset_flow=true`,
+    // 1. Check if user has an existing password
+    const clientResult = await pool.query(
+      `SELECT password_hash FROM clients WHERE company_email=$1`,
+      [email]
+    );
+    const userResult = await pool.query(
+      `SELECT password_hash FROM users WHERE email=$1`,
       [email]
     );
 
+    let passwordHash = null;
+    if (clientResult.rows.length > 0) {
+      passwordHash = clientResult.rows[0].password_hash;
+    } else if (userResult.rows.length > 0) {
+      passwordHash = userResult.rows[0].password_hash;
+    }
+
+    // 2. If no password exists, block reset flow
+    if (!passwordHash) {
+      return res.json({
+        success: false,
+        error: "This account has no password yet. Please follow the first‑login flow to set your password."
+      });
+    }
+
+    // 3. Delete any existing token for this email
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+
+    // 4. Create new token
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
@@ -379,6 +426,7 @@ app.post('/reset-resend', async (req, res) => {
       [email, code, sessionId]
     );
 
+    // 5. Send email immediately
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -387,11 +435,12 @@ app.post('/reset-resend', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    // 6. Return success + expiry timestamp
     res.json({
       success: true,
       message: "New reset code sent.",
       sessionId,
-      expiresAt: insertResult.rows[0].expires_at // ✅ return expiry timestamp
+      expiresAt: insertResult.rows[0].expires_at
     });
   } catch (err) {
     console.error("Resend reset error:", err);
