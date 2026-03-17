@@ -195,7 +195,7 @@ app.post("/firstlogin-send", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert and confirm row (reset_flow=false for first login)
+    // Insert token (reset_flow=false for first login)
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
@@ -205,13 +205,15 @@ app.post("/firstlogin-send", async (req, res) => {
 
     console.log("Inserted token:", insertResult.rows[0]);
 
-    await transporter.sendMail({
+    // 🔹 Send email and log response
+    const info = await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
-      subject: "Set your password - OneProjectApp",
+      subject: "OneProjectApp Verification Code",
       html: `<p>Your verification code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
+    console.log("Mail response:", info);
 
     res.json({ success: true, message: "Verification code sent.", sessionId });
   } catch (err) {
@@ -224,7 +226,7 @@ app.post("/firstlogin-send", async (req, res) => {
 app.post("/firstlogin-resend", async (req, res) => {
   const { email } = req.body;
   try {
-    // Clean up only old first-login tokens (reset_flow=false)
+    // Clean up old first-login tokens
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -243,13 +245,15 @@ app.post("/firstlogin-resend", async (req, res) => {
 
     console.log("Inserted new token:", insertResult.rows[0]);
 
-    await transporter.sendMail({
+    // 🔹 Send email and log response
+    const info = await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
-      subject: "Resend verification - OneProjectApp",
+      subject: "OneProjectApp Verification Code (Resend)",
       html: `<p>Your new verification code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
+    console.log("Mail response:", info);
 
     res.json({ success: true, message: "New verification code sent.", sessionId });
   } catch (err) {
