@@ -19,6 +19,8 @@ app.get('/ping', async (req, res) => {
   res.json({ connected: result.rows[0] });
 });
 
-app.listen(4000, () => {
-  console.log('Dashboard backend running on port 4000');
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`Dashboard backend running on port ${PORT}`);
 });
+
