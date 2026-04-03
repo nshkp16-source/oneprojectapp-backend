@@ -648,6 +648,62 @@ setInterval(async () => {
   }
 }, 3 * 60 * 1000); // 3 minutes in milliseconds
 
+// ============= CLIENT PROFILE ROUTES =============
+
+const multer = require("multer");
+const upload = multer({
+  limits: { fileSize: 1024 * 1024 }, // 1MB limit
+  storage: multer.diskStorage({
+    destination: "uploads/",
+    filename: (req, file, cb) => {
+      cb(null, Date.now() + "-" + file.originalname);
+    }
+  })
+});
+
+// 16. Fetch client profile
+app.get("/client/profile", async (req, res) => {
+  try {
+    const { email } = req.session.client; // session contains client email
+    const result = await pool.query(
+      "SELECT email, role, profile_picture FROM clients WHERE email=$1",
+      [email]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch client profile" });
+  }
+});
+
+// Upload client profile picture
+app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
+  try {
+    const { email } = req.session.client;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+
+    const fileUrl = `/uploads/${req.file.filename}`;
+    await pool.query("UPDATE clients SET profile_picture=$1 WHERE email=$2", [fileUrl, email]);
+
+    res.json({ url: fileUrl });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to upload client picture" });
+  }
+});
+
+// Delete client profile picture
+app.delete("/client/delete-picture", async (req, res) => {
+  try {
+    const { email } = req.session.client;
+    await pool.query("UPDATE clients SET profile_picture=NULL WHERE email=$1", [email]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete client picture" });
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
