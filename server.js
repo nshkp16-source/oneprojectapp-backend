@@ -722,9 +722,9 @@ setInterval(async () => {
   }
 }, 3 * 60 * 1000); // 3 minutes in milliseconds
 
-// 16.============= CLIENT PROFILE ROUTES =============
+// 16.=========== CLIENT PROFILE ROUTES =============
 
-// ✅ ES module import already at the top: import multer from "multer"
+// ✅ Multer is already imported at the top: import multer from "multer";
 const upload = multer({
   limits: { fileSize: 1024 * 1024 }, // 1MB limit
   storage: multer.diskStorage({
@@ -735,24 +735,32 @@ const upload = multer({
   })
 });
 
-// 1. Fetch client profile
-app.get("/client/profile", async (req, res) => {
+//  Fetch client profile
+app.post("/client/profile", async (req, res) => {
   try {
-    const { email } = req.session.client; // session contains client email
+    // 🔹 Use email from request body instead of req.session
+    const { email } = req.body;
+
     const result = await pool.query(
       "SELECT company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
+    console.error("Fetch client profile error:", err);
     res.status(500).json({ error: "Failed to fetch client profile" });
   }
 });
 
-// 2. Upload client profile picture
+// Upload client profile picture
 app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
   try {
-    const { email } = req.session.client;
+    const { email } = req.body;
 
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
@@ -766,20 +774,24 @@ app.post("/client/upload-picture", upload.single("profile_picture"), async (req,
 
     res.json({ url: fileUrl });
   } catch (err) {
+    console.error("Upload client picture error:", err);
     res.status(500).json({ error: "Failed to upload client picture" });
   }
 });
 
-// 3. Delete client profile picture
-app.delete("/client/delete-picture", async (req, res) => {
+// Delete client profile picture
+app.post("/client/delete-picture", async (req, res) => {
   try {
-    const { email } = req.session.client;
+    const { email } = req.body;
+
     await pool.query(
       "UPDATE clients SET profile_picture=NULL WHERE company_email=$1",
       [email]
     );
+
     res.json({ success: true });
   } catch (err) {
+    console.error("Delete client picture error:", err);
     res.status(500).json({ error: "Failed to delete client picture" });
   }
 });
