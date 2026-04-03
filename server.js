@@ -738,7 +738,7 @@ const upload = multer({
 // ✅ Serve uploads folder publicly
 app.use("/uploads", express.static("uploads"));
 
-// Fetch client profile + projects
+// Fetch client profile + projects (only projects where user is the client)
 app.post("/client/profile", async (req, res) => {
   try {
     const { email } = req.body;
@@ -755,13 +755,18 @@ app.post("/client/profile", async (req, res) => {
 
     const client = clientResult.rows[0];
 
-    // Fetch projects for this client
+    // ✅ Only fetch projects where this user is the client
     const projectsResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE client_id=$1",
       [client.id]
     );
 
     client.projects = projectsResult.rows;
+
+    // If only one project, mark it as default
+    if (client.projects.length === 1) {
+      client.defaultProject = client.projects[0];
+    }
 
     res.json(client);
   } catch (err) {
@@ -826,9 +831,10 @@ app.post("/client/project-details", async (req, res) => {
     }
     const clientId = clientResult.rows[0].id;
 
-    // Verify project belongs to this client
+    // ✅ Verify project belongs to this client
     const projectResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
+      "SELECT id, name, location, contract_reference, created_at 
+       FROM projects WHERE id=$1 AND client_id=$2",
       [projectId, clientId]
     );
     if (projectResult.rows.length === 0) {
