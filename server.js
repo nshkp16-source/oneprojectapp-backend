@@ -735,10 +735,12 @@ const upload = multer({
   })
 });
 
-//  Fetch client profile
+// ✅ Serve uploads folder publicly
+app.use("/uploads", express.static("uploads"));
+
+// Fetch client profile
 app.post("/client/profile", async (req, res) => {
   try {
-    // 🔹 Use email from request body instead of req.session
     const { email } = req.body;
 
     const result = await pool.query(
@@ -766,13 +768,15 @@ app.post("/client/upload-picture", upload.single("profile_picture"), async (req,
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
-    const fileUrl = `/uploads/${req.file.filename}`;
+    // ✅ Use full Render backend URL
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+
     await pool.query(
       "UPDATE clients SET profile_picture=$1 WHERE company_email=$2",
       [fileUrl, email]
     );
 
-    res.json({ url: fileUrl });
+    res.json({ success: true, url: fileUrl });
   } catch (err) {
     console.error("Upload client picture error:", err);
     res.status(500).json({ error: "Failed to upload client picture" });
