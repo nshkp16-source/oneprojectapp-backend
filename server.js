@@ -29,18 +29,21 @@ const transporter = nodemailer.createTransport(
 // -------------------- ROUTES --------------------
 
 // Root route
-app.get('/', (req, res) => res.send('Backend is running successfully!'));
+app.get('/', (req, res) => {
+  res.send('Backend is running successfully!');
+});
 
 // 1. Finalize Account (send verification only)
 app.post("/finalize-account", async (req, res) => {
   const { clientEmail } = req.body;
+
   try {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
     await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',0,$3,false,false)`,
+       VALUES ($1, $2, NOW() + interval '3 minutes', 0, $3, false, false)`,
       [clientEmail, code, sessionId]
     );
 
@@ -48,7 +51,8 @@ app.post("/finalize-account", async (req, res) => {
       from: "skyprincenkp16@gmail.com",
       to: clientEmail,
       subject: "Verify your OneProjectApp account",
-      html: `<p>Your verification code is: <b>${code}</b></p><p>This code will expire in 3 minutes.</p>`
+      html: `<p>Your verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
     });
 
     res.json({ success: true, message: "Verification email sent.", sessionId });
@@ -61,6 +65,7 @@ app.post("/finalize-account", async (req, res) => {
 // 2. Verify Code (commit staged data)
 app.post("/verify-code", async (req, res) => {
   const { email, code, client, project, contractor, consultant } = req.body;
+
   try {
     // Always check latest valid token for this email
     const result = await pool.query(
@@ -72,10 +77,17 @@ app.post("/verify-code", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.json({ success: false, verified: false, error: "Invalid or expired code." });
+      return res.json({
+        success: false,
+        verified: false,
+        error: "Invalid or expired code."
+      });
     }
 
-    const hashedPassword = client.password_hash ? await bcrypt.hash(client.password_hash, 10) : null;
+    // Hash password if provided
+    const hashedPassword = client.password_hash
+      ? await bcrypt.hash(client.password_hash, 10)
+      : null;
 
     // Insert client
     const clientResult = await pool.query(
@@ -89,7 +101,14 @@ app.post("/verify-code", async (req, res) => {
          password_hash=EXCLUDED.password_hash,
          verified=true
        RETURNING id;`,
-      [client.company_name, client.company_email, client.representative, client.title, client.telephone, hashedPassword]
+      [
+        client.company_name,
+        client.company_email,
+        client.representative,
+        client.title,
+        client.telephone,
+        hashedPassword
+      ]
     );
     const client_id = clientResult.rows[0].id;
 
@@ -100,13 +119,20 @@ app.post("/verify-code", async (req, res) => {
        ON CONFLICT (name, client_id) DO NOTHING RETURNING id;`,
       [project.name, project.location, project.contract_reference, client_id]
     );
-    let project_id = projectResult.rows[0]?.id || (await pool.query(
-      `SELECT id FROM projects WHERE name=$1 AND client_id=$2`, [project.name, client_id]
-    )).rows[0].id;
+
+    let project_id =
+      projectResult.rows[0]?.id ||
+      (
+        await pool.query(
+          `SELECT id FROM projects WHERE name=$1 AND client_id=$2`,
+          [project.name, client_id]
+        )
+      ).rows[0].id;
 
     // Helper for contractor/consultant
     async function addUser(user, role) {
       if (!user?.email) return;
+
       const userResult = await pool.query(
         `INSERT INTO users (role, company_name, email, representative, title, telephone, created_at, verified, project_id)
          VALUES ($1,$2,$3,$4,$5,$6,NOW(),true,$7)
@@ -117,11 +143,22 @@ app.post("/verify-code", async (req, res) => {
            telephone=EXCLUDED.telephone,
            verified=true
          RETURNING id;`,
-        [role, user.company, user.email, user.representative, user.title, user.telephone, project_id]
+        [
+          role,
+          user.company,
+          user.email,
+          user.representative,
+          user.title,
+          user.telephone,
+          project_id
+        ]
       );
+
       const user_id = userResult.rows[0].id;
+
       await pool.query(
-        `INSERT INTO user_projects (user_id, project_id, created_at) VALUES ($1,$2,NOW())
+        `INSERT INTO user_projects (user_id, project_id, created_at) 
+         VALUES ($1,$2,NOW())
          ON CONFLICT (user_id, project_id) DO NOTHING;`,
         [user_id, project_id]
       );
@@ -131,12 +168,22 @@ app.post("/verify-code", async (req, res) => {
     await addUser(consultant, "Consultant");
 
     // ✅ Mark token as verified
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [result.rows[0].id]);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+      result.rows[0].id
+    ]);
 
-    return res.json({ success: true, verified: true, message: "Account verified and data committed." });
+    return res.json({
+      success: true,
+      verified: true,
+      message: "Account verified and data committed."
+    });
   } catch (err) {
     console.error("Verification error:", err.message);
-    res.status(500).json({ success: false, verified: false, error: "Server error verifying code." });
+    res.status(500).json({
+      success: false,
+      verified: false,
+      error: "Server error verifying code."
+    });
   }
 });
 
@@ -145,11 +192,15 @@ app.post("/resend-verification", async (req, res) => {
   const { email } = req.body;
   try {
     // Delete old unverified tokens for this email
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND verified=false`, [email]);
+    await pool.query(
+      `DELETE FROM email_tokens WHERE email=$1 AND verified=false`,
+      [email]
+    );
 
     // Check latest token attempts (after cleanup, may be empty)
     const check = await pool.query(
-      `SELECT attempts, session_id FROM email_tokens WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
+      `SELECT attempts, session_id FROM email_tokens 
+       WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
       [email]
     );
 
@@ -159,10 +210,28 @@ app.post("/resend-verification", async (req, res) => {
     if (check.rows.length > 0) {
       if (check.rows[0].attempts >= 2) {
         // Too many resends → cleanup client/project
-        await pool.query(`DELETE FROM users WHERE project_id IN (SELECT id FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false))`, [email]);
-        await pool.query(`DELETE FROM projects WHERE client_id IN (SELECT id FROM clients WHERE company_email=$1 AND verified=false)`, [email]);
-        await pool.query(`DELETE FROM clients WHERE company_email=$1 AND verified=false`, [email]);
-        return res.json({ success: false, error: "Resend attempts exceeded. Please restart account creation." });
+        await pool.query(
+          `DELETE FROM users WHERE project_id IN (
+             SELECT id FROM projects WHERE client_id IN (
+               SELECT id FROM clients WHERE company_email=$1 AND verified=false
+             )
+           )`,
+          [email]
+        );
+        await pool.query(
+          `DELETE FROM projects WHERE client_id IN (
+             SELECT id FROM clients WHERE company_email=$1 AND verified=false
+           )`,
+          [email]
+        );
+        await pool.query(
+          `DELETE FROM clients WHERE company_email=$1 AND verified=false`,
+          [email]
+        );
+        return res.json({
+          success: false,
+          error: "Resend attempts exceeded. Please restart account creation."
+        });
       }
       newAttempts = check.rows[0].attempts + 1;
       sessionId = check.rows[0].session_id || uuidv4();
@@ -180,7 +249,8 @@ app.post("/resend-verification", async (req, res) => {
       from: "skyprincenkp16@gmail.com",
       to: email,
       subject: "Resend Verification Code - OneProjectApp",
-      html: `<p>Your new verification code is: <b>${code}</b></p><p>This code will expire in 3 minutes.</p>`
+      html: `<p>Your new verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
     });
 
     res.json({ success: true, message: "Verification code resent.", sessionId });
@@ -197,7 +267,6 @@ app.post("/firstlogin-send", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert token (reset_flow=false for first login)
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
@@ -207,7 +276,6 @@ app.post("/firstlogin-send", async (req, res) => {
 
     console.log("Inserted token:", insertResult.rows[0]);
 
-    // 🔹 Send email and log response
     const info = await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -228,7 +296,6 @@ app.post("/firstlogin-send", async (req, res) => {
 app.post("/firstlogin-resend", async (req, res) => {
   const { email } = req.body;
   try {
-    // Clean up old first-login tokens
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -247,7 +314,6 @@ app.post("/firstlogin-resend", async (req, res) => {
 
     console.log("Inserted new token:", insertResult.rows[0]);
 
-    // 🔹 Send email and log response
     const info = await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -285,7 +351,9 @@ app.post('/verify-password-code', async (req, res) => {
       return res.json({ success: false, error: "Invalid or expired code." });
     }
 
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+      tokenCheck.rows[0].id
+    ]);
 
     res.json({ success: true, message: "Code verified. You may now set your password." });
   } catch (err) {
@@ -302,7 +370,11 @@ app.post("/set-password", async (req, res) => {
 
     const hash = await bcrypt.hash(password, 10);
 
-    const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
+    const clientResult = await pool.query(
+      `SELECT id FROM clients WHERE company_email=$1`,
+      [email]
+    );
+
     if (clientResult.rows.length > 0) {
       await pool.query(
         `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
@@ -650,9 +722,9 @@ setInterval(async () => {
   }
 }, 3 * 60 * 1000); // 3 minutes in milliseconds
 
-// ============= CLIENT PROFILE ROUTES =============
+// 16.============= CLIENT PROFILE ROUTES =============
 
-const multer = require("multer");
+// ✅ ES module import already at the top: import multer from "multer"
 const upload = multer({
   limits: { fileSize: 1024 * 1024 }, // 1MB limit
   storage: multer.diskStorage({
@@ -663,12 +735,12 @@ const upload = multer({
   })
 });
 
-// 16. Fetch client profile
+// 1. Fetch client profile
 app.get("/client/profile", async (req, res) => {
   try {
     const { email } = req.session.client; // session contains client email
     const result = await pool.query(
-      "SELECT email, role, profile_picture FROM clients WHERE email=$1",
+      "SELECT company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
     res.json(result.rows[0]);
@@ -677,7 +749,7 @@ app.get("/client/profile", async (req, res) => {
   }
 });
 
-// Upload client profile picture
+// 2. Upload client profile picture
 app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
   try {
     const { email } = req.session.client;
@@ -687,7 +759,10 @@ app.post("/client/upload-picture", upload.single("profile_picture"), async (req,
     }
 
     const fileUrl = `/uploads/${req.file.filename}`;
-    await pool.query("UPDATE clients SET profile_picture=$1 WHERE email=$2", [fileUrl, email]);
+    await pool.query(
+      "UPDATE clients SET profile_picture=$1 WHERE company_email=$2",
+      [fileUrl, email]
+    );
 
     res.json({ url: fileUrl });
   } catch (err) {
@@ -695,11 +770,14 @@ app.post("/client/upload-picture", upload.single("profile_picture"), async (req,
   }
 });
 
-// Delete client profile picture
+// 3. Delete client profile picture
 app.delete("/client/delete-picture", async (req, res) => {
   try {
     const { email } = req.session.client;
-    await pool.query("UPDATE clients SET profile_picture=NULL WHERE email=$1", [email]);
+    await pool.query(
+      "UPDATE clients SET profile_picture=NULL WHERE company_email=$1",
+      [email]
+    );
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Failed to delete client picture" });
