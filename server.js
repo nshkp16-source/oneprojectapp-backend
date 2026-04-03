@@ -831,10 +831,9 @@ app.post("/client/project-details", async (req, res) => {
     }
     const clientId = clientResult.rows[0].id;
 
-    // ✅ Verify project belongs to this client
+    // ✅ Fixed query string (single line)
     const projectResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at 
-       FROM projects WHERE id=$1 AND client_id=$2",
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
       [projectId, clientId]
     );
     if (projectResult.rows.length === 0) {
