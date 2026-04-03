@@ -823,46 +823,33 @@ app.post("/client/project-details", async (req, res) => {
 
     // Verify client exists
     const clientResult = await pool.query(
-      "SELECT id FROM clients WHERE company_email=$1",
+      "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
-    const clientId = clientResult.rows[0].id;
+    const client = clientResult.rows[0];
 
-    // ✅ Fixed query string (single line)
+    // ✅ Verify project belongs to this client
     const projectResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
-      [projectId, clientId]
+      [projectId, client.id]
     );
     if (projectResult.rows.length === 0) {
       return res.status(404).json({ error: "Project not found or not owned by client" });
     }
     const project = projectResult.rows[0];
 
-    // Fetch related data (reports, schedule, members)
-    const reportsResult = await pool.query(
-      "SELECT id, title, type, status, created_at FROM reports WHERE project_id=$1",
-      [projectId]
-    );
-
-    const scheduleResult = await pool.query(
-      "SELECT id, task_name, planned_date, actual_date, status FROM schedule WHERE project_id=$1",
-      [projectId]
-    );
-
-    const membersResult = await pool.query(
-      "SELECT id, name, role, email FROM team_members WHERE project_id=$1",
-      [projectId]
-    );
-
-    // Combine everything
-    project.reports = reportsResult.rows;
-    project.schedule = scheduleResult.rows;
-    project.members = membersResult.rows;
-
-    res.json(project);
+    // ✅ Only return client + project info
+    res.json({
+      client: {
+        email: client.email,
+        role: client.role,
+        profile_picture: client.profile_picture
+      },
+      project: project
+    });
   } catch (err) {
     console.error("Fetch project details error:", err);
     res.status(500).json({ error: "Failed to fetch project details" });
