@@ -738,21 +738,32 @@ const upload = multer({
 // ✅ Serve uploads folder publicly
 app.use("/uploads", express.static("uploads"));
 
-// Fetch client profile
+// Fetch client profile + projects
 app.post("/client/profile", async (req, res) => {
   try {
     const { email } = req.body;
 
-    const result = await pool.query(
-      "SELECT company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
+    // Fetch client info
+    const clientResult = await pool.query(
+      "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
 
-    if (result.rows.length === 0) {
+    if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
 
-    res.json(result.rows[0]);
+    const client = clientResult.rows[0];
+
+    // Fetch projects for this client
+    const projectsResult = await pool.query(
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE client_id=$1",
+      [client.id]
+    );
+
+    client.projects = projectsResult.rows;
+
+    res.json(client);
   } catch (err) {
     console.error("Fetch client profile error:", err);
     res.status(500).json({ error: "Failed to fetch client profile" });
@@ -797,6 +808,59 @@ app.post("/client/delete-picture", async (req, res) => {
   } catch (err) {
     console.error("Delete client picture error:", err);
     res.status(500).json({ error: "Failed to delete client picture" });
+  }
+});
+
+// Fetch project details for a specific client project
+app.post("/client/project-details", async (req, res) => {
+  try {
+    const { email, projectId } = req.body;
+
+    // Verify client exists
+    const clientResult = await pool.query(
+      "SELECT id FROM clients WHERE company_email=$1",
+      [email]
+    );
+    if (clientResult.rows.length === 0) {
+      return res.status(404).json({ error: "Client not found" });
+    }
+    const clientId = clientResult.rows[0].id;
+
+    // Verify project belongs to this client
+    const projectResult = await pool.query(
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
+      [projectId, clientId]
+    );
+    if (projectResult.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found or not owned by client" });
+    }
+    const project = projectResult.rows[0];
+
+    // Fetch related data (reports, schedule, members)
+    const reportsResult = await pool.query(
+      "SELECT id, title, type, status, created_at FROM reports WHERE project_id=$1",
+      [projectId]
+    );
+
+    const scheduleResult = await pool.query(
+      "SELECT id, task_name, planned_date, actual_date, status FROM schedule WHERE project_id=$1",
+      [projectId]
+    );
+
+    const membersResult = await pool.query(
+      "SELECT id, name, role, email FROM team_members WHERE project_id=$1",
+      [projectId]
+    );
+
+    // Combine everything
+    project.reports = reportsResult.rows;
+    project.schedule = scheduleResult.rows;
+    project.members = membersResult.rows;
+
+    res.json(project);
+  } catch (err) {
+    console.error("Fetch project details error:", err);
+    res.status(500).json({ error: "Failed to fetch project details" });
   }
 });
 
