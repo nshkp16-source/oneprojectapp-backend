@@ -856,16 +856,16 @@ app.post("/client/project-details", async (req, res) => {
   }
 });
 
-// ============ CONTRACTOR PROFILE ROUTES =============
+// 17. ============ CONTRACTOR PROFILE ROUTES =============
 
-// Fetch contractor profile + projects (only projects where user is the contractor)
+// Fetch contractor profile + projects (projects linked via users.project_id)
 app.post("/contractor/profile", async (req, res) => {
   try {
     const { email } = req.body;
 
     // Fetch contractor info from users table
     const contractorResult = await pool.query(
-      "SELECT id, email, 'Contractor' AS role, profile_picture FROM users WHERE email=$1 AND role='Contractor'",
+      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Contractor'",
       [email]
     );
 
@@ -875,10 +875,10 @@ app.post("/contractor/profile", async (req, res) => {
 
     const contractor = contractorResult.rows[0];
 
-    // Fetch projects where this user is the contractor
+    // Fetch projects using project_id from users table
     const projectsResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE contractor_id=$1",
-      [contractor.id]
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1",
+      [contractor.project_id]
     );
 
     contractor.projects = projectsResult.rows;
@@ -940,7 +940,7 @@ app.post("/contractor/project-details", async (req, res) => {
     const { email, projectId } = req.body;
 
     const contractorResult = await pool.query(
-      "SELECT id, email, 'Contractor' AS role, profile_picture FROM users WHERE email=$1 AND role='Contractor'",
+      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Contractor'",
       [email]
     );
     if (contractorResult.rows.length === 0) {
@@ -948,12 +948,17 @@ app.post("/contractor/project-details", async (req, res) => {
     }
     const contractor = contractorResult.rows[0];
 
+    // Ensure the requested projectId matches the contractor's project_id
+    if (contractor.project_id != projectId) {
+      return res.status(404).json({ error: "Project not found or not linked to contractor" });
+    }
+
     const projectResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND contractor_id=$2",
-      [projectId, contractor.id]
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1",
+      [projectId]
     );
     if (projectResult.rows.length === 0) {
-      return res.status(404).json({ error: "Project not found or not owned by contractor" });
+      return res.status(404).json({ error: "Project not found" });
     }
     const project = projectResult.rows[0];
 
@@ -973,14 +978,14 @@ app.post("/contractor/project-details", async (req, res) => {
 
 // ============ CONSULTANT PROFILE ROUTES =============
 
-// Fetch consultant profile + projects (only projects where user is the consultant)
+// Fetch consultant profile + projects (projects linked via users.project_id)
 app.post("/consultant/profile", async (req, res) => {
   try {
     const { email } = req.body;
 
     // Fetch consultant info from users table
     const consultantResult = await pool.query(
-      "SELECT id, email, 'Consultant' AS role, profile_picture FROM users WHERE email=$1 AND role='Consultant'",
+      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Consultant'",
       [email]
     );
 
@@ -990,10 +995,10 @@ app.post("/consultant/profile", async (req, res) => {
 
     const consultant = consultantResult.rows[0];
 
-    // Fetch projects where this user is the consultant
+    // Fetch projects using project_id from users table
     const projectsResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE consultant_id=$1",
-      [consultant.id]
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1",
+      [consultant.project_id]
     );
 
     consultant.projects = projectsResult.rows;
@@ -1055,7 +1060,7 @@ app.post("/consultant/project-details", async (req, res) => {
     const { email, projectId } = req.body;
 
     const consultantResult = await pool.query(
-      "SELECT id, email, 'Consultant' AS role, profile_picture FROM users WHERE email=$1 AND role='Consultant'",
+      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Consultant'",
       [email]
     );
     if (consultantResult.rows.length === 0) {
@@ -1063,12 +1068,17 @@ app.post("/consultant/project-details", async (req, res) => {
     }
     const consultant = consultantResult.rows[0];
 
+    // Ensure the requested projectId matches the consultant's project_id
+    if (consultant.project_id != projectId) {
+      return res.status(404).json({ error: "Project not found or not linked to consultant" });
+    }
+
     const projectResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND consultant_id=$2",
-      [projectId, consultant.id]
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1",
+      [projectId]
     );
     if (projectResult.rows.length === 0) {
-      return res.status(404).json({ error: "Project not found or not owned by consultant" });
+      return res.status(404).json({ error: "Project not found" });
     }
     const project = projectResult.rows[0];
 
