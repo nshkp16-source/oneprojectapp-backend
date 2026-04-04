@@ -856,6 +856,236 @@ app.post("/client/project-details", async (req, res) => {
   }
 });
 
+// ============ CONTRACTOR PROFILE ROUTES =============
+
+// Fetch contractor profile + projects (only projects where user is the contractor)
+app.post("/contractor/profile", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    // Fetch contractor info from users table
+    const contractorResult = await pool.query(
+      "SELECT id, email, 'Contractor' AS role, profile_picture FROM users WHERE email=$1 AND role='Contractor'",
+      [email]
+    );
+
+    if (contractorResult.rows.length === 0) {
+      return res.status(404).json({ error: "Contractor not found" });
+    }
+
+    const contractor = contractorResult.rows[0];
+
+    // Fetch projects where this user is the contractor
+    const projectsResult = await pool.query(
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE contractor_id=$1",
+      [contractor.id]
+    );
+
+    contractor.projects = projectsResult.rows;
+
+    if (contractor.projects.length === 1) {
+      contractor.defaultProject = contractor.projects[0];
+    }
+
+    res.json(contractor);
+  } catch (err) {
+    console.error("Fetch contractor profile error:", err);
+    res.status(500).json({ error: "Failed to fetch contractor profile" });
+  }
+});
+
+// Upload contractor profile picture
+app.post("/contractor/upload-picture", upload.single("profile_picture"), async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+
+    await pool.query(
+      "UPDATE users SET profile_picture=$1 WHERE email=$2 AND role='Contractor'",
+      [fileUrl, email]
+    );
+
+    res.json({ success: true, url: fileUrl });
+  } catch (err) {
+    console.error("Upload contractor picture error:", err);
+    res.status(500).json({ error: "Failed to upload contractor picture" });
+  }
+});
+
+// Delete contractor profile picture
+app.post("/contractor/delete-picture", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    await pool.query(
+      "UPDATE users SET profile_picture=NULL WHERE email=$1 AND role='Contractor'",
+      [email]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete contractor picture error:", err);
+    res.status(500).json({ error: "Failed to delete contractor picture" });
+  }
+});
+
+// Fetch project details for a specific contractor project
+app.post("/contractor/project-details", async (req, res) => {
+  try {
+    const { email, projectId } = req.body;
+
+    const contractorResult = await pool.query(
+      "SELECT id, email, 'Contractor' AS role, profile_picture FROM users WHERE email=$1 AND role='Contractor'",
+      [email]
+    );
+    if (contractorResult.rows.length === 0) {
+      return res.status(404).json({ error: "Contractor not found" });
+    }
+    const contractor = contractorResult.rows[0];
+
+    const projectResult = await pool.query(
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND contractor_id=$2",
+      [projectId, contractor.id]
+    );
+    if (projectResult.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found or not owned by contractor" });
+    }
+    const project = projectResult.rows[0];
+
+    res.json({
+      contractor: {
+        email: contractor.email,
+        role: contractor.role,
+        profile_picture: contractor.profile_picture
+      },
+      project: project
+    });
+  } catch (err) {
+    console.error("Fetch contractor project details error:", err);
+    res.status(500).json({ error: "Failed to fetch contractor project details" });
+  }
+});
+
+// ============ CONSULTANT PROFILE ROUTES =============
+
+// Fetch consultant profile + projects (only projects where user is the consultant)
+app.post("/consultant/profile", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    // Fetch consultant info from users table
+    const consultantResult = await pool.query(
+      "SELECT id, email, 'Consultant' AS role, profile_picture FROM users WHERE email=$1 AND role='Consultant'",
+      [email]
+    );
+
+    if (consultantResult.rows.length === 0) {
+      return res.status(404).json({ error: "Consultant not found" });
+    }
+
+    const consultant = consultantResult.rows[0];
+
+    // Fetch projects where this user is the consultant
+    const projectsResult = await pool.query(
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE consultant_id=$1",
+      [consultant.id]
+    );
+
+    consultant.projects = projectsResult.rows;
+
+    if (consultant.projects.length === 1) {
+      consultant.defaultProject = consultant.projects[0];
+    }
+
+    res.json(consultant);
+  } catch (err) {
+    console.error("Fetch consultant profile error:", err);
+    res.status(500).json({ error: "Failed to fetch consultant profile" });
+  }
+});
+
+// Upload consultant profile picture
+app.post("/consultant/upload-picture", upload.single("profile_picture"), async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+
+    await pool.query(
+      "UPDATE users SET profile_picture=$1 WHERE email=$2 AND role='Consultant'",
+      [fileUrl, email]
+    );
+
+    res.json({ success: true, url: fileUrl });
+  } catch (err) {
+    console.error("Upload consultant picture error:", err);
+    res.status(500).json({ error: "Failed to upload consultant picture" });
+  }
+});
+
+// Delete consultant profile picture
+app.post("/consultant/delete-picture", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    await pool.query(
+      "UPDATE users SET profile_picture=NULL WHERE email=$1 AND role='Consultant'",
+      [email]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete consultant picture error:", err);
+    res.status(500).json({ error: "Failed to delete consultant picture" });
+  }
+});
+
+// Fetch project details for a specific consultant project
+app.post("/consultant/project-details", async (req, res) => {
+  try {
+    const { email, projectId } = req.body;
+
+    const consultantResult = await pool.query(
+      "SELECT id, email, 'Consultant' AS role, profile_picture FROM users WHERE email=$1 AND role='Consultant'",
+      [email]
+    );
+    if (consultantResult.rows.length === 0) {
+      return res.status(404).json({ error: "Consultant not found" });
+    }
+    const consultant = consultantResult.rows[0];
+
+    const projectResult = await pool.query(
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND consultant_id=$2",
+      [projectId, consultant.id]
+    );
+    if (projectResult.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found or not owned by consultant" });
+    }
+    const project = projectResult.rows[0];
+
+    res.json({
+      consultant: {
+        email: consultant.email,
+        role: consultant.role,
+        profile_picture: consultant.profile_picture
+      },
+      project: project
+    });
+  } catch (err) {
+    console.error("Fetch consultant project details error:", err);
+    res.status(500).json({ error: "Failed to fetch consultant project details" });
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
