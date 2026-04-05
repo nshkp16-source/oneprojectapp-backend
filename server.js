@@ -1103,21 +1103,19 @@ app.post("/client/check-email", async (req, res) => {
   const { email } = req.body;
 
   try {
-    // ✅ Check in clients table
+    // ✅ Only check company_email in clients table
     const result = await pool.query(
-      "SELECT id FROM clients WHERE company_email = $1",
+      "SELECT company_email FROM clients WHERE company_email = $1",
       [email]
     );
 
     if (result.rows.length > 0) {
-      // Email already exists → tell frontend to switch to Existing Account
       return res.json({
         exists: true,
         message: "This email is already registered. Please use 'Existing Account' option."
       });
     }
 
-    // Email not found → allow frontend to continue with new account flow
     res.json({ exists: false });
   } catch (err) {
     console.error("Check email error:", err);
@@ -1130,14 +1128,13 @@ app.post("/client/login", async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    // ✅ Look up client in clients table
+    // ✅ Only fetch company_email and password_hash
     const result = await pool.query(
-      "SELECT * FROM clients WHERE company_email = $1",
+      "SELECT company_email, password_hash FROM clients WHERE company_email = $1",
       [email]
     );
 
     if (result.rows.length === 0) {
-      // Email not found → tell frontend to switch to New Account
       return res.status(401).json({
         success: false,
         error: "Client not found. Please use 'New Account' option."
@@ -1148,7 +1145,6 @@ app.post("/client/login", async (req, res) => {
     const match = await bcrypt.compare(password, client.password_hash);
 
     if (!match) {
-      // Invalid password → also suggest New Account
       return res.status(401).json({
         success: false,
         error: "Invalid password. Please use 'New Account' option."
