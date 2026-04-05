@@ -976,7 +976,7 @@ app.post("/contractor/project-details", async (req, res) => {
   }
 });
 
-// ============ CONSULTANT PROFILE ROUTES =============
+// 18. ============ CONSULTANT PROFILE ROUTES =============
 
 // Fetch consultant profile + projects (projects linked via users.project_id)
 app.post("/consultant/profile", async (req, res) => {
@@ -1095,6 +1095,77 @@ app.post("/consultant/project-details", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch consultant project details" });
   }
 });
+
+// 19. clientRoutes.js
+const express = require("express");
+const router = express.Router();
+const bcrypt = require("bcrypt");
+const { pool } = require("./db"); // CockroachDB/Neon connection pool
+
+// POST /client/login
+router.post("/client/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    // 1. Find client by email
+    const result = await pool.query(
+      "SELECT * FROM users WHERE email = $1 AND role = 'Client'",
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Client not found" });
+    }
+
+    const client = result.rows[0];
+
+    // 2. Compare password
+    const match = await bcrypt.compare(password, client.password_hash);
+    if (!match) {
+      return res.status(401).json({ error: "Invalid password" });
+    }
+
+    // 3. Return client info (omit sensitive fields)
+    res.json({
+      client: {
+        id: client.id,
+        company_name: client.company_name,
+        company_email: client.email,
+        representative: client.representative_name,
+        telephone: client.phone_number,
+        title: client.title,
+        profile_picture: client.profile_picture || null,
+        verified: client.verified,
+        created_at: client.created_at
+      }
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /client/check-email
+router.post("/client/check-email", async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    const result = await pool.query(
+      "SELECT id FROM users WHERE email = $1 AND role = 'Client'",
+      [email]
+    );
+
+    if (result.rows.length > 0) {
+      return res.json({ exists: true });
+    }
+    res.json({ exists: false });
+  } catch (err) {
+    console.error("Check email error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+module.exports = router;
 
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
