@@ -1097,10 +1097,11 @@ app.post("/consultant/project-details", async (req, res) => {
 });
 
 // 19. clientRoutes.js
-const express = require("express");
+import express from "express";
+import bcrypt from "bcrypt";
+import { pool } from "./db.js"; // ensure .js extension for ES modules
+
 const router = express.Router();
-const bcrypt = require("bcrypt");
-const { pool } = require("./db"); // CockroachDB/Neon connection pool
 
 // POST /client/login
 router.post("/client/login", async (req, res) => {
@@ -1165,7 +1166,7 @@ router.post("/client/check-email", async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
 
 // 20. ADD PROJECT TO EXISTING CLIENT
 // Send project verification code (with global uniqueness check)
