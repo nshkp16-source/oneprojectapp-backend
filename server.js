@@ -1096,13 +1096,7 @@ app.post("/consultant/project-details", async (req, res) => {
   }
 });
 
-// 19. clientRoutes.js
-import express from "express";
-import bcrypt from "bcrypt";
-import { pool } from "./db.js"; // ensure .js extension for ES modules
-
-const router = express.Router();
-
+// 19. clientRoutes
 // POST /client/login
 router.post("/client/login", async (req, res) => {
   const { email, password } = req.body;
@@ -1165,8 +1159,6 @@ router.post("/client/check-email", async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
-export default router;
 
 // 20. ADD PROJECT TO EXISTING CLIENT
 // Send project verification code (with global uniqueness check)
