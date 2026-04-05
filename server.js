@@ -1103,8 +1103,9 @@ app.post("/client/check-email", async (req, res) => {
   const { email } = req.body;
 
   try {
+    // ✅ Check in users table for consistency
     const result = await pool.query(
-      "SELECT id FROM clients WHERE company_email = $1",
+      "SELECT id FROM users WHERE email = $1 AND role = 'Client'",
       [email]
     );
 
@@ -1137,6 +1138,7 @@ app.post("/client/login", async (req, res) => {
     if (result.rows.length === 0) {
       // Email not found → tell frontend to switch to New Account
       return res.status(401).json({
+        success: false,
         error: "Client not found. Please use 'New Account' option."
       });
     }
@@ -1147,27 +1149,19 @@ app.post("/client/login", async (req, res) => {
     if (!match) {
       // Invalid password → also suggest New Account
       return res.status(401).json({
+        success: false,
         error: "Invalid password. Please use 'New Account' option."
       });
     }
 
-    // Valid login → return client info
+    // ✅ Valid login → return only email for frontend
     res.json({
-      client: {
-        id: client.id,
-        company_name: client.company_name,
-        company_email: client.email,
-        representative: client.representative_name,
-        telephone: client.phone_number,
-        title: client.title,
-        profile_picture: client.profile_picture || null,
-        verified: client.verified,
-        created_at: client.created_at
-      }
+      success: true,
+      clientEmail: client.email
     });
   } catch (err) {
     console.error("Login error:", err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
@@ -1248,11 +1242,14 @@ app.post("/project-resend-code", async (req, res) => {
   }
 });
 
-// Verify project code and save project
+// Verify project code and save project + contractor + consultant
 app.post("/project-verify-code", async (req, res) => {
-  const { email, token, project } = req.body;
+  const { email, token, project, contractor, consultant } = req.body;
+  const client = await pool.connect();
   try {
-    const tokenCheck = await pool.query(
+    await client.query("BEGIN");
+
+    const tokenCheck = await client.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 
        AND expires_at > NOW() 
@@ -1262,35 +1259,81 @@ app.post("/project-verify-code", async (req, res) => {
     );
 
     if (tokenCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.json({ success: false, error: "Invalid or expired code." });
     }
 
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+    await client.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
       tokenCheck.rows[0].id
     ]);
 
-    const clientResult = await pool.query(
+    const clientResult = await client.query(
       `SELECT id FROM clients WHERE company_email=$1`,
       [email]
     );
 
     if (clientResult.rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.json({ success: false, error: "Client not found." });
     }
 
     const clientId = clientResult.rows[0].id;
 
-    const projectInsert = await pool.query(
+    // Insert project
+    const projectInsert = await client.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1,$2,$3,$4,NOW())
        RETURNING *`,
       [project.name, project.location, project.contract_reference, clientId]
     );
 
-    res.json({ success: true, message: "Project verified and saved.", project: projectInsert.rows[0] });
+    const projectId = projectInsert.rows[0].id;
+
+    // Insert contractor
+    if (contractor) {
+      await client.query(
+        `INSERT INTO users (role, company_name, email, representative, title, telephone, project_id, created_at, verified)
+         VALUES ('Contractor',$1,$2,$3,$4,$5,$6,NOW(),true)`,
+        [
+          contractor.company,
+          contractor.email,
+          contractor.representative,
+          contractor.title,
+          contractor.telephone,
+          projectId
+        ]
+      );
+    }
+
+    // Insert consultant
+    if (consultant) {
+      await client.query(
+        `INSERT INTO users (role, company_name, email, representative, title, telephone, project_id, created_at, verified)
+         VALUES ('Consultant',$1,$2,$3,$4,$5,$6,NOW(),true)`,
+        [
+          consultant.company,
+          consultant.email,
+          consultant.representative,
+          consultant.title,
+          consultant.telephone,
+          projectId
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      success: true,
+      message: "Project verified and saved with contractor and consultant.",
+      project: projectInsert.rows[0]
+    });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("Project verify error:", err);
     res.status(500).json({ success: false, error: "Failed to verify project." });
+  } finally {
+    client.release();
   }
 });
 
