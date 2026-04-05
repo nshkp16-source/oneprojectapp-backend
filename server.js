@@ -1167,6 +1167,141 @@ router.post("/client/check-email", async (req, res) => {
 
 module.exports = router;
 
+// 20. ADD PROJECT TO EXISTING CLIENT
+// Send project verification code (with global uniqueness check)
+app.post("/project-send-code", async (req, res) => {
+  const { email, project } = req.body;
+  try {
+    // ✅ Check if project name or contract reference already exists globally
+    const duplicateCheck = await pool.query(
+      `SELECT id FROM projects 
+       WHERE LOWER(name)=LOWER($1) 
+       OR LOWER(contract_reference)=LOWER($2)`,
+      [project.name, project.contract_reference]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      return res.json({ success: false, error: "A project with this name or contract reference already exists." });
+    }
+
+    // ✅ If unique, send verification code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    const insertResult = await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
+       RETURNING *`,
+      [email, code, sessionId]
+    );
+
+    console.log("Inserted project token:", insertResult.rows[0]);
+
+    const info = await transporter.sendMail({
+      from: "skyprincenkp16@gmail.com",
+      to: email,
+      subject: "OneProjectApp Project Verification Code",
+      html: `<p>Your project verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+    console.log("Mail response:", info);
+
+    res.json({ success: true, message: "Verification code sent.", sessionId, expiresAt: insertResult.rows[0].expires_at });
+  } catch (err) {
+    console.error("Project send error:", err);
+    res.status(500).json({ success: false, error: "Failed to send project verification." });
+  }
+});
+
+// Resend project verification code
+app.post("/project-resend-code", async (req, res) => {
+  const { email } = req.body;
+  try {
+    await pool.query(
+      `DELETE FROM email_tokens 
+       WHERE email=$1 AND verified=false AND reset_flow=false`,
+      [email]
+    );
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    const insertResult = await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
+       RETURNING *`,
+      [email, code, sessionId]
+    );
+
+    console.log("Inserted new project token:", insertResult.rows[0]);
+
+    const info = await transporter.sendMail({
+      from: "skyprincenkp16@gmail.com",
+      to: email,
+      subject: "OneProjectApp Project Verification Code (Resend)",
+      html: `<p>Your new project verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+    console.log("Mail response:", info);
+
+    res.json({ success: true, message: "New project verification code sent.", sessionId, expiresAt: insertResult.rows[0].expires_at });
+  } catch (err) {
+    console.error("Project resend error:", err);
+    res.status(500).json({ success: false, error: "Failed to resend project verification." });
+  }
+});
+
+// Verify project code and save project
+app.post("/project-verify-code", async (req, res) => {
+  const { email, token, project } = req.body;
+  try {
+    console.log("Verifying project code:", token, "for email:", email);
+
+    const tokenCheck = await pool.query(
+      `SELECT * FROM email_tokens 
+       WHERE email=$1 AND token=$2 
+       AND expires_at > NOW() 
+       AND verified=false AND reset_flow=false
+       ORDER BY expires_at DESC LIMIT 1`,
+      [email, token]
+    );
+
+    if (tokenCheck.rows.length === 0) {
+      return res.json({ success: false, error: "Invalid or expired code." });
+    }
+
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+      tokenCheck.rows[0].id
+    ]);
+
+    // ✅ Link project to existing client
+    const clientResult = await pool.query(
+      `SELECT id FROM clients WHERE company_email=$1`,
+      [email]
+    );
+
+    if (clientResult.rows.length === 0) {
+      return res.json({ success: false, error: "Client not found." });
+    }
+
+    const clientId = clientResult.rows[0].id;
+
+    const projectInsert = await pool.query(
+      `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
+       VALUES ($1,$2,$3,$4,NOW())
+       RETURNING *`,
+      [project.name, project.location, project.contract_reference, clientId]
+    );
+
+    console.log("Project saved:", projectInsert.rows[0]);
+
+    res.json({ success: true, message: "Project verified and saved.", project: projectInsert.rows[0] });
+  } catch (err) {
+    console.error("Project verify error:", err);
+    res.status(500).json({ success: false, error: "Failed to verify project." });
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
