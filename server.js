@@ -1334,6 +1334,30 @@ app.post("/project-verify-code", async (req, res) => {
   }
 });
 
+// profile picture
+app.post("/client/profile-picture", async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    const result = await pool.query(
+      "SELECT profile_picture FROM clients WHERE company_email = $1",
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ success: false, error: "Client not found." });
+    }
+
+    res.json({
+      success: true,
+      profile_picture: result.rows[0].profile_picture
+    });
+  } catch (err) {
+    console.error("Profile picture fetch error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
