@@ -1098,7 +1098,33 @@ app.post("/consultant/project-details", async (req, res) => {
 
 // 19. ============ CLIENT ROUTES =============
 
-// Client login
+// Check if client email exists (for new account creation)
+app.post("/client/check-email", async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    const result = await pool.query(
+      "SELECT id FROM clients WHERE company_email = $1",
+      [email]
+    );
+
+    if (result.rows.length > 0) {
+      // Email already exists → tell frontend to switch to Existing Account
+      return res.json({
+        exists: true,
+        message: "This email is already registered. Please use 'Existing Account' option."
+      });
+    }
+
+    // Email not found → allow frontend to continue with new account flow
+    res.json({ exists: false });
+  } catch (err) {
+    console.error("Check email error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Client login (for existing account)
 app.post("/client/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -1109,16 +1135,23 @@ app.post("/client/login", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: "Client not found" });
+      // Email not found → tell frontend to switch to New Account
+      return res.status(401).json({
+        error: "Client not found. Please use 'New Account' option."
+      });
     }
 
     const client = result.rows[0];
     const match = await bcrypt.compare(password, client.password_hash);
 
     if (!match) {
-      return res.status(401).json({ error: "Invalid password" });
+      // Invalid password → also suggest New Account
+      return res.status(401).json({
+        error: "Invalid password. Please use 'New Account' option."
+      });
     }
 
+    // Valid login → return client info
     res.json({
       client: {
         id: client.id,
@@ -1134,26 +1167,6 @@ app.post("/client/login", async (req, res) => {
     });
   } catch (err) {
     console.error("Login error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Check if client email exists
-app.post("/client/check-email", async (req, res) => {
-  const { email } = req.body;
-
-  try {
-    const result = await pool.query(
-      "SELECT id FROM users WHERE email = $1 AND role = 'Client'",
-      [email]
-    );
-
-    if (result.rows.length > 0) {
-      return res.json({ exists: true });
-    }
-    res.json({ exists: false });
-  } catch (err) {
-    console.error("Check email error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
