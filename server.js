@@ -1096,13 +1096,13 @@ app.post("/consultant/project-details", async (req, res) => {
   }
 });
 
-// 19. clientRoutes
-// POST /client/login
-router.post("/client/login", async (req, res) => {
+// 19. ============ CLIENT ROUTES =============
+
+// Client login
+app.post("/client/login", async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    // 1. Find client by email
     const result = await pool.query(
       "SELECT * FROM users WHERE email = $1 AND role = 'Client'",
       [email]
@@ -1113,14 +1113,12 @@ router.post("/client/login", async (req, res) => {
     }
 
     const client = result.rows[0];
-
-    // 2. Compare password
     const match = await bcrypt.compare(password, client.password_hash);
+
     if (!match) {
       return res.status(401).json({ error: "Invalid password" });
     }
 
-    // 3. Return client info (omit sensitive fields)
     res.json({
       client: {
         id: client.id,
@@ -1140,8 +1138,8 @@ router.post("/client/login", async (req, res) => {
   }
 });
 
-// POST /client/check-email
-router.post("/client/check-email", async (req, res) => {
+// Check if client email exists
+app.post("/client/check-email", async (req, res) => {
   const { email } = req.body;
 
   try {
@@ -1160,12 +1158,12 @@ router.post("/client/check-email", async (req, res) => {
   }
 });
 
-// 20. ADD PROJECT TO EXISTING CLIENT
-// Send project verification code (with global uniqueness check)
+// 20. ============ ADD PROJECT TO EXISTING CLIENT =============
+
+// Send project verification code
 app.post("/project-send-code", async (req, res) => {
   const { email, project } = req.body;
   try {
-    // ✅ Check if project name or contract reference already exists globally
     const duplicateCheck = await pool.query(
       `SELECT id FROM projects 
        WHERE LOWER(name)=LOWER($1) 
@@ -1177,7 +1175,6 @@ app.post("/project-send-code", async (req, res) => {
       return res.json({ success: false, error: "A project with this name or contract reference already exists." });
     }
 
-    // ✅ If unique, send verification code
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
@@ -1188,16 +1185,13 @@ app.post("/project-send-code", async (req, res) => {
       [email, code, sessionId]
     );
 
-    console.log("Inserted project token:", insertResult.rows[0]);
-
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
       subject: "OneProjectApp Project Verification Code",
       html: `<p>Your project verification code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
-    console.log("Mail response:", info);
 
     res.json({ success: true, message: "Verification code sent.", sessionId, expiresAt: insertResult.rows[0].expires_at });
   } catch (err) {
@@ -1226,16 +1220,13 @@ app.post("/project-resend-code", async (req, res) => {
       [email, code, sessionId]
     );
 
-    console.log("Inserted new project token:", insertResult.rows[0]);
-
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
       subject: "OneProjectApp Project Verification Code (Resend)",
       html: `<p>Your new project verification code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
-    console.log("Mail response:", info);
 
     res.json({ success: true, message: "New project verification code sent.", sessionId, expiresAt: insertResult.rows[0].expires_at });
   } catch (err) {
@@ -1248,8 +1239,6 @@ app.post("/project-resend-code", async (req, res) => {
 app.post("/project-verify-code", async (req, res) => {
   const { email, token, project } = req.body;
   try {
-    console.log("Verifying project code:", token, "for email:", email);
-
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 
@@ -1267,7 +1256,6 @@ app.post("/project-verify-code", async (req, res) => {
       tokenCheck.rows[0].id
     ]);
 
-    // ✅ Link project to existing client
     const clientResult = await pool.query(
       `SELECT id FROM clients WHERE company_email=$1`,
       [email]
@@ -1285,8 +1273,6 @@ app.post("/project-verify-code", async (req, res) => {
        RETURNING *`,
       [project.name, project.location, project.contract_reference, clientId]
     );
-
-    console.log("Project saved:", projectInsert.rows[0]);
 
     res.json({ success: true, message: "Project verified and saved.", project: projectInsert.rows[0] });
   } catch (err) {
