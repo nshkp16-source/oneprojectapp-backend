@@ -1103,9 +1103,9 @@ app.post("/client/check-email", async (req, res) => {
   const { email } = req.body;
 
   try {
-    // ✅ Check in users table for consistency
+    // ✅ Check in clients table
     const result = await pool.query(
-      "SELECT id FROM users WHERE email = $1 AND role = 'Client'",
+      "SELECT id FROM clients WHERE company_email = $1",
       [email]
     );
 
@@ -1130,8 +1130,9 @@ app.post("/client/login", async (req, res) => {
   const { email, password } = req.body;
 
   try {
+    // ✅ Look up client in clients table
     const result = await pool.query(
-      "SELECT * FROM users WHERE email = $1 AND role = 'Client'",
+      "SELECT * FROM clients WHERE company_email = $1",
       [email]
     );
 
@@ -1157,7 +1158,7 @@ app.post("/client/login", async (req, res) => {
     // ✅ Valid login → return only email for frontend
     res.json({
       success: true,
-      clientEmail: client.email
+      clientEmail: client.company_email
     });
   } catch (err) {
     console.error("Login error:", err);
