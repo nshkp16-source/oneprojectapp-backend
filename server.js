@@ -1192,66 +1192,85 @@ app.post("/client/profile-picture", async (req, res) => {
   }
 });
 
-// ============ CHECK PROJECT DUPLICATE ============
-app.post("/project/check-duplicate", async (req, res) => {
-  const { email, project } = req.body;
+// ============ SAVE PROJECT AFTER VERIFICATION ============
+app.post("/project-save", async (req, res) => {
+  const { project, contractor, consultant, clientEmail } = req.body;
+
   try {
     // Find client_id from email
     const clientResult = await pool.query(
       `SELECT id FROM clients WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1))`,
-      [email]
+      [clientEmail]
     );
 
     if (clientResult.rows.length === 0) {
       return res.json({ success: false, error: "Client not found." });
     }
 
-    const clientId = clientResult.rows[0].id;
+    const client_id = clientResult.rows[0].id;
 
-    // Check for duplicate project name
-    const nameCheck = await pool.query(
-      `SELECT id FROM projects 
-       WHERE client_id = $1 AND TRIM(LOWER(name)) = TRIM(LOWER($2))`,
-      [clientId, project.name]
+    // Insert project tied to client_id
+    const projectResult = await pool.query(
+      `INSERT INTO projects (name, location, contract_reference, client_id, created_at, verified)
+       VALUES ($1,$2,$3,$4,NOW(),true)
+       ON CONFLICT (name, client_id) DO NOTHING RETURNING id;`,
+      [project.name, project.location, project.contract_reference, client_id]
     );
-    if (nameCheck.rows.length > 0) {
-      return res.json({
-        success: false,
-        error: "A project with the same Name already exists for this client."
-      });
+
+    let project_id =
+      projectResult.rows[0]?.id ||
+      (
+        await pool.query(
+          `SELECT id FROM projects WHERE name=$1 AND client_id=$2`,
+          [project.name, client_id]
+        )
+      ).rows[0].id;
+
+    // Helper function to add contractor/consultant
+    async function addUser(user, role) {
+      if (!user?.email) return;
+
+      const userResult = await pool.query(
+        `INSERT INTO users (role, company_name, email, representative_name, title, phone_number, created_at, verified, project_id)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW(),true,$7)
+         ON CONFLICT (email, project_id) DO UPDATE SET 
+           company_name=EXCLUDED.company_name,
+           representative_name=EXCLUDED.representative_name,
+           title=EXCLUDED.title,
+           phone_number=EXCLUDED.phone_number,
+           verified=true
+         RETURNING id;`,
+        [
+          role,
+          user.company,
+          user.email,
+          user.representative,
+          user.title,
+          user.telephone,
+          project_id
+        ]
+      );
+
+      const user_id = userResult.rows[0].id;
+
+      await pool.query(
+        `INSERT INTO user_projects (user_id, project_id, created_at) 
+         VALUES ($1,$2,NOW())
+         ON CONFLICT (user_id, project_id) DO NOTHING;`,
+        [user_id, project_id]
+      );
     }
 
-    // Check for duplicate project location
-    const locationCheck = await pool.query(
-      `SELECT id FROM projects 
-       WHERE client_id = $1 AND TRIM(LOWER(location)) = TRIM(LOWER($2))`,
-      [clientId, project.location]
-    );
-    if (locationCheck.rows.length > 0) {
-      return res.json({
-        success: false,
-        error: "A project with the same Location already exists for this client."
-      });
-    }
+    await addUser(contractor, "Contractor");
+    await addUser(consultant, "Consultant");
 
-    // Check for duplicate contract reference
-    const referenceCheck = await pool.query(
-      `SELECT id FROM projects 
-       WHERE client_id = $1 AND TRIM(LOWER(contract_reference)) = TRIM(LOWER($2))`,
-      [clientId, project.contract_reference]
-    );
-    if (referenceCheck.rows.length > 0) {
-      return res.json({
-        success: false,
-        error: "A project with the same Contract Reference already exists for this client."
-      });
-    }
-
-    // If no duplicate, confirm uniqueness — do not save here
-    res.json({ success: true, message: "No duplicate project found for this client." });
+    return res.json({
+      success: true,
+      message: "Project and team saved successfully."
+    });
   } catch (err) {
-    console.error("Project duplicate check error:", err);
-    res.status(500).json({ success: false, error: "Server error checking project." });
+    console.error("Project save error:", err.message);
+    res.status(500).json({ success: false, error: "Server error saving project." });
   }
 });
 
