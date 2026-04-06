@@ -1209,7 +1209,6 @@ app.post("/project/check-duplicate", async (req, res) => {
        WHERE client_id = $1 AND TRIM(LOWER(name)) = TRIM(LOWER($2))`,
       [clientId, project.name]
     );
-
     if (nameCheck.rows.length > 0) {
       return res.json({
         success: false,
@@ -1223,7 +1222,6 @@ app.post("/project/check-duplicate", async (req, res) => {
        WHERE client_id = $1 AND TRIM(LOWER(location)) = TRIM(LOWER($2))`,
       [clientId, project.location]
     );
-
     if (locationCheck.rows.length > 0) {
       return res.json({
         success: false,
@@ -1237,7 +1235,6 @@ app.post("/project/check-duplicate", async (req, res) => {
        WHERE client_id = $1 AND TRIM(LOWER(contract_reference)) = TRIM(LOWER($2))`,
       [clientId, project.contract_reference]
     );
-
     if (referenceCheck.rows.length > 0) {
       return res.json({
         success: false,
@@ -1245,7 +1242,7 @@ app.post("/project/check-duplicate", async (req, res) => {
       });
     }
 
-    // If no duplicate, just confirm uniqueness — do not save here
+    // If no duplicate, confirm uniqueness — do not save here
     res.json({ success: true, message: "No duplicate project found for this client." });
   } catch (err) {
     console.error("Project duplicate check error:", err);
