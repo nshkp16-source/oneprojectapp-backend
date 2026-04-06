@@ -1187,24 +1187,44 @@ app.post("/client/profile-picture", async (req, res) => {
   }
 });
 
-// ============ PROJECT REFERENCE CHECK ============
-app.post("/project-check-reference", async (req, res) => {
-  const { reference, clientId } = req.body; // include clientId in request
+// ============ CREATE PROJECT ============
+app.post("/project/create", async (req, res) => {
+  const { email, project } = req.body;
   try {
+    // Find client_id from email
+    const clientResult = await pool.query(
+      `SELECT id FROM clients WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1))`,
+      [email]
+    );
+
+    if (clientResult.rows.length === 0) {
+      return res.json({ success: false, error: "Client not found." });
+    }
+
+    const clientId = clientResult.rows[0].id;
+
+    // Check if this client already has a project with the same contract_reference
     const duplicateCheck = await pool.query(
       `SELECT id FROM projects 
-       WHERE client_id = $2 AND LOWER(contract_reference) = LOWER($1)`,
-      [reference, clientId]
+       WHERE client_id = $1 AND TRIM(LOWER(contract_reference)) = TRIM(LOWER($2))`,
+      [clientId, project.contract_reference]
     );
 
     if (duplicateCheck.rows.length > 0) {
-      return res.json({ success: false, error: "Project reference already exists for this client." });
+      return res.json({ success: false, error: "This client already has a project with that contract reference." });
     }
 
-    res.json({ success: true, message: "Reference is unique for this client." });
+    // Insert new project
+    await pool.query(
+      `INSERT INTO projects (name, location, contract_reference, client_id, created_at, verified)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [project.name, project.location, project.contract_reference, clientId, project.created_at, project.verified]
+    );
+
+    res.json({ success: true, message: "Project created successfully." });
   } catch (err) {
-    console.error("Project reference check error:", err);
-    res.status(500).json({ success: false, error: "Server error checking reference." });
+    console.error("Project creation error:", err);
+    res.status(500).json({ success: false, error: "Server error creating project." });
   }
 });
 
