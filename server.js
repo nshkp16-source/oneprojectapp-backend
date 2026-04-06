@@ -1192,12 +1192,96 @@ app.post("/client/profile-picture", async (req, res) => {
   }
 });
 
+// ============ SEND VERIFICATION CODE ============
+app.post("/project-send-code", async (req, res) => {
+  const { email } = req.body;
+  try {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
+       VALUES ($1,$2,NOW() + interval '3 minutes',0,$3,false)`,
+      [email, code, sessionId]
+    );
+
+    await transporter.sendMail({
+      from: "yourapp@example.com",
+      to: email,
+      subject: "Project Verification Code",
+      html: `<p>Your verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+
+    res.json({ success: true, message: "Verification code sent.", sessionId });
+  } catch (err) {
+    console.error("Send code error:", err);
+    res.status(500).json({ success: false, error: "Server error sending code." });
+  }
+});
+
+// ============ VERIFY CODE ============
+app.post("/project-verify-code", async (req, res) => {
+  const { email, token } = req.body;
+  try {
+    const result = await pool.query(
+      `SELECT * FROM email_tokens 
+       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false
+       ORDER BY expires_at DESC LIMIT 1`,
+      [email, token]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({ success: false, error: "Invalid or expired code." });
+    }
+
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+      result.rows[0].id
+    ]);
+
+    res.json({ success: true, message: "Code verified." });
+  } catch (err) {
+    console.error("Verify code error:", err);
+    res.status(500).json({ success: false, error: "Server error verifying code." });
+  }
+});
+
+// ============ RESEND CODE ============
+app.post("/project-resend-code", async (req, res) => {
+  const { email } = req.body;
+  try {
+    // Clean up old unverified tokens
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND verified=false`, [email]);
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
+       VALUES ($1,$2,NOW() + interval '3 minutes',1,$3,false)`,
+      [email, code, sessionId]
+    );
+
+    await transporter.sendMail({
+      from: "yourapp@example.com",
+      to: email,
+      subject: "Resend Project Verification Code",
+      html: `<p>Your new verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+
+    res.json({ success: true, message: "Verification code resent.", sessionId });
+  } catch (err) {
+    console.error("Resend code error:", err);
+    res.status(500).json({ success: false, error: "Server error resending code." });
+  }
+});
+
 // ============ SAVE PROJECT AFTER VERIFICATION ============
 app.post("/project-save", async (req, res) => {
   const { project, contractor, consultant, clientEmail } = req.body;
 
   try {
-    // Find client_id from email
     const clientResult = await pool.query(
       `SELECT id FROM clients WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1))`,
       [clientEmail]
@@ -1209,7 +1293,6 @@ app.post("/project-save", async (req, res) => {
 
     const client_id = clientResult.rows[0].id;
 
-    // Insert project tied to client_id
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at, verified)
        VALUES ($1,$2,$3,$4,NOW(),true)
@@ -1226,7 +1309,6 @@ app.post("/project-save", async (req, res) => {
         )
       ).rows[0].id;
 
-    // Helper function to add contractor/consultant
     async function addUser(user, role) {
       if (!user?.email) return;
 
