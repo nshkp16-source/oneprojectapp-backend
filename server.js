@@ -1192,93 +1192,105 @@ app.post("/client/profile-picture", async (req, res) => {
   }
 });
 
-// ============ SEND VERIFICATION CODE ============
-app.post("/project-send-code", async (req, res) => {
+// 1. Send project verification code
+app.post('/project-send', async (req, res) => {
   const { email } = req.body;
   try {
+    // Delete any existing project tokens for this email
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`, [email]);
+
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
-       VALUES ($1,$2,NOW() + interval '3 minutes',0,$3,false)`,
+    const insertResult = await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, project_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
+       RETURNING *`,
       [email, code, sessionId]
     );
 
     await transporter.sendMail({
-      from: "yourapp@example.com",
+      from: "skyprincenkp16@gmail.com",
       to: email,
-      subject: "Project Verification Code",
-      html: `<p>Your verification code is: <b>${code}</b></p>
+      subject: "Project Verification - OneProjectApp",
+      html: `<p>Your project verification code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    res.json({ success: true, message: "Verification code sent.", sessionId });
+    res.json({
+      success: true,
+      message: "Project verification code sent.",
+      sessionId,
+      expiresAt: insertResult.rows[0].expires_at
+    });
   } catch (err) {
-    console.error("Send code error:", err);
-    res.status(500).json({ success: false, error: "Server error sending code." });
+    console.error("Project send error:", err);
+    res.status(500).json({ success: false, error: "Failed to send project code." });
   }
 });
 
-// ============ VERIFY CODE ============
-app.post("/project-verify-code", async (req, res) => {
+// 2. Resend project verification code
+app.post('/project-resend', async (req, res) => {
+  const { email } = req.body;
+  try {
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`, [email]);
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
+
+    const insertResult = await pool.query(
+      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, project_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
+       RETURNING *`,
+      [email, code, sessionId]
+    );
+
+    await transporter.sendMail({
+      from: "skyprincenkp16@gmail.com",
+      to: email,
+      subject: "Resend Project Verification Code - OneProjectApp",
+      html: `<p>Your new project verification code is: <b>${code}</b></p>
+             <p>This code will expire in 3 minutes.</p>`
+    });
+
+    res.json({
+      success: true,
+      message: "New project verification code sent.",
+      sessionId,
+      expiresAt: insertResult.rows[0].expires_at
+    });
+  } catch (err) {
+    console.error("Project resend error:", err);
+    res.status(500).json({ success: false, error: "Failed to resend project code." });
+  }
+});
+
+// 3. Verify project code
+app.post('/project-verify', async (req, res) => {
   const { email, token } = req.body;
   try {
-    const result = await pool.query(
+    const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
-       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false
+       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND project_flow=true
        ORDER BY expires_at DESC LIMIT 1`,
       [email, token]
     );
 
-    if (result.rows.length === 0) {
-      return res.json({ success: false, error: "Invalid or expired code." });
+    if (tokenCheck.rows.length === 0) {
+      return res.json({ success: false, error: "Invalid or expired project code." });
     }
 
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
-      result.rows[0].id
-    ]);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
 
-    res.json({ success: true, message: "Code verified." });
+    res.json({ success: true, message: "Project code verified." });
   } catch (err) {
-    console.error("Verify code error:", err);
-    res.status(500).json({ success: false, error: "Server error verifying code." });
+    console.error("Project verify error:", err);
+    res.status(500).json({ success: false, error: "Failed to verify project code." });
   }
 });
 
-// ============ RESEND CODE ============
-app.post("/project-resend-code", async (req, res) => {
-  const { email } = req.body;
-  try {
-    // Clean up old unverified tokens
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND verified=false`, [email]);
-
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const sessionId = uuidv4();
-
-    await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
-       VALUES ($1,$2,NOW() + interval '3 minutes',1,$3,false)`,
-      [email, code, sessionId]
-    );
-
-    await transporter.sendMail({
-      from: "yourapp@example.com",
-      to: email,
-      subject: "Resend Project Verification Code",
-      html: `<p>Your new verification code is: <b>${code}</b></p>
-             <p>This code will expire in 3 minutes.</p>`
-    });
-
-    res.json({ success: true, message: "Verification code resent.", sessionId });
-  } catch (err) {
-    console.error("Resend code error:", err);
-    res.status(500).json({ success: false, error: "Server error resending code." });
-  }
-});
-
-// ============ SAVE PROJECT AFTER VERIFICATION ============
-app.post("/project-save", async (req, res) => {
+// 4. Save project after verification
+app.post('/project-save', async (req, res) => {
   const { project, contractor, consultant, clientEmail } = req.body;
 
   try {
