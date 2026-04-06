@@ -1162,12 +1162,14 @@ app.post("/client/login", async (req, res) => {
   }
 });
 
-// 20. ============ CLIENT PROFILE INFO ============
+// 20. ============ ADD PROJECT CLIENT PROFILE INFO ============
 app.post("/client/profile-picture", async (req, res) => {
   const { email } = req.body;
   try {
     const result = await pool.query(
-      "SELECT company_name, profile_picture FROM clients WHERE company_email = $1",
+      `SELECT company_name, company_email, representative, title, telephone, profile_picture 
+       FROM clients 
+       WHERE company_email = $1`,
       [email]
     );
 
@@ -1175,10 +1177,16 @@ app.post("/client/profile-picture", async (req, res) => {
       return res.json({ success: false, error: "Client not found." });
     }
 
+    const client = result.rows[0];
+
     res.json({
       success: true,
-      company_name: result.rows[0].company_name,
-      profile_picture: result.rows[0].profile_picture
+      company_name: client.company_name,
+      company_email: client.company_email,
+      representative: client.representative,
+      title: client.title,
+      telephone: client.telephone,
+      profile_picture: client.profile_picture
     });
   } catch (err) {
     console.error("Profile picture fetch error:", err);
