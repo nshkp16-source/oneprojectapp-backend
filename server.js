@@ -1162,13 +1162,12 @@ app.post("/client/login", async (req, res) => {
   }
 });
 
-// 20. ============ ADD PROJECT CLIENT PROFILE INFO ============
 app.post("/client/profile-picture", async (req, res) => {
   const { email } = req.body;
   try {
     const result = await pool.query(
-      `SELECT company_name, company_email, representative, title, telephone, profile_picture 
-       FROM clients 
+      `SELECT company_name, company_email, representative, title, telephone, profile_picture
+       FROM clients
        WHERE company_email = $1`,
       [email]
     );
@@ -1189,31 +1188,31 @@ app.post("/client/profile-picture", async (req, res) => {
       profile_picture: client.profile_picture
     });
   } catch (err) {
-    console.error("Profile picture fetch error:", err);
+    console.error("Profile fetch error:", err);
     res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
 // ============ PROJECT REFERENCE CHECK ============
 app.post("/project-check-reference", async (req, res) => {
-  const { reference } = req.body;
+  const { reference, clientId } = req.body; // include clientId in request
   try {
     const duplicateCheck = await pool.query(
-      `SELECT id FROM projects WHERE LOWER(contract_reference)=LOWER($1)`,
-      [reference]
+      `SELECT id FROM projects 
+       WHERE client_id = $2 AND LOWER(contract_reference) = LOWER($1)`,
+      [reference, clientId]
     );
 
     if (duplicateCheck.rows.length > 0) {
-      return res.json({ success: false, error: "Project reference already exists." });
+      return res.json({ success: false, error: "Project reference already exists for this client." });
     }
 
-    res.json({ success: true, message: "Reference is unique." });
+    res.json({ success: true, message: "Reference is unique for this client." });
   } catch (err) {
     console.error("Project reference check error:", err);
     res.status(500).json({ success: false, error: "Server error checking reference." });
   }
 });
-
 
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
