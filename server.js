@@ -1162,7 +1162,7 @@ app.post("/client/login", async (req, res) => {
   }
 });
 
-// ============ ADD PROJECT CLIENT PROFILE PICTURE ============
+// ============ FETCH CLIENT PROFILE PICTURE ============
 app.post("/client/profile-picture", async (req, res) => {
   const { email } = req.body;
   try {
@@ -1177,13 +1177,18 @@ app.post("/client/profile-picture", async (req, res) => {
       return res.json({ success: false, error: "Client not found." });
     }
 
-    res.json({
-      success: true,
-      profile_picture: result.rows[0].profile_picture || null
-    });
+    const profilePicture = result.rows[0].profile_picture;
+
+    if (!profilePicture) {
+      // Explicitly tell frontend there is no picture
+      return res.json({ success: true, profile_picture: null });
+    }
+
+    // Return the stored picture URL
+    res.json({ success: true, profile_picture: profilePicture });
   } catch (err) {
     console.error("Profile picture fetch error:", err);
-    res.status(500).json({ success: false, error: "Server error" });
+    res.status(500).json({ success: false, error: "Server error fetching profile picture." });
   }
 });
 
