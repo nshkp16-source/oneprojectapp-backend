@@ -1203,22 +1203,45 @@ app.post("/project/check-duplicate", async (req, res) => {
 
     const clientId = clientResult.rows[0].id;
 
-    // Check if this client already has a project with same name, location, and contract_reference
-    const duplicateCheck = await pool.query(
-      `SELECT id, name, location, contract_reference 
-       FROM projects 
-       WHERE client_id = $1
-         AND TRIM(LOWER(name)) = TRIM(LOWER($2))
-         AND TRIM(LOWER(location)) = TRIM(LOWER($3))
-         AND TRIM(LOWER(contract_reference)) = TRIM(LOWER($4))`,
-      [clientId, project.name, project.location, project.contract_reference]
+    // Check for duplicate project name
+    const nameCheck = await pool.query(
+      `SELECT id FROM projects 
+       WHERE client_id = $1 AND TRIM(LOWER(name)) = TRIM(LOWER($2))`,
+      [clientId, project.name]
     );
 
-    if (duplicateCheck.rows.length > 0) {
-      // Tell the user the data they filled already exists
+    if (nameCheck.rows.length > 0) {
       return res.json({
         success: false,
-        error: "A project with the same Name, Location, and Contract Reference already exists for this client."
+        error: "A project with the same Name already exists for this client."
+      });
+    }
+
+    // Check for duplicate project location
+    const locationCheck = await pool.query(
+      `SELECT id FROM projects 
+       WHERE client_id = $1 AND TRIM(LOWER(location)) = TRIM(LOWER($2))`,
+      [clientId, project.location]
+    );
+
+    if (locationCheck.rows.length > 0) {
+      return res.json({
+        success: false,
+        error: "A project with the same Location already exists for this client."
+      });
+    }
+
+    // Check for duplicate contract reference
+    const referenceCheck = await pool.query(
+      `SELECT id FROM projects 
+       WHERE client_id = $1 AND TRIM(LOWER(contract_reference)) = TRIM(LOWER($2))`,
+      [clientId, project.contract_reference]
+    );
+
+    if (referenceCheck.rows.length > 0) {
+      return res.json({
+        success: false,
+        error: "A project with the same Contract Reference already exists for this client."
       });
     }
 
