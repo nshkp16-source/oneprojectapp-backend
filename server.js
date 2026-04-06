@@ -1325,13 +1325,13 @@ app.post('/project-save', async (req, res) => {
       if (!user?.email) return;
 
       const userResult = await pool.query(
-        `INSERT INTO users (role, company_name, email, representative_name, title, phone_number, created_at, verified, project_id)
+        `INSERT INTO users (role, company_name, email, representative, title, telephone, created_at, verified, project_id)
          VALUES ($1,$2,$3,$4,$5,$6,NOW(),true,$7)
          ON CONFLICT (email, project_id) DO UPDATE SET 
            company_name=EXCLUDED.company_name,
-           representative_name=EXCLUDED.representative_name,
+           representative=EXCLUDED.representative,
            title=EXCLUDED.title,
-           phone_number=EXCLUDED.phone_number,
+           telephone=EXCLUDED.telephone,
            verified=true
          RETURNING id;`,
         [
