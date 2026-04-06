@@ -1162,185 +1162,12 @@ app.post("/client/login", async (req, res) => {
   }
 });
 
-// 20. ============ ADD PROJECT TO EXISTING CLIENT =============
-
-// Send project verification code
-app.post("/project-send-code", async (req, res) => {
-  const { email, project } = req.body;
-  try {
-    const duplicateCheck = await pool.query(
-      `SELECT id FROM projects 
-       WHERE LOWER(name)=LOWER($1) 
-       OR LOWER(contract_reference)=LOWER($2)`,
-      [project.name, project.contract_reference]
-    );
-
-    if (duplicateCheck.rows.length > 0) {
-      return res.json({ success: false, error: "A project with this name or contract reference already exists." });
-    }
-
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const sessionId = uuidv4();
-
-    const insertResult = await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
-       RETURNING *`,
-      [email, code, sessionId]
-    );
-
-    await transporter.sendMail({
-      from: "skyprincenkp16@gmail.com",
-      to: email,
-      subject: "OneProjectApp Project Verification Code",
-      html: `<p>Your project verification code is: <b>${code}</b></p>
-             <p>This code will expire in 3 minutes.</p>`
-    });
-
-    res.json({ success: true, message: "Verification code sent.", sessionId, expiresAt: insertResult.rows[0].expires_at });
-  } catch (err) {
-    console.error("Project send error:", err);
-    res.status(500).json({ success: false, error: "Failed to send project verification." });
-  }
-});
-
-// Resend project verification code
-app.post("/project-resend-code", async (req, res) => {
-  const { email } = req.body;
-  try {
-    await pool.query(
-      `DELETE FROM email_tokens 
-       WHERE email=$1 AND verified=false AND reset_flow=false`,
-      [email]
-    );
-
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const sessionId = uuidv4();
-
-    const insertResult = await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
-       RETURNING *`,
-      [email, code, sessionId]
-    );
-
-    await transporter.sendMail({
-      from: "skyprincenkp16@gmail.com",
-      to: email,
-      subject: "OneProjectApp Project Verification Code (Resend)",
-      html: `<p>Your new project verification code is: <b>${code}</b></p>
-             <p>This code will expire in 3 minutes.</p>`
-    });
-
-    res.json({ success: true, message: "New project verification code sent.", sessionId, expiresAt: insertResult.rows[0].expires_at });
-  } catch (err) {
-    console.error("Project resend error:", err);
-    res.status(500).json({ success: false, error: "Failed to resend project verification." });
-  }
-});
-
-// Verify project code and save project + contractor + consultant
-app.post("/project-verify-code", async (req, res) => {
-  const { email, token, project, contractor, consultant } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-
-    const tokenCheck = await client.query(
-      `SELECT * FROM email_tokens 
-       WHERE email=$1 AND token=$2 
-       AND expires_at > NOW() 
-       AND verified=false AND reset_flow=false
-       ORDER BY expires_at DESC LIMIT 1`,
-      [email, token]
-    );
-
-    if (tokenCheck.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.json({ success: false, error: "Invalid or expired code." });
-    }
-
-    await client.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
-      tokenCheck.rows[0].id
-    ]);
-
-    const clientResult = await client.query(
-      `SELECT id FROM clients WHERE company_email=$1`,
-      [email]
-    );
-
-    if (clientResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.json({ success: false, error: "Client not found." });
-    }
-
-    const clientId = clientResult.rows[0].id;
-
-    // Insert project
-    const projectInsert = await client.query(
-      `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
-       VALUES ($1,$2,$3,$4,NOW())
-       RETURNING *`,
-      [project.name, project.location, project.contract_reference, clientId]
-    );
-
-    const projectId = projectInsert.rows[0].id;
-
-    // Insert contractor
-    if (contractor) {
-      await client.query(
-        `INSERT INTO users (role, company_name, email, representative, title, telephone, project_id, created_at, verified)
-         VALUES ('Contractor',$1,$2,$3,$4,$5,$6,NOW(),true)`,
-        [
-          contractor.company,
-          contractor.email,
-          contractor.representative,
-          contractor.title,
-          contractor.telephone,
-          projectId
-        ]
-      );
-    }
-
-    // Insert consultant
-    if (consultant) {
-      await client.query(
-        `INSERT INTO users (role, company_name, email, representative, title, telephone, project_id, created_at, verified)
-         VALUES ('Consultant',$1,$2,$3,$4,$5,$6,NOW(),true)`,
-        [
-          consultant.company,
-          consultant.email,
-          consultant.representative,
-          consultant.title,
-          consultant.telephone,
-          projectId
-        ]
-      );
-    }
-
-    await client.query("COMMIT");
-
-    res.json({
-      success: true,
-      message: "Project verified and saved with contractor and consultant.",
-      project: projectInsert.rows[0]
-    });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("Project verify error:", err);
-    res.status(500).json({ success: false, error: "Failed to verify project." });
-  } finally {
-    client.release();
-  }
-});
-
-// profile picture
+// 20. ============ CLIENT PROFILE INFO ============
 app.post("/client/profile-picture", async (req, res) => {
   const { email } = req.body;
-
   try {
     const result = await pool.query(
-      "SELECT profile_picture FROM clients WHERE company_email = $1",
+      "SELECT company_name, profile_picture FROM clients WHERE company_email = $1",
       [email]
     );
 
@@ -1350,6 +1177,7 @@ app.post("/client/profile-picture", async (req, res) => {
 
     res.json({
       success: true,
+      company_name: result.rows[0].company_name,
       profile_picture: result.rows[0].profile_picture
     });
   } catch (err) {
@@ -1357,6 +1185,27 @@ app.post("/client/profile-picture", async (req, res) => {
     res.status(500).json({ success: false, error: "Server error" });
   }
 });
+
+// ============ PROJECT REFERENCE CHECK ============
+app.post("/project-check-reference", async (req, res) => {
+  const { reference } = req.body;
+  try {
+    const duplicateCheck = await pool.query(
+      `SELECT id FROM projects WHERE LOWER(contract_reference)=LOWER($1)`,
+      [reference]
+    );
+
+    if (duplicateCheck.rows.length > 0) {
+      return res.json({ success: false, error: "Project reference already exists." });
+    }
+
+    res.json({ success: true, message: "Reference is unique." });
+  } catch (err) {
+    console.error("Project reference check error:", err);
+    res.status(500).json({ success: false, error: "Server error checking reference." });
+  }
+});
+
 
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
