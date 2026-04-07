@@ -85,10 +85,10 @@ app.post("/verify-code", async (req, res) => {
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
-    // Insert/update client with ALL columns
+    // Insert/update client (without projects column)
     const clientResult = await pool.query(
-      `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at, profile_picture, projects) 
-       VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7,$8)
+      `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at, profile_picture) 
+       VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7)
        ON CONFLICT (company_email) DO UPDATE SET 
          company_name=EXCLUDED.company_name,
          representative=EXCLUDED.representative,
@@ -96,7 +96,6 @@ app.post("/verify-code", async (req, res) => {
          telephone=EXCLUDED.telephone,
          password_hash=EXCLUDED.password_hash,
          profile_picture=EXCLUDED.profile_picture,
-         projects=EXCLUDED.projects,
          verified=true
        RETURNING id;`,
       [
@@ -106,8 +105,7 @@ app.post("/verify-code", async (req, res) => {
         client.title,
         client.telephone,
         hashedPassword,
-        client.profile_picture || null,
-        client.projects || null
+        client.profile_picture || null
       ]
     );
     const client_id = clientResult.rows[0].id;
