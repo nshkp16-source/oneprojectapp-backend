@@ -33,38 +33,6 @@ app.get('/', (req, res) => {
   res.send('Backend is running successfully!');
 });
 
-// Configure multer storage
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, path.join(__dirname, "uploads")); // adjust path if needed
-  },
-  filename: function (req, file, cb) {
-    const uniqueName = Date.now() + "-" + file.originalname.replace(/\s+/g, "-");
-    cb(null, uniqueName);
-  }
-});
-
-// ✅ Single upload instance with 500KB limit
-const upload = multer({ storage: storage, limits: { fileSize: 500 * 1024 } });
-
-// Route: Upload client profile picture (return permanent URL only, no DB commit yet)
-app.post("/client/upload-picture-temp", upload.single("picture"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded." });
-    }
-
-    // Construct permanent URL based on your Render deployment
-    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-
-    // ✅ Return URL only, save later during verification
-    res.json({ success: true, url: fileUrl });
-  } catch (err) {
-    console.error("Upload error:", err);
-    res.status(500).json({ error: "Server error uploading picture." });
-  }
-});
-
 // 1. Finalize Account (send verification only)
 app.post("/finalize-account", async (req, res) => {
   const { clientEmail } = req.body;
@@ -757,11 +725,11 @@ setInterval(async () => {
 
 // ✅ Multer is already imported at the top: import multer from "multer";
 const upload = multer({
-  limits: { fileSize: 1024 * 1024 }, // 1MB limit
+  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit everywhere
   storage: multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
-      cb(null, Date.now() + "-" + file.originalname);
+      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
     }
   })
 });
@@ -774,7 +742,6 @@ app.post("/client/profile", async (req, res) => {
   try {
     const { email } = req.body;
 
-    // Fetch client info
     const clientResult = await pool.query(
       "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
@@ -786,7 +753,6 @@ app.post("/client/profile", async (req, res) => {
 
     const client = clientResult.rows[0];
 
-    // ✅ Only fetch projects where this user is the client
     const projectsResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE client_id=$1",
       [client.id]
@@ -794,7 +760,6 @@ app.post("/client/profile", async (req, res) => {
 
     client.projects = projectsResult.rows;
 
-    // If only one project, mark it as default
     if (client.projects.length === 1) {
       client.defaultProject = client.projects[0];
     }
@@ -806,24 +771,28 @@ app.post("/client/profile", async (req, res) => {
   }
 });
 
-// Upload client profile picture
+// Unified route: Upload client profile picture
 app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, commit } = req.body;
 
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
-    // ✅ Use full Render backend URL
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
 
-    await pool.query(
-      "UPDATE clients SET profile_picture=$1 WHERE company_email=$2",
-      [fileUrl, email]
-    );
-
-    res.json({ success: true, url: fileUrl });
+    if (commit && email) {
+      // ✅ Commit to DB as client profile picture
+      await pool.query(
+        "UPDATE clients SET profile_picture=$1 WHERE company_email=$2",
+        [fileUrl, email]
+      );
+      return res.json({ success: true, url: fileUrl, committed: true });
+    } else {
+      // ✅ Return URL only (for localStorage use)
+      return res.json({ success: true, url: fileUrl, committed: false });
+    }
   } catch (err) {
     console.error("Upload client picture error:", err);
     res.status(500).json({ error: "Failed to upload client picture" });
@@ -834,12 +803,7 @@ app.post("/client/upload-picture", upload.single("profile_picture"), async (req,
 app.post("/client/delete-picture", async (req, res) => {
   try {
     const { email } = req.body;
-
-    await pool.query(
-      "UPDATE clients SET profile_picture=NULL WHERE company_email=$1",
-      [email]
-    );
-
+    await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [email]);
     res.json({ success: true });
   } catch (err) {
     console.error("Delete client picture error:", err);
@@ -852,7 +816,6 @@ app.post("/client/project-details", async (req, res) => {
   try {
     const { email, projectId } = req.body;
 
-    // Verify client exists
     const clientResult = await pool.query(
       "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
@@ -862,7 +825,6 @@ app.post("/client/project-details", async (req, res) => {
     }
     const client = clientResult.rows[0];
 
-    // ✅ Verify project belongs to this client
     const projectResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
       [projectId, client.id]
@@ -872,7 +834,6 @@ app.post("/client/project-details", async (req, res) => {
     }
     const project = projectResult.rows[0];
 
-    // ✅ Only return client + project info
     res.json({
       client: {
         email: client.email,
