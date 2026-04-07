@@ -295,6 +295,7 @@ app.post("/firstlogin-send", async (req, res) => {
 app.post("/firstlogin-resend", async (req, res) => {
   const { email } = req.body;
   try {
+    // Delete only unverified first-login tokens
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -347,17 +348,17 @@ app.post('/verify-password-code', async (req, res) => {
     console.log("DB result:", tokenCheck.rows);
 
     if (tokenCheck.rows.length === 0) {
-      return res.json({ success: false, error: "Invalid or expired code." });
+      return res.json({ success: false, verified: false, error: "Invalid or expired code." });
     }
 
     await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
       tokenCheck.rows[0].id
     ]);
 
-    res.json({ success: true, message: "Code verified. You may now set your password." });
+    res.json({ success: true, verified: true, message: "Code verified. You may now set your password." });
   } catch (err) {
     console.error("Verify password code error:", err);
-    res.status(500).json({ success: false, error: "Failed to verify code." });
+    res.status(500).json({ success: false, verified: false, error: "Failed to verify code." });
   }
 });
 
@@ -380,15 +381,15 @@ app.post("/set-password", async (req, res) => {
         [hash, email]
       );
       console.log("Password set for client:", email);
-    } else {
-      await pool.query(
-        `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
-        [hash, email]
-      );
-      console.log("Password set for user:", email);
+      return res.json({ success: true, role: "Client", message: "Password set successfully." });
     }
 
-    res.json({ success: true, message: "Password set successfully." });
+    await pool.query(
+      `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
+      [hash, email]
+    );
+    console.log("Password set for user:", email);
+    return res.json({ success: true, role: "User", message: "Password set successfully." });
   } catch (err) {
     console.error("Set password error:", err);
     res.status(500).json({ success: false, error: "Failed to set password." });
@@ -424,8 +425,8 @@ app.post('/reset-send', async (req, res) => {
       });
     }
 
-    // 3. Delete any existing token for this email
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+    // 3. Delete any existing reset tokens
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND reset_flow=true`, [email]);
 
     // 4. Create new token
     const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -489,8 +490,8 @@ app.post('/reset-resend', async (req, res) => {
       });
     }
 
-    // 3. Delete any existing token for this email
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1`, [email]);
+    // 3. Delete any existing reset tokens
+    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND reset_flow=true`, [email]);
 
     // 4. Create new token
     const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -537,15 +538,15 @@ app.post('/reset-verify', async (req, res) => {
     );
 
     if (tokenCheck.rows.length === 0) {
-      return res.json({ success: false, error: "Invalid or expired code." });
+      return res.json({ success: false, verified: false, error: "Invalid or expired code." });
     }
 
     await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
 
-    res.json({ success: true, message: "Code verified. You may now set your new password." });
+    res.json({ success: true, verified: true, message: "Code verified. You may now set your new password." });
   } catch (err) {
     console.error("Verify reset code error:", err);
-    res.status(500).json({ success: false, error: "Failed to verify reset code." });
+    res.status(500).json({ success: false, verified: false, error: "Failed to verify reset code." });
   }
 });
 
@@ -562,15 +563,15 @@ app.post('/reset-set-password', async (req, res) => {
         [hash, email]
       );
       console.log("Password reset for client:", email);
-    } else {
-      await pool.query(
-        `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
-        [hash, email]
-      );
-      console.log("Password reset for user:", email);
+      return res.json({ success: true, role: "Client", message: "Password reset successfully." });
     }
 
-    res.json({ success: true, message: "Password reset successfully." });
+    await pool.query(
+      `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
+      [hash, email]
+    );
+    console.log("Password reset for user:", email);
+    return res.json({ success: true, role: "User", message: "Password reset successfully." });
   } catch (err) {
     console.error("Reset set password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
@@ -583,17 +584,17 @@ app.post("/login", async (req, res) => {
   try {
     let result;
 
-    // 🔹 Check Client table
     if (role === "Client") {
+      // ✅ Check Client table
       result = await pool.query(
         `SELECT id, company_name, company_email, representative, title, telephone, password_hash, verified 
          FROM clients WHERE company_email=$1`,
         [email]
       );
     } else {
-      // 🔹 Check Users table for non-client roles
+      // ✅ Check Users table for non-client roles
       result = await pool.query(
-        `SELECT id, role, company_name, email, representative, title, telephone, password_hash, verified, project_id 
+        `SELECT id, role, company_name, email, representative, title, telephone, password_hash, verified 
          FROM users WHERE email=$1 AND role=$2`,
         [email, role]
       );
@@ -610,7 +611,7 @@ app.post("/login", async (req, res) => {
     if (!user.password_hash) {
       return res.json({
         success: false,
-        error: "No password set yet. Follow the top first login guideline."
+        error: "No password set yet. Follow the first-login guideline."
       });
     }
 
@@ -625,6 +626,16 @@ app.post("/login", async (req, res) => {
       return res.json({ success: false, error: "Account not verified. Please check your email." });
     }
 
+    // 🔹 If non-client, fetch project assignments
+    let projectAssignments = [];
+    if (role !== "Client") {
+      const projectsRes = await pool.query(
+        `SELECT project_id FROM user_projects WHERE user_id=$1`,
+        [user.id]
+      );
+      projectAssignments = projectsRes.rows.map(r => r.project_id);
+    }
+
     // 🔹 Success response
     res.json({
       success: true,
@@ -637,7 +648,7 @@ app.post("/login", async (req, res) => {
         representative: user.representative,
         title: user.title,
         telephone: user.telephone,
-        project_id: user.project_id || null
+        projects: projectAssignments // array of project IDs for non-clients
       }
     });
   } catch (err) {
@@ -667,18 +678,20 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 14. Check Email Exists (fix role casing)
+// 14. Check Email Exists (normalize role casing)
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
+    const normalizedRole = role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
     let result;
-    if (role === "Client") {
+
+    if (normalizedRole === "Client") {
       result = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
     } else {
-      result = await pool.query(`SELECT id FROM users WHERE email=$1 AND role=$2`, [email, role]);
+      result = await pool.query(`SELECT id FROM users WHERE email=$1 AND role=$2`, [email, normalizedRole]);
     }
 
-    res.json({ exists: result.rows.length > 0 });
+    res.json({ success: true, exists: result.rows.length > 0 });
   } catch (err) {
     console.error("Check email error:", err);
     res.status(500).json({ success: false, error: "Server error checking email." });
@@ -696,7 +709,7 @@ app.post("/cleanup-tokens", async (req, res) => {
 
     res.json({
       success: true,
-      message: `Expired tokens cleaned up.`,
+      message: "Expired tokens cleaned up.",
       deletedCount: result.rowCount
     });
   } catch (err) {
@@ -719,7 +732,7 @@ setInterval(async () => {
   } catch (err) {
     console.error("Scheduled cleanup error:", err.message);
   }
-}, 3 * 60 * 1000); // 3 minutes in milliseconds
+}, 3 * 60 * 1000); // 3 minutes
 
 // 16.=========== CLIENT PROFILE ROUTES =============
 
