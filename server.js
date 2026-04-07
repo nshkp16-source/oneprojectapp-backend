@@ -33,6 +33,37 @@ app.get('/', (req, res) => {
   res.send('Backend is running successfully!');
 });
 
+// Configure multer storage
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, path.join(__dirname, "uploads")); // adjust path if needed
+  },
+  filename: function (req, file, cb) {
+    const uniqueName = Date.now() + "-" + file.originalname.replace(/\s+/g, "-");
+    cb(null, uniqueName);
+  }
+});
+
+const upload = multer({ storage: storage, limits: { fileSize: 500 * 1024 } });
+
+// Route: Upload profile picture and return permanent URL
+router.post("/client/upload-picture", upload.single("picture"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded." });
+    }
+
+    // Construct permanent URL based on your Render deployment
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+
+    // ✅ Only return the URL, do not commit to DB yet
+    res.json({ success: true, url: fileUrl });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ error: "Server error uploading picture." });
+  }
+});
+
 // 1. Finalize Account (send verification only)
 app.post("/finalize-account", async (req, res) => {
   const { clientEmail } = req.body;
