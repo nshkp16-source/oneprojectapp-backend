@@ -578,27 +578,16 @@ app.post('/reset-set-password', async (req, res) => {
   }
 });
 
-// 12. LOGIN route (Client + Non-Client users)
+// 12. LOGIN route (all roles use users table for credentials)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
-    let result;
-
-    if (role === "Client") {
-      // ✅ Check Client table
-      result = await pool.query(
-        `SELECT id, company_name, company_email, representative, title, telephone, password_hash, verified 
-         FROM clients WHERE company_email=$1`,
-        [email]
-      );
-    } else {
-      // ✅ Check Users table for non-client roles
-      result = await pool.query(
-        `SELECT id, role, company_name, email, representative, title, telephone, password_hash, verified 
-         FROM users WHERE email=$1 AND role=$2`,
-        [email, role]
-      );
-    }
+    // ✅ Always check Users table for credentials
+    const result = await pool.query(
+      `SELECT id, role, company_name, email, representative, title, telephone, password_hash, verified 
+       FROM users WHERE email=$1 AND role=$2`,
+      [email, role]
+    );
 
     // 🔹 Account not found
     if (result.rows.length === 0) {
@@ -626,29 +615,26 @@ app.post("/login", async (req, res) => {
       return res.json({ success: false, error: "Account not verified. Please check your email." });
     }
 
-    // 🔹 If non-client, fetch project assignments
-    let projectAssignments = [];
-    if (role !== "Client") {
-      const projectsRes = await pool.query(
-        `SELECT project_id FROM user_projects WHERE user_id=$1`,
-        [user.id]
-      );
-      projectAssignments = projectsRes.rows.map(r => r.project_id);
-    }
+    // 🔹 Fetch project assignments
+    const projectsRes = await pool.query(
+      `SELECT project_id FROM user_projects WHERE user_id=$1`,
+      [user.id]
+    );
+    const projectAssignments = projectsRes.rows.map(r => r.project_id);
 
     // 🔹 Success response
     res.json({
       success: true,
       message: "Login successful.",
-      role: role,
+      role: user.role,
       userDetails: {
         id: user.id,
-        email: role === "Client" ? user.company_email : user.email,
+        email: user.email,
         company_name: user.company_name,
         representative: user.representative,
         title: user.title,
         telephone: user.telephone,
-        projects: projectAssignments // array of project IDs for non-clients
+        projects: projectAssignments
       }
     });
   } catch (err) {
