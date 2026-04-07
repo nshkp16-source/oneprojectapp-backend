@@ -42,8 +42,9 @@ app.post("/finalize-account", async (req, res) => {
     const sessionId = uuidv4();
 
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified, reset_flow)
-       VALUES ($1, $2, NOW() + interval '3 minutes', 0, $3, false, false)`,
+      `INSERT INTO email_tokens 
+       (email, token, expires_at, attempts, session_id, verified, pending_password, reset_flow, created_at, project_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',0,$3,false,false,false,NOW(),false)`,
       [clientEmail, code, sessionId]
     );
 
@@ -71,8 +72,7 @@ app.post("/verify-code", async (req, res) => {
     const result = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false
-       ORDER BY expires_at DESC
-       LIMIT 1`,
+       ORDER BY expires_at DESC LIMIT 1`,
       [email, code]
     );
 
@@ -236,8 +236,9 @@ app.post("/resend-verification", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
 
     await pool.query(
-      `INSERT INTO email_tokens (email, token, expires_at, attempts, session_id, verified)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false)`,
+      `INSERT INTO email_tokens 
+       (email, token, expires_at, attempts, session_id, verified, pending_password, reset_flow, created_at, project_flow)
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,false,false,NOW(),false)`,
       [email, code, newAttempts, sessionId]
     );
 
