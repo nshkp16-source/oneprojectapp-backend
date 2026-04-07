@@ -1188,7 +1188,6 @@ app.post("/client/profile-picture", async (req, res) => {
 app.post('/project-send', async (req, res) => {
   const { email } = req.body;
   try {
-    // Delete any existing project tokens for this email
     await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`, [email]);
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -1313,37 +1312,35 @@ app.post('/project-save', async (req, res) => {
         )
       ).rows[0].id;
 
+    // ✅ Helper to add contractor/consultant without duplication
     async function addUser(user, role) {
       if (!user?.email) return;
 
-      const userResult = await pool.query(
-        `INSERT INTO users (role, company_name, email, representative, title, telephone, created_at, verified, project_id)
-         VALUES ($1,$2,$3,$4,$5,$6,NOW(),true,$7)
-         ON CONFLICT (email, project_id) DO UPDATE SET 
-           company_name=EXCLUDED.company_name,
-           representative=EXCLUDED.representative,
-           title=EXCLUDED.title,
-           telephone=EXCLUDED.telephone,
-           verified=true
-         RETURNING id;`,
-        [
-          role,
-          user.company,
-          user.email,
-          user.representative,
-          user.title,
-          user.telephone,
-          project_id
-        ]
+      // Step 1: ensure global identity exists
+      let userResult = await pool.query(
+        `SELECT id FROM users WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
+        [user.email]
       );
 
-      const user_id = userResult.rows[0].id;
+      let user_id;
+      if (userResult.rows.length === 0) {
+        const insertResult = await pool.query(
+          `INSERT INTO users (email, created_at, verified)
+           VALUES ($1, NOW(), true)
+           RETURNING id;`,
+          [user.email]
+        );
+        user_id = insertResult.rows[0].id;
+      } else {
+        user_id = userResult.rows[0].id;
+      }
 
+      // Step 2: tie to project with role/details
       await pool.query(
-        `INSERT INTO user_projects (user_id, project_id, created_at) 
-         VALUES ($1,$2,NOW())
-         ON CONFLICT (user_id, project_id) DO NOTHING;`,
-        [user_id, project_id]
+        `INSERT INTO user_projects (user_id, project_id, role, company_name, representative, title, telephone, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+         ON CONFLICT (user_id, project_id, role) DO NOTHING;`,
+        [user_id, project_id, role, user.company, user.representative, user.title, user.telephone]
       );
     }
 
@@ -1352,7 +1349,8 @@ app.post('/project-save', async (req, res) => {
 
     return res.json({
       success: true,
-      message: "Project and team saved successfully."
+      message: "Project and team saved successfully.",
+      projectId: project_id
     });
   } catch (err) {
     console.error("Project save error:", err.message);
