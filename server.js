@@ -44,10 +44,11 @@ const storage = multer.diskStorage({
   }
 });
 
+// ✅ Single upload instance with 500KB limit
 const upload = multer({ storage: storage, limits: { fileSize: 500 * 1024 } });
 
-// Route: Upload profile picture and return permanent URL
-router.post("/client/upload-picture", upload.single("picture"), async (req, res) => {
+// Route: Upload client profile picture (return permanent URL only, no DB commit yet)
+app.post("/client/upload-picture-temp", upload.single("picture"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded." });
@@ -56,7 +57,7 @@ router.post("/client/upload-picture", upload.single("picture"), async (req, res)
     // Construct permanent URL based on your Render deployment
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
 
-    // ✅ Only return the URL, do not commit to DB yet
+    // ✅ Return URL only, save later during verification
     res.json({ success: true, url: fileUrl });
   } catch (err) {
     console.error("Upload error:", err);
