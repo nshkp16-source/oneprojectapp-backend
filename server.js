@@ -67,7 +67,7 @@ app.post("/verify-code", async (req, res) => {
   const { email, code, client, project, contractor, consultant } = req.body;
 
   try {
-    // Always check latest valid token for this email
+    // Check latest valid token
     const result = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false
@@ -77,11 +77,7 @@ app.post("/verify-code", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.json({
-        success: false,
-        verified: false,
-        error: "Invalid or expired code."
-      });
+      return res.json({ success: false, verified: false, error: "Invalid or expired code." });
     }
 
     // Hash password if provided
@@ -89,7 +85,7 @@ app.post("/verify-code", async (req, res) => {
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
-    // Insert client
+    // Insert/update client
     const clientResult = await pool.query(
       `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at) 
        VALUES ($1,$2,$3,$4,$5,$6,true,NOW())
@@ -133,34 +129,31 @@ app.post("/verify-code", async (req, res) => {
     async function addUser(user, role) {
       if (!user?.email) return;
 
-      const userResult = await pool.query(
-        `INSERT INTO users (role, company_name, email, representative, title, telephone, created_at, verified, project_id)
-         VALUES ($1,$2,$3,$4,$5,$6,NOW(),true,$7)
-         ON CONFLICT (email, project_id) DO UPDATE SET 
-           company_name=EXCLUDED.company_name,
-           representative=EXCLUDED.representative,
-           title=EXCLUDED.title,
-           telephone=EXCLUDED.telephone,
-           verified=true
-         RETURNING id;`,
-        [
-          role,
-          user.company,
-          user.email,
-          user.representative,
-          user.title,
-          user.telephone,
-          project_id
-        ]
+      // Step 1: ensure global identity exists
+      let userResult = await pool.query(
+        `SELECT id FROM users WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
+        [user.email]
       );
 
-      const user_id = userResult.rows[0].id;
+      let user_id;
+      if (userResult.rows.length === 0) {
+        const insertResult = await pool.query(
+          `INSERT INTO users (email, created_at, verified)
+           VALUES ($1, NOW(), true)
+           RETURNING id;`,
+          [user.email]
+        );
+        user_id = insertResult.rows[0].id;
+      } else {
+        user_id = userResult.rows[0].id;
+      }
 
+      // Step 2: tie to project with role/details
       await pool.query(
-        `INSERT INTO user_projects (user_id, project_id, created_at) 
-         VALUES ($1,$2,NOW())
-         ON CONFLICT (user_id, project_id) DO NOTHING;`,
-        [user_id, project_id]
+        `INSERT INTO user_projects (user_id, project_id, role, company_name, representative, title, telephone, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+         ON CONFLICT (user_id, project_id, role) DO NOTHING;`,
+        [user_id, project_id, role, user.company, user.representative, user.title, user.telephone]
       );
     }
 
@@ -209,25 +202,28 @@ app.post("/resend-verification", async (req, res) => {
 
     if (check.rows.length > 0) {
       if (check.rows[0].attempts >= 2) {
-        // Too many resends → cleanup client/project
+        // Too many resends → cleanup client/project and related user assignments
         await pool.query(
-          `DELETE FROM users WHERE project_id IN (
+          `DELETE FROM user_projects WHERE project_id IN (
              SELECT id FROM projects WHERE client_id IN (
                SELECT id FROM clients WHERE company_email=$1 AND verified=false
              )
            )`,
           [email]
         );
+
         await pool.query(
           `DELETE FROM projects WHERE client_id IN (
              SELECT id FROM clients WHERE company_email=$1 AND verified=false
            )`,
           [email]
         );
+
         await pool.query(
           `DELETE FROM clients WHERE company_email=$1 AND verified=false`,
           [email]
         );
+
         return res.json({
           success: false,
           error: "Resend attempts exceeded. Please restart account creation."
