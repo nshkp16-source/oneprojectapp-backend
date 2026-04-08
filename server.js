@@ -85,7 +85,7 @@ app.post("/verify-code", async (req, res) => {
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
-    // Insert/update client (without projects column)
+    // Insert/update client
     const clientResult = await pool.query(
       `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at, profile_picture) 
        VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7)
@@ -112,8 +112,8 @@ app.post("/verify-code", async (req, res) => {
 
     // Insert project
     const projectResult = await pool.query(
-      `INSERT INTO projects (name, location, contract_reference, client_id, created_at, verified)
-       VALUES ($1,$2,$3,$4,NOW(),true)
+      `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
+       VALUES ($1,$2,$3,$4,NOW())
        ON CONFLICT (name, client_id) DO NOTHING RETURNING id;`,
       [project.name, project.location, project.contract_reference, client_id]
     );
@@ -127,40 +127,45 @@ app.post("/verify-code", async (req, res) => {
         )
       ).rows[0].id;
 
-    // Helper for contractor/consultant
-    async function addUser(user, role) {
+    // Helper for role tables + assignments
+    async function addRoleUser(user, role, tableName) {
       if (!user?.email) return;
 
-      // Step 1: ensure global identity exists
-      let userResult = await pool.query(
-        `SELECT id FROM users WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
-        [user.email]
+      // Step 1: ensure role identity exists
+      const roleResult = await pool.query(
+        `INSERT INTO ${tableName} (email, password_hash, verified, profile_picture, created_at)
+         VALUES ($1,$2,true,$3,NOW())
+         ON CONFLICT (email) DO UPDATE SET 
+           password_hash=EXCLUDED.password_hash,
+           profile_picture=EXCLUDED.profile_picture,
+           verified=true
+         RETURNING id;`,
+        [user.email, user.password_hash || null, user.profile_picture || null]
       );
+      const role_id = roleResult.rows[0].id;
 
-      let user_id;
-      if (userResult.rows.length === 0) {
-        const insertResult = await pool.query(
-          `INSERT INTO users (email, created_at, verified)
-           VALUES ($1, NOW(), true)
-           RETURNING id;`,
-          [user.email]
-        );
-        user_id = insertResult.rows[0].id;
-      } else {
-        user_id = userResult.rows[0].id;
-      }
-
-      // Step 2: tie to project with role/details
+      // Step 2: tie to project with assignment details
       await pool.query(
-        `INSERT INTO user_projects (user_id, project_id, role, company_name, representative, title, telephone, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-         ON CONFLICT (user_id, project_id, role) DO NOTHING;`,
-        [user_id, project_id, role, user.company, user.representative, user.title, user.telephone]
+        `INSERT INTO assignments (project_id, role, role_id, company_name, title, position, telephone, task, representative, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+         ON CONFLICT (project_id, role, role_id) DO NOTHING;`,
+        [
+          project_id,
+          role,
+          role_id,
+          user.company_name || null,
+          user.title || null,
+          user.position || null,
+          user.telephone || null,
+          user.task || null,
+          user.representative || null
+        ]
       );
     }
 
-    await addUser(contractor, "Contractor");
-    await addUser(consultant, "Consultant");
+    // Add contractor and consultant
+    await addRoleUser(contractor, "Contractor", "contractors");
+    await addRoleUser(consultant, "Consultant", "consultants");
 
     // ✅ Mark token as verified
     await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
@@ -182,7 +187,7 @@ app.post("/verify-code", async (req, res) => {
   }
 });
 
-// 3. Resend Verification (with cleanup)
+// 3. Resend Verification (replace old token with new one)
 app.post("/resend-verification", async (req, res) => {
   const { email } = req.body;
   try {
@@ -192,58 +197,19 @@ app.post("/resend-verification", async (req, res) => {
       [email]
     );
 
-    // Check latest token attempts (after cleanup, may be empty)
-    const check = await pool.query(
-      `SELECT attempts, session_id FROM email_tokens 
-       WHERE email=$1 ORDER BY expires_at DESC LIMIT 1`,
-      [email]
-    );
-
-    let newAttempts = 1;
-    let sessionId = uuidv4();
-
-    if (check.rows.length > 0) {
-      if (check.rows[0].attempts >= 2) {
-        // Too many resends → cleanup client/project and related user assignments
-        await pool.query(
-          `DELETE FROM user_projects WHERE project_id IN (
-             SELECT id FROM projects WHERE client_id IN (
-               SELECT id FROM clients WHERE company_email=$1 AND verified=false
-             )
-           )`,
-          [email]
-        );
-
-        await pool.query(
-          `DELETE FROM projects WHERE client_id IN (
-             SELECT id FROM clients WHERE company_email=$1 AND verified=false
-           )`,
-          [email]
-        );
-
-        await pool.query(
-          `DELETE FROM clients WHERE company_email=$1 AND verified=false`,
-          [email]
-        );
-
-        return res.json({
-          success: false,
-          error: "Resend attempts exceeded. Please restart account creation."
-        });
-      }
-      newAttempts = check.rows[0].attempts + 1;
-      sessionId = check.rows[0].session_id || uuidv4();
-    }
-
+    // Generate new code and session
     const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const sessionId = uuidv4();
 
+    // Insert new token
     await pool.query(
       `INSERT INTO email_tokens 
        (email, token, expires_at, attempts, session_id, verified, pending_password, reset_flow, created_at, project_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,$4,false,false,false,NOW(),false)`,
-      [email, code, newAttempts, sessionId]
+       VALUES ($1,$2,NOW() + interval '3 minutes',0,$3,false,false,false,NOW(),false)`,
+      [email, code, sessionId]
     );
 
+    // Send new verification email
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -1284,17 +1250,19 @@ app.post('/project-save', async (req, res) => {
   const { project, contractor, consultant, clientEmail } = req.body;
 
   try {
+    // ✅ Ensure client exists
     const clientResult = await pool.query(
-      `SELECT id FROM clients WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1))`,
+      `SELECT id FROM clients WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1)) AND verified=true`,
       [clientEmail]
     );
 
     if (clientResult.rows.length === 0) {
-      return res.json({ success: false, error: "Client not found." });
+      return res.json({ success: false, error: "Client not found or not verified." });
     }
 
     const client_id = clientResult.rows[0].id;
 
+    // ✅ Insert project
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at, verified)
        VALUES ($1,$2,$3,$4,NOW(),true)
@@ -1311,7 +1279,7 @@ app.post('/project-save', async (req, res) => {
         )
       ).rows[0].id;
 
-    // ✅ Helper to add contractor/consultant without duplication
+    // ✅ Helper to add contractor/consultant with full details
     async function addUser(user, role) {
       if (!user?.email) return;
 
@@ -1334,12 +1302,23 @@ app.post('/project-save', async (req, res) => {
         user_id = userResult.rows[0].id;
       }
 
-      // Step 2: tie to project with role/details
+      // Step 2: tie to project with role + details
       await pool.query(
-        `INSERT INTO user_projects (user_id, project_id, role, company_name, representative, title, telephone, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+        `INSERT INTO user_projects 
+         (user_id, project_id, role, company_name, representative, title, position, telephone, task, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
          ON CONFLICT (user_id, project_id, role) DO NOTHING;`,
-        [user_id, project_id, role, user.company, user.representative, user.title, user.telephone]
+        [
+          user_id,
+          project_id,
+          role,
+          user.company_name || null,
+          user.representative || null,
+          user.title || null,
+          user.position || null,
+          user.telephone || null,
+          user.task || null
+        ]
       );
     }
 
