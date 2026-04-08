@@ -95,9 +95,9 @@ app.post("/verify-code", async (req, res) => {
   }
 });
 
-// 3. Commit Account (save client, project, contractor, consultant, assignments)
+// 3. Commit Account (save client, project, role users, assignments)
 app.post("/commit-account", async (req, res) => {
-  const { client, project, contractor, consultant } = req.body;
+  const { client, project, contractor, consultant, teamMember, contractorPM, consultantPM } = req.body;
 
   try {
     // Hash password if provided
@@ -147,29 +147,36 @@ app.post("/commit-account", async (req, res) => {
         )
       ).rows[0].id;
 
-    // Helper for contractors/consultants + assignments
-    async function addRoleUser(user, role, tableName) {
+    // Helper for role users + assignments
+    async function addRoleUser(user, tableName, assignmentTable, fkColumn) {
       if (!user?.email) return;
 
-      const roleResult = await pool.query(
-        `INSERT INTO ${tableName} (email, password_hash, verified, profile_picture, created_at)
-         VALUES ($1,$2,true,$3,NOW())
-         ON CONFLICT (email) DO UPDATE SET 
-           password_hash=EXCLUDED.password_hash,
-           profile_picture=EXCLUDED.profile_picture,
-           verified=true
-         RETURNING id;`,
-        [user.email, user.password_hash || null, user.profile_picture || null]
+      // Check if user already exists
+      const existing = await pool.query(
+        `SELECT id FROM ${tableName} WHERE email=$1`,
+        [user.email]
       );
-      const role_id = roleResult.rows[0].id;
 
+      let role_id;
+      if (existing.rows.length > 0) {
+        role_id = existing.rows[0].id;
+      } else {
+        const roleResult = await pool.query(
+          `INSERT INTO ${tableName} (email, password_hash, verified, profile_picture, created_at)
+           VALUES ($1,$2,true,$3,NOW())
+           RETURNING id;`,
+          [user.email, user.password_hash || null, user.profile_picture || null]
+        );
+        role_id = roleResult.rows[0].id;
+      }
+
+      // Insert into the correct assignment table
       await pool.query(
-        `INSERT INTO assignments (project_id, role, role_id, company_name, title, position, telephone, task, representative, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-         ON CONFLICT (project_id, role, role_id) DO NOTHING;`,
+        `INSERT INTO ${assignmentTable} (project_id, ${fkColumn}, company_name, title, position, telephone, task, representative, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+         ON CONFLICT (project_id, ${fkColumn}) DO NOTHING;`,
         [
           project_id,
-          role,
           role_id,
           user.company_name || null,
           user.title || null,
@@ -181,8 +188,12 @@ app.post("/commit-account", async (req, res) => {
       );
     }
 
-    await addRoleUser(contractor, "Contractor", "contractors");
-    await addRoleUser(consultant, "Consultant", "consultants");
+    // Apply helper for each role
+    await addRoleUser(contractor, "contractors", "contractor_assignments", "contractor_id");
+    await addRoleUser(consultant, "consultants", "consultant_assignments", "consultant_id");
+    await addRoleUser(teamMember, "team_members", "team_member_assignments", "team_member_id");
+    await addRoleUser(contractorPM, "contractor_project_managers", "contractor_pm_assignments", "contractor_pm_id");
+    await addRoleUser(consultantPM, "consultant_project_managers", "consultant_pm_assignments", "consultant_pm_id");
 
     return res.json({
       success: true,
