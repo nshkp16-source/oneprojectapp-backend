@@ -63,12 +63,11 @@ app.post("/finalize-account", async (req, res) => {
   }
 });
 
-// 2. Verify Code (commit staged data only after token is verified)
+// 2. Verify Code (only mark token verified)
 app.post("/verify-code", async (req, res) => {
-  const { email, code, client, project, contractor, consultant } = req.body;
+  const { email, code } = req.body;
 
   try {
-    // Check latest valid token
     const result = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false
@@ -80,17 +79,33 @@ app.post("/verify-code", async (req, res) => {
       return res.json({ success: false, verified: false, error: "Invalid or expired code." });
     }
 
-    // ✅ Mark token as verified first
+    // ✅ Mark token as verified
     await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
       result.rows[0].id
     ]);
 
+    return res.json({
+      success: true,
+      verified: true,
+      message: "Verification successful. You may now commit account data."
+    });
+  } catch (err) {
+    console.error("Verification error:", err.message);
+    res.status(500).json({ success: false, verified: false, error: "Server error verifying code." });
+  }
+});
+
+// 3. Commit Account (save client, project, contractor, consultant, assignments)
+app.post("/commit-account", async (req, res) => {
+  const { client, project, contractor, consultant } = req.body;
+
+  try {
     // Hash password if provided
     const hashedPassword = client.password_hash
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
-    // Insert/update client only after token is verified
+    // Insert/update client
     const clientResult = await pool.query(
       `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at, profile_picture) 
        VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7)
@@ -132,11 +147,10 @@ app.post("/verify-code", async (req, res) => {
         )
       ).rows[0].id;
 
-    // Helper for role tables + assignments
+    // Helper for contractors/consultants + assignments
     async function addRoleUser(user, role, tableName) {
       if (!user?.email) return;
 
-      // Step 1: ensure role identity exists
       const roleResult = await pool.query(
         `INSERT INTO ${tableName} (email, password_hash, verified, profile_picture, created_at)
          VALUES ($1,$2,true,$3,NOW())
@@ -149,7 +163,6 @@ app.post("/verify-code", async (req, res) => {
       );
       const role_id = roleResult.rows[0].id;
 
-      // Step 2: tie to project with assignment details
       await pool.query(
         `INSERT INTO assignments (project_id, role, role_id, company_name, title, position, telephone, task, representative, created_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
@@ -168,22 +181,18 @@ app.post("/verify-code", async (req, res) => {
       );
     }
 
-    // Add contractor and consultant
     await addRoleUser(contractor, "Contractor", "contractors");
     await addRoleUser(consultant, "Consultant", "consultants");
 
     return res.json({
       success: true,
-      verified: true,
-      message: "Account verified and data committed."
+      message: "Account, project, and assignments saved successfully.",
+      clientId: client_id,
+      projectId: project_id
     });
   } catch (err) {
-    console.error("Verification error:", err.message);
-    res.status(500).json({
-      success: false,
-      verified: false,
-      error: "Server error verifying code."
-    });
+    console.error("Commit error:", err.message);
+    res.status(500).json({ success: false, error: "Server error committing account." });
   }
 });
 
