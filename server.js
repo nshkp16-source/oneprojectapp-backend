@@ -474,15 +474,35 @@ app.post('/reset-resend', async (req, res) => {
     let table, emailColumn;
 
     switch (role) {
-      case "Client": table = "clients"; emailColumn = "company_email"; break;
-      case "Contractor": table = "contractors"; emailColumn = "email"; break;
-      case "Consultant": table = "consultants"; emailColumn = "email"; break;
-      case "Team Member": table = "team_members"; emailColumn = "email"; break;
-      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; break;
-      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
-      default: return res.json({ success: false, error: "Invalid role." });
+      case "Client":
+        table = "clients";
+        emailColumn = "company_email";
+        break;
+      case "Consultant":
+        table = "consultants";
+        emailColumn = "email";
+        break;
+      case "Consultant Project Manager":
+        table = "consultant_project_managers";
+        emailColumn = "email";
+        break;
+      case "Contractor":
+        table = "contractors";
+        emailColumn = "email";
+        break;
+      case "Contractor Project Manager":
+        table = "contractor_project_managers";
+        emailColumn = "email";
+        break;
+      case "Team Member":
+        table = "team_members";
+        emailColumn = "email";
+        break;
+      default:
+        return res.json({ success: false, error: "Invalid role." });
     }
 
+    // 1. Check if user has an existing password
     const result = await pool.query(
       `SELECT password_hash FROM ${table} WHERE ${emailColumn}=$1`,
       [email]
@@ -495,8 +515,10 @@ app.post('/reset-resend', async (req, res) => {
       });
     }
 
+    // 2. Delete any existing reset tokens
     await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND reset_flow=true`, [email]);
 
+    // 3. Create new token
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
@@ -507,6 +529,7 @@ app.post('/reset-resend', async (req, res) => {
       [email, code, sessionId]
     );
 
+    // 4. Send email immediately
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -559,13 +582,32 @@ app.post('/reset-set-password', async (req, res) => {
 
     let table, emailColumn;
     switch (role) {
-      case "Client": table = "clients"; emailColumn = "company_email"; break;
-      case "Contractor": table = "contractors"; emailColumn = "email"; break;
-      case "Consultant": table = "consultants"; emailColumn = "email"; break;
-      case "Team Member": table = "team_members"; emailColumn = "email"; break;
-      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; break;
-      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
-      default: return res.json({ success: false, error: "Invalid role." });
+      case "Client":
+        table = "clients";
+        emailColumn = "company_email";
+        break;
+      case "Consultant":
+        table = "consultants";
+        emailColumn = "email";
+        break;
+      case "Consultant Project Manager":
+        table = "consultant_project_managers";
+        emailColumn = "email";
+        break;
+      case "Contractor":
+        table = "contractors";
+        emailColumn = "email";
+        break;
+      case "Contractor Project Manager":
+        table = "contractor_project_managers";
+        emailColumn = "email";
+        break;
+      case "Team Member":
+        table = "team_members";
+        emailColumn = "email";
+        break;
+      default:
+        return res.json({ success: false, error: "Invalid role." });
     }
 
     await pool.query(
