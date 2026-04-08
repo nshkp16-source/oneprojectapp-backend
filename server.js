@@ -568,48 +568,54 @@ app.post('/reset-set-password', async (req, res) => {
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
-    let table, assignmentTable, foreignKey;
+    let table, assignmentTable, foreignKey, emailColumn;
 
-    // ✅ Map role to correct table and assignment
+    // ✅ Map role to correct table, assignment, and email column
     switch (role) {
       case "Client":
-        table = "clients";                  // fixed: clients table has email
+        table = "clients";
         assignmentTable = "projects";       // clients own projects directly
         foreignKey = "client_id";
+        emailColumn = "company_email";      // FIXED: clients use company_email
         break;
       case "Contractor":
         table = "contractors";
         assignmentTable = "contractor_assignments";
         foreignKey = "contractor_id";
+        emailColumn = "email";
         break;
       case "Consultant":
         table = "consultants";
         assignmentTable = "consultant_assignments";
         foreignKey = "consultant_id";
+        emailColumn = "email";
         break;
       case "Team Member":
         table = "team_members";
         assignmentTable = "team_member_assignments";
         foreignKey = "team_member_id";
+        emailColumn = "email";
         break;
       case "Contractor Project Manager":
         table = "contractor_project_managers";
         assignmentTable = "contractor_pm_assignments";
         foreignKey = "contractor_pm_id";
+        emailColumn = "email";
         break;
       case "Consultant Project Manager":
         table = "consultant_project_managers";
         assignmentTable = "consultant_pm_assignments";
         foreignKey = "consultant_pm_id";
+        emailColumn = "email";
         break;
       default:
         return res.json({ success: false, error: "Invalid role." });
     }
 
-    // ✅ Fetch account
+    // ✅ Fetch account using correct email column
     const result = await pool.query(
-      `SELECT id, company_name, email, representative, title, telephone, password_hash, verified 
-       FROM ${table} WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
+      `SELECT id, company_name, ${emailColumn} AS email, representative, title, telephone, password_hash, verified 
+       FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
       [email]
     );
 
