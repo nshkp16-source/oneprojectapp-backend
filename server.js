@@ -1282,10 +1282,10 @@ app.post('/project-save', async (req, res) => {
 
     const client_id = clientResult.rows[0].id;
 
-    // ✅ Insert project
+    // ✅ Insert project (without verified column)
     const projectResult = await pool.query(
-      `INSERT INTO projects (name, location, contract_reference, client_id, created_at, verified)
-       VALUES ($1,$2,$3,$4,NOW(),true)
+      `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
+       VALUES ($1,$2,$3,$4,NOW())
        ON CONFLICT (name, client_id) DO NOTHING RETURNING id;`,
       [project.name, project.location, project.contract_reference, client_id]
     );
