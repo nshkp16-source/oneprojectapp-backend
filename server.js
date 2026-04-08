@@ -1282,7 +1282,7 @@ app.post('/project-save', async (req, res) => {
 
     const client_id = clientResult.rows[0].id;
 
-    // ✅ Insert project (without verified column)
+    // ✅ Insert project (no verified column)
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1,$2,$3,$4,NOW())
@@ -1299,51 +1299,81 @@ app.post('/project-save', async (req, res) => {
         )
       ).rows[0].id;
 
-    // ✅ Helper to add contractor/consultant with full details
-    async function addUser(user, role) {
-      if (!user?.email) return;
-
-      // Step 1: ensure global identity exists
-      let userResult = await pool.query(
-        `SELECT id FROM users WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
-        [user.email]
+    // ✅ Ensure contractor exists and assign to project
+    if (contractor?.email) {
+      let contractorResult = await pool.query(
+        `SELECT id FROM contractors WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
+        [contractor.email]
       );
 
-      let user_id;
-      if (userResult.rows.length === 0) {
+      let contractor_id;
+      if (contractorResult.rows.length === 0) {
         const insertResult = await pool.query(
-          `INSERT INTO users (email, created_at, verified)
-           VALUES ($1, NOW(), true)
+          `INSERT INTO contractors (email, verified, created_at)
+           VALUES ($1, true, NOW())
            RETURNING id;`,
-          [user.email]
+          [contractor.email]
         );
-        user_id = insertResult.rows[0].id;
+        contractor_id = insertResult.rows[0].id;
       } else {
-        user_id = userResult.rows[0].id;
+        contractor_id = contractorResult.rows[0].id;
       }
 
-      // Step 2: tie to project with role + details
       await pool.query(
-        `INSERT INTO user_projects 
-         (user_id, project_id, role, company_name, representative, title, position, telephone, task, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-         ON CONFLICT (user_id, project_id, role) DO NOTHING;`,
+        `INSERT INTO contractor_assignments
+         (project_id, contractor_id, company_name, representative, title, position, telephone, task, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+         ON CONFLICT (project_id, contractor_id) DO NOTHING;`,
         [
-          user_id,
           project_id,
-          role,
-          user.company_name || null,
-          user.representative || null,
-          user.title || null,
-          user.position || null,
-          user.telephone || null,
-          user.task || null
+          contractor_id,
+          contractor.company_name || null,
+          contractor.representative || null,
+          contractor.title || null,
+          contractor.position || null,
+          contractor.telephone || null,
+          contractor.task || null
         ]
       );
     }
 
-    await addUser(contractor, "Contractor");
-    await addUser(consultant, "Consultant");
+    // ✅ Ensure consultant exists and assign to project
+    if (consultant?.email) {
+      let consultantResult = await pool.query(
+        `SELECT id FROM consultants WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
+        [consultant.email]
+      );
+
+      let consultant_id;
+      if (consultantResult.rows.length === 0) {
+        const insertResult = await pool.query(
+          `INSERT INTO consultants (email, verified, created_at)
+           VALUES ($1, true, NOW())
+           RETURNING id;`,
+          [consultant.email]
+        );
+        consultant_id = insertResult.rows[0].id;
+      } else {
+        consultant_id = consultantResult.rows[0].id;
+      }
+
+      await pool.query(
+        `INSERT INTO consultant_assignments
+         (project_id, consultant_id, company_name, representative, title, position, telephone, task, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+         ON CONFLICT (project_id, consultant_id) DO NOTHING;`,
+        [
+          project_id,
+          consultant_id,
+          consultant.company_name || null,
+          consultant.representative || null,
+          consultant.title || null,
+          consultant.position || null,
+          consultant.telephone || null,
+          consultant.task || null
+        ]
+      );
+    }
 
     return res.json({
       success: true,
