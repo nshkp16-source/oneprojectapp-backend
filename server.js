@@ -384,37 +384,56 @@ app.post("/set-password", async (req, res) => {
 
 // 8. Reset Password (send verification code)
 app.post('/reset-send', async (req, res) => {
-  const { email } = req.body;
+  const { email, role } = req.body;
   try {
-    // 1. Check if user has an existing password
-    const clientResult = await pool.query(
-      `SELECT password_hash FROM clients WHERE company_email=$1`,
-      [email]
-    );
-    const userResult = await pool.query(
-      `SELECT password_hash FROM users WHERE email=$1`,
-      [email]
-    );
+    let table, emailColumn;
 
-    let passwordHash = null;
-    if (clientResult.rows.length > 0) {
-      passwordHash = clientResult.rows[0].password_hash;
-    } else if (userResult.rows.length > 0) {
-      passwordHash = userResult.rows[0].password_hash;
+    switch (role) {
+      case "Client":
+        table = "clients";
+        emailColumn = "company_email";
+        break;
+      case "Contractor":
+        table = "contractors";
+        emailColumn = "email";
+        break;
+      case "Consultant":
+        table = "consultants";
+        emailColumn = "email";
+        break;
+      case "Team Member":
+        table = "team_members";
+        emailColumn = "email";
+        break;
+      case "Contractor Project Manager":
+        table = "contractor_project_managers";
+        emailColumn = "email";
+        break;
+      case "Consultant Project Manager":
+        table = "consultant_project_managers";
+        emailColumn = "email";
+        break;
+      default:
+        return res.json({ success: false, error: "Invalid role." });
     }
 
-    // 2. If no password exists, block reset flow
-    if (!passwordHash) {
+    // 1. Check if user has an existing password
+    const result = await pool.query(
+      `SELECT password_hash FROM ${table} WHERE ${emailColumn}=$1`,
+      [email]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].password_hash) {
       return res.json({
         success: false,
         error: "This account has no password yet. Please follow the first‑login flow to set your password."
       });
     }
 
-    // 3. Delete any existing reset tokens
+    // 2. Delete any existing reset tokens
     await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND reset_flow=true`, [email]);
 
-    // 4. Create new token
+    // 3. Create new token
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
@@ -425,7 +444,7 @@ app.post('/reset-send', async (req, res) => {
       [email, code, sessionId]
     );
 
-    // 5. Send email immediately
+    // 4. Send email immediately
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -434,7 +453,6 @@ app.post('/reset-send', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    // 6. Return success + expiry timestamp
     res.json({
       success: true,
       message: "Reset code sent.",
@@ -449,37 +467,34 @@ app.post('/reset-send', async (req, res) => {
 
 // 9. Resend reset code
 app.post('/reset-resend', async (req, res) => {
-  const { email } = req.body;
+  const { email, role } = req.body;
   try {
-    // 1. Check if user has an existing password
-    const clientResult = await pool.query(
-      `SELECT password_hash FROM clients WHERE company_email=$1`,
-      [email]
-    );
-    const userResult = await pool.query(
-      `SELECT password_hash FROM users WHERE email=$1`,
-      [email]
-    );
+    let table, emailColumn;
 
-    let passwordHash = null;
-    if (clientResult.rows.length > 0) {
-      passwordHash = clientResult.rows[0].password_hash;
-    } else if (userResult.rows.length > 0) {
-      passwordHash = userResult.rows[0].password_hash;
+    switch (role) {
+      case "Client": table = "clients"; emailColumn = "company_email"; break;
+      case "Contractor": table = "contractors"; emailColumn = "email"; break;
+      case "Consultant": table = "consultants"; emailColumn = "email"; break;
+      case "Team Member": table = "team_members"; emailColumn = "email"; break;
+      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; break;
+      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
+      default: return res.json({ success: false, error: "Invalid role." });
     }
 
-    // 2. If no password exists, block reset flow
-    if (!passwordHash) {
+    const result = await pool.query(
+      `SELECT password_hash FROM ${table} WHERE ${emailColumn}=$1`,
+      [email]
+    );
+
+    if (result.rows.length === 0 || !result.rows[0].password_hash) {
       return res.json({
         success: false,
         error: "This account has no password yet. Please follow the first‑login flow to set your password."
       });
     }
 
-    // 3. Delete any existing reset tokens
     await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND reset_flow=true`, [email]);
 
-    // 4. Create new token
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
@@ -490,7 +505,6 @@ app.post('/reset-resend', async (req, res) => {
       [email, code, sessionId]
     );
 
-    // 5. Send email immediately
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -499,7 +513,6 @@ app.post('/reset-resend', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    // 6. Return success + expiry timestamp
     res.json({
       success: true,
       message: "New reset code sent.",
@@ -512,7 +525,7 @@ app.post('/reset-resend', async (req, res) => {
   }
 });
 
-// 10. Verify reset password code
+// 10. Verify reset password code (unchanged, works with email_tokens)
 app.post('/reset-verify', async (req, res) => {
   const { email, token } = req.body;
   try {
@@ -538,26 +551,28 @@ app.post('/reset-verify', async (req, res) => {
 
 // 11. Save new password after verification
 app.post('/reset-set-password', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, role } = req.body;
   try {
     const hash = await bcrypt.hash(password, 10);
 
-    const clientResult = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
-    if (clientResult.rows.length > 0) {
-      await pool.query(
-        `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
-        [hash, email]
-      );
-      console.log("Password reset for client:", email);
-      return res.json({ success: true, role: "Client", message: "Password reset successfully." });
+    let table, emailColumn;
+    switch (role) {
+      case "Client": table = "clients"; emailColumn = "company_email"; break;
+      case "Contractor": table = "contractors"; emailColumn = "email"; break;
+      case "Consultant": table = "consultants"; emailColumn = "email"; break;
+      case "Team Member": table = "team_members"; emailColumn = "email"; break;
+      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; break;
+      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
+      default: return res.json({ success: false, error: "Invalid role." });
     }
 
     await pool.query(
-      `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
+      `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2`,
       [hash, email]
     );
-    console.log("Password reset for user:", email);
-    return res.json({ success: true, role: "User", message: "Password reset successfully." });
+
+    console.log(`Password reset for ${role}:`, email);
+    return res.json({ success: true, role, message: "Password reset successfully." });
   } catch (err) {
     console.error("Reset set password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
