@@ -564,18 +564,55 @@ app.post('/reset-set-password', async (req, res) => {
   }
 });
 
-// 12. LOGIN route (all roles use users table for credentials)
+// LOGIN route (role-specific tables)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
-    // ✅ Always check Users table for credentials
+    let table, assignmentTable, foreignKey;
+
+    // ✅ Map role to table and assignment
+    switch (role) {
+      case "Client":
+        table = "clients";
+        assignmentTable = "projects"; // clients own projects directly
+        foreignKey = "client_id";
+        break;
+      case "Contractor":
+        table = "contractors";
+        assignmentTable = "contractor_assignments";
+        foreignKey = "contractor_id";
+        break;
+      case "Consultant":
+        table = "consultants";
+        assignmentTable = "consultant_assignments";
+        foreignKey = "consultant_id";
+        break;
+      case "TeamMember":
+        table = "team_members";
+        assignmentTable = "team_member_assignments";
+        foreignKey = "team_member_id";
+        break;
+      case "ContractorPM":
+        table = "contractor_project_managers";
+        assignmentTable = "contractor_pm_assignments";
+        foreignKey = "contractor_pm_id";
+        break;
+      case "ConsultantPM":
+        table = "consultant_project_managers";
+        assignmentTable = "consultant_pm_assignments";
+        foreignKey = "consultant_pm_id";
+        break;
+      default:
+        return res.json({ success: false, error: "Invalid role." });
+    }
+
+    // ✅ Fetch account
     const result = await pool.query(
-      `SELECT id, role, company_name, email, representative, title, telephone, password_hash, verified 
-       FROM users WHERE email=$1 AND role=$2`,
-      [email, role]
+      `SELECT id, company_name, email, representative, title, telephone, password_hash, verified 
+       FROM ${table} WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
+      [email]
     );
 
-    // 🔹 Account not found
     if (result.rows.length === 0) {
       return res.json({ success: false, error: "Account not found." });
     }
@@ -602,17 +639,26 @@ app.post("/login", async (req, res) => {
     }
 
     // 🔹 Fetch project assignments
-    const projectsRes = await pool.query(
-      `SELECT project_id FROM user_projects WHERE user_id=$1`,
-      [user.id]
-    );
-    const projectAssignments = projectsRes.rows.map(r => r.project_id);
+    let projectAssignments = [];
+    if (role === "Client") {
+      const projectsRes = await pool.query(
+        `SELECT id FROM projects WHERE ${foreignKey}=$1`,
+        [user.id]
+      );
+      projectAssignments = projectsRes.rows.map(r => r.id);
+    } else {
+      const projectsRes = await pool.query(
+        `SELECT project_id FROM ${assignmentTable} WHERE ${foreignKey}=$1`,
+        [user.id]
+      );
+      projectAssignments = projectsRes.rows.map(r => r.project_id);
+    }
 
     // 🔹 Success response
     res.json({
       success: true,
       message: "Login successful.",
-      role: user.role,
+      role,
       userDetails: {
         id: user.id,
         email: user.email,
@@ -624,7 +670,7 @@ app.post("/login", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Login error:", err);
+    console.error("Login error:", err.message);
     res.status(500).json({ success: false, error: "Server error logging in." });
   }
 });
