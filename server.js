@@ -63,7 +63,7 @@ app.post("/finalize-account", async (req, res) => {
   }
 });
 
-// 2. Verify Code (commit staged data)
+// 2. Verify Code (commit staged data only after token is verified)
 app.post("/verify-code", async (req, res) => {
   const { email, code, client, project, contractor, consultant } = req.body;
 
@@ -80,12 +80,17 @@ app.post("/verify-code", async (req, res) => {
       return res.json({ success: false, verified: false, error: "Invalid or expired code." });
     }
 
+    // ✅ Mark token as verified first
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+      result.rows[0].id
+    ]);
+
     // Hash password if provided
     const hashedPassword = client.password_hash
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
-    // Insert/update client
+    // Insert/update client only after token is verified
     const clientResult = await pool.query(
       `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at, profile_picture) 
        VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7)
@@ -166,11 +171,6 @@ app.post("/verify-code", async (req, res) => {
     // Add contractor and consultant
     await addRoleUser(contractor, "Contractor", "contractors");
     await addRoleUser(consultant, "Consultant", "consultants");
-
-    // ✅ Mark token as verified
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
-      result.rows[0].id
-    ]);
 
     return res.json({
       success: true,
