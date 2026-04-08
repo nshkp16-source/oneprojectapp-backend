@@ -388,29 +388,30 @@ app.post('/reset-send', async (req, res) => {
   try {
     let table, emailColumn;
 
+    // ✅ Match frontend role strings exactly
     switch (role) {
       case "Client":
         table = "clients";
-        emailColumn = "company_email";
-        break;
-      case "Contractor":
-        table = "contractors";
-        emailColumn = "email";
+        emailColumn = "company_email";   // clients use company_email
         break;
       case "Consultant":
         table = "consultants";
         emailColumn = "email";
         break;
-      case "Team Member":
-        table = "team_members";
+      case "Consultant Project Manager":
+        table = "consultant_project_managers";
+        emailColumn = "email";
+        break;
+      case "Contractor":
+        table = "contractors";
         emailColumn = "email";
         break;
       case "Contractor Project Manager":
         table = "contractor_project_managers";
         emailColumn = "email";
         break;
-      case "Consultant Project Manager":
-        table = "consultant_project_managers";
+      case "Team Member":
+        table = "team_members";
         emailColumn = "email";
         break;
       default:
@@ -453,6 +454,7 @@ app.post('/reset-send', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    // 5. Return success + expiry timestamp
     res.json({
       success: true,
       message: "Reset code sent.",
