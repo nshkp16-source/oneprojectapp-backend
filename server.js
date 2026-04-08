@@ -570,11 +570,11 @@ app.post("/login", async (req, res) => {
   try {
     let table, assignmentTable, foreignKey;
 
-    // ✅ Map role to table and assignment
+    // ✅ Map role to correct table and assignment
     switch (role) {
       case "Client":
-        table = "clients";
-        assignmentTable = "projects"; // clients own projects directly
+        table = "clients";                  // fixed: clients table has email
+        assignmentTable = "projects";       // clients own projects directly
         foreignKey = "client_id";
         break;
       case "Contractor":
@@ -587,17 +587,17 @@ app.post("/login", async (req, res) => {
         assignmentTable = "consultant_assignments";
         foreignKey = "consultant_id";
         break;
-      case "TeamMember":
+      case "Team Member":
         table = "team_members";
         assignmentTable = "team_member_assignments";
         foreignKey = "team_member_id";
         break;
-      case "ContractorPM":
+      case "Contractor Project Manager":
         table = "contractor_project_managers";
         assignmentTable = "contractor_pm_assignments";
         foreignKey = "contractor_pm_id";
         break;
-      case "ConsultantPM":
+      case "Consultant Project Manager":
         table = "consultant_project_managers";
         assignmentTable = "consultant_pm_assignments";
         foreignKey = "consultant_pm_id";
