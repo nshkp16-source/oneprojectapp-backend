@@ -629,11 +629,10 @@ app.post("/login", async (req, res) => {
   try {
     let table, assignmentTable, foreignKey, emailColumn, selectFields;
 
-    // ✅ Map role to correct table, assignment, and email column
     switch (role) {
       case "Client":
         table = "clients";
-        assignmentTable = "projects";       // clients own projects directly
+        assignmentTable = "projects";
         foreignKey = "client_id";
         emailColumn = "company_email";
         selectFields = "id, company_name, company_email AS email, representative, title, telephone, password_hash, verified";
@@ -677,7 +676,7 @@ app.post("/login", async (req, res) => {
         return res.json({ success: false, error: "Invalid role." });
     }
 
-    // ✅ Fetch account using correct fields
+    // Fetch account
     const result = await pool.query(
       `SELECT ${selectFields} FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
       [email]
@@ -689,7 +688,7 @@ app.post("/login", async (req, res) => {
 
     const user = result.rows[0];
 
-    // 🔹 Guardrail: no password yet → must follow first-login
+    // First-login guardrail
     if (!user.password_hash) {
       return res.json({
         success: false,
@@ -697,18 +696,18 @@ app.post("/login", async (req, res) => {
       });
     }
 
-    // 🔹 Compare password
+    // Password check
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
       return res.json({ success: false, error: "Invalid password." });
     }
 
-    // 🔹 Check verified status
+    // Verified check
     if (!user.verified) {
       return res.json({ success: false, error: "Account not verified. Please check your email." });
     }
 
-    // 🔹 Fetch project assignments
+    // Project assignments
     let projectAssignments = [];
     if (role === "Client") {
       const projectsRes = await pool.query(
@@ -724,7 +723,7 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // 🔹 Build role-specific userDetails
+    // Role-specific userDetails
     let userDetails;
     if (role === "Client") {
       userDetails = {
@@ -746,7 +745,6 @@ app.post("/login", async (req, res) => {
       };
     }
 
-    // 🔹 Success response
     res.json({
       success: true,
       message: "Login successful.",
