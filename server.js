@@ -350,32 +350,30 @@ app.post('/verify-password-code', async (req, res) => {
 
 // 7. Set password after verification
 app.post("/set-password", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, role } = req.body;
   try {
-    console.log("Setting password for:", email);
+    console.log("Setting password for:", email, "role:", role);
 
     const hash = await bcrypt.hash(password, 10);
 
-    const clientResult = await pool.query(
-      `SELECT id FROM clients WHERE company_email=$1`,
-      [email]
-    );
-
-    if (clientResult.rows.length > 0) {
-      await pool.query(
-        `UPDATE clients SET password_hash=$1, verified=true WHERE company_email=$2`,
-        [hash, email]
-      );
-      console.log("Password set for client:", email);
-      return res.json({ success: true, role: "Client", message: "Password set successfully." });
+    let table, emailColumn;
+    switch (role) {
+      case "Client": table = "clients"; emailColumn = "company_email"; break;
+      case "Consultant": table = "consultants"; emailColumn = "email"; break;
+      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
+      case "Contractor": table = "contractors"; emailColumn = "email"; break;
+      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; break;
+      case "Team Member": table = "team_members"; emailColumn = "email"; break;
+      default: return res.json({ success: false, error: "Invalid role." });
     }
 
     await pool.query(
-      `UPDATE users SET password_hash=$1, verified=true WHERE email=$2`,
+      `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2`,
       [hash, email]
     );
-    console.log("Password set for user:", email);
-    return res.json({ success: true, role: "User", message: "Password set successfully." });
+
+    console.log(`Password set for ${role}:`, email);
+    return res.json({ success: true, role, message: "Password set successfully." });
   } catch (err) {
     console.error("Set password error:", err);
     res.status(500).json({ success: false, error: "Failed to set password." });
@@ -778,22 +776,49 @@ app.post("/sendgrid-events", async (req, res) => {
   res.status(200).send("OK");
 });
 
-// 14. Check Email Exists (normalize role casing)
+// 14. Check Email Exists (role-specific tables)
 app.post("/check-email", async (req, res) => {
   const { email, role } = req.body;
   try {
-    const normalizedRole = role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
-    let result;
+    let table, emailColumn;
 
-    if (normalizedRole === "Client") {
-      result = await pool.query(`SELECT id FROM clients WHERE company_email=$1`, [email]);
-    } else {
-      result = await pool.query(`SELECT id FROM users WHERE email=$1 AND role=$2`, [email, normalizedRole]);
+    switch (role) {
+      case "Client":
+        table = "clients";
+        emailColumn = "company_email";
+        break;
+      case "Consultant":
+        table = "consultants";
+        emailColumn = "email";
+        break;
+      case "Consultant Project Manager":
+        table = "consultant_project_managers";
+        emailColumn = "email";
+        break;
+      case "Contractor":
+        table = "contractors";
+        emailColumn = "email";
+        break;
+      case "Contractor Project Manager":
+        table = "contractor_project_managers";
+        emailColumn = "email";
+        break;
+      case "Team Member":
+        table = "team_members";
+        emailColumn = "email";
+        break;
+      default:
+        return res.json({ success: false, exists: false, error: "Invalid role." });
     }
+
+    const result = await pool.query(
+      `SELECT id FROM ${table} WHERE ${emailColumn}=$1`,
+      [email]
+    );
 
     res.json({ success: true, exists: result.rows.length > 0 });
   } catch (err) {
-    console.error("Check email error:", err);
+    console.error("Check email error:", err.message);
     res.status(500).json({ success: false, error: "Server error checking email." });
   }
 });
