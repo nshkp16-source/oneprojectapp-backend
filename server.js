@@ -627,7 +627,7 @@ app.post('/reset-set-password', async (req, res) => {
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
-    let table, assignmentTable, foreignKey, emailColumn;
+    let table, assignmentTable, foreignKey, emailColumn, selectFields;
 
     // ✅ Map role to correct table, assignment, and email column
     switch (role) {
@@ -635,46 +635,51 @@ app.post("/login", async (req, res) => {
         table = "clients";
         assignmentTable = "projects";       // clients own projects directly
         foreignKey = "client_id";
-        emailColumn = "company_email";      // FIXED: clients use company_email
+        emailColumn = "company_email";
+        selectFields = "id, company_name, company_email AS email, representative, title, telephone, password_hash, verified";
         break;
       case "Contractor":
         table = "contractors";
         assignmentTable = "contractor_assignments";
         foreignKey = "contractor_id";
         emailColumn = "email";
+        selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
       case "Consultant":
         table = "consultants";
         assignmentTable = "consultant_assignments";
         foreignKey = "consultant_id";
         emailColumn = "email";
+        selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
       case "Team Member":
         table = "team_members";
         assignmentTable = "team_member_assignments";
         foreignKey = "team_member_id";
         emailColumn = "email";
+        selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
       case "Contractor Project Manager":
         table = "contractor_project_managers";
         assignmentTable = "contractor_pm_assignments";
         foreignKey = "contractor_pm_id";
         emailColumn = "email";
+        selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
       case "Consultant Project Manager":
         table = "consultant_project_managers";
         assignmentTable = "consultant_pm_assignments";
         foreignKey = "consultant_pm_id";
         emailColumn = "email";
+        selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
       default:
         return res.json({ success: false, error: "Invalid role." });
     }
 
-    // ✅ Fetch account using correct email column
+    // ✅ Fetch account using correct fields
     const result = await pool.query(
-      `SELECT id, company_name, ${emailColumn} AS email, representative, title, telephone, password_hash, verified 
-       FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
+      `SELECT ${selectFields} FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
       [email]
     );
 
@@ -719,12 +724,10 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // 🔹 Success response
-    res.json({
-      success: true,
-      message: "Login successful.",
-      role,
-      userDetails: {
+    // 🔹 Build role-specific userDetails
+    let userDetails;
+    if (role === "Client") {
+      userDetails = {
         id: user.id,
         email: user.email,
         company_name: user.company_name,
@@ -732,7 +735,23 @@ app.post("/login", async (req, res) => {
         title: user.title,
         telephone: user.telephone,
         projects: projectAssignments
-      }
+      };
+    } else {
+      userDetails = {
+        id: user.id,
+        email: user.email,
+        profile_picture: user.profile_picture,
+        created_at: user.created_at,
+        projects: projectAssignments
+      };
+    }
+
+    // 🔹 Success response
+    res.json({
+      success: true,
+      message: "Login successful.",
+      role,
+      userDetails
     });
   } catch (err) {
     console.error("Login error:", err.message);
