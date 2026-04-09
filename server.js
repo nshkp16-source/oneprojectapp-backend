@@ -986,29 +986,31 @@ app.post("/client/project-details", async (req, res) => {
   }
 });
 
-// 17. ============ CONTRACTOR PROFILE ROUTES =============
+// ============ CONTRACTOR PROFILE ROUTES (Schema-Aligned) =============
 
-// Fetch contractor profile + projects (projects linked via users.project_id)
+// Fetch contractor profile + projects (via contractor_assignments)
 app.post("/contractor/profile", async (req, res) => {
   try {
     const { email } = req.body;
 
-    // Fetch contractor info from users table
+    // Fetch contractor info
     const contractorResult = await pool.query(
-      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Contractor'",
+      "SELECT id, email, 'Contractor' AS role, profile_picture, verified, created_at FROM contractors WHERE email=$1",
       [email]
     );
 
     if (contractorResult.rows.length === 0) {
       return res.status(404).json({ error: "Contractor not found" });
     }
-
     const contractor = contractorResult.rows[0];
 
-    // Fetch projects using project_id from users table
+    // Fetch projects linked via contractor_assignments
     const projectsResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1",
-      [contractor.project_id]
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM contractor_assignments ca
+       JOIN projects p ON ca.project_id = p.id
+       WHERE ca.contractor_id=$1`,
+      [contractor.id]
     );
 
     contractor.projects = projectsResult.rows;
@@ -1036,7 +1038,7 @@ app.post("/contractor/upload-picture", upload.single("profile_picture"), async (
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
 
     await pool.query(
-      "UPDATE users SET profile_picture=$1 WHERE email=$2 AND role='Contractor'",
+      "UPDATE contractors SET profile_picture=$1 WHERE email=$2",
       [fileUrl, email]
     );
 
@@ -1053,7 +1055,7 @@ app.post("/contractor/delete-picture", async (req, res) => {
     const { email } = req.body;
 
     await pool.query(
-      "UPDATE users SET profile_picture=NULL WHERE email=$1 AND role='Contractor'",
+      "UPDATE contractors SET profile_picture=NULL WHERE email=$1",
       [email]
     );
 
@@ -1070,7 +1072,7 @@ app.post("/contractor/project-details", async (req, res) => {
     const { email, projectId } = req.body;
 
     const contractorResult = await pool.query(
-      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Contractor'",
+      "SELECT id, email, 'Contractor' AS role, profile_picture FROM contractors WHERE email=$1",
       [email]
     );
     if (contractorResult.rows.length === 0) {
@@ -1078,8 +1080,12 @@ app.post("/contractor/project-details", async (req, res) => {
     }
     const contractor = contractorResult.rows[0];
 
-    // Ensure the requested projectId matches the contractor's project_id
-    if (contractor.project_id != projectId) {
+    // Ensure contractor is assigned to the requested project
+    const assignmentCheck = await pool.query(
+      "SELECT 1 FROM contractor_assignments WHERE contractor_id=$1 AND project_id=$2",
+      [contractor.id, projectId]
+    );
+    if (assignmentCheck.rows.length === 0) {
       return res.status(404).json({ error: "Project not found or not linked to contractor" });
     }
 
@@ -1106,29 +1112,31 @@ app.post("/contractor/project-details", async (req, res) => {
   }
 });
 
-// 18. ============ CONSULTANT PROFILE ROUTES =============
+// ============ CONSULTANT PROFILE ROUTES (Schema-Aligned) =============
 
-// Fetch consultant profile + projects (projects linked via users.project_id)
+// Fetch consultant profile + projects (via consultant_assignments)
 app.post("/consultant/profile", async (req, res) => {
   try {
     const { email } = req.body;
 
-    // Fetch consultant info from users table
+    // Fetch consultant info
     const consultantResult = await pool.query(
-      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Consultant'",
+      "SELECT id, email, 'Consultant' AS role, profile_picture, verified, created_at FROM consultants WHERE email=$1",
       [email]
     );
 
     if (consultantResult.rows.length === 0) {
       return res.status(404).json({ error: "Consultant not found" });
     }
-
     const consultant = consultantResult.rows[0];
 
-    // Fetch projects using project_id from users table
+    // Fetch projects linked via consultant_assignments
     const projectsResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1",
-      [consultant.project_id]
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM consultant_assignments ca
+       JOIN projects p ON ca.project_id = p.id
+       WHERE ca.consultant_id=$1`,
+      [consultant.id]
     );
 
     consultant.projects = projectsResult.rows;
@@ -1156,7 +1164,7 @@ app.post("/consultant/upload-picture", upload.single("profile_picture"), async (
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
 
     await pool.query(
-      "UPDATE users SET profile_picture=$1 WHERE email=$2 AND role='Consultant'",
+      "UPDATE consultants SET profile_picture=$1 WHERE email=$2",
       [fileUrl, email]
     );
 
@@ -1173,7 +1181,7 @@ app.post("/consultant/delete-picture", async (req, res) => {
     const { email } = req.body;
 
     await pool.query(
-      "UPDATE users SET profile_picture=NULL WHERE email=$1 AND role='Consultant'",
+      "UPDATE consultants SET profile_picture=NULL WHERE email=$1",
       [email]
     );
 
@@ -1190,7 +1198,7 @@ app.post("/consultant/project-details", async (req, res) => {
     const { email, projectId } = req.body;
 
     const consultantResult = await pool.query(
-      "SELECT id, email, role, profile_picture, project_id FROM users WHERE email=$1 AND role='Consultant'",
+      "SELECT id, email, 'Consultant' AS role, profile_picture FROM consultants WHERE email=$1",
       [email]
     );
     if (consultantResult.rows.length === 0) {
@@ -1198,8 +1206,12 @@ app.post("/consultant/project-details", async (req, res) => {
     }
     const consultant = consultantResult.rows[0];
 
-    // Ensure the requested projectId matches the consultant's project_id
-    if (consultant.project_id != projectId) {
+    // Ensure consultant is assigned to the requested project
+    const assignmentCheck = await pool.query(
+      "SELECT 1 FROM consultant_assignments WHERE consultant_id=$1 AND project_id=$2",
+      [consultant.id, projectId]
+    );
+    if (assignmentCheck.rows.length === 0) {
       return res.status(404).json({ error: "Project not found or not linked to consultant" });
     }
 
