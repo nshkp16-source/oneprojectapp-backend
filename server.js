@@ -863,7 +863,7 @@ setInterval(async () => {
 
 // ✅ Multer is already imported at the top: import multer from "multer";
 const upload = multer({
-  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit everywhere
+  limits: { fileSize: 1024 * 1024 }, // enforce 1MB limit to match script validation
   storage: multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
@@ -884,18 +884,15 @@ app.post("/client/profile", async (req, res) => {
       "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
-
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
-
     const client = clientResult.rows[0];
 
     const projectsResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE client_id=$1",
       [client.id]
     );
-
     client.projects = projectsResult.rows;
 
     if (client.projects.length === 1) {
@@ -909,28 +906,18 @@ app.post("/client/profile", async (req, res) => {
   }
 });
 
-// Unified route: Upload client profile picture
+// Upload client profile picture
 app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
   try {
-    const { email, commit } = req.body;
-
+    const { email } = req.body;
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    await pool.query("UPDATE clients SET profile_picture=$1 WHERE company_email=$2", [fileUrl, email]);
 
-    if (commit && email) {
-      // ✅ Commit to DB as client profile picture
-      await pool.query(
-        "UPDATE clients SET profile_picture=$1 WHERE company_email=$2",
-        [fileUrl, email]
-      );
-      return res.json({ success: true, url: fileUrl, committed: true });
-    } else {
-      // ✅ Return URL only (for localStorage use)
-      return res.json({ success: true, url: fileUrl, committed: false });
-    }
+    res.json({ success: true, url: fileUrl });
   } catch (err) {
     console.error("Upload client picture error:", err);
     res.status(500).json({ error: "Failed to upload client picture" });
