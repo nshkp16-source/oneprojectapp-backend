@@ -1514,6 +1514,64 @@ app.post('/project-save', async (req, res) => {
   }
 });
 
+// ---------------- ASSIGN TEAM ROUTE ----------------
+app.post("/assign-team", async (req, res) => {
+  const { projectId, role, assignments } = req.body;
+
+  if (!projectId || !role || !Array.isArray(assignments)) {
+    return res.status(400).json({ success: false, message: "Invalid payload" });
+  }
+
+  const client = await pool.connect();
+  try {
+    for (const a of assignments) {
+      if (a.role === "Project Manager") {
+        if (role === "Client") {
+          await client.query(
+            `INSERT INTO client_pm_assignments 
+             (project_id, client_pm_id, company_name, title, position, telephone, task, representative) 
+             VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8) 
+             ON CONFLICT DO NOTHING`,
+            [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+          );
+        } else if (role === "Contractor") {
+          await client.query(
+            `INSERT INTO contractor_pm_assignments 
+             (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative) 
+             VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8) 
+             ON CONFLICT DO NOTHING`,
+            [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+          );
+        } else if (role === "Consultant") {
+          await client.query(
+            `INSERT INTO consultant_pm_assignments 
+             (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative) 
+             VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8) 
+             ON CONFLICT DO NOTHING`,
+            [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+          );
+        }
+      } else {
+        // Team Member assignment
+        await client.query(
+          `INSERT INTO team_member_assignments 
+           (project_id, team_member_id, company_name, title, position, telephone, task, representative) 
+           VALUES ($1, (SELECT id FROM team_members WHERE email=$2), $3,$4,$5,$6,$7,$8) 
+           ON CONFLICT DO NOTHING`,
+          [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+        );
+      }
+    }
+
+    res.json({ success: true, message: "Assignments saved" });
+  } catch (err) {
+    console.error("Error saving assignments:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
