@@ -863,7 +863,7 @@ setInterval(async () => {
 
 // ✅ Multer is already imported at the top: import multer from "multer";
 const upload = multer({
-  limits: { fileSize: 1024 * 1024 }, // enforce 1MB limit to match script validation
+  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit to match script validation
   storage: multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
