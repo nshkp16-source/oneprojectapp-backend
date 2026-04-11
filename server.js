@@ -1514,6 +1514,70 @@ app.post('/project-save', async (req, res) => {
   }
 });
 
+// Unified route for all roles
+app.post("/profile/project-details", async (req, res) => {
+  try {
+    const { email, role, projectId } = req.body;
+
+    let userResult, projectResult;
+
+    switch (role) {
+      case "Client":
+      case "Client Project Manager":
+        userResult = await pool.query(
+          "SELECT id, company_email AS email, $2 AS role, profile_picture FROM clients WHERE company_email=$1",
+          [email, role]
+        );
+        if (userResult.rows.length === 0) return res.status(404).json({ error: "Client not found" });
+        const client = userResult.rows[0];
+        projectResult = await pool.query(
+          "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
+          [projectId, client.id]
+        );
+        if (projectResult.rows.length === 0) return res.status(404).json({ error: "Project not found or not owned by client" });
+        return res.json({ user: client, project: projectResult.rows[0] });
+
+      case "Contractor":
+      case "Contractor Project Manager":
+        userResult = await pool.query(
+          "SELECT id, email, $2 AS role, profile_picture FROM contractors WHERE email=$1",
+          [email, role]
+        );
+        if (userResult.rows.length === 0) return res.status(404).json({ error: "Contractor not found" });
+        const contractor = userResult.rows[0];
+        const assignmentCheck = await pool.query(
+          "SELECT 1 FROM contractor_assignments WHERE contractor_id=$1 AND project_id=$2",
+          [contractor.id, projectId]
+        );
+        if (assignmentCheck.rows.length === 0) return res.status(404).json({ error: "Project not linked to contractor" });
+        projectResult = await pool.query("SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1", [projectId]);
+        return res.json({ user: contractor, project: projectResult.rows[0] });
+
+      case "Consultant":
+      case "Consultant Project Manager":
+        userResult = await pool.query(
+          "SELECT id, email, $2 AS role, profile_picture FROM consultants WHERE email=$1",
+          [email, role]
+        );
+        if (userResult.rows.length === 0) return res.status(404).json({ error: "Consultant not found" });
+        const consultant = userResult.rows[0];
+        const consultantCheck = await pool.query(
+          "SELECT 1 FROM consultant_assignments WHERE consultant_id=$1 AND project_id=$2",
+          [consultant.id, projectId]
+        );
+        if (consultantCheck.rows.length === 0) return res.status(404).json({ error: "Project not linked to consultant" });
+        projectResult = await pool.query("SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1", [projectId]);
+        return res.json({ user: consultant, project: projectResult.rows[0] });
+
+      default:
+        return res.status(400).json({ error: "Unsupported role" });
+    }
+  } catch (err) {
+    console.error("Unified project-details error:", err);
+    res.status(500).json({ error: "Failed to fetch project details" });
+  }
+});
+
 // ---------------- ASSIGN TEAM ROUTE ----------------
 app.post("/assign-team", async (req, res) => {
   const { projectId, role, assignments } = req.body;
@@ -1526,7 +1590,7 @@ app.post("/assign-team", async (req, res) => {
   try {
     for (const a of assignments) {
       if (a.role === "Project Manager") {
-        if (role === "Client") {
+        if (role === "Client" || role === "Client Project Manager") {
           await client.query(
             `INSERT INTO client_pm_assignments 
              (project_id, client_pm_id, company_name, title, position, telephone, task, representative) 
@@ -1534,7 +1598,7 @@ app.post("/assign-team", async (req, res) => {
              ON CONFLICT DO NOTHING`,
             [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
           );
-        } else if (role === "Contractor") {
+        } else if (role === "Contractor" || role === "Contractor Project Manager") {
           await client.query(
             `INSERT INTO contractor_pm_assignments 
              (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative) 
@@ -1542,7 +1606,7 @@ app.post("/assign-team", async (req, res) => {
              ON CONFLICT DO NOTHING`,
             [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
           );
-        } else if (role === "Consultant") {
+        } else if (role === "Consultant" || role === "Consultant Project Manager") {
           await client.query(
             `INSERT INTO consultant_pm_assignments 
              (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative) 
