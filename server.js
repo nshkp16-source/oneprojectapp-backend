@@ -982,10 +982,9 @@ app.post("/contractor/profile", async (req, res) => {
 
     // Fetch contractor info
     const contractorResult = await pool.query(
-      "SELECT id, email, 'Contractor' AS role, profile_picture, verified, created_at FROM contractors WHERE email=$1",
+      "SELECT id, email, 'Contractor' AS role, profile_picture FROM contractors WHERE email=$1",
       [email]
     );
-
     if (contractorResult.rows.length === 0) {
       return res.status(404).json({ error: "Contractor not found" });
     }
@@ -999,7 +998,6 @@ app.post("/contractor/profile", async (req, res) => {
        WHERE ca.contractor_id=$1`,
       [contractor.id]
     );
-
     contractor.projects = projectsResult.rows;
 
     if (contractor.projects.length === 1) {
@@ -1017,17 +1015,12 @@ app.post("/contractor/profile", async (req, res) => {
 app.post("/contractor/upload-picture", upload.single("profile_picture"), async (req, res) => {
   try {
     const { email } = req.body;
-
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-
-    await pool.query(
-      "UPDATE contractors SET profile_picture=$1 WHERE email=$2",
-      [fileUrl, email]
-    );
+    await pool.query("UPDATE contractors SET profile_picture=$1 WHERE email=$2", [fileUrl, email]);
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
@@ -1040,12 +1033,7 @@ app.post("/contractor/upload-picture", upload.single("profile_picture"), async (
 app.post("/contractor/delete-picture", async (req, res) => {
   try {
     const { email } = req.body;
-
-    await pool.query(
-      "UPDATE contractors SET profile_picture=NULL WHERE email=$1",
-      [email]
-    );
-
+    await pool.query("UPDATE contractors SET profile_picture=NULL WHERE email=$1", [email]);
     res.json({ success: true });
   } catch (err) {
     console.error("Delete contractor picture error:", err);
@@ -1111,7 +1099,6 @@ app.post("/consultant/profile", async (req, res) => {
       "SELECT id, email, 'Consultant' AS role, profile_picture, verified, created_at FROM consultants WHERE email=$1",
       [email]
     );
-
     if (consultantResult.rows.length === 0) {
       return res.status(404).json({ error: "Consultant not found" });
     }
@@ -1125,7 +1112,6 @@ app.post("/consultant/profile", async (req, res) => {
        WHERE ca.consultant_id=$1`,
       [consultant.id]
     );
-
     consultant.projects = projectsResult.rows;
 
     if (consultant.projects.length === 1) {
@@ -1143,17 +1129,12 @@ app.post("/consultant/profile", async (req, res) => {
 app.post("/consultant/upload-picture", upload.single("profile_picture"), async (req, res) => {
   try {
     const { email } = req.body;
-
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-
-    await pool.query(
-      "UPDATE consultants SET profile_picture=$1 WHERE email=$2",
-      [fileUrl, email]
-    );
+    await pool.query("UPDATE consultants SET profile_picture=$1 WHERE email=$2", [fileUrl, email]);
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
@@ -1166,12 +1147,7 @@ app.post("/consultant/upload-picture", upload.single("profile_picture"), async (
 app.post("/consultant/delete-picture", async (req, res) => {
   try {
     const { email } = req.body;
-
-    await pool.query(
-      "UPDATE consultants SET profile_picture=NULL WHERE email=$1",
-      [email]
-    );
-
+    await pool.query("UPDATE consultants SET profile_picture=NULL WHERE email=$1", [email]);
     res.json({ success: true });
   } catch (err) {
     console.error("Delete consultant picture error:", err);
