@@ -117,7 +117,7 @@ app.post("/commit-account", async (req, res) => {
          password_hash=EXCLUDED.password_hash,
          profile_picture=EXCLUDED.profile_picture,
          verified=true
-       RETURNING id;`,
+       RETURNING id, company_email;`,
       [
         client.company_name,
         client.company_email,
@@ -151,7 +151,6 @@ app.post("/commit-account", async (req, res) => {
     async function addRoleUser(user, tableName, assignmentTable, fkColumn) {
       if (!user?.email) return;
 
-      // Check if user already exists
       const existing = await pool.query(
         `SELECT id FROM ${tableName} WHERE email=$1`,
         [user.email]
@@ -170,7 +169,6 @@ app.post("/commit-account", async (req, res) => {
         role_id = roleResult.rows[0].id;
       }
 
-      // Insert into the correct assignment table
       await pool.query(
         `INSERT INTO ${assignmentTable} (project_id, ${fkColumn}, company_name, title, position, telephone, task, representative, created_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
@@ -195,11 +193,21 @@ app.post("/commit-account", async (req, res) => {
     await addRoleUser(contractorPM, "contractor_project_managers", "contractor_pm_assignments", "contractor_pm_id");
     await addRoleUser(consultantPM, "consultant_project_managers", "consultant_pm_assignments", "consultant_pm_id");
 
+    // ✅ Generate JWT for client
+    const jwt = require("jsonwebtoken");
+    const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const token = jwt.sign(
+      { sub: client_id, role: "Client", email: clientResult.rows[0].company_email },
+      SECRET,
+      { expiresIn: "1h" }
+    );
+
     return res.json({
       success: true,
       message: "Account, project, and assignments saved successfully.",
       clientId: client_id,
-      projectId: project_id
+      projectId: project_id,
+      token   // ✅ include token
     });
   } catch (err) {
     console.error("Commit error:", err.message);
@@ -259,16 +267,13 @@ app.post("/firstlogin-send", async (req, res) => {
       [email, code, sessionId]
     );
 
-    console.log("Inserted token:", insertResult.rows[0]);
-
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
       subject: "OneProjectApp Verification Code",
       html: `<p>Your verification code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
-    console.log("Mail response:", info);
 
     res.json({ success: true, message: "Verification code sent.", sessionId });
   } catch (err) {
@@ -281,7 +286,6 @@ app.post("/firstlogin-send", async (req, res) => {
 app.post("/firstlogin-resend", async (req, res) => {
   const { email } = req.body;
   try {
-    // Delete only unverified first-login tokens
     await pool.query(
       `DELETE FROM email_tokens 
        WHERE email=$1 AND verified=false AND reset_flow=false`,
@@ -298,16 +302,13 @@ app.post("/firstlogin-resend", async (req, res) => {
       [email, code, sessionId]
     );
 
-    console.log("Inserted new token:", insertResult.rows[0]);
-
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
       subject: "OneProjectApp Verification Code (Resend)",
       html: `<p>Your new verification code is: <b>${code}</b></p>
              <p>This code will expire in 3 minutes.</p>`
     });
-    console.log("Mail response:", info);
 
     res.json({ success: true, message: "New verification code sent.", sessionId });
   } catch (err) {
@@ -320,8 +321,6 @@ app.post("/firstlogin-resend", async (req, res) => {
 app.post('/verify-password-code', async (req, res) => {
   const { email, token } = req.body;
   try {
-    console.log("Verifying code:", token, "for email:", email);
-
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
        WHERE email=$1 AND token=$2 
@@ -330,8 +329,6 @@ app.post('/verify-password-code', async (req, res) => {
        ORDER BY expires_at DESC LIMIT 1`,
       [email, token]
     );
-
-    console.log("DB result:", tokenCheck.rows);
 
     if (tokenCheck.rows.length === 0) {
       return res.json({ success: false, verified: false, error: "Invalid or expired code." });
@@ -348,17 +345,16 @@ app.post('/verify-password-code', async (req, res) => {
   }
 });
 
-// 7. Set password after verification
+// 7. Set password after verification (adjusted to issue JWT)
 app.post("/set-password", async (req, res) => {
   const { email, password, role } = req.body;
   try {
-    console.log("Setting password for:", email, "role:", role);
-
     const hash = await bcrypt.hash(password, 10);
 
     let table, emailColumn;
     switch (role) {
       case "Client": table = "clients"; emailColumn = "company_email"; break;
+      case "Client Project Manager": table = "client_project_managers"; emailColumn = "email"; break;
       case "Consultant": table = "consultants"; emailColumn = "email"; break;
       case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
       case "Contractor": table = "contractors"; emailColumn = "email"; break;
@@ -367,13 +363,33 @@ app.post("/set-password", async (req, res) => {
       default: return res.json({ success: false, error: "Invalid role." });
     }
 
-    await pool.query(
-      `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2`,
+    const updateRes = await pool.query(
+      `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2 RETURNING id, ${emailColumn} AS email`,
       [hash, email]
     );
 
+    if (updateRes.rows.length === 0) {
+      return res.json({ success: false, error: "Account not found." });
+    }
+
+    const user = updateRes.rows[0];
+
+    // ✅ Generate JWT token
+    const jwt = require("jsonwebtoken");
+    const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const token = jwt.sign(
+      { sub: user.id, role, email: user.email },
+      SECRET,
+      { expiresIn: "1h" }
+    );
+
     console.log(`Password set for ${role}:`, email);
-    return res.json({ success: true, role, message: "Password set successfully." });
+    return res.json({
+      success: true,
+      role,
+      message: "Password set successfully.",
+      token   // ✅ include token
+    });
   } catch (err) {
     console.error("Set password error:", err);
     res.status(500).json({ success: false, error: "Failed to set password." });
@@ -391,6 +407,10 @@ app.post('/reset-send', async (req, res) => {
       case "Client":
         table = "clients";
         emailColumn = "company_email";   // clients use company_email
+        break;
+      case "Client Project Manager":
+        table = "client_project_managers";
+        emailColumn = "email";
         break;
       case "Consultant":
         table = "consultants";
@@ -476,6 +496,9 @@ app.post('/reset-resend', async (req, res) => {
         table = "clients";
         emailColumn = "company_email";
         break;
+      case "Client Project Manager":
+        table = "client_project_managers";
+        emailColumn = "email";
       case "Consultant":
         table = "consultants";
         emailColumn = "email";
@@ -584,6 +607,10 @@ app.post('/reset-set-password', async (req, res) => {
         table = "clients";
         emailColumn = "company_email";
         break;
+      case "Client Project Manager":
+        table = "client_project_managers";
+        emailColumn = "email";
+        break;
       case "Consultant":
         table = "consultants";
         emailColumn = "email";
@@ -608,20 +635,42 @@ app.post('/reset-set-password', async (req, res) => {
         return res.json({ success: false, error: "Invalid role." });
     }
 
-    await pool.query(
-      `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2`,
+    // Update password and mark verified
+    const updateRes = await pool.query(
+      `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2 RETURNING id, ${emailColumn} AS email`,
       [hash, email]
     );
 
+    if (updateRes.rows.length === 0) {
+      return res.json({ success: false, error: "Account not found." });
+    }
+
+    const user = updateRes.rows[0];
+
+    // ✅ Generate JWT token
+    const jwt = require("jsonwebtoken");
+    const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const token = jwt.sign(
+      { sub: user.id, role, email: user.email },
+      SECRET,
+      { expiresIn: "1h" }
+    );
+
     console.log(`Password reset for ${role}:`, email);
-    return res.json({ success: true, role, message: "Password reset successfully." });
+
+    return res.json({
+      success: true,
+      role,
+      message: "Password reset successfully.",
+      token   // ✅ include token so frontend can store it
+    });
   } catch (err) {
     console.error("Reset set password error:", err);
     res.status(500).json({ success: false, error: "Failed to reset password." });
   }
 });
 
-// LOGIN route (role-specific tables)
+// LOGIN route (role-specific tables with JWT)
 app.post("/login", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -653,6 +702,13 @@ app.post("/login", async (req, res) => {
         table = "team_members";
         assignmentTable = "team_member_assignments";
         foreignKey = "team_member_id";
+        emailColumn = "email";
+        selectFields = "id, email, password_hash, verified, profile_picture, created_at";
+        break;
+      case "Client Project Manager":
+        table = "client_project_managers";
+        assignmentTable = "client_pm_assignments";
+        foreignKey = "client_pm_id";
         emailColumn = "email";
         selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
@@ -743,11 +799,21 @@ app.post("/login", async (req, res) => {
       };
     }
 
+    // ✅ Generate JWT token
+    const jwt = require("jsonwebtoken");
+    const SECRET = process.env.JWT_SECRET || "supersecretkey"; // use env var in production
+    const token = jwt.sign(
+      { sub: user.id, role, email: user.email },
+      SECRET,
+      { expiresIn: "1h" }
+    );
+
     res.json({
       success: true,
       message: "Login successful.",
       role,
-      userDetails
+      userDetails,
+      token   // ✅ include token in response
     });
   } catch (err) {
     console.error("Login error:", err.message);
@@ -1393,14 +1459,15 @@ app.post('/project-verify', async (req, res) => {
   }
 });
 
-// 4. Save project after verification
+// 4. Save project after verification (adjusted to issue JWT)
 app.post('/project-save', async (req, res) => {
   const { project, contractor, consultant, clientEmail } = req.body;
 
   try {
     // ✅ Ensure client exists
     const clientResult = await pool.query(
-      `SELECT id FROM clients WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1)) AND verified=true`,
+      `SELECT id, company_email FROM clients 
+       WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1)) AND verified=true`,
       [clientEmail]
     );
 
@@ -1410,7 +1477,7 @@ app.post('/project-save', async (req, res) => {
 
     const client_id = clientResult.rows[0].id;
 
-    // ✅ Insert project (no verified column)
+    // ✅ Insert project
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1,$2,$3,$4,NOW())
@@ -1427,7 +1494,7 @@ app.post('/project-save', async (req, res) => {
         )
       ).rows[0].id;
 
-    // ✅ Ensure contractor exists and assign to project
+    // ✅ Ensure contractor exists and assign
     if (contractor?.email) {
       let contractorResult = await pool.query(
         `SELECT id FROM contractors WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
@@ -1465,7 +1532,7 @@ app.post('/project-save', async (req, res) => {
       );
     }
 
-    // ✅ Ensure consultant exists and assign to project
+    // ✅ Ensure consultant exists and assign
     if (consultant?.email) {
       let consultantResult = await pool.query(
         `SELECT id FROM consultants WHERE TRIM(LOWER(email))=TRIM(LOWER($1))`,
@@ -1503,10 +1570,20 @@ app.post('/project-save', async (req, res) => {
       );
     }
 
+    // ✅ Generate JWT for client
+    const jwt = require("jsonwebtoken");
+    const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const token = jwt.sign(
+      { sub: client_id, role: "Client", email: clientResult.rows[0].company_email },
+      SECRET,
+      { expiresIn: "1h" }
+    );
+
     return res.json({
       success: true,
       message: "Project and team saved successfully.",
-      projectId: project_id
+      projectId: project_id,
+      token   // ✅ include token
     });
   } catch (err) {
     console.error("Project save error:", err.message);
