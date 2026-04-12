@@ -8,6 +8,7 @@ import nodemailerSendgrid from 'nodemailer-sendgrid';
 import fetch from "node-fetch";
 import pkg from 'uuid';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';   // ✅ ES module import for JWT
 
 const { v4: uuidv4 } = pkg;
 
@@ -100,12 +101,10 @@ app.post("/commit-account", async (req, res) => {
   const { client, project, contractor, consultant, teamMember, contractorPM, consultantPM } = req.body;
 
   try {
-    // Hash password if provided
     const hashedPassword = client.password_hash
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
-    // Insert/update client
     const clientResult = await pool.query(
       `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at, profile_picture) 
        VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7)
@@ -130,7 +129,6 @@ app.post("/commit-account", async (req, res) => {
     );
     const client_id = clientResult.rows[0].id;
 
-    // Insert project
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1,$2,$3,$4,NOW())
@@ -147,7 +145,6 @@ app.post("/commit-account", async (req, res) => {
         )
       ).rows[0].id;
 
-    // Helper for role users + assignments
     async function addRoleUser(user, tableName, assignmentTable, fkColumn) {
       if (!user?.email) return;
 
@@ -186,15 +183,13 @@ app.post("/commit-account", async (req, res) => {
       );
     }
 
-    // Apply helper for each role
     await addRoleUser(contractor, "contractors", "contractor_assignments", "contractor_id");
     await addRoleUser(consultant, "consultants", "consultant_assignments", "consultant_id");
     await addRoleUser(teamMember, "team_members", "team_member_assignments", "team_member_id");
     await addRoleUser(contractorPM, "contractor_project_managers", "contractor_pm_assignments", "contractor_pm_id");
     await addRoleUser(consultantPM, "consultant_project_managers", "consultant_pm_assignments", "consultant_pm_id");
 
-    // ✅ Generate JWT for client
-    const jwt = require("jsonwebtoken");
+    // ✅ Generate JWT for client (ES module style)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: client_id, role: "Client", email: clientResult.rows[0].company_email },
@@ -207,7 +202,7 @@ app.post("/commit-account", async (req, res) => {
       message: "Account, project, and assignments saved successfully.",
       clientId: client_id,
       projectId: project_id,
-      token   // ✅ include token
+      token
     });
   } catch (err) {
     console.error("Commit error:", err.message);
@@ -374,8 +369,7 @@ app.post("/set-password", async (req, res) => {
 
     const user = updateRes.rows[0];
 
-    // ✅ Generate JWT token
-    const jwt = require("jsonwebtoken");
+    // ✅ Generate JWT token (ES module style)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: user.id, role, email: user.email },
@@ -388,7 +382,7 @@ app.post("/set-password", async (req, res) => {
       success: true,
       role,
       message: "Password set successfully.",
-      token   // ✅ include token
+      token
     });
   } catch (err) {
     console.error("Set password error:", err);
@@ -499,6 +493,7 @@ app.post('/reset-resend', async (req, res) => {
       case "Client Project Manager":
         table = "client_project_managers";
         emailColumn = "email";
+        break; // ✅ added break to prevent fall-through
       case "Consultant":
         table = "consultants";
         emailColumn = "email";
@@ -577,7 +572,10 @@ app.post('/reset-verify', async (req, res) => {
   try {
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
-       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND reset_flow=true
+       WHERE email=$1 AND token=$2 
+       AND expires_at > NOW() 
+       AND verified=false 
+       AND reset_flow=true
        ORDER BY expires_at DESC LIMIT 1`,
       [email, token]
     );
@@ -586,12 +584,22 @@ app.post('/reset-verify', async (req, res) => {
       return res.json({ success: false, verified: false, error: "Invalid or expired code." });
     }
 
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+      tokenCheck.rows[0].id
+    ]);
 
-    res.json({ success: true, verified: true, message: "Code verified. You may now set your new password." });
+    res.json({
+      success: true,
+      verified: true,
+      message: "Code verified. You may now set your new password."
+    });
   } catch (err) {
     console.error("Verify reset code error:", err);
-    res.status(500).json({ success: false, verified: false, error: "Failed to verify reset code." });
+    res.status(500).json({
+      success: false,
+      verified: false,
+      error: "Failed to verify reset code."
+    });
   }
 });
 
@@ -647,8 +655,7 @@ app.post('/reset-set-password', async (req, res) => {
 
     const user = updateRes.rows[0];
 
-    // ✅ Generate JWT token
-    const jwt = require("jsonwebtoken");
+    // ✅ Generate JWT token (ES module style)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: user.id, role, email: user.email },
@@ -794,8 +801,7 @@ app.post("/login", async (req, res) => {
       projects: projectAssignments
     };
 
-    // ✅ Generate JWT token
-    const jwt = require("jsonwebtoken");
+    // ✅ Generate JWT token (ES module style)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: user.id, role, email: user.email },
@@ -847,6 +853,10 @@ app.post("/check-email", async (req, res) => {
       case "Client":
         table = "clients";
         emailColumn = "company_email";
+        break;
+      case "Client Project Manager":
+        table = "client_project_managers";
+        emailColumn = "email";
         break;
       case "Consultant":
         table = "consultants";
