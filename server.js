@@ -682,7 +682,11 @@ app.post("/login", async (req, res) => {
         assignmentTable = "projects";
         foreignKey = "client_id";
         emailColumn = "company_email";
-        selectFields = "id, company_name, company_email AS email, representative, title, telephone, password_hash, verified";
+        selectFields = `
+          id, company_name, company_email AS email,
+          representative, title, telephone,
+          password_hash, verified, profile_picture, created_at
+        `;
         break;
       case "Contractor":
         table = "contractors";
@@ -777,31 +781,22 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // Role-specific userDetails
-    let userDetails;
-    if (role === "Client") {
-      userDetails = {
-        id: user.id,
-        email: user.email,
-        company_name: user.company_name,
-        representative: user.representative,
-        title: user.title,
-        telephone: user.telephone,
-        projects: projectAssignments
-      };
-    } else {
-      userDetails = {
-        id: user.id,
-        email: user.email,
-        profile_picture: user.profile_picture,
-        created_at: user.created_at,
-        projects: projectAssignments
-      };
-    }
+    // ✅ Consistent userDetails for all roles
+    const userDetails = {
+      id: user.id,
+      email: user.email, // always present
+      company_name: user.company_name || null,
+      representative: user.representative || null,
+      title: user.title || null,
+      telephone: user.telephone || null,
+      profile_picture: user.profile_picture || null,
+      created_at: user.created_at || null,
+      projects: projectAssignments
+    };
 
     // ✅ Generate JWT token
     const jwt = require("jsonwebtoken");
-    const SECRET = process.env.JWT_SECRET || "supersecretkey"; // use env var in production
+    const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: user.id, role, email: user.email },
       SECRET,
@@ -813,7 +808,7 @@ app.post("/login", async (req, res) => {
       message: "Login successful.",
       role,
       userDetails,
-      token   // ✅ include token in response
+      token
     });
   } catch (err) {
     console.error("Login error:", err.message);
