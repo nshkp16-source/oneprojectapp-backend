@@ -1372,11 +1372,17 @@ app.post("/client/profile-picture", async (req, res) => {
 app.post('/project-send', async (req, res) => {
   const { email } = req.body;
   try {
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`, [email]);
+    // Delete any existing unverified project tokens for this email
+    await pool.query(
+      `DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`,
+      [email]
+    );
 
+    // Generate new code and session
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
+    // Insert new token
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, project_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
@@ -1384,6 +1390,7 @@ app.post('/project-send', async (req, res) => {
       [email, code, sessionId]
     );
 
+    // Send verification email
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -1392,6 +1399,7 @@ app.post('/project-send', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    // Respond with success
     res.json({
       success: true,
       message: "Project verification code sent.",
@@ -1408,11 +1416,17 @@ app.post('/project-send', async (req, res) => {
 app.post('/project-resend', async (req, res) => {
   const { email } = req.body;
   try {
-    await pool.query(`DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`, [email]);
+    // Delete any existing unverified project tokens for this email
+    await pool.query(
+      `DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`,
+      [email]
+    );
 
+    // Generate new code and session
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
+    // Insert new token
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, project_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
@@ -1420,6 +1434,7 @@ app.post('/project-resend', async (req, res) => {
       [email, code, sessionId]
     );
 
+    // Send verification email
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -1428,6 +1443,7 @@ app.post('/project-resend', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
+    // Respond with success
     res.json({
       success: true,
       message: "New project verification code sent.",
@@ -1446,7 +1462,11 @@ app.post('/project-verify', async (req, res) => {
   try {
     const tokenCheck = await pool.query(
       `SELECT * FROM email_tokens 
-       WHERE email=$1 AND token=$2 AND expires_at > NOW() AND verified=false AND project_flow=true
+       WHERE email=$1 
+       AND token=$2 
+       AND expires_at > NOW() 
+       AND verified=false 
+       AND project_flow=true
        ORDER BY expires_at DESC LIMIT 1`,
       [email, token]
     );
@@ -1455,7 +1475,9 @@ app.post('/project-verify', async (req, res) => {
       return res.json({ success: false, error: "Invalid or expired project code." });
     }
 
-    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [tokenCheck.rows[0].id]);
+    await pool.query(`UPDATE email_tokens SET verified=true WHERE id=$1`, [
+      tokenCheck.rows[0].id
+    ]);
 
     res.json({ success: true, message: "Project code verified." });
   } catch (err) {
@@ -1469,7 +1491,7 @@ app.post('/project-save', async (req, res) => {
   const { project, contractor, consultant, clientEmail } = req.body;
 
   try {
-    // ✅ Ensure client exists
+    // ✅ Ensure client exists and is verified
     const clientResult = await pool.query(
       `SELECT id, company_email FROM clients 
        WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1)) AND verified=true`,
@@ -1482,7 +1504,7 @@ app.post('/project-save', async (req, res) => {
 
     const client_id = clientResult.rows[0].id;
 
-    // ✅ Insert project
+    // ✅ Insert project or fetch existing
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1,$2,$3,$4,NOW())
@@ -1575,8 +1597,7 @@ app.post('/project-save', async (req, res) => {
       );
     }
 
-    // ✅ Generate JWT for client
-    const jwt = require("jsonwebtoken");
+    // ✅ Generate JWT for client (ES module style)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: client_id, role: "Client", email: clientResult.rows[0].company_email },
@@ -1596,10 +1617,24 @@ app.post('/project-save', async (req, res) => {
   }
 });
 
-// Unified route for all roles
+// Unified route for all roles using JWT
 app.post("/profile/project-details", async (req, res) => {
   try {
-    const { email, role, projectId } = req.body;
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: "Authorization header missing" });
+    }
+
+    const token = authHeader.split(" ")[1];
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET || "supersecretkey");
+    } catch (err) {
+      return res.status(401).json({ error: "Invalid or expired token" });
+    }
+
+    const { sub: userId, role, email } = decoded;
+    const { projectId } = req.body;
 
     let userResult, projectResult;
 
@@ -1607,8 +1642,8 @@ app.post("/profile/project-details", async (req, res) => {
       case "Client":
       case "Client Project Manager":
         userResult = await pool.query(
-          "SELECT id, company_email AS email, $2 AS role, profile_picture FROM clients WHERE company_email=$1",
-          [email, role]
+          "SELECT id, company_email AS email, $2 AS role, profile_picture FROM clients WHERE id=$1",
+          [userId, role]
         );
         if (userResult.rows.length === 0) return res.status(404).json({ error: "Client not found" });
         const client = userResult.rows[0];
@@ -1622,8 +1657,8 @@ app.post("/profile/project-details", async (req, res) => {
       case "Contractor":
       case "Contractor Project Manager":
         userResult = await pool.query(
-          "SELECT id, email, $2 AS role, profile_picture FROM contractors WHERE email=$1",
-          [email, role]
+          "SELECT id, email, $2 AS role, profile_picture FROM contractors WHERE id=$1",
+          [userId, role]
         );
         if (userResult.rows.length === 0) return res.status(404).json({ error: "Contractor not found" });
         const contractor = userResult.rows[0];
@@ -1638,8 +1673,8 @@ app.post("/profile/project-details", async (req, res) => {
       case "Consultant":
       case "Consultant Project Manager":
         userResult = await pool.query(
-          "SELECT id, email, $2 AS role, profile_picture FROM consultants WHERE email=$1",
-          [email, role]
+          "SELECT id, email, $2 AS role, profile_picture FROM consultants WHERE id=$1",
+          [userId, role]
         );
         if (userResult.rows.length === 0) return res.status(404).json({ error: "Consultant not found" });
         const consultant = userResult.rows[0];
