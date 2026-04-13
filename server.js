@@ -771,8 +771,11 @@ app.post("/login", async (req, res) => {
 
     const loginEmail = role === "Client" ? company_email : email;
 
+    // ✅ FIX: Select both company_email and email so both are available
     const result = await pool.query(
-      `SELECT ${selectFields} FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
+      `SELECT ${selectFields}, company_email, email 
+       FROM ${table} 
+       WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
       [loginEmail]
     );
     if (result.rows.length === 0) return res.json({ success: false, error: "Account not found." });
@@ -798,6 +801,8 @@ app.post("/login", async (req, res) => {
     }
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
+
+    // ✅ FIX: Keep separation — Clients use company_email, others use email
     const userEmail = role === "Client" ? user.company_email : user.email;
 
     const accessToken = jwt.sign(
@@ -842,20 +847,23 @@ app.post("/refresh", async (req, res) => {
     const { user_id, role, expires_at } = tokenRes.rows[0];
     if (new Date(expires_at) < new Date()) return res.status(403).json({ success: false, error: "Refresh token expired." });
 
-    let emailColumn = role === "Client" ? "company_email" : "email";
-    let table;
+    let emailColumn, table;
     switch (role) {
-      case "Client": table = "clients"; break;
-      case "Contractor": table = "contractors"; break;
-      case "Consultant": table = "consultants"; break;
-      case "Team Member": table = "team_members"; break;
-      case "Client Project Manager": table = "client_project_managers"; break;
-      case "Contractor Project Manager": table = "contractor_project_managers"; break;
-      case "Consultant Project Manager": table = "consultant_project_managers"; break;
+      case "Client":
+        table = "clients";
+        emailColumn = "company_email";
+        break;
+      case "Contractor": table = "contractors"; emailColumn = "email"; break;
+      case "Consultant": table = "consultants"; emailColumn = "email"; break;
+      case "Team Member": table = "team_members"; emailColumn = "email"; break;
+      case "Client Project Manager": table = "client_project_managers"; emailColumn = "email"; break;
+      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; break;
+      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
       default: return res.status(400).json({ success: false, error: "Invalid role." });
     }
 
-    const userRes = await pool.query(`SELECT id, ${emailColumn} FROM ${table} WHERE id=$1`, [user_id]);
+    // ✅ Select both company_email and email separately
+    const userRes = await pool.query(`SELECT id, company_email, email FROM ${table} WHERE id=$1`, [user_id]);
     if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: "User not found." });
     const user = userRes.rows[0];
 
@@ -881,6 +889,8 @@ app.post("/refresh", async (req, res) => {
     }
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
+
+    // ✅ Keep separation: Clients use company_email, others use email
     const userEmail = role === "Client" ? user.company_email : user.email;
 
     const newAccessToken = jwt.sign(
@@ -1010,12 +1020,11 @@ setInterval(async () => {
 app.post("/client/profile", authenticateToken, async (req, res) => {
   try {
     const role = (req.user.role || "Client").toLowerCase();
-    const email = req.user.email;
+    const companyEmail = req.user.email; // JWT carries company_email for Clients
 
-    // For Clients, query by company_email
     const clientResult = await pool.query(
-      "SELECT id, company_email AS email, profile_picture FROM clients WHERE company_email=$1",
-      [email]
+      "SELECT id, company_email, profile_picture FROM clients WHERE company_email=$1",
+      [companyEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
@@ -1028,6 +1037,11 @@ app.post("/client/profile", authenticateToken, async (req, res) => {
       [client.id]
     );
     client.projects = projectsResult.rows;
+
+    // ✅ Enforce that projects must exist
+    if (!client.projects || client.projects.length === 0) {
+      return res.status(400).json({ error: "Client must have at least one project" });
+    }
 
     if (client.projects.length === 1) {
       client.defaultProject = client.projects[0];
@@ -1043,13 +1057,13 @@ app.post("/client/profile", authenticateToken, async (req, res) => {
 // Upload client profile picture
 app.post("/client/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const email = req.user.email;
+    const companyEmail = req.user.email; // JWT carries company_email
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-    await pool.query("UPDATE clients SET profile_picture=$1 WHERE company_email=$2", [fileUrl, email]);
+    await pool.query("UPDATE clients SET profile_picture=$1 WHERE company_email=$2", [fileUrl, companyEmail]);
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
@@ -1061,8 +1075,8 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
 // Delete client profile picture
 app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email;
-    await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [email]);
+    const companyEmail = req.user.email; // JWT carries company_email
+    await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [companyEmail]);
     res.json({ success: true });
   } catch (err) {
     console.error("Delete client picture error:", err);
@@ -1074,12 +1088,12 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
 app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
     const role = (req.user.role || "Client").toLowerCase();
-    const email = req.user.email;
+    const companyEmail = req.user.email; // JWT carries company_email
     const { projectId } = req.body;
 
     const clientResult = await pool.query(
-      "SELECT id, company_email AS email, profile_picture FROM clients WHERE company_email=$1",
-      [email]
+      "SELECT id, company_email, profile_picture FROM clients WHERE company_email=$1",
+      [companyEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
@@ -1098,7 +1112,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
 
     res.json({
       client: {
-        email: client.email,
+        company_email: client.company_email,
         role: client.role,
         profile_picture: client.profile_picture
       },
