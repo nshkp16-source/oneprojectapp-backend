@@ -776,39 +776,26 @@ app.post("/login", async (req, res) => {
       `SELECT ${selectFields} FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
       [loginEmail]
     );
-
-    if (result.rows.length === 0) {
-      return res.json({ success: false, error: "Account not found." });
-    }
+    if (result.rows.length === 0) return res.json({ success: false, error: "Account not found." });
 
     const user = result.rows[0];
 
     // First-login guardrail
     if (!user.password_hash) {
-      return res.json({
-        success: false,
-        error: "No password set yet. Follow the first-login guideline."
-      });
+      return res.json({ success: false, error: "No password set yet. Follow the first-login guideline." });
     }
 
     // Password check
     const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) {
-      return res.json({ success: false, error: "Invalid password." });
-    }
+    if (!match) return res.json({ success: false, error: "Invalid password." });
 
     // Verified check
-    if (!user.verified) {
-      return res.json({ success: false, error: "Account not verified. Please check your email." });
-    }
+    if (!user.verified) return res.json({ success: false, error: "Account not verified. Please check your email." });
 
     // Project assignments
     let projectAssignments = [];
     if (role === "Client") {
-      const projectsRes = await pool.query(
-        `SELECT id FROM projects WHERE ${foreignKey}=$1`,
-        [user.id]
-      );
+      const projectsRes = await pool.query("SELECT id FROM projects WHERE client_id=$1", [user.id]);
       projectAssignments = projectsRes.rows.map(r => r.id);
     } else {
       const projectsRes = await pool.query(
@@ -818,33 +805,23 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // ✅ Generate Access Token (short-lived)
+    // Generate Access Token (short-lived)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const accessToken = jwt.sign(
-      {
-        sub: user.id,
-        email: user.email, // company_email for Client, email for others
-        role,
-        projects: projectAssignments
-      },
+      { sub: user.id, email: user.email, role, projects: projectAssignments },
       SECRET,
-      { expiresIn: "15m" } // short-lived access token
+      { expiresIn: "15m" }
     );
 
-    // ✅ Generate Refresh Token (24h)
-    const refreshToken = jwt.sign(
-      { sub: user.id, role },
-      SECRET,
-      { expiresIn: "24h" }
-    );
-
-    // Store refresh token in DB for revocation
+    // Generate Refresh Token (random string, stored with 24h expiry)
+    const refreshToken = crypto.randomBytes(64).toString("hex");
     await pool.query(
-      "INSERT INTO refresh_tokens (user_id, token, role, created_at) VALUES ($1, $2, $3, NOW())",
-      [user.id, refreshToken, role]
+      `INSERT INTO refresh_tokens (user_id, role, token, expires_at)
+       VALUES ($1, $2, $3, NOW() + interval '24 hours')`,
+      [user.id, role, refreshToken]
     );
 
-    // ✅ Return both tokens
+    // Return both tokens
     res.json({
       success: true,
       message: "Login successful.",
@@ -863,97 +840,67 @@ app.post("/login", async (req, res) => {
 app.post("/refresh", async (req, res) => {
   try {
     const { refreshToken } = req.body;
-    if (!refreshToken) {
-      return res.status(401).json({ success: false, error: "No refresh token provided." });
+    if (!refreshToken) return res.status(401).json({ success: false, error: "No refresh token provided." });
+
+    // Check DB for token and expiry
+    const tokenRes = await pool.query(
+      "SELECT user_id, role, expires_at FROM refresh_tokens WHERE token=$1",
+      [refreshToken]
+    );
+    if (tokenRes.rows.length === 0) return res.status(403).json({ success: false, error: "Refresh token not recognized." });
+
+    const { user_id, role, expires_at } = tokenRes.rows[0];
+    if (new Date(expires_at) < new Date()) return res.status(403).json({ success: false, error: "Refresh token expired." });
+
+    // Fetch user email depending on role
+    let emailColumn = role === "Client" ? "company_email" : "email";
+    let table;
+    switch (role) {
+      case "Client": table = "clients"; break;
+      case "Contractor": table = "contractors"; break;
+      case "Consultant": table = "consultants"; break;
+      case "Team Member": table = "team_members"; break;
+      case "Client Project Manager": table = "client_project_managers"; break;
+      case "Contractor Project Manager": table = "contractor_project_managers"; break;
+      case "Consultant Project Manager": table = "consultant_project_managers"; break;
+      default: return res.status(400).json({ success: false, error: "Invalid role." });
     }
 
-    const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const userRes = await pool.query(`SELECT id, ${emailColumn} AS email FROM ${table} WHERE id=$1`, [user_id]);
+    if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: "User not found." });
+    const user = userRes.rows[0];
 
-    // Verify refresh token signature
-    jwt.verify(refreshToken, SECRET, async (err, decoded) => {
-      if (err) {
-        return res.status(403).json({ success: false, error: "Invalid or expired refresh token." });
-      }
-
-      const userId = decoded.sub;
-      const role = decoded.role;
-
-      // Check if refresh token exists in DB (revocation support)
-      const tokenRes = await pool.query(
-        "SELECT token FROM refresh_tokens WHERE user_id=$1 AND token=$2",
-        [userId, refreshToken]
-      );
-      if (tokenRes.rows.length === 0) {
-        return res.status(403).json({ success: false, error: "Refresh token not recognized." });
-      }
-
-      // Fetch user email depending on role
-      let emailColumn = role === "Client" ? "company_email" : "email";
-      let table;
+    // Fetch project assignments
+    let projectAssignments = [];
+    if (role === "Client") {
+      const projectsRes = await pool.query("SELECT id FROM projects WHERE client_id=$1", [user_id]);
+      projectAssignments = projectsRes.rows.map(r => r.id);
+    } else {
+      let assignmentTable;
       switch (role) {
-        case "Client": table = "clients"; break;
-        case "Contractor": table = "contractors"; break;
-        case "Consultant": table = "consultants"; break;
-        case "Team Member": table = "team_members"; break;
-        case "Client Project Manager": table = "client_project_managers"; break;
-        case "Contractor Project Manager": table = "contractor_project_managers"; break;
-        case "Consultant Project Manager": table = "consultant_project_managers"; break;
-        default: return res.status(400).json({ success: false, error: "Invalid role." });
+        case "Contractor": assignmentTable = "contractor_assignments"; break;
+        case "Consultant": assignmentTable = "consultant_assignments"; break;
+        case "Team Member": assignmentTable = "team_member_assignments"; break;
+        case "Client Project Manager": assignmentTable = "client_pm_assignments"; break;
+        case "Contractor Project Manager": assignmentTable = "contractor_pm_assignments"; break;
+        case "Consultant Project Manager": assignmentTable = "consultant_pm_assignments"; break;
       }
-
-      const userRes = await pool.query(
-        `SELECT id, ${emailColumn} AS email FROM ${table} WHERE id=$1`,
-        [userId]
+      const projectsRes = await pool.query(
+        `SELECT project_id FROM ${assignmentTable} WHERE ${role.toLowerCase().replace(/ /g, "_")}_id=$1`,
+        [user_id]
       );
-      if (userRes.rows.length === 0) {
-        return res.status(404).json({ success: false, error: "User not found." });
-      }
-      const user = userRes.rows[0];
+      projectAssignments = projectsRes.rows.map(r => r.project_id);
+    }
 
-      // Fetch project assignments
-      let projectAssignments = [];
-      if (role === "Client") {
-        const projectsRes = await pool.query(
-          "SELECT id FROM projects WHERE client_id=$1",
-          [userId]
-        );
-        projectAssignments = projectsRes.rows.map(r => r.id);
-      } else {
-        let assignmentTable;
-        switch (role) {
-          case "Contractor": assignmentTable = "contractor_assignments"; break;
-          case "Consultant": assignmentTable = "consultant_assignments"; break;
-          case "Team Member": assignmentTable = "team_member_assignments"; break;
-          case "Client Project Manager": assignmentTable = "client_pm_assignments"; break;
-          case "Contractor Project Manager": assignmentTable = "contractor_pm_assignments"; break;
-          case "Consultant Project Manager": assignmentTable = "consultant_pm_assignments"; break;
-        }
-        const projectsRes = await pool.query(
-          `SELECT project_id FROM ${assignmentTable} WHERE ${role.toLowerCase().replace(/ /g, "_")}_id=$1`,
-          [userId]
-        );
-        projectAssignments = projectsRes.rows.map(r => r.project_id);
-      }
+    // Issue new access token
+    const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const newAccessToken = jwt.sign(
+      { sub: user_id, email: user.email, role, projects: projectAssignments },
+      SECRET,
+      { expiresIn: "15m" }
+    );
 
-      // Issue new access token (15m expiry)
-      const newAccessToken = jwt.sign(
-        {
-          sub: userId,
-          email: user.email,
-          role,
-          projects: projectAssignments
-        },
-        SECRET,
-        { expiresIn: "15m" }
-      );
-
-      res.json({
-        success: true,
-        accessToken: newAccessToken,
-        role,
-        projects: projectAssignments
-      });
-    });
+    res.json({ success: true, accessToken: newAccessToken, role, projects: projectAssignments });
   } catch (err) {
     console.error("Refresh error:", err.message);
     res.status(500).json({ success: false, error: "Server error refreshing token." });
