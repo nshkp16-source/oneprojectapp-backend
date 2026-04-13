@@ -704,9 +704,9 @@ app.post('/reset-set-password', async (req, res) => {
   }
 });
 
-// LOGIN route (role-specific tables with JWT)
+// LOGIN route (role-specific tables with JWT + Refresh Token)
 app.post("/login", async (req, res) => {
-  const { email, password, role } = req.body;
+  const { email, company_email, password, role } = req.body;
   try {
     let table, assignmentTable, foreignKey, emailColumn, selectFields;
 
@@ -768,10 +768,13 @@ app.post("/login", async (req, res) => {
         return res.json({ success: false, error: "Invalid role." });
     }
 
+    // Use company_email for Client, email for others
+    const loginEmail = role === "Client" ? company_email : email;
+
     // Fetch account
     const result = await pool.query(
       `SELECT ${selectFields} FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
-      [email]
+      [loginEmail]
     );
 
     if (result.rows.length === 0) {
@@ -815,25 +818,145 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // ✅ Generate JWT token with consistent claims
+    // ✅ Generate Access Token (short-lived)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
-    const token = jwt.sign(
-      { sub: user.id, role, email: user.email, projects: projectAssignments },
+    const accessToken = jwt.sign(
+      {
+        sub: user.id,
+        email: user.email, // company_email for Client, email for others
+        role,
+        projects: projectAssignments
+      },
       SECRET,
-      { expiresIn: "1h" }
+      { expiresIn: "15m" } // short-lived access token
     );
 
-    // ✅ Return token + role + projects
+    // ✅ Generate Refresh Token (24h)
+    const refreshToken = jwt.sign(
+      { sub: user.id, role },
+      SECRET,
+      { expiresIn: "24h" }
+    );
+
+    // Store refresh token in DB for revocation
+    await pool.query(
+      "INSERT INTO refresh_tokens (user_id, token, role, created_at) VALUES ($1, $2, $3, NOW())",
+      [user.id, refreshToken, role]
+    );
+
+    // ✅ Return both tokens
     res.json({
       success: true,
       message: "Login successful.",
-      token,
+      accessToken,
+      refreshToken,
       role,
       projects: projectAssignments
     });
   } catch (err) {
     console.error("Login error:", err.message);
     res.status(500).json({ success: false, error: "Server error logging in." });
+  }
+});
+
+// REFRESH route (issue new access token using refresh token)
+app.post("/refresh", async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) {
+      return res.status(401).json({ success: false, error: "No refresh token provided." });
+    }
+
+    const SECRET = process.env.JWT_SECRET || "supersecretkey";
+
+    // Verify refresh token signature
+    jwt.verify(refreshToken, SECRET, async (err, decoded) => {
+      if (err) {
+        return res.status(403).json({ success: false, error: "Invalid or expired refresh token." });
+      }
+
+      const userId = decoded.sub;
+      const role = decoded.role;
+
+      // Check if refresh token exists in DB (revocation support)
+      const tokenRes = await pool.query(
+        "SELECT token FROM refresh_tokens WHERE user_id=$1 AND token=$2",
+        [userId, refreshToken]
+      );
+      if (tokenRes.rows.length === 0) {
+        return res.status(403).json({ success: false, error: "Refresh token not recognized." });
+      }
+
+      // Fetch user email depending on role
+      let emailColumn = role === "Client" ? "company_email" : "email";
+      let table;
+      switch (role) {
+        case "Client": table = "clients"; break;
+        case "Contractor": table = "contractors"; break;
+        case "Consultant": table = "consultants"; break;
+        case "Team Member": table = "team_members"; break;
+        case "Client Project Manager": table = "client_project_managers"; break;
+        case "Contractor Project Manager": table = "contractor_project_managers"; break;
+        case "Consultant Project Manager": table = "consultant_project_managers"; break;
+        default: return res.status(400).json({ success: false, error: "Invalid role." });
+      }
+
+      const userRes = await pool.query(
+        `SELECT id, ${emailColumn} AS email FROM ${table} WHERE id=$1`,
+        [userId]
+      );
+      if (userRes.rows.length === 0) {
+        return res.status(404).json({ success: false, error: "User not found." });
+      }
+      const user = userRes.rows[0];
+
+      // Fetch project assignments
+      let projectAssignments = [];
+      if (role === "Client") {
+        const projectsRes = await pool.query(
+          "SELECT id FROM projects WHERE client_id=$1",
+          [userId]
+        );
+        projectAssignments = projectsRes.rows.map(r => r.id);
+      } else {
+        let assignmentTable;
+        switch (role) {
+          case "Contractor": assignmentTable = "contractor_assignments"; break;
+          case "Consultant": assignmentTable = "consultant_assignments"; break;
+          case "Team Member": assignmentTable = "team_member_assignments"; break;
+          case "Client Project Manager": assignmentTable = "client_pm_assignments"; break;
+          case "Contractor Project Manager": assignmentTable = "contractor_pm_assignments"; break;
+          case "Consultant Project Manager": assignmentTable = "consultant_pm_assignments"; break;
+        }
+        const projectsRes = await pool.query(
+          `SELECT project_id FROM ${assignmentTable} WHERE ${role.toLowerCase().replace(/ /g, "_")}_id=$1`,
+          [userId]
+        );
+        projectAssignments = projectsRes.rows.map(r => r.project_id);
+      }
+
+      // Issue new access token (15m expiry)
+      const newAccessToken = jwt.sign(
+        {
+          sub: userId,
+          email: user.email,
+          role,
+          projects: projectAssignments
+        },
+        SECRET,
+        { expiresIn: "15m" }
+      );
+
+      res.json({
+        success: true,
+        accessToken: newAccessToken,
+        role,
+        projects: projectAssignments
+      });
+    });
+  } catch (err) {
+    console.error("Refresh error:", err.message);
+    res.status(500).json({ success: false, error: "Server error refreshing token." });
   }
 });
 
@@ -950,7 +1073,7 @@ setInterval(async () => {
 // Fetch client profile + projects
 app.post("/client/profile", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email;
+    const email = req.user.email; // company_email for Client, email for others
     const role = (req.user.role || "Client").toLowerCase(); // normalize role
 
     const clientResult = await pool.query(
