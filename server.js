@@ -1744,7 +1744,7 @@ app.post('/project-save', async (req, res) => {
   }
 });
 
-// Unified route for all roles using JWT
+// ============ UNIFIED PROJECT DETAILS ROUTE (JWT-based) ============
 app.post("/profile/project-details", async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -1760,7 +1760,7 @@ app.post("/profile/project-details", async (req, res) => {
       return res.status(401).json({ error: "Invalid or expired token" });
     }
 
-    const { sub: userId, role, email } = decoded;
+    const { sub: userId, role } = decoded;
     const { projectId } = req.body;
 
     let userResult, projectResult;
@@ -1793,7 +1793,7 @@ app.post("/profile/project-details", async (req, res) => {
           "SELECT 1 FROM contractor_assignments WHERE contractor_id=$1 AND project_id=$2",
           [contractor.id, projectId]
         );
-        if (assignmentCheck.rows.length === 0) return res.status(404).json({ error: "Project not linked to contractor" });
+        if (assignmentCheck.rows.length === 0) return res.status(403).json({ error: "Project not linked to contractor" });
         projectResult = await pool.query("SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1", [projectId]);
         return res.json({ user: contractor, project: projectResult.rows[0] });
 
@@ -1809,7 +1809,7 @@ app.post("/profile/project-details", async (req, res) => {
           "SELECT 1 FROM consultant_assignments WHERE consultant_id=$1 AND project_id=$2",
           [consultant.id, projectId]
         );
-        if (consultantCheck.rows.length === 0) return res.status(404).json({ error: "Project not linked to consultant" });
+        if (consultantCheck.rows.length === 0) return res.status(403).json({ error: "Project not linked to consultant" });
         projectResult = await pool.query("SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1", [projectId]);
         return res.json({ user: consultant, project: projectResult.rows[0] });
 
@@ -1822,61 +1822,95 @@ app.post("/profile/project-details", async (req, res) => {
   }
 });
 
-// ---------------- ASSIGN TEAM ROUTE ----------------
+// ============ ASSIGN TEAM ROUTE (JWT-based) ============
 app.post("/assign-team", async (req, res) => {
-  const { projectId, role, assignments } = req.body;
-
-  if (!projectId || !role || !Array.isArray(assignments)) {
-    return res.status(400).json({ success: false, message: "Invalid payload" });
-  }
-
-  const client = await pool.connect();
   try {
-    for (const a of assignments) {
-      if (a.role === "Project Manager") {
-        if (role === "Client" || role === "Client Project Manager") {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ success: false, error: "Authorization header missing" });
+    }
+
+    const token = authHeader.split(" ")[1];
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET || "supersecretkey");
+    } catch (err) {
+      return res.status(401).json({ success: false, error: "Invalid or expired token" });
+    }
+
+    const { sub: userId, role } = decoded;
+    const { projectId, assignments } = req.body;
+
+    if (!projectId || !Array.isArray(assignments)) {
+      return res.status(400).json({ success: false, error: "Invalid payload" });
+    }
+
+    // Verify project ownership/assignment
+    let projectCheck;
+    if (role.startsWith("Client")) {
+      projectCheck = await pool.query("SELECT 1 FROM projects WHERE id=$1 AND client_id=$2", [projectId, userId]);
+    } else if (role.startsWith("Contractor")) {
+      projectCheck = await pool.query("SELECT 1 FROM contractor_assignments WHERE project_id=$1 AND contractor_id=$2", [projectId, userId]);
+    } else if (role.startsWith("Consultant")) {
+      projectCheck = await pool.query("SELECT 1 FROM consultant_assignments WHERE project_id=$1 AND consultant_id=$2", [projectId, userId]);
+    } else {
+      return res.status(400).json({ success: false, error: "Unsupported role" });
+    }
+
+    if (projectCheck.rows.length === 0) {
+      return res.status(403).json({ success: false, error: "Project not linked to this user" });
+    }
+
+    const client = await pool.connect();
+    try {
+      for (const a of assignments) {
+        if (a.role === "Project Manager") {
+          if (role.startsWith("Client")) {
+            await client.query(
+              `INSERT INTO client_pm_assignments 
+               (project_id, client_pm_id, company_name, title, position, telephone, task, representative) 
+               VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+               ON CONFLICT DO NOTHING`,
+              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+            );
+          } else if (role.startsWith("Contractor")) {
+            await client.query(
+              `INSERT INTO contractor_pm_assignments 
+               (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative) 
+               VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+               ON CONFLICT DO NOTHING`,
+              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+            );
+          } else if (role.startsWith("Consultant")) {
+            await client.query(
+              `INSERT INTO consultant_pm_assignments 
+               (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative) 
+               VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+               ON CONFLICT DO NOTHING`,
+              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+            );
+          }
+        } else {
+          // Team Member assignment
           await client.query(
-            `INSERT INTO client_pm_assignments 
-             (project_id, client_pm_id, company_name, title, position, telephone, task, representative) 
-             VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8) 
-             ON CONFLICT DO NOTHING`,
-            [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
-          );
-        } else if (role === "Contractor" || role === "Contractor Project Manager") {
-          await client.query(
-            `INSERT INTO contractor_pm_assignments 
-             (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative) 
-             VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8) 
-             ON CONFLICT DO NOTHING`,
-            [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
-          );
-        } else if (role === "Consultant" || role === "Consultant Project Manager") {
-          await client.query(
-            `INSERT INTO consultant_pm_assignments 
-             (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative) 
-             VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8) 
+            `INSERT INTO team_member_assignments 
+             (project_id, team_member_id, company_name, title, position, telephone, task, representative) 
+             VALUES ($1, (SELECT id FROM team_members WHERE email=$2), $3,$4,$5,$6,$7,$8)
              ON CONFLICT DO NOTHING`,
             [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
           );
         }
-      } else {
-        // Team Member assignment
-        await client.query(
-          `INSERT INTO team_member_assignments 
-           (project_id, team_member_id, company_name, title, position, telephone, task, representative) 
-           VALUES ($1, (SELECT id FROM team_members WHERE email=$2), $3,$4,$5,$6,$7,$8) 
-           ON CONFLICT DO NOTHING`,
-          [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
-        );
       }
+      res.json({ success: true, message: "Assignments saved" });
+    } catch (err) {
+      console.error("Error saving assignments:", err);
+      res.status(500).json({ success: false, error: "Server error" });
+    } finally {
+      client.release();
     }
-
-    res.json({ success: true, message: "Assignments saved" });
   } catch (err) {
-    console.error("Error saving assignments:", err);
-    res.status(500).json({ success: false, message: "Server error" });
-  } finally {
-    client.release();
+    console.error("Assign team error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
