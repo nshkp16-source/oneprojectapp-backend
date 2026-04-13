@@ -718,7 +718,7 @@ app.post("/login", async (req, res) => {
         foreignKey = "client_id";
         emailColumn = "company_email";
         selectFields = `
-          id, company_name, company_email AS email,
+          id, company_name, company_email,
           representative, title, telephone,
           password_hash, verified, profile_picture, created_at
         `;
@@ -798,8 +798,10 @@ app.post("/login", async (req, res) => {
     }
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const userEmail = role === "Client" ? user.company_email : user.email;
+
     const accessToken = jwt.sign(
-      { sub: user.id, email: user.email, role, projects: projectAssignments },
+      { sub: user.id, email: userEmail, role, projects: projectAssignments },
       SECRET,
       { expiresIn: "15m" }
     );
@@ -853,7 +855,7 @@ app.post("/refresh", async (req, res) => {
       default: return res.status(400).json({ success: false, error: "Invalid role." });
     }
 
-    const userRes = await pool.query(`SELECT id, ${emailColumn} AS email FROM ${table} WHERE id=$1`, [user_id]);
+    const userRes = await pool.query(`SELECT id, ${emailColumn} FROM ${table} WHERE id=$1`, [user_id]);
     if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: "User not found." });
     const user = userRes.rows[0];
 
@@ -879,8 +881,10 @@ app.post("/refresh", async (req, res) => {
     }
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
+    const userEmail = role === "Client" ? user.company_email : user.email;
+
     const newAccessToken = jwt.sign(
-      { sub: user_id, email: user.email, role, projects: projectAssignments },
+      { sub: user_id, email: userEmail, role, projects: projectAssignments },
       SECRET,
       { expiresIn: "15m" }
     );
