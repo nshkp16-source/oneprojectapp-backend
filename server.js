@@ -1009,8 +1009,8 @@ setInterval(async () => {
 // Fetch client profile + projects
 app.post("/client/profile", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email; // company_email for Client, email for others
-    const role = (req.user.role || "Client").toLowerCase(); // normalize role
+    const role = (req.user.role || "Client").toLowerCase();
+    const email = req.user.email; // For Clients this is company_email
 
     const clientResult = await pool.query(
       "SELECT id, company_email AS email, profile_picture FROM clients WHERE company_email=$1",
@@ -1042,7 +1042,7 @@ app.post("/client/profile", authenticateToken, async (req, res) => {
 // Upload client profile picture
 app.post("/client/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const email = req.user.email;
+    const email = req.user.email; // company_email for Client
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
@@ -1060,7 +1060,7 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
 // Delete client profile picture
 app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email;
+    const email = req.user.email; // company_email for Client
     await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [email]);
     res.json({ success: true });
   } catch (err) {
@@ -1072,8 +1072,8 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
 // Fetch project details for a specific client project
 app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email;
     const role = (req.user.role || "Client").toLowerCase();
+    const email = req.user.email; // company_email for Client
     const { projectId } = req.body;
 
     const clientResult = await pool.query(
@@ -1098,7 +1098,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     res.json({
       client: {
         email: client.email,
-        role: client.role, // always normalized
+        role: client.role,
         profile_picture: client.profile_picture
       },
       project: project
