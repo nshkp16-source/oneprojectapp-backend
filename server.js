@@ -916,11 +916,11 @@ setInterval(async () => {
   }
 }, 3 * 60 * 1000); // 3 minutes
 
-// 16.=========== CLIENT PROFILE ROUTES =============
+// ============ CLIENT PROFILE ROUTES (JWT-based) =============
 
 // ✅ Multer is already imported at the top: import multer from "multer";
 const upload = multer({
-  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit to match script validation
+  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit to match frontend validation
   storage: multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
@@ -932,10 +932,24 @@ const upload = multer({
 // ✅ Serve uploads folder publicly
 app.use("/uploads", express.static("uploads"));
 
-// Fetch client profile + projects (only projects where user is the client)
-app.post("/client/profile", async (req, res) => {
+// ✅ JWT authentication middleware
+import jwt from "jsonwebtoken";
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user; // contains email, role, sub
+    next();
+  });
+}
+
+// Fetch client profile + projects
+app.post("/client/profile", authenticateToken, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
 
     const clientResult = await pool.query(
       "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
@@ -964,9 +978,9 @@ app.post("/client/profile", async (req, res) => {
 });
 
 // Upload client profile picture
-app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
+app.post("/client/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
@@ -982,9 +996,9 @@ app.post("/client/upload-picture", upload.single("profile_picture"), async (req,
 });
 
 // Delete client profile picture
-app.post("/client/delete-picture", async (req, res) => {
+app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
     await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [email]);
     res.json({ success: true });
   } catch (err) {
@@ -994,9 +1008,10 @@ app.post("/client/delete-picture", async (req, res) => {
 });
 
 // Fetch project details for a specific client project
-app.post("/client/project-details", async (req, res) => {
+app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
-    const { email, projectId } = req.body;
+    const email = req.user.email;
+    const { projectId } = req.body;
 
     const clientResult = await pool.query(
       "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
@@ -1030,14 +1045,41 @@ app.post("/client/project-details", async (req, res) => {
   }
 });
 
-// ============ CONTRACTOR PROFILE ROUTES (Schema-Aligned) =============
+// ============ CONTRACTOR PROFILE ROUTES (JWT-based, Schema-Aligned) =============
+
+// ✅ Multer is already imported at the top: import multer from "multer";
+const upload = multer({
+  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit
+  storage: multer.diskStorage({
+    destination: "uploads/",
+    filename: (req, file, cb) => {
+      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
+    }
+  })
+});
+
+// ✅ Serve uploads folder publicly
+app.use("/uploads", express.static("uploads"));
+
+// ✅ JWT authentication middleware
+import jwt from "jsonwebtoken";
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user; // contains email, role, sub
+    next();
+  });
+}
 
 // Fetch contractor profile + projects (via contractor_assignments)
-app.post("/contractor/profile", async (req, res) => {
+app.post("/contractor/profile", authenticateToken, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
 
-    // Fetch contractor info
     const contractorResult = await pool.query(
       "SELECT id, email, 'Contractor' AS role, profile_picture FROM contractors WHERE email=$1",
       [email]
@@ -1047,7 +1089,6 @@ app.post("/contractor/profile", async (req, res) => {
     }
     const contractor = contractorResult.rows[0];
 
-    // Fetch projects linked via contractor_assignments
     const projectsResult = await pool.query(
       `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
        FROM contractor_assignments ca
@@ -1069,9 +1110,9 @@ app.post("/contractor/profile", async (req, res) => {
 });
 
 // Upload contractor profile picture
-app.post("/contractor/upload-picture", upload.single("profile_picture"), async (req, res) => {
+app.post("/contractor/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
@@ -1087,9 +1128,9 @@ app.post("/contractor/upload-picture", upload.single("profile_picture"), async (
 });
 
 // Delete contractor profile picture
-app.post("/contractor/delete-picture", async (req, res) => {
+app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
     await pool.query("UPDATE contractors SET profile_picture=NULL WHERE email=$1", [email]);
     res.json({ success: true });
   } catch (err) {
@@ -1099,9 +1140,10 @@ app.post("/contractor/delete-picture", async (req, res) => {
 });
 
 // Fetch project details for a specific contractor project
-app.post("/contractor/project-details", async (req, res) => {
+app.post("/contractor/project-details", authenticateToken, async (req, res) => {
   try {
-    const { email, projectId } = req.body;
+    const email = req.user.email;
+    const { projectId } = req.body;
 
     const contractorResult = await pool.query(
       "SELECT id, email, 'Contractor' AS role, profile_picture FROM contractors WHERE email=$1",
@@ -1144,14 +1186,41 @@ app.post("/contractor/project-details", async (req, res) => {
   }
 });
 
-// ============ CONSULTANT PROFILE ROUTES (Schema-Aligned) =============
+// ============ CONSULTANT PROFILE ROUTES (JWT-based, Schema-Aligned) =============
+
+// ✅ Multer is already imported at the top: import multer from "multer";
+const upload = multer({
+  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit
+  storage: multer.diskStorage({
+    destination: "uploads/",
+    filename: (req, file, cb) => {
+      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
+    }
+  })
+});
+
+// ✅ Serve uploads folder publicly
+app.use("/uploads", express.static("uploads"));
+
+// ✅ JWT authentication middleware
+import jwt from "jsonwebtoken";
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user; // contains email, role, sub
+    next();
+  });
+}
 
 // Fetch consultant profile + projects (via consultant_assignments)
-app.post("/consultant/profile", async (req, res) => {
+app.post("/consultant/profile", authenticateToken, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
 
-    // Fetch consultant info
     const consultantResult = await pool.query(
       "SELECT id, email, 'Consultant' AS role, profile_picture, verified, created_at FROM consultants WHERE email=$1",
       [email]
@@ -1161,7 +1230,6 @@ app.post("/consultant/profile", async (req, res) => {
     }
     const consultant = consultantResult.rows[0];
 
-    // Fetch projects linked via consultant_assignments
     const projectsResult = await pool.query(
       `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
        FROM consultant_assignments ca
@@ -1183,9 +1251,9 @@ app.post("/consultant/profile", async (req, res) => {
 });
 
 // Upload consultant profile picture
-app.post("/consultant/upload-picture", upload.single("profile_picture"), async (req, res) => {
+app.post("/consultant/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
@@ -1201,9 +1269,9 @@ app.post("/consultant/upload-picture", upload.single("profile_picture"), async (
 });
 
 // Delete consultant profile picture
-app.post("/consultant/delete-picture", async (req, res) => {
+app.post("/consultant/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.user.email;
     await pool.query("UPDATE consultants SET profile_picture=NULL WHERE email=$1", [email]);
     res.json({ success: true });
   } catch (err) {
@@ -1213,9 +1281,10 @@ app.post("/consultant/delete-picture", async (req, res) => {
 });
 
 // Fetch project details for a specific consultant project
-app.post("/consultant/project-details", async (req, res) => {
+app.post("/consultant/project-details", authenticateToken, async (req, res) => {
   try {
-    const { email, projectId } = req.body;
+    const email = req.user.email;
+    const { projectId } = req.body;
 
     const consultantResult = await pool.query(
       "SELECT id, email, 'Consultant' AS role, profile_picture FROM consultants WHERE email=$1",
