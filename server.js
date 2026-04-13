@@ -1011,36 +1011,22 @@ setInterval(async () => {
 
 // ============ CLIENT PROFILE ROUTES (JWT-based) =============
 
-// Fetch client profile + projects
+// Fetch client profile basics (company_email + profile picture)
 app.post("/client/profile", authenticateToken, async (req, res) => {
   try {
-    const role = (req.user.role || "Client").toLowerCase();
+    const role = req.user.role || "Client";
     const companyEmail = req.user.email; // JWT carries company_email for Clients
 
     const clientResult = await pool.query(
-      "SELECT id, company_email, profile_picture FROM clients WHERE company_email=$1",
+      "SELECT company_email, profile_picture FROM clients WHERE company_email=$1",
       [companyEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
+
     const client = clientResult.rows[0];
     client.role = role;
-
-    const projectsResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE client_id=$1",
-      [client.id]
-    );
-    client.projects = projectsResult.rows;
-
-    // ✅ Enforce that projects must exist
-    if (!client.projects || client.projects.length === 0) {
-      return res.status(400).json({ error: "Client must have at least one project" });
-    }
-
-    if (client.projects.length === 1) {
-      client.defaultProject = client.projects[0];
-    }
 
     res.json(client);
   } catch (err) {
@@ -1082,7 +1068,7 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
 // Fetch project details for a specific client project
 app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
-    const role = (req.user.role || "Client").toLowerCase();
+    const role = req.user.role || "Client";
     const companyEmail = req.user.email; // JWT carries company_email
     const { projectId } = req.body;
 
