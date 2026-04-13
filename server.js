@@ -8,13 +8,40 @@ import nodemailerSendgrid from 'nodemailer-sendgrid';
 import fetch from "node-fetch";
 import pkg from 'uuid';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';   // ✅ ES module import for JWT
+import jwt from 'jsonwebtoken';
 
 const { v4: uuidv4 } = pkg;
 
 const app = express();
 app.use(express.json());
 app.use(cors());
+
+// ✅ Multer setup (only once)
+const upload = multer({
+  limits: { fileSize: 500 * 1024 },
+  storage: multer.diskStorage({
+    destination: "uploads/",
+    filename: (req, file, cb) => {
+      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
+    }
+  })
+});
+
+// ✅ Serve uploads folder publicly (only once)
+app.use("/uploads", express.static("uploads"));
+
+// ✅ JWT middleware (only once)
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) return res.sendStatus(401);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+}
 
 // 🔹 Neon DB connection
 const pool = new Pool({
@@ -28,7 +55,6 @@ const transporter = nodemailer.createTransport(
 );
 
 // -------------------- ROUTES --------------------
-
 // Root route
 app.get('/', (req, res) => {
   res.send('Backend is running successfully!');
@@ -918,33 +944,6 @@ setInterval(async () => {
 
 // ============ CLIENT PROFILE ROUTES (JWT-based) =============
 
-// ✅ Multer is already imported at the top: import multer from "multer";
-const upload = multer({
-  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit to match frontend validation
-  storage: multer.diskStorage({
-    destination: "uploads/",
-    filename: (req, file, cb) => {
-      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
-    }
-  })
-});
-
-// ✅ Serve uploads folder publicly
-app.use("/uploads", express.static("uploads"));
-
-// ✅ JWT authentication middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
-  if (!token) return res.sendStatus(401);
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user; // contains email, role, sub
-    next();
-  });
-}
-
 // Fetch client profile + projects
 app.post("/client/profile", authenticateToken, async (req, res) => {
   try {
@@ -1045,33 +1044,6 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
 });
 
 // ============ CONTRACTOR PROFILE ROUTES (JWT-based, Schema-Aligned) =============
-
-// ✅ Multer is already imported at the top: import multer from "multer";
-const upload = multer({
-  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit
-  storage: multer.diskStorage({
-    destination: "uploads/",
-    filename: (req, file, cb) => {
-      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
-    }
-  })
-});
-
-// ✅ Serve uploads folder publicly
-app.use("/uploads", express.static("uploads"));
-
-// ✅ JWT authentication middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
-  if (!token) return res.sendStatus(401);
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user; // contains email, role, sub
-    next();
-  });
-}
 
 // Fetch contractor profile + projects (via contractor_assignments)
 app.post("/contractor/profile", authenticateToken, async (req, res) => {
@@ -1185,33 +1157,6 @@ app.post("/contractor/project-details", authenticateToken, async (req, res) => {
 });
 
 // ============ CONSULTANT PROFILE ROUTES (JWT-based, Schema-Aligned) =============
-
-// ✅ Multer is already imported at the top: import multer from "multer";
-const upload = multer({
-  limits: { fileSize: 500 * 1024 }, // enforce 500KB limit
-  storage: multer.diskStorage({
-    destination: "uploads/",
-    filename: (req, file, cb) => {
-      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
-    }
-  })
-});
-
-// ✅ Serve uploads folder publicly
-app.use("/uploads", express.static("uploads"));
-
-// ✅ JWT authentication middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
-  if (!token) return res.sendStatus(401);
-
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user; // contains email, role, sub
-    next();
-  });
-}
 
 // Fetch consultant profile + projects (via consultant_assignments)
 app.post("/consultant/profile", authenticateToken, async (req, res) => {
