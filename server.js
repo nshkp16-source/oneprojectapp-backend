@@ -9,6 +9,7 @@ import fetch from "node-fetch";
 import pkg from 'uuid';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from "crypto";
 
 const { v4: uuidv4 } = pkg;
 
@@ -768,10 +769,8 @@ app.post("/login", async (req, res) => {
         return res.json({ success: false, error: "Invalid role." });
     }
 
-    // Use company_email for Client, email for others
     const loginEmail = role === "Client" ? company_email : email;
 
-    // Fetch account
     const result = await pool.query(
       `SELECT ${selectFields} FROM ${table} WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
       [loginEmail]
@@ -779,20 +778,13 @@ app.post("/login", async (req, res) => {
     if (result.rows.length === 0) return res.json({ success: false, error: "Account not found." });
 
     const user = result.rows[0];
+    if (!user.password_hash) return res.json({ success: false, error: "No password set yet. Follow the first-login guideline." });
 
-    // First-login guardrail
-    if (!user.password_hash) {
-      return res.json({ success: false, error: "No password set yet. Follow the first-login guideline." });
-    }
-
-    // Password check
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.json({ success: false, error: "Invalid password." });
 
-    // Verified check
     if (!user.verified) return res.json({ success: false, error: "Account not verified. Please check your email." });
 
-    // Project assignments
     let projectAssignments = [];
     if (role === "Client") {
       const projectsRes = await pool.query("SELECT id FROM projects WHERE client_id=$1", [user.id]);
@@ -805,7 +797,6 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // Generate Access Token (short-lived)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const accessToken = jwt.sign(
       { sub: user.id, email: user.email, role, projects: projectAssignments },
@@ -813,7 +804,6 @@ app.post("/login", async (req, res) => {
       { expiresIn: "15m" }
     );
 
-    // Generate Refresh Token (random string, stored with 24h expiry)
     const refreshToken = crypto.randomBytes(64).toString("hex");
     await pool.query(
       `INSERT INTO refresh_tokens (user_id, role, token, expires_at)
@@ -821,7 +811,6 @@ app.post("/login", async (req, res) => {
       [user.id, role, refreshToken]
     );
 
-    // Return both tokens
     res.json({
       success: true,
       message: "Login successful.",
@@ -842,7 +831,6 @@ app.post("/refresh", async (req, res) => {
     const { refreshToken } = req.body;
     if (!refreshToken) return res.status(401).json({ success: false, error: "No refresh token provided." });
 
-    // Check DB for token and expiry
     const tokenRes = await pool.query(
       "SELECT user_id, role, expires_at FROM refresh_tokens WHERE token=$1",
       [refreshToken]
@@ -852,7 +840,6 @@ app.post("/refresh", async (req, res) => {
     const { user_id, role, expires_at } = tokenRes.rows[0];
     if (new Date(expires_at) < new Date()) return res.status(403).json({ success: false, error: "Refresh token expired." });
 
-    // Fetch user email depending on role
     let emailColumn = role === "Client" ? "company_email" : "email";
     let table;
     switch (role) {
@@ -870,7 +857,6 @@ app.post("/refresh", async (req, res) => {
     if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: "User not found." });
     const user = userRes.rows[0];
 
-    // Fetch project assignments
     let projectAssignments = [];
     if (role === "Client") {
       const projectsRes = await pool.query("SELECT id FROM projects WHERE client_id=$1", [user_id]);
@@ -892,7 +878,6 @@ app.post("/refresh", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // Issue new access token
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const newAccessToken = jwt.sign(
       { sub: user_id, email: user.email, role, projects: projectAssignments },
