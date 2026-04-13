@@ -771,9 +771,9 @@ app.post("/login", async (req, res) => {
 
     const loginEmail = role === "Client" ? company_email : email;
 
-    // ✅ FIX: Select both company_email and email so both are available
+    // ✅ Only select the correct column for that role
     const result = await pool.query(
-      `SELECT ${selectFields}, company_email, email 
+      `SELECT ${selectFields} 
        FROM ${table} 
        WHERE TRIM(LOWER(${emailColumn}))=TRIM(LOWER($1))`,
       [loginEmail]
@@ -802,7 +802,6 @@ app.post("/login", async (req, res) => {
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
 
-    // ✅ FIX: Keep separation — Clients use company_email, others use email
     const userEmail = role === "Client" ? user.company_email : user.email;
 
     const accessToken = jwt.sign(
@@ -849,10 +848,7 @@ app.post("/refresh", async (req, res) => {
 
     let emailColumn, table;
     switch (role) {
-      case "Client":
-        table = "clients";
-        emailColumn = "company_email";
-        break;
+      case "Client": table = "clients"; emailColumn = "company_email"; break;
       case "Contractor": table = "contractors"; emailColumn = "email"; break;
       case "Consultant": table = "consultants"; emailColumn = "email"; break;
       case "Team Member": table = "team_members"; emailColumn = "email"; break;
@@ -862,8 +858,8 @@ app.post("/refresh", async (req, res) => {
       default: return res.status(400).json({ success: false, error: "Invalid role." });
     }
 
-    // ✅ Select both company_email and email separately
-    const userRes = await pool.query(`SELECT id, company_email, email FROM ${table} WHERE id=$1`, [user_id]);
+    // ✅ Only select the correct column for that role
+    const userRes = await pool.query(`SELECT id, ${emailColumn} FROM ${table} WHERE id=$1`, [user_id]);
     if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: "User not found." });
     const user = userRes.rows[0];
 
@@ -890,7 +886,6 @@ app.post("/refresh", async (req, res) => {
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
 
-    // ✅ Keep separation: Clients use company_email, others use email
     const userEmail = role === "Client" ? user.company_email : user.email;
 
     const newAccessToken = jwt.sign(
