@@ -953,7 +953,7 @@ app.post("/client/profile", authenticateToken, async (req, res) => {
     const email = req.user.email;
 
     const clientResult = await pool.query(
-      "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
+      "SELECT id, company_email AS email, LOWER('Client') AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
     if (clientResult.rows.length === 0) {
@@ -1015,7 +1015,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     const { projectId } = req.body;
 
     const clientResult = await pool.query(
-      "SELECT id, company_email AS email, 'Client' AS role, profile_picture FROM clients WHERE company_email=$1",
+      "SELECT id, company_email AS email, LOWER('Client') AS role, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
     if (clientResult.rows.length === 0) {
@@ -1035,7 +1035,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     res.json({
       client: {
         email: client.email,
-        role: client.role,
+        role: client.role, // always lowercase "client"
         profile_picture: client.profile_picture
       },
       project: project
