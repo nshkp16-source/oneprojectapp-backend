@@ -788,20 +788,7 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // ✅ Consistent userDetails for all roles
-    const userDetails = {
-      id: user.id,
-      email: user.email, // always present
-      company_name: user.company_name || null,
-      representative: user.representative || null,
-      title: user.title || null,
-      telephone: user.telephone || null,
-      profile_picture: user.profile_picture || null,
-      created_at: user.created_at || null,
-      projects: projectAssignments
-    };
-
-    // ✅ Generate JWT token (ES module style)
+    // ✅ Generate JWT token with claims
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: user.id, role, email: user.email },
@@ -809,11 +796,10 @@ app.post("/login", async (req, res) => {
       { expiresIn: "1h" }
     );
 
+    // ✅ Return only token + role (frontend decodes everything else)
     res.json({
       success: true,
       message: "Login successful.",
-      role,
-      userDetails,
       token
     });
   } catch (err) {
