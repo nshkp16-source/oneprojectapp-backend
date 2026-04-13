@@ -951,15 +951,17 @@ setInterval(async () => {
 app.post("/client/profile", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
+    const role = (req.user.role || "Client").toLowerCase(); // normalize role
 
     const clientResult = await pool.query(
-      "SELECT id, company_email AS email, LOWER('Client') AS role, profile_picture FROM clients WHERE company_email=$1",
+      "SELECT id, company_email AS email, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
     const client = clientResult.rows[0];
+    client.role = role;
 
     const projectsResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE client_id=$1",
@@ -1012,16 +1014,18 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
 app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
     const email = req.user.email;
+    const role = (req.user.role || "Client").toLowerCase();
     const { projectId } = req.body;
 
     const clientResult = await pool.query(
-      "SELECT id, company_email AS email, LOWER('Client') AS role, profile_picture FROM clients WHERE company_email=$1",
+      "SELECT id, company_email AS email, profile_picture FROM clients WHERE company_email=$1",
       [email]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
     const client = clientResult.rows[0];
+    client.role = role;
 
     const projectResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
@@ -1035,7 +1039,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     res.json({
       client: {
         email: client.email,
-        role: client.role, // always lowercase "client"
+        role: client.role, // always normalized
         profile_picture: client.profile_picture
       },
       project: project
