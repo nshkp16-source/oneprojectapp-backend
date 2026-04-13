@@ -814,19 +814,21 @@ app.post("/login", async (req, res) => {
       projectAssignments = projectsRes.rows.map(r => r.project_id);
     }
 
-    // ✅ Generate JWT token with claims
+    // ✅ Generate JWT token with consistent claims
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
-      { sub: user.id, role, email: user.email },
+      { sub: user.id, role, email: user.email, projects: projectAssignments },
       SECRET,
       { expiresIn: "1h" }
     );
 
-    // ✅ Return only token + role (frontend decodes everything else)
+    // ✅ Return token + role + projects
     res.json({
       success: true,
       message: "Login successful.",
-      token
+      token,
+      role,
+      projects: projectAssignments
     });
   } catch (err) {
     console.error("Login error:", err.message);
