@@ -215,7 +215,7 @@ app.post("/commit-account", async (req, res) => {
     await addRoleUser(contractorPM, "contractor_project_managers", "contractor_pm_assignments", "contractor_pm_id");
     await addRoleUser(consultantPM, "consultant_project_managers", "consultant_pm_assignments", "consultant_pm_id");
 
-    // ✅ Generate JWT for client (ES module style)
+    // ✅ Generate JWT for client
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: client_id, role: "Client", email: clientResult.rows[0].company_email },
@@ -228,7 +228,7 @@ app.post("/commit-account", async (req, res) => {
       message: "Account, project, and assignments saved successfully.",
       clientId: client_id,
       projectId: project_id,
-      token
+      token   // frontend stores this for dashboard redirect
     });
   } catch (err) {
     console.error("Commit error:", err.message);
@@ -366,7 +366,7 @@ app.post('/verify-password-code', async (req, res) => {
   }
 });
 
-// 7. Set password after verification (adjusted to issue JWT)
+// 7. Set password after verification (issue JWT)
 app.post("/set-password", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -384,6 +384,7 @@ app.post("/set-password", async (req, res) => {
       default: return res.json({ success: false, error: "Invalid role." });
     }
 
+    // Update password and mark verified
     const updateRes = await pool.query(
       `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2 RETURNING id, ${emailColumn} AS email`,
       [hash, email]
@@ -395,7 +396,7 @@ app.post("/set-password", async (req, res) => {
 
     const user = updateRes.rows[0];
 
-    // ✅ Generate JWT token (ES module style)
+    // ✅ Generate JWT token
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: user.id, role, email: user.email },
@@ -408,7 +409,7 @@ app.post("/set-password", async (req, res) => {
       success: true,
       role,
       message: "Password set successfully.",
-      token
+      token   // ✅ frontend stores this
     });
   } catch (err) {
     console.error("Set password error:", err);
@@ -681,7 +682,7 @@ app.post('/reset-set-password', async (req, res) => {
 
     const user = updateRes.rows[0];
 
-    // ✅ Generate JWT token (ES module style)
+    // ✅ Generate JWT token (same claims as login)
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: user.id, role, email: user.email },
@@ -1485,7 +1486,7 @@ app.post('/project-verify', async (req, res) => {
   }
 });
 
-// 4. Save project after verification (adjusted to issue JWT)
+// 4. Save project after verification (issue JWT)
 app.post('/project-save', async (req, res) => {
   const { project, contractor, consultant, clientEmail } = req.body;
 
@@ -1596,7 +1597,7 @@ app.post('/project-save', async (req, res) => {
       );
     }
 
-    // ✅ Generate JWT for client (ES module style)
+    // ✅ Generate JWT for client
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
     const token = jwt.sign(
       { sub: client_id, role: "Client", email: clientResult.rows[0].company_email },
@@ -1608,7 +1609,7 @@ app.post('/project-save', async (req, res) => {
       success: true,
       message: "Project and team saved successfully.",
       projectId: project_id,
-      token   // ✅ include token
+      token   // ✅ frontend stores this for dashboard redirect
     });
   } catch (err) {
     console.error("Project save error:", err.message);
