@@ -861,16 +861,22 @@ app.post("/login", async (req, res) => {
 app.post("/refresh", async (req, res) => {
   try {
     const { refreshToken } = req.body;
-    if (!refreshToken) return res.status(401).json({ success: false, error: "No refresh token provided." });
+    if (!refreshToken) {
+      return res.status(401).json({ success: false, error: "No refresh token provided." });
+    }
 
     const tokenRes = await pool.query(
       "SELECT user_id, role, expires_at FROM refresh_tokens WHERE token=$1",
       [refreshToken]
     );
-    if (tokenRes.rows.length === 0) return res.status(403).json({ success: false, error: "Refresh token not recognized." });
+    if (tokenRes.rows.length === 0) {
+      return res.status(401).json({ success: false, error: "Refresh token not recognized." });
+    }
 
     const { user_id, role, expires_at } = tokenRes.rows[0];
-    if (new Date(expires_at) < new Date()) return res.status(403).json({ success: false, error: "Refresh token expired." });
+    if (new Date(expires_at) < new Date()) {
+      return res.status(403).json({ success: false, error: "Refresh token expired." });
+    }
 
     let emailColumn, table, foreignKey, assignmentTable;
     switch (role) {
@@ -885,7 +891,9 @@ app.post("/refresh", async (req, res) => {
     }
 
     const userRes = await pool.query(`SELECT id, ${emailColumn} FROM ${table} WHERE id=$1`, [user_id]);
-    if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: "User not found." });
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "User not found." });
+    }
     const user = userRes.rows[0];
 
     let projectAssignments = [];
@@ -910,10 +918,45 @@ app.post("/refresh", async (req, res) => {
 
     const newAccessToken = jwt.sign(payload, SECRET, { expiresIn: "15m" });
 
-    res.json({ success: true, accessToken: newAccessToken, role, projects: projectAssignments });
+    // Optionally rotate refresh token
+    // const newRefreshToken = crypto.randomBytes(64).toString("hex");
+    // await pool.query(`UPDATE refresh_tokens SET token=$1, expires_at=NOW() + interval '24 hours' WHERE user_id=$2 AND role=$3`, [newRefreshToken, user_id, role]);
+
+    res.json({
+      success: true,
+      accessToken: newAccessToken,
+      refreshToken, // reuse existing until expiry
+      role,
+      projects: projectAssignments
+    });
   } catch (err) {
     console.error("Refresh error:", err.message);
     res.status(500).json({ success: false, error: "Server error refreshing token." });
+  }
+});
+
+// Global logout route (invalidate refresh token for any role)
+app.post("/logout", async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, error: "No refresh token provided." });
+    }
+
+    // Delete the refresh token from DB
+    const result = await pool.query(
+      "DELETE FROM refresh_tokens WHERE token=$1 RETURNING id",
+      [refreshToken]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: "Refresh token not found." });
+    }
+
+    res.json({ success: true, message: "Logged out successfully. Refresh token revoked." });
+  } catch (err) {
+    console.error("Logout error:", err);
+    res.status(500).json({ success: false, error: "Server error during logout." });
   }
 });
 
@@ -1031,11 +1074,12 @@ setInterval(async () => {
 app.get("/client/profile", authenticateToken, async (req, res) => {
   try {
     const role = req.user.role || "Client";
-    const clientEmail = req.user.userEmail; // JWT carries userEmail, treat as clientEmail
+    const clientEmail = req.user.company_email;
+    const clientId = req.user.user_id;
 
     const clientResult = await pool.query(
-      "SELECT profile_picture FROM clients WHERE company_email=$1",
-      [clientEmail]
+      "SELECT profile_picture FROM clients WHERE id=$1 AND company_email=$2",
+      [clientId, clientEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
@@ -1055,13 +1099,16 @@ app.get("/client/profile", authenticateToken, async (req, res) => {
 // Upload client profile picture
 app.post("/client/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const clientEmail = req.user.userEmail;
+    const clientEmail = req.user.company_email;
+    const clientId = req.user.user_id;
+
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-    await pool.query("UPDATE clients SET profile_picture=$1 WHERE company_email=$2", [fileUrl, clientEmail]);
+    await pool.query("UPDATE clients SET profile_picture=$1 WHERE id=$2 AND company_email=$3", 
+      [fileUrl, clientId, clientEmail]);
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
@@ -1073,8 +1120,12 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
 // Delete client profile picture
 app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const clientEmail = req.user.userEmail;
-    await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [clientEmail]);
+    const clientEmail = req.user.company_email;
+    const clientId = req.user.user_id;
+
+    await pool.query("UPDATE clients SET profile_picture=NULL WHERE id=$1 AND company_email=$2", 
+      [clientId, clientEmail]);
+
     res.json({ success: true });
   } catch (err) {
     console.error("Delete client picture error:", err);
@@ -1082,17 +1133,35 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   }
 });
 
+// Fetch all projects for this client
+app.post("/client/projects", authenticateToken, async (req, res) => {
+  try {
+    const clientId = req.user.user_id;
+
+    const projectsResult = await pool.query(
+      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE client_id=$1",
+      [clientId]
+    );
+
+    res.json({ projects: projectsResult.rows });
+  } catch (err) {
+    console.error("Fetch client projects error:", err);
+    res.status(500).json({ error: "Failed to fetch client projects" });
+  }
+});
+
 // Fetch project details for a specific client project
 app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
     const role = req.user.role || "Client";
-    const clientEmail = req.user.userEmail;
+    const clientId = req.user.user_id;
+    const clientEmail = req.user.company_email;
     const { projectId } = req.body;
 
     // Get client record
     const clientResult = await pool.query(
-      "SELECT id, profile_picture FROM clients WHERE company_email=$1",
-      [clientEmail]
+      "SELECT id, profile_picture FROM clients WHERE id=$1 AND company_email=$2",
+      [clientId, clientEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
@@ -1102,7 +1171,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     // Get project record
     const projectResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
-      [projectId, client.id]
+      [projectId, clientId]
     );
     if (projectResult.rows.length === 0) {
       return res.status(404).json({ error: "Project not found or not owned by client" });
