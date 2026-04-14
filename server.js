@@ -1433,17 +1433,14 @@ app.post("/client/profile-picture", async (req, res) => {
 app.post('/project-send', async (req, res) => {
   const { email } = req.body;
   try {
-    // Delete any existing unverified project tokens for this email
     await pool.query(
       `DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`,
       [email]
     );
 
-    // Generate new code and session
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert new token
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, project_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
@@ -1451,7 +1448,6 @@ app.post('/project-send', async (req, res) => {
       [email, code, sessionId]
     );
 
-    // Send verification email
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -1460,7 +1456,6 @@ app.post('/project-send', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    // Respond with success
     res.json({
       success: true,
       message: "Project verification code sent.",
@@ -1477,17 +1472,14 @@ app.post('/project-send', async (req, res) => {
 app.post('/project-resend', async (req, res) => {
   const { email } = req.body;
   try {
-    // Delete any existing unverified project tokens for this email
     await pool.query(
       `DELETE FROM email_tokens WHERE email=$1 AND project_flow=true`,
       [email]
     );
 
-    // Generate new code and session
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    // Insert new token
     const insertResult = await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, project_flow)
        VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,true)
@@ -1495,7 +1487,6 @@ app.post('/project-resend', async (req, res) => {
       [email, code, sessionId]
     );
 
-    // Send verification email
     await transporter.sendMail({
       from: "skyprincenkp16@gmail.com",
       to: email,
@@ -1504,7 +1495,6 @@ app.post('/project-resend', async (req, res) => {
              <p>This code will expire in 3 minutes.</p>`
     });
 
-    // Respond with success
     res.json({
       success: true,
       message: "New project verification code sent.",
@@ -1547,7 +1537,7 @@ app.post('/project-verify', async (req, res) => {
   }
 });
 
-// 4. Save project after verification (issue JWT)
+// 4. Save project after verification (issue JWT + Refresh Token)
 app.post('/project-save', async (req, res) => {
   const { project, contractor, consultant, clientEmail } = req.body;
 
@@ -1658,19 +1648,30 @@ app.post('/project-save', async (req, res) => {
       );
     }
 
-    // ✅ Generate JWT for client
+    // ✅ Generate JWT + Refresh Token for client
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
-    const token = jwt.sign(
-      { sub: client_id, role: "Client", email: clientResult.rows[0].company_email },
-      SECRET,
-      { expiresIn: "1h" }
+    const payload = {
+      sub: client_id,
+      companyEmail: clientResult.rows[0].company_email,
+      role: "Client",
+      projects: [project_id]
+    };
+
+    const accessToken = jwt.sign(payload, SECRET, { expiresIn: "15m" });
+
+    const refreshToken = crypto.randomBytes(64).toString("hex");
+    await pool.query(
+      `INSERT INTO refresh_tokens (user_id, role, token, expires_at)
+       VALUES ($1, $2, $3, NOW() + interval '24 hours')`,
+      [client_id, "Client", refreshToken]
     );
 
     return res.json({
       success: true,
       message: "Project and team saved successfully.",
       projectId: project_id,
-      token   // ✅ frontend stores this for dashboard redirect
+      accessToken,
+      refreshToken
     });
   } catch (err) {
     console.error("Project save error:", err.message);
