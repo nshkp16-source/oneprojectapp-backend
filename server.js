@@ -684,7 +684,8 @@ app.post('/reset-set-password', async (req, res) => {
 
     // Update password and mark verified
     const updateRes = await pool.query(
-      `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2 RETURNING id, ${emailColumn} AS email`,
+      `UPDATE ${table} SET password_hash=$1, verified=true 
+       WHERE ${emailColumn}=$2 RETURNING id, ${emailColumn} AS email`,
       [hash, email]
     );
 
@@ -694,12 +695,21 @@ app.post('/reset-set-password', async (req, res) => {
 
     const user = updateRes.rows[0];
 
-    // ✅ Generate JWT token (same claims as login)
+    // ✅ Generate JWT + Refresh Token
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
-    const token = jwt.sign(
-      { sub: user.id, role, email: user.email },
-      SECRET,
-      { expiresIn: "1h" }
+
+    const payload =
+      role === "Client"
+        ? { sub: user.id, companyEmail: user.email, role }
+        : { sub: user.id, email: user.email, role };
+
+    const accessToken = jwt.sign(payload, SECRET, { expiresIn: "15m" });
+
+    const refreshToken = crypto.randomBytes(64).toString("hex");
+    await pool.query(
+      `INSERT INTO refresh_tokens (user_id, role, token, expires_at)
+       VALUES ($1, $2, $3, NOW() + interval '24 hours')`,
+      [user.id, role, refreshToken]
     );
 
     console.log(`Password reset for ${role}:`, email);
@@ -708,7 +718,8 @@ app.post('/reset-set-password', async (req, res) => {
       success: true,
       role,
       message: "Password reset successfully.",
-      token   // ✅ include token so frontend can store it
+      accessToken,
+      refreshToken
     });
   } catch (err) {
     console.error("Reset set password error:", err);
