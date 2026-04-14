@@ -17,7 +17,7 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// ✅ Multer setup (only once)
+// ✅ Multer setup
 const upload = multer({
   limits: { fileSize: 500 * 1024 },
   storage: multer.diskStorage({
@@ -28,18 +28,28 @@ const upload = multer({
   })
 });
 
-// ✅ Serve uploads folder publicly (only once)
+// ✅ Serve uploads folder publicly
 app.use("/uploads", express.static("uploads"));
 
 // ✅ JWT middleware (only once)
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
-  if (!token) return res.sendStatus(401);
+  if (!token) return res.status(401).json({ error: "No token provided" });
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user;
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+    if (err) {
+      console.error("JWT verification error:", err);
+      return res.status(403).json({ error: "Invalid or expired token" });
+    }
+
+    // Attach decoded payload to request
+    req.user = {
+      user_id: decoded.user_id,
+      company_email: decoded.company_email,
+      role: decoded.role
+    };
+
     next();
   });
 }
@@ -1073,22 +1083,29 @@ setInterval(async () => {
 // Fetch client profile basics (company_email + profile picture + role)
 app.get("/client/profile", authenticateToken, async (req, res) => {
   try {
-    const role = req.user.role || "Client";
-    const clientEmail = req.user.company_email;   // JWT carries company_email
-    const clientId = req.user.user_id;            // JWT carries clients.id
+    if (req.user.role !== "Client") {
+      return res.status(403).json({ error: "Access denied: Client only route" });
+    }
+
+    const clientEmail = req.user.company_email;   // mapped from JWT companyEmail
+    const clientId = req.user.user_id;            // mapped from JWT sub
 
     const clientResult = await pool.query(
-      "SELECT profile_picture FROM clients WHERE id=$1 AND company_email=$2",
+      "SELECT company_email, representative, title, telephone, profile_picture FROM clients WHERE id=$1 AND company_email=$2",
       [clientId, clientEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
 
+    const client = clientResult.rows[0];
     res.json({
-      email: clientEmail,
-      role,
-      profile_picture: clientResult.rows[0].profile_picture
+      email: client.company_email,
+      role: req.user.role,
+      representative: client.representative,
+      title: client.title,
+      telephone: client.telephone,
+      profile_picture: client.profile_picture
     });
   } catch (err) {
     console.error("Fetch client profile error:", err);
@@ -1099,11 +1116,18 @@ app.get("/client/profile", authenticateToken, async (req, res) => {
 // Upload client profile picture
 app.post("/client/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
+    if (req.user.role !== "Client") {
+      return res.status(403).json({ error: "Access denied: Client only route" });
+    }
+
     const clientEmail = req.user.company_email;
     const clientId = req.user.user_id;
 
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+    if (!req.file.mimetype.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files allowed." });
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
@@ -1122,6 +1146,10 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
 // Delete client profile picture
 app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   try {
+    if (req.user.role !== "Client") {
+      return res.status(403).json({ error: "Access denied: Client only route" });
+    }
+
     const clientEmail = req.user.company_email;
     const clientId = req.user.user_id;
 
@@ -1140,6 +1168,10 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
 // Fetch all projects for this client
 app.post("/client/projects", authenticateToken, async (req, res) => {
   try {
+    if (req.user.role !== "Client") {
+      return res.status(403).json({ error: "Access denied: Client only route" });
+    }
+
     const clientId = req.user.user_id;
 
     const projectsResult = await pool.query(
@@ -1157,7 +1189,10 @@ app.post("/client/projects", authenticateToken, async (req, res) => {
 // Fetch project details for a specific client project
 app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
-    const role = req.user.role || "Client";
+    if (req.user.role !== "Client") {
+      return res.status(403).json({ error: "Access denied: Client only route" });
+    }
+
     const clientId = req.user.user_id;
     const clientEmail = req.user.company_email;
     const { projectId } = req.body;
@@ -1185,7 +1220,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     res.json({
       client: {
         email: clientEmail,
-        role,
+        role: req.user.role,
         profile_picture: client.profile_picture
       },
       project
