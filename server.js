@@ -1009,26 +1009,27 @@ setInterval(async () => {
   }
 }, 3 * 60 * 1000); // 3 minutes
 
-// ============ CLIENT PROFILE ROUTES (JWT-based) =============
+// ============ CLIENT PROFILE ROUTES (JWT-based, redesigned) =============
 
-// Fetch client profile basics (company_email + profile picture)
-app.post("/client/profile", authenticateToken, async (req, res) => {
+// Fetch client profile basics (email + profile picture + role)
+app.get("/client/profile", authenticateToken, async (req, res) => {
   try {
     const role = req.user.role || "Client";
-    const companyEmail = req.user.email; // JWT carries company_email for Clients
+    const clientEmail = req.user.userEmail; // JWT carries userEmail, treat as clientEmail
 
     const clientResult = await pool.query(
-      "SELECT company_email, profile_picture FROM clients WHERE company_email=$1",
-      [companyEmail]
+      "SELECT profile_picture FROM clients WHERE company_email=$1",
+      [clientEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
 
-    const client = clientResult.rows[0];
-    client.role = role;
-
-    res.json(client);
+    res.json({
+      email: clientEmail,
+      role,
+      profile_picture: clientResult.rows[0].profile_picture
+    });
   } catch (err) {
     console.error("Fetch client profile error:", err);
     res.status(500).json({ error: "Failed to fetch client profile" });
@@ -1038,13 +1039,13 @@ app.post("/client/profile", authenticateToken, async (req, res) => {
 // Upload client profile picture
 app.post("/client/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const companyEmail = req.user.email; // JWT carries company_email
+    const clientEmail = req.user.userEmail;
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-    await pool.query("UPDATE clients SET profile_picture=$1 WHERE company_email=$2", [fileUrl, companyEmail]);
+    await pool.query("UPDATE clients SET profile_picture=$1 WHERE company_email=$2", [fileUrl, clientEmail]);
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
@@ -1056,8 +1057,8 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
 // Delete client profile picture
 app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const companyEmail = req.user.email; // JWT carries company_email
-    await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [companyEmail]);
+    const clientEmail = req.user.userEmail;
+    await pool.query("UPDATE clients SET profile_picture=NULL WHERE company_email=$1", [clientEmail]);
     res.json({ success: true });
   } catch (err) {
     console.error("Delete client picture error:", err);
@@ -1069,19 +1070,20 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
 app.post("/client/project-details", authenticateToken, async (req, res) => {
   try {
     const role = req.user.role || "Client";
-    const companyEmail = req.user.email; // JWT carries company_email
+    const clientEmail = req.user.userEmail;
     const { projectId } = req.body;
 
+    // Get client record
     const clientResult = await pool.query(
-      "SELECT id, company_email, profile_picture FROM clients WHERE company_email=$1",
-      [companyEmail]
+      "SELECT id, profile_picture FROM clients WHERE company_email=$1",
+      [clientEmail]
     );
     if (clientResult.rows.length === 0) {
       return res.status(404).json({ error: "Client not found" });
     }
     const client = clientResult.rows[0];
-    client.role = role;
 
+    // Get project record
     const projectResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
       [projectId, client.id]
@@ -1093,11 +1095,11 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
 
     res.json({
       client: {
-        company_email: client.company_email,
-        role: client.role,
+        email: clientEmail,
+        role,
         profile_picture: client.profile_picture
       },
-      project: project
+      project
     });
   } catch (err) {
     console.error("Fetch project details error:", err);
