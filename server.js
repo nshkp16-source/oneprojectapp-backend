@@ -1068,14 +1068,14 @@ setInterval(async () => {
   }
 }, 3 * 60 * 1000); // 3 minutes
 
-// ============ CLIENT PROFILE ROUTES (JWT-based, redesigned) =============
+// ============ CLIENT PROFILE ROUTES (JWT-based, aligned with clients table) =============
 
-// Fetch client profile basics (email + profile picture + role)
+// Fetch client profile basics (company_email + profile picture + role)
 app.get("/client/profile", authenticateToken, async (req, res) => {
   try {
     const role = req.user.role || "Client";
-    const clientEmail = req.user.company_email;
-    const clientId = req.user.user_id;
+    const clientEmail = req.user.company_email;   // JWT carries company_email
+    const clientId = req.user.user_id;            // JWT carries clients.id
 
     const clientResult = await pool.query(
       "SELECT profile_picture FROM clients WHERE id=$1 AND company_email=$2",
@@ -1107,8 +1107,10 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
     }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-    await pool.query("UPDATE clients SET profile_picture=$1 WHERE id=$2 AND company_email=$3", 
-      [fileUrl, clientId, clientEmail]);
+    await pool.query(
+      "UPDATE clients SET profile_picture=$1 WHERE id=$2 AND company_email=$3",
+      [fileUrl, clientId, clientEmail]
+    );
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
@@ -1123,8 +1125,10 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
     const clientEmail = req.user.company_email;
     const clientId = req.user.user_id;
 
-    await pool.query("UPDATE clients SET profile_picture=NULL WHERE id=$1 AND company_email=$2", 
-      [clientId, clientEmail]);
+    await pool.query(
+      "UPDATE clients SET profile_picture=NULL WHERE id=$1 AND company_email=$2",
+      [clientId, clientEmail]
+    );
 
     res.json({ success: true });
   } catch (err) {
@@ -1158,7 +1162,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     const clientEmail = req.user.company_email;
     const { projectId } = req.body;
 
-    // Get client record
+    // Verify client exists
     const clientResult = await pool.query(
       "SELECT id, profile_picture FROM clients WHERE id=$1 AND company_email=$2",
       [clientId, clientEmail]
@@ -1168,7 +1172,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     }
     const client = clientResult.rows[0];
 
-    // Get project record
+    // Verify project belongs to client
     const projectResult = await pool.query(
       "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1 AND client_id=$2",
       [projectId, clientId]
