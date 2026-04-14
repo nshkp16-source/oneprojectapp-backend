@@ -31,7 +31,7 @@ const upload = multer({
 // ✅ Serve uploads folder publicly
 app.use("/uploads", express.static("uploads"));
 
-// ✅ JWT middleware (only once)
+// ✅ JWT middleware (corrected)
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
