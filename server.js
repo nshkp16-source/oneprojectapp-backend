@@ -293,10 +293,9 @@ app.post("/firstlogin-send", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    const insertResult = await pool.query(
+    await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
-       RETURNING *`,
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)`,
       [email, code, sessionId]
     );
 
@@ -328,10 +327,9 @@ app.post("/firstlogin-resend", async (req, res) => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const sessionId = uuidv4();
 
-    const insertResult = await pool.query(
+    await pool.query(
       `INSERT INTO email_tokens (email, token, expires_at, session_id, verified, reset_flow)
-       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)
-       RETURNING *`,
+       VALUES ($1,$2,NOW() + interval '3 minutes',$3,false,false)`,
       [email, code, sessionId]
     );
 
@@ -378,7 +376,7 @@ app.post('/verify-password-code', async (req, res) => {
   }
 });
 
-// 7. Set password after verification (issue JWT)
+// 7. Set password after verification (issue JWT + refresh token)
 app.post("/set-password", async (req, res) => {
   const { email, password, role } = req.body;
   try {
@@ -396,7 +394,6 @@ app.post("/set-password", async (req, res) => {
       default: return res.json({ success: false, error: "Invalid role." });
     }
 
-    // Update password and mark verified
     const updateRes = await pool.query(
       `UPDATE ${table} SET password_hash=$1, verified=true WHERE ${emailColumn}=$2 RETURNING id, ${emailColumn} AS email`,
       [hash, email]
@@ -408,12 +405,19 @@ app.post("/set-password", async (req, res) => {
 
     const user = updateRes.rows[0];
 
-    // ✅ Generate JWT token
+    // ✅ Generate JWT + refresh token
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
-    const token = jwt.sign(
-      { sub: user.id, role, email: user.email },
-      SECRET,
-      { expiresIn: "1h" }
+    const payload = role === "Client"
+      ? { sub: user.id, role, companyEmail: user.email }
+      : { sub: user.id, role, email: user.email };
+
+    const accessToken = jwt.sign(payload, SECRET, { expiresIn: "15m" });
+    const refreshToken = crypto.randomBytes(64).toString("hex");
+
+    await pool.query(
+      `INSERT INTO refresh_tokens (user_id, role, token, expires_at)
+       VALUES ($1, $2, $3, NOW() + interval '24 hours')`,
+      [user.id, role, refreshToken]
     );
 
     console.log(`Password set for ${role}:`, email);
@@ -421,7 +425,8 @@ app.post("/set-password", async (req, res) => {
       success: true,
       role,
       message: "Password set successfully.",
-      token   // ✅ frontend stores this
+      accessToken,
+      refreshToken
     });
   } catch (err) {
     console.error("Set password error:", err);
