@@ -771,7 +771,6 @@ app.post("/login", async (req, res) => {
 
     const loginEmail = role === "Client" ? company_email : email;
 
-    // ✅ Only select the correct column for that role
     const result = await pool.query(
       `SELECT ${selectFields} 
        FROM ${table} 
@@ -802,13 +801,13 @@ app.post("/login", async (req, res) => {
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
 
-    const userEmail = role === "Client" ? user.company_email : user.email;
+    // ✅ Payload distinction
+    const payload =
+      role === "Client"
+        ? { sub: user.id, companyEmail: user.company_email, role, projects: projectAssignments }
+        : { sub: user.id, email: user.email, role, projects: projectAssignments };
 
-    const accessToken = jwt.sign(
-      { sub: user.id, email: userEmail, role, projects: projectAssignments },
-      SECRET,
-      { expiresIn: "15m" }
-    );
+    const accessToken = jwt.sign(payload, SECRET, { expiresIn: "15m" });
 
     const refreshToken = crypto.randomBytes(64).toString("hex");
     await pool.query(
@@ -846,19 +845,18 @@ app.post("/refresh", async (req, res) => {
     const { user_id, role, expires_at } = tokenRes.rows[0];
     if (new Date(expires_at) < new Date()) return res.status(403).json({ success: false, error: "Refresh token expired." });
 
-    let emailColumn, table;
+    let emailColumn, table, foreignKey, assignmentTable;
     switch (role) {
-      case "Client": table = "clients"; emailColumn = "company_email"; break;
-      case "Contractor": table = "contractors"; emailColumn = "email"; break;
-      case "Consultant": table = "consultants"; emailColumn = "email"; break;
-      case "Team Member": table = "team_members"; emailColumn = "email"; break;
-      case "Client Project Manager": table = "client_project_managers"; emailColumn = "email"; break;
-      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; break;
-      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; break;
+      case "Client": table = "clients"; emailColumn = "company_email"; assignmentTable = "projects"; foreignKey = "client_id"; break;
+      case "Contractor": table = "contractors"; emailColumn = "email"; assignmentTable = "contractor_assignments"; foreignKey = "contractor_id"; break;
+      case "Consultant": table = "consultants"; emailColumn = "email"; assignmentTable = "consultant_assignments"; foreignKey = "consultant_id"; break;
+      case "Team Member": table = "team_members"; emailColumn = "email"; assignmentTable = "team_member_assignments"; foreignKey = "team_member_id"; break;
+      case "Client Project Manager": table = "client_project_managers"; emailColumn = "email"; assignmentTable = "client_pm_assignments"; foreignKey = "client_pm_id"; break;
+      case "Contractor Project Manager": table = "contractor_project_managers"; emailColumn = "email"; assignmentTable = "contractor_pm_assignments"; foreignKey = "contractor_pm_id"; break;
+      case "Consultant Project Manager": table = "consultant_project_managers"; emailColumn = "email"; assignmentTable = "consultant_pm_assignments"; foreignKey = "consultant_pm_id"; break;
       default: return res.status(400).json({ success: false, error: "Invalid role." });
     }
 
-    // ✅ Only select the correct column for that role
     const userRes = await pool.query(`SELECT id, ${emailColumn} FROM ${table} WHERE id=$1`, [user_id]);
     if (userRes.rows.length === 0) return res.status(404).json({ success: false, error: "User not found." });
     const user = userRes.rows[0];
@@ -868,17 +866,8 @@ app.post("/refresh", async (req, res) => {
       const projectsRes = await pool.query("SELECT id FROM projects WHERE client_id=$1", [user_id]);
       projectAssignments = projectsRes.rows.map(r => r.id);
     } else {
-      let assignmentTable;
-      switch (role) {
-        case "Contractor": assignmentTable = "contractor_assignments"; break;
-        case "Consultant": assignmentTable = "consultant_assignments"; break;
-        case "Team Member": assignmentTable = "team_member_assignments"; break;
-        case "Client Project Manager": assignmentTable = "client_pm_assignments"; break;
-        case "Contractor Project Manager": assignmentTable = "contractor_pm_assignments"; break;
-        case "Consultant Project Manager": assignmentTable = "consultant_pm_assignments"; break;
-      }
       const projectsRes = await pool.query(
-        `SELECT project_id FROM ${assignmentTable} WHERE ${role.toLowerCase().replace(/ /g, "_")}_id=$1`,
+        `SELECT project_id FROM ${assignmentTable} WHERE ${foreignKey}=$1`,
         [user_id]
       );
       projectAssignments = projectsRes.rows.map(r => r.project_id);
@@ -886,13 +875,13 @@ app.post("/refresh", async (req, res) => {
 
     const SECRET = process.env.JWT_SECRET || "supersecretkey";
 
-    const userEmail = role === "Client" ? user.company_email : user.email;
+    // ✅ Payload distinction
+    const payload =
+      role === "Client"
+        ? { sub: user_id, companyEmail: user.company_email, role, projects: projectAssignments }
+        : { sub: user_id, email: user.email, role, projects: projectAssignments };
 
-    const newAccessToken = jwt.sign(
-      { sub: user_id, email: userEmail, role, projects: projectAssignments },
-      SECRET,
-      { expiresIn: "15m" }
-    );
+    const newAccessToken = jwt.sign(payload, SECRET, { expiresIn: "15m" });
 
     res.json({ success: true, accessToken: newAccessToken, role, projects: projectAssignments });
   } catch (err) {
