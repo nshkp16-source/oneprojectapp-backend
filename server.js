@@ -46,8 +46,9 @@ function authenticateToken(req, res, next) {
     // Attach decoded payload to request
     req.user = {
       user_id: decoded.user_id,
-      company_email: decoded.company_email,
-      role: decoded.role
+      role: decoded.role,
+      // Use company_email for Clients, email for others
+      email: decoded.company_email || decoded.email
     };
 
     next();
@@ -1087,8 +1088,8 @@ app.get("/client/profile", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Access denied: Client only route" });
     }
 
-    const clientEmail = req.user.company_email;   // mapped from JWT companyEmail
-    const clientId = req.user.user_id;            // mapped from JWT sub
+    const clientEmail = req.user.email;   // unified field from JWT
+    const clientId = req.user.user_id;    // mapped from JWT sub
 
     const clientResult = await pool.query(
       "SELECT company_email, representative, title, telephone, profile_picture FROM clients WHERE id=$1 AND company_email=$2",
@@ -1120,7 +1121,7 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
       return res.status(403).json({ error: "Access denied: Client only route" });
     }
 
-    const clientEmail = req.user.company_email;
+    const clientEmail = req.user.email;
     const clientId = req.user.user_id;
 
     if (!req.file) {
@@ -1150,7 +1151,7 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Access denied: Client only route" });
     }
 
-    const clientEmail = req.user.company_email;
+    const clientEmail = req.user.email;
     const clientId = req.user.user_id;
 
     await pool.query(
@@ -1194,7 +1195,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
     }
 
     const clientId = req.user.user_id;
-    const clientEmail = req.user.company_email;
+    const clientEmail = req.user.email;
     const { projectId } = req.body;
 
     // Verify client exists
