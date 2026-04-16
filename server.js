@@ -37,7 +37,7 @@ function authenticateToken(req, res, next) {
   const token = authHeader && authHeader.split(" ")[1];
   if (!token) return res.status(401).json({ error: "No token provided" });
 
-  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {   // <-- changed here
     if (err) {
       console.error("JWT verification error:", err);
       return res.status(403).json({ error: "Invalid or expired token" });
@@ -45,10 +45,10 @@ function authenticateToken(req, res, next) {
 
     // Attach decoded payload to request
     req.user = {
-      user_id: decoded.user_id,
+      user_id: decoded.sub,   // JWT "sub" is the user id
       role: decoded.role,
       // Use company_email for Clients, email for others
-      email: decoded.company_email || decoded.email
+      email: decoded.companyEmail || decoded.email
     };
 
     next();
