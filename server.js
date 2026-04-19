@@ -1882,87 +1882,97 @@ app.post("/profile/project-details", async (req, res) => {
   }
 });
 
-// =========================
-// Global Assign Team Route (all roles)
-// =========================
-async function openAssignTeam() {
+// ============ ASSIGN TEAM ROUTE (JWT-based) ============
+app.post("/assign-team", async (req, res) => {
   try {
-    // 1. Get JWT
-    const token = localStorage.getItem("authToken");
-    if (!token) {
-      alert("No token found. Please log in again.");
-      window.location.href = "home.html";
-      return;
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ success: false, error: "Authorization header missing" });
     }
 
-    // 2. Decode JWT
-    const decoded = parseJwt(token);
-    const userRole = decoded?.role;
-    const userId = decoded?.sub;
-
-    if (!userId || !userRole) {
-      alert("Invalid token payload. Please log in again.");
-      return;
+    const token = authHeader.split(" ")[1];
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET || "supersecretkey");
+    } catch (err) {
+      return res.status(401).json({ success: false, error: "Invalid or expired token" });
     }
 
-    // 3. Get active project ID from selector
-    const activeProjectId = sessionStorage.getItem("activeProjectId");
-    if (!activeProjectId) {
-      alert("No active project selected. Please choose a project first.");
-      return;
+    const { sub: userId, role } = decoded;
+    const { projectId, assignments } = req.body;
+
+    if (!projectId || !Array.isArray(assignments)) {
+      return res.status(400).json({ success: false, error: "Invalid payload" });
     }
 
-    // 4. Choose backend route based on role
-    let endpoint = "";
-    switch (userRole) {
-      case "Client":
-        endpoint = "/client/project-details";
-        break;
-      case "Contractor":
-        endpoint = "/contractor/project-details";
-        break;
-      case "Consultant":
-        endpoint = "/consultant/project-details";
-        break;
-      case "ContractorPM":
-        endpoint = "/contractor-pm/project-details";
-        break;
-      case "ConsultantPM":
-        endpoint = "/consultant-pm/project-details";
-        break;
-      case "TeamMember":
-        endpoint = "/team-member/project-details";
-        break;
-      default:
-        alert("Unsupported role for assignment.");
-        return;
+    // Verify project ownership/assignment
+    let projectCheck;
+    if (role.startsWith("Client")) {
+      projectCheck = await pool.query("SELECT 1 FROM projects WHERE id=$1 AND client_id=$2", [projectId, userId]);
+    } else if (role.startsWith("Contractor")) {
+      projectCheck = await pool.query("SELECT 1 FROM contractor_assignments WHERE project_id=$1 AND contractor_id=$2", [projectId, userId]);
+    } else if (role.startsWith("Consultant")) {
+      projectCheck = await pool.query("SELECT 1 FROM consultant_assignments WHERE project_id=$1 AND consultant_id=$2", [projectId, userId]);
+    } else {
+      return res.status(400).json({ success: false, error: "Unsupported role" });
     }
 
-    // 5. Fetch project details
-    const projectData = await apiRequest(`https://oneprojectapp-backend.onrender.com${endpoint}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId: activeProjectId })
-    });
-
-    if (!projectData || !projectData.project) {
-      alert("Failed to load project details.");
-      return;
+    if (projectCheck.rows.length === 0) {
+      return res.status(403).json({ success: false, error: "Project not linked to this user" });
     }
 
-    // 6. Save context for assign-team.html
-    sessionStorage.setItem("projectDetails", JSON.stringify(projectData.project));
-    sessionStorage.setItem("projectRole", userRole);
-    sessionStorage.setItem("projectId", activeProjectId);
-
-    // 7. Redirect
-    window.location.href = "assign-team.html";
-
+    const client = await pool.connect();
+    try {
+      for (const a of assignments) {
+        if (a.role === "Project Manager") {
+          if (role.startsWith("Client")) {
+            await client.query(
+              `INSERT INTO client_pm_assignments 
+               (project_id, client_pm_id, company_name, title, position, telephone, task, representative) 
+               VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+               ON CONFLICT DO NOTHING`,
+              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+            );
+          } else if (role.startsWith("Contractor")) {
+            await client.query(
+              `INSERT INTO contractor_pm_assignments 
+               (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative) 
+               VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+               ON CONFLICT DO NOTHING`,
+              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+            );
+          } else if (role.startsWith("Consultant")) {
+            await client.query(
+              `INSERT INTO consultant_pm_assignments 
+               (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative) 
+               VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+               ON CONFLICT DO NOTHING`,
+              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+            );
+          }
+        } else {
+          // Team Member assignment
+          await client.query(
+            `INSERT INTO team_member_assignments 
+             (project_id, team_member_id, company_name, title, position, telephone, task, representative) 
+             VALUES ($1, (SELECT id FROM team_members WHERE email=$2), $3,$4,$5,$6,$7,$8)
+             ON CONFLICT DO NOTHING`,
+            [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+          );
+        }
+      }
+      res.json({ success: true, message: "Assignments saved" });
+    } catch (err) {
+      console.error("Error saving assignments:", err);
+      res.status(500).json({ success: false, error: "Server error" });
+    } finally {
+      client.release();
+    }
   } catch (err) {
-    console.error("Error in openAssignTeam:", err);
-    alert("Something went wrong while switching project.");
+    console.error("Assign team error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
   }
-}
+});
 
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
