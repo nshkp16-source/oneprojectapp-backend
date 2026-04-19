@@ -1234,30 +1234,30 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
 
 // ============ CONTRACTOR PROFILE ROUTES (JWT-based, aligned with contractors table) =============
 
-// Fetch contractor profile basics (email + profile picture + role)
+// Fetch contractor profile basics
 app.get("/contractor/profile", authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== "Contractor") {
       return res.status(403).json({ error: "Access denied: Contractor only route" });
     }
 
-    const contractorEmail = req.user.email;
     const contractorId = req.user.user_id;
+    const contractorEmail = req.user.email;
 
-    const contractorResult = await pool.query(
-      "SELECT email, profile_picture, created_at FROM contractors WHERE id=$1 AND email=$2",
+    const result = await pool.query(
+      "SELECT email, profile_picture FROM contractors WHERE id=$1 AND email=$2",
       [contractorId, contractorEmail]
     );
-    if (contractorResult.rows.length === 0) {
+
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: "Contractor not found" });
     }
 
-    const contractor = contractorResult.rows[0];
+    const contractor = result.rows[0];
     res.json({
       email: contractor.email,
       role: req.user.role,
-      profile_picture: contractor.profile_picture,
-      created_at: contractor.created_at
+      profile_picture: contractor.profile_picture
     });
   } catch (err) {
     console.error("Fetch contractor profile error:", err);
@@ -1272,8 +1272,8 @@ app.post("/contractor/upload-picture", authenticateToken, upload.single("profile
       return res.status(403).json({ error: "Access denied: Contractor only route" });
     }
 
-    const contractorEmail = req.user.email;
     const contractorId = req.user.user_id;
+    const contractorEmail = req.user.email;
 
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
@@ -1302,8 +1302,8 @@ app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Access denied: Contractor only route" });
     }
 
-    const contractorEmail = req.user.email;
     const contractorId = req.user.user_id;
+    const contractorEmail = req.user.email;
 
     await pool.query(
       "UPDATE contractors SET profile_picture=NULL WHERE id=$1 AND email=$2",
@@ -1326,7 +1326,7 @@ app.post("/contractor/projects", authenticateToken, async (req, res) => {
 
     const contractorId = req.user.user_id;
 
-    const projectsResult = await pool.query(
+    const result = await pool.query(
       `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
        FROM contractor_assignments ca
        JOIN projects p ON ca.project_id = p.id
@@ -1334,7 +1334,7 @@ app.post("/contractor/projects", authenticateToken, async (req, res) => {
       [contractorId]
     );
 
-    res.json({ projects: projectsResult.rows });
+    res.json({ projects: result.rows });
   } catch (err) {
     console.error("Fetch contractor projects error:", err);
     res.status(500).json({ error: "Failed to fetch contractor projects" });
@@ -1349,40 +1349,21 @@ app.post("/contractor/project-details", authenticateToken, async (req, res) => {
     }
 
     const contractorId = req.user.user_id;
-    const contractorEmail = req.user.email;
     const { projectId } = req.body;
 
-    // Verify contractor exists
-    const contractorResult = await pool.query(
-      "SELECT id, profile_picture FROM contractors WHERE id=$1 AND email=$2",
-      [contractorId, contractorEmail]
-    );
-    if (contractorResult.rows.length === 0) {
-      return res.status(404).json({ error: "Contractor not found" });
-    }
-    const contractor = contractorResult.rows[0];
-
-    // Verify project is assigned to contractor
-    const projectResult = await pool.query(
+    const result = await pool.query(
       `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
        FROM contractor_assignments ca
        JOIN projects p ON ca.project_id = p.id
        WHERE ca.contractor_id=$1 AND p.id=$2`,
       [contractorId, projectId]
     );
-    if (projectResult.rows.length === 0) {
+
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: "Project not found or not assigned to contractor" });
     }
-    const project = projectResult.rows[0];
 
-    res.json({
-      contractor: {
-        email: contractorEmail,
-        role: req.user.role,
-        profile_picture: contractor.profile_picture
-      },
-      project
-    });
+    res.json({ project: result.rows[0] });
   } catch (err) {
     console.error("Fetch contractor project details error:", err);
     res.status(500).json({ error: "Failed to fetch project details" });
