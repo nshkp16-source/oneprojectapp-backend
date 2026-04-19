@@ -1882,60 +1882,6 @@ app.post("/profile/project-details", async (req, res) => {
   }
 });
 
-// =========================
-// Global Assign Team Route
-// =========================
-async function openAssignTeam() {
-  try {
-    // 1. Get JWT
-    const token = localStorage.getItem("authToken");
-    if (!token) {
-      alert("No token found. Please log in again.");
-      window.location.href = "home.html";
-      return;
-    }
-
-    // 2. Decode JWT
-    const decoded = parseJwt(token);
-    const userRole = decoded?.role;
-    const clientId = decoded?.sub;
-    const activeProjectId = decoded?.projectId;
-
-    if (!clientId || !userRole) {
-      alert("Invalid token payload. Please log in again.");
-      return;
-    }
-    if (!activeProjectId) {
-      alert("No active project found. Please select a project first.");
-      return;
-    }
-
-    // 3. Fetch project details
-    const projectData = await apiRequest("https://oneprojectapp-backend.onrender.com/client/project-details", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId: activeProjectId })
-    });
-
-    if (!projectData || !projectData.project) {
-      alert("Failed to load project details.");
-      return;
-    }
-
-    // 4. Save context for assign-team.html
-    sessionStorage.setItem("projectDetails", JSON.stringify(projectData.project));
-    sessionStorage.setItem("projectRole", userRole);
-    sessionStorage.setItem("projectId", activeProjectId);
-
-    // 5. Redirect
-    window.location.href = "assign-team.html";
-
-  } catch (err) {
-    console.error("Error in openAssignTeam:", err);
-    alert("Something went wrong while switching project.");
-  }
-}
-
 // ============ ASSIGN TEAM ROUTE (JWT-based) ============
 app.post("/assign-team", async (req, res) => {
   try {
