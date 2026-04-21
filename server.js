@@ -1372,34 +1372,31 @@ app.post("/contractor/project-details", authenticateToken, async (req, res) => {
 
 // ============ CONSULTANT PROFILE ROUTES (JWT-based, Schema-Aligned) =============
 
-// Fetch consultant profile + projects (via consultant_assignments)
-app.post("/consultant/profile", authenticateToken, async (req, res) => {
+// Fetch consultant profile basics
+app.get("/consultant/profile", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email;
+    if (req.user.role !== "Consultant") {
+      return res.status(403).json({ error: "Access denied: Consultant only route" });
+    }
 
-    const consultantResult = await pool.query(
-      "SELECT id, email, 'Consultant' AS role, profile_picture, verified, created_at FROM consultants WHERE email=$1",
-      [email]
+    const consultantId = req.user.user_id;
+    const consultantEmail = req.user.email;
+
+    const result = await pool.query(
+      "SELECT email, profile_picture FROM consultants WHERE id=$1 AND email=$2",
+      [consultantId, consultantEmail]
     );
-    if (consultantResult.rows.length === 0) {
+
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: "Consultant not found" });
     }
-    const consultant = consultantResult.rows[0];
 
-    const projectsResult = await pool.query(
-      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
-       FROM consultant_assignments ca
-       JOIN projects p ON ca.project_id = p.id
-       WHERE ca.consultant_id=$1`,
-      [consultant.id]
-    );
-    consultant.projects = projectsResult.rows;
-
-    if (consultant.projects.length === 1) {
-      consultant.defaultProject = consultant.projects[0];
-    }
-
-    res.json(consultant);
+    const consultant = result.rows[0];
+    res.json({
+      email: consultant.email,
+      role: req.user.role,
+      profile_picture: consultant.profile_picture
+    });
   } catch (err) {
     console.error("Fetch consultant profile error:", err);
     res.status(500).json({ error: "Failed to fetch consultant profile" });
@@ -1409,13 +1406,25 @@ app.post("/consultant/profile", authenticateToken, async (req, res) => {
 // Upload consultant profile picture
 app.post("/consultant/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    const email = req.user.email;
+    if (req.user.role !== "Consultant") {
+      return res.status(403).json({ error: "Access denied: Consultant only route" });
+    }
+
+    const consultantId = req.user.user_id;
+    const consultantEmail = req.user.email;
+
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
     }
+    if (!req.file.mimetype.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files allowed." });
+    }
 
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-    await pool.query("UPDATE consultants SET profile_picture=$1 WHERE email=$2", [fileUrl, email]);
+    await pool.query(
+      "UPDATE consultants SET profile_picture=$1 WHERE id=$2 AND email=$3",
+      [fileUrl, consultantId, consultantEmail]
+    );
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
@@ -1427,8 +1436,18 @@ app.post("/consultant/upload-picture", authenticateToken, upload.single("profile
 // Delete consultant profile picture
 app.post("/consultant/delete-picture", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email;
-    await pool.query("UPDATE consultants SET profile_picture=NULL WHERE email=$1", [email]);
+    if (req.user.role !== "Consultant") {
+      return res.status(403).json({ error: "Access denied: Consultant only route" });
+    }
+
+    const consultantId = req.user.user_id;
+    const consultantEmail = req.user.email;
+
+    await pool.query(
+      "UPDATE consultants SET profile_picture=NULL WHERE id=$1 AND email=$2",
+      [consultantId, consultantEmail]
+    );
+
     res.json({ success: true });
   } catch (err) {
     console.error("Delete consultant picture error:", err);
@@ -1436,50 +1455,470 @@ app.post("/consultant/delete-picture", authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch project details for a specific consultant project
+// Fetch all projects assigned to this consultant
+app.post("/consultant/projects", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Consultant") {
+      return res.status(403).json({ error: "Access denied: Consultant only route" });
+    }
+
+    const consultantId = req.user.user_id;
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM consultant_assignments ca
+       JOIN projects p ON ca.project_id = p.id
+       WHERE ca.consultant_id=$1`,
+      [consultantId]
+    );
+
+    res.json({ projects: result.rows });
+  } catch (err) {
+    console.error("Fetch consultant projects error:", err);
+    res.status(500).json({ error: "Failed to fetch consultant projects" });
+  }
+});
+
+// Fetch project details for a specific consultant assignment
 app.post("/consultant/project-details", authenticateToken, async (req, res) => {
   try {
-    const email = req.user.email;
+    if (req.user.role !== "Consultant") {
+      return res.status(403).json({ error: "Access denied: Consultant only route" });
+    }
+
+    const consultantId = req.user.user_id;
     const { projectId } = req.body;
 
-    const consultantResult = await pool.query(
-      "SELECT id, email, 'Consultant' AS role, profile_picture FROM consultants WHERE email=$1",
-      [email]
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM consultant_assignments ca
+       JOIN projects p ON ca.project_id = p.id
+       WHERE ca.consultant_id=$1 AND p.id=$2`,
+      [consultantId, projectId]
     );
-    if (consultantResult.rows.length === 0) {
-      return res.status(404).json({ error: "Consultant not found" });
-    }
-    const consultant = consultantResult.rows[0];
 
-    // Ensure consultant is assigned to the requested project
-    const assignmentCheck = await pool.query(
-      "SELECT 1 FROM consultant_assignments WHERE consultant_id=$1 AND project_id=$2",
-      [consultant.id, projectId]
-    );
-    if (assignmentCheck.rows.length === 0) {
-      return res.status(404).json({ error: "Project not found or not linked to consultant" });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found or not assigned to consultant" });
     }
 
-    const projectResult = await pool.query(
-      "SELECT id, name, location, contract_reference, created_at FROM projects WHERE id=$1",
-      [projectId]
-    );
-    if (projectResult.rows.length === 0) {
-      return res.status(404).json({ error: "Project not found" });
-    }
-    const project = projectResult.rows[0];
-
-    res.json({
-      consultant: {
-        email: consultant.email,
-        role: consultant.role,
-        profile_picture: consultant.profile_picture
-      },
-      project: project
-    });
+    res.json({ project: result.rows[0] });
   } catch (err) {
     console.error("Fetch consultant project details error:", err);
-    res.status(500).json({ error: "Failed to fetch consultant project details" });
+    res.status(500).json({ error: "Failed to fetch project details" });
+  }
+});
+
+// ============ CONSULTANT PROJECT MANAGER PROFILE ROUTES (JWT-based, Schema-Aligned) =============
+
+// Fetch consultant PM profile basics
+app.get("/consultant-project-manager/profile", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Consultant PM") {
+      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    }
+
+    const consultantPMId = req.user.user_id;
+    const consultantPMEmail = req.user.email;
+
+    const result = await pool.query(
+      "SELECT email, profile_picture FROM consultant_project_managers WHERE id=$1 AND email=$2",
+      [consultantPMId, consultantPMEmail]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Consultant PM not found" });
+    }
+
+    const consultantPM = result.rows[0];
+    res.json({
+      email: consultantPM.email,
+      role: req.user.role,
+      profile_picture: consultantPM.profile_picture
+    });
+  } catch (err) {
+    console.error("Fetch consultant PM profile error:", err);
+    res.status(500).json({ error: "Failed to fetch consultant PM profile" });
+  }
+});
+
+// Upload consultant PM profile picture
+app.post("/consultant-project-manager/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
+  try {
+    if (req.user.role !== "Consultant PM") {
+      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    }
+
+    const consultantPMId = req.user.user_id;
+    const consultantPMEmail = req.user.email;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+    if (!req.file.mimetype.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files allowed." });
+    }
+
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    await pool.query(
+      "UPDATE consultant_project_managers SET profile_picture=$1 WHERE id=$2 AND email=$3",
+      [fileUrl, consultantPMId, consultantPMEmail]
+    );
+
+    res.json({ success: true, url: fileUrl });
+  } catch (err) {
+    console.error("Upload consultant PM picture error:", err);
+    res.status(500).json({ error: "Failed to upload consultant PM picture" });
+  }
+});
+
+// Delete consultant PM profile picture
+app.post("/consultant-project-manager/delete-picture", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Consultant PM") {
+      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    }
+
+    const consultantPMId = req.user.user_id;
+    const consultantPMEmail = req.user.email;
+
+    await pool.query(
+      "UPDATE consultant_project_managers SET profile_picture=NULL WHERE id=$1 AND email=$2",
+      [consultantPMId, consultantPMEmail]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete consultant PM picture error:", err);
+    res.status(500).json({ error: "Failed to delete consultant PM picture" });
+  }
+});
+
+// Fetch all projects assigned to this consultant PM
+app.post("/consultant-project-manager/projects", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Consultant PM") {
+      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    }
+
+    const consultantPMId = req.user.user_id;
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM consultant_pm_assignments cpa
+       JOIN projects p ON cpa.project_id = p.id
+       WHERE cpa.consultant_pm_id=$1`,
+      [consultantPMId]
+    );
+
+    res.json({ projects: result.rows });
+  } catch (err) {
+    console.error("Fetch consultant PM projects error:", err);
+    res.status(500).json({ error: "Failed to fetch consultant PM projects" });
+  }
+});
+
+// Fetch project details for a specific consultant PM assignment
+app.post("/consultant-project-manager/project-details", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Consultant PM") {
+      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    }
+
+    const consultantPMId = req.user.user_id;
+    const { projectId } = req.body;
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM consultant_pm_assignments cpa
+       JOIN projects p ON cpa.project_id = p.id
+       WHERE cpa.consultant_pm_id=$1 AND p.id=$2`,
+      [consultantPMId, projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found or not assigned to consultant PM" });
+    }
+
+    res.json({ project: result.rows[0] });
+  } catch (err) {
+    console.error("Fetch consultant PM project details error:", err);
+    res.status(500).json({ error: "Failed to fetch project details" });
+  }
+});
+
+// ============ CONTRACTOR PROJECT MANAGER PROFILE ROUTES (JWT-based, Schema-Aligned) =============
+
+// Fetch Contractor PM profile basics
+app.get("/contractor-project-manager/profile", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Contractor PM") {
+      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    }
+
+    const contractorPMId = req.user.user_id;
+    const contractorPMEmail = req.user.email;
+
+    const result = await pool.query(
+      "SELECT email, profile_picture FROM contractor_project_managers WHERE id=$1 AND email=$2",
+      [contractorPMId, contractorPMEmail]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Contractor PM not found" });
+    }
+
+    const contractorPM = result.rows[0];
+    res.json({
+      email: contractorPM.email,
+      role: req.user.role,
+      profile_picture: contractorPM.profile_picture
+    });
+  } catch (err) {
+    console.error("Fetch Contractor PM profile error:", err);
+    res.status(500).json({ error: "Failed to fetch Contractor PM profile" });
+  }
+});
+
+// Upload Contractor PM profile picture
+app.post("/contractor-project-manager/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
+  try {
+    if (req.user.role !== "Contractor PM") {
+      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    }
+
+    const contractorPMId = req.user.user_id;
+    const contractorPMEmail = req.user.email;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+    if (!req.file.mimetype.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files allowed." });
+    }
+
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    await pool.query(
+      "UPDATE contractor_project_managers SET profile_picture=$1 WHERE id=$2 AND email=$3",
+      [fileUrl, contractorPMId, contractorPMEmail]
+    );
+
+    res.json({ success: true, url: fileUrl });
+  } catch (err) {
+    console.error("Upload Contractor PM picture error:", err);
+    res.status(500).json({ error: "Failed to upload Contractor PM picture" });
+  }
+});
+
+// Delete Contractor PM profile picture
+app.post("/contractor-project-manager/delete-picture", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Contractor PM") {
+      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    }
+
+    const contractorPMId = req.user.user_id;
+    const contractorPMEmail = req.user.email;
+
+    await pool.query(
+      "UPDATE contractor_project_managers SET profile_picture=NULL WHERE id=$1 AND email=$2",
+      [contractorPMId, contractorPMEmail]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete Contractor PM picture error:", err);
+    res.status(500).json({ error: "Failed to delete Contractor PM picture" });
+  }
+});
+
+// Fetch all projects assigned to this Contractor PM
+app.post("/contractor-project-manager/projects", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Contractor PM") {
+      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    }
+
+    const contractorPMId = req.user.user_id;
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM contractor_pm_assignments cpa
+       JOIN projects p ON cpa.project_id = p.id
+       WHERE cpa.contractor_pm_id=$1`,
+      [contractorPMId]
+    );
+
+    res.json({ projects: result.rows });
+  } catch (err) {
+    console.error("Fetch Contractor PM projects error:", err);
+    res.status(500).json({ error: "Failed to fetch Contractor PM projects" });
+  }
+});
+
+// Fetch project details for a specific Contractor PM assignment
+app.post("/contractor-project-manager/project-details", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Contractor PM") {
+      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    }
+
+    const contractorPMId = req.user.user_id;
+    const { projectId } = req.body;
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM contractor_pm_assignments cpa
+       JOIN projects p ON cpa.project_id = p.id
+       WHERE cpa.contractor_pm_id=$1 AND p.id=$2`,
+      [contractorPMId, projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found or not assigned to Contractor PM" });
+    }
+
+    res.json({ project: result.rows[0] });
+  } catch (err) {
+    console.error("Fetch Contractor PM project details error:", err);
+    res.status(500).json({ error: "Failed to fetch project details" });
+  }
+});
+
+// ============ CLIENT PROJECT MANAGER PROFILE ROUTES (JWT-based, Schema-Aligned) =============
+
+// Fetch Client PM profile basics
+app.get("/client-project-manager/profile", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Client PM") {
+      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    }
+
+    const clientPMId = req.user.user_id;
+    const clientPMEmail = req.user.email;
+
+    const result = await pool.query(
+      "SELECT email, profile_picture FROM client_project_managers WHERE id=$1 AND email=$2",
+      [clientPMId, clientPMEmail]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Client PM not found" });
+    }
+
+    const clientPM = result.rows[0];
+    res.json({
+      email: clientPM.email,
+      role: req.user.role,
+      profile_picture: clientPM.profile_picture
+    });
+  } catch (err) {
+    console.error("Fetch Client PM profile error:", err);
+    res.status(500).json({ error: "Failed to fetch Client PM profile" });
+  }
+});
+
+// Upload Client PM profile picture
+app.post("/client-project-manager/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
+  try {
+    if (req.user.role !== "Client PM") {
+      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    }
+
+    const clientPMId = req.user.user_id;
+    const clientPMEmail = req.user.email;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+    if (!req.file.mimetype.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files allowed." });
+    }
+
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    await pool.query(
+      "UPDATE client_project_managers SET profile_picture=$1 WHERE id=$2 AND email=$3",
+      [fileUrl, clientPMId, clientPMEmail]
+    );
+
+    res.json({ success: true, url: fileUrl });
+  } catch (err) {
+    console.error("Upload Client PM picture error:", err);
+    res.status(500).json({ error: "Failed to upload Client PM picture" });
+  }
+});
+
+// Delete Client PM profile picture
+app.post("/client-project-manager/delete-picture", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Client PM") {
+      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    }
+
+    const clientPMId = req.user.user_id;
+    const clientPMEmail = req.user.email;
+
+    await pool.query(
+      "UPDATE client_project_managers SET profile_picture=NULL WHERE id=$1 AND email=$2",
+      [clientPMId, clientPMEmail]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete Client PM picture error:", err);
+    res.status(500).json({ error: "Failed to delete Client PM picture" });
+  }
+});
+
+// Fetch all projects assigned to this Client PM
+app.post("/client-project-manager/projects", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Client PM") {
+      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    }
+
+    const clientPMId = req.user.user_id;
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM client_pm_assignments cpa
+       JOIN projects p ON cpa.project_id = p.id
+       WHERE cpa.client_pm_id=$1`,
+      [clientPMId]
+    );
+
+    res.json({ projects: result.rows });
+  } catch (err) {
+    console.error("Fetch Client PM projects error:", err);
+    res.status(500).json({ error: "Failed to fetch Client PM projects" });
+  }
+});
+
+// Fetch project details for a specific Client PM assignment
+app.post("/client-project-manager/project-details", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Client PM") {
+      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    }
+
+    const clientPMId = req.user.user_id;
+    const { projectId } = req.body;
+
+    const result = await pool.query(
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at
+       FROM client_pm_assignments cpa
+       JOIN projects p ON cpa.project_id = p.id
+       WHERE cpa.client_pm_id=$1 AND p.id=$2`,
+      [clientPMId, projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Project not found or not assigned to Client PM" });
+    }
+
+    res.json({ project: result.rows[0] });
+  } catch (err) {
+    console.error("Fetch Client PM project details error:", err);
+    res.status(500).json({ error: "Failed to fetch project details" });
   }
 });
 
