@@ -55,7 +55,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// 🔹 Neon DB connection
+// CockroachDB connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
