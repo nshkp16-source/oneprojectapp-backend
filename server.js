@@ -2389,6 +2389,7 @@ app.post("/assign-team", async (req, res) => {
     try {
       for (const a of assignments) {
         if (a.role === "Project Manager") {
+          // Insert PM assignment depending on role
           if (role.startsWith("Client")) {
             await client.query(
               `INSERT INTO client_pm_assignments 
@@ -2425,7 +2426,15 @@ app.post("/assign-team", async (req, res) => {
           );
         }
       }
-      res.json({ success: true, message: "Assignments saved" });
+
+      // ✅ Return role + project context so frontend can redirect correctly
+      res.json({
+        success: true,
+        message: "Assignments saved",
+        role,
+        projectId,
+        redirectSource: role.toLowerCase().replace(/\s+/g, "-") + "-dashboard"
+      });
     } catch (err) {
       console.error("Error saving assignments:", err);
       res.status(500).json({ success: false, error: "Server error" });
