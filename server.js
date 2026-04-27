@@ -55,7 +55,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// CockroachDB connection
+// 🔹 Neon DB connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -2459,12 +2459,12 @@ app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
 });
 
-// 🔹 Keep-alive ping
+// 🔹 Keep-alive ping (once every 24 hours)
 setInterval(() => {
   fetch("https://oneprojectapp-backend.onrender.com/")
-    .then(res => console.log("Keep-alive ping:", res.status))
+    .then(res => console.log("Daily keep-alive ping:", res.status))
     .catch(err => console.error("Keep-alive error:", err));
-}, 14 * 60 * 1000);
+}, 24 * 60 * 60 * 1000); // 24 hours
 
 export default app;
 
