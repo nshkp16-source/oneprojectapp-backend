@@ -2464,7 +2464,7 @@ setInterval(() => {
   fetch("https://oneprojectapp-backend.onrender.com/")
     .then(res => console.log("Daily keep-alive ping:", res.status))
     .catch(err => console.error("Keep-alive error:", err));
-}, 24 * 60 * 60 * 1000); // 24 hours
+}, 14 * 60 * 1000); // 24 hours
 
 export default app;
 
