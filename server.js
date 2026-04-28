@@ -2358,7 +2358,7 @@ app.post("/assign-team", async (req, res) => {
     let decoded;
     try {
       decoded = jwt.verify(token, process.env.JWT_SECRET || "supersecretkey");
-    } catch (err) {
+    } catch {
       return res.status(401).json({ success: false, error: "Invalid or expired token" });
     }
 
@@ -2372,11 +2372,20 @@ app.post("/assign-team", async (req, res) => {
     // Verify project ownership/assignment
     let projectCheck;
     if (role.startsWith("Client")) {
-      projectCheck = await pool.query("SELECT 1 FROM projects WHERE id=$1 AND client_id=$2", [projectId, userId]);
+      projectCheck = await pool.query(
+        "SELECT 1 FROM projects WHERE id=$1 AND client_id=$2",
+        [projectId, userId]
+      );
     } else if (role.startsWith("Contractor")) {
-      projectCheck = await pool.query("SELECT 1 FROM contractor_assignments WHERE project_id=$1 AND contractor_id=$2", [projectId, userId]);
+      projectCheck = await pool.query(
+        "SELECT 1 FROM contractor_assignments WHERE project_id=$1 AND contractor_id=$2",
+        [projectId, userId]
+      );
     } else if (role.startsWith("Consultant")) {
-      projectCheck = await pool.query("SELECT 1 FROM consultant_assignments WHERE project_id=$1 AND consultant_id=$2", [projectId, userId]);
+      projectCheck = await pool.query(
+        "SELECT 1 FROM consultant_assignments WHERE project_id=$1 AND consultant_id=$2",
+        [projectId, userId]
+      );
     } else {
       return res.status(400).json({ success: false, error: "Unsupported role" });
     }
@@ -2411,7 +2420,7 @@ app.post("/assign-team", async (req, res) => {
               [projectId, a.email]
             );
           }
-        } else {
+        } else if (a.role === "Team Member") {
           await client.query(
             `INSERT INTO team_member_assignments (project_id, team_member_id)
              VALUES ($1, (SELECT id FROM team_members WHERE email=$2))
@@ -2437,6 +2446,106 @@ app.post("/assign-team", async (req, res) => {
     }
   } catch (err) {
     console.error("Assign team error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
+  }
+});
+
+// ============ ASSIGN ROLE ROUTE ============
+app.post("/assign", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ success: false, error: "Authorization header missing" });
+
+    const token = authHeader.split(" ")[1];
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET || "supersecretkey");
+    } catch {
+      return res.status(401).json({ success: false, error: "Invalid or expired token" });
+    }
+
+    const { sub: userId, role: jwtRole } = decoded;
+    const { projectId, assignment } = req.body;
+
+    if (!projectId || !assignment || !assignment.role || !assignment.email) {
+      return res.status(400).json({ success: false, error: "Invalid payload" });
+    }
+
+    const client = await pool.connect();
+    let insertQuery, roleLabel;
+
+    try {
+      switch (assignment.role) {
+        case "Client Project Manager":
+          insertQuery = `
+            INSERT INTO client_pm_assignments (project_id, client_pm_id, company_name, title, position, telephone, task, representative)
+            VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+            RETURNING client_pm_id AS assigned_id`;
+          roleLabel = "Client";
+          break;
+
+        case "Contractor Project Manager":
+          insertQuery = `
+            INSERT INTO contractor_pm_assignments (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative)
+            VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+            RETURNING contractor_pm_id AS assigned_id`;
+          roleLabel = "Contractor";
+          break;
+
+        case "Consultant Project Manager":
+          insertQuery = `
+            INSERT INTO consultant_pm_assignments (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative)
+            VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+            RETURNING consultant_pm_id AS assigned_id`;
+          roleLabel = "Consultant";
+          break;
+
+        case "Team Member":
+          insertQuery = `
+            INSERT INTO team_member_assignments 
+            (project_id, team_member_id, company_name, title, position, telephone, task, representative, assigned_part, assigned_by)
+            VALUES ($1, (SELECT id FROM team_members WHERE email=$2), $3,$4,$5,$6,$7,$8,$9,$10)
+            RETURNING team_member_id AS assigned_id`;
+          roleLabel = "TeamMember";
+          break;
+
+        default:
+          return res.status(400).json({ success: false, error: "Unsupported role" });
+      }
+
+      const result = await client.query(insertQuery, [
+        projectId,
+        assignment.email,
+        assignment.company_name,
+        assignment.title,
+        assignment.position,
+        assignment.telephone,
+        assignment.task,
+        assignment.representative,
+        assignment.assigned_part || (jwtRole.startsWith("Client") ? "Client" :
+                                     jwtRole.startsWith("Contractor") ? "Contractor" :
+                                     jwtRole.startsWith("Consultant") ? "Consultant" : null),
+        assignment.assigned_by || userId
+      ]);
+
+      const assignedId = result.rows[0]?.assigned_id;
+
+      res.json({
+        success: true,
+        message: "Assignment saved",
+        role: roleLabel,
+        projectId,
+        assignedId,
+        redirectSource: roleLabel.toLowerCase() + "-dashboard"
+      });
+    } catch (err) {
+      console.error("Error saving assignment:", err);
+      res.status(500).json({ success: false, error: "Server error" });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error("Assign route error:", err);
     res.status(500).json({ success: false, error: "Server error" });
   }
 });
