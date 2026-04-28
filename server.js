@@ -2454,7 +2454,9 @@ app.post("/assign-team", async (req, res) => {
 app.post("/assign", async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ success: false, error: "Authorization header missing" });
+    if (!authHeader) {
+      return res.status(401).json({ success: false, error: "Authorization header missing" });
+    }
 
     const token = authHeader.split(" ")[1];
     let decoded;
@@ -2478,7 +2480,8 @@ app.post("/assign", async (req, res) => {
       switch (assignment.role) {
         case "Client Project Manager":
           insertQuery = `
-            INSERT INTO client_pm_assignments (project_id, client_pm_id, company_name, title, position, telephone, task, representative)
+            INSERT INTO client_pm_assignments 
+            (project_id, client_pm_id, company_name, title, position, telephone, task, representative)
             VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
             RETURNING client_pm_id AS assigned_id`;
           roleLabel = "Client";
@@ -2486,7 +2489,8 @@ app.post("/assign", async (req, res) => {
 
         case "Contractor Project Manager":
           insertQuery = `
-            INSERT INTO contractor_pm_assignments (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative)
+            INSERT INTO contractor_pm_assignments 
+            (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative)
             VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
             RETURNING contractor_pm_id AS assigned_id`;
           roleLabel = "Contractor";
@@ -2494,7 +2498,8 @@ app.post("/assign", async (req, res) => {
 
         case "Consultant Project Manager":
           insertQuery = `
-            INSERT INTO consultant_pm_assignments (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative)
+            INSERT INTO consultant_pm_assignments 
+            (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative)
             VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
             RETURNING consultant_pm_id AS assigned_id`;
           roleLabel = "Consultant";
@@ -2522,9 +2527,11 @@ app.post("/assign", async (req, res) => {
         assignment.telephone,
         assignment.task,
         assignment.representative,
-        assignment.assigned_part || (jwtRole.startsWith("Client") ? "Client" :
-                                     jwtRole.startsWith("Contractor") ? "Contractor" :
-                                     jwtRole.startsWith("Consultant") ? "Consultant" : null),
+        assignment.assigned_part || (
+          jwtRole.startsWith("Client") ? "Client" :
+          jwtRole.startsWith("Contractor") ? "Contractor" :
+          jwtRole.startsWith("Consultant") ? "Consultant" : null
+        ),
         assignment.assigned_by || userId
       ]);
 
