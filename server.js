@@ -2392,37 +2392,33 @@ app.post("/assign-team", async (req, res) => {
           // Insert PM assignment depending on role
           if (role.startsWith("Client")) {
             await client.query(
-              `INSERT INTO client_pm_assignments 
-               (project_id, client_pm_id, company_name, title, position, telephone, task, representative) 
-               VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+              `INSERT INTO client_pm_assignments (project_id, client_pm_id)
+               VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2))
                ON CONFLICT DO NOTHING`,
-              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+              [projectId, a.email]
             );
           } else if (role.startsWith("Contractor")) {
             await client.query(
-              `INSERT INTO contractor_pm_assignments 
-               (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative) 
-               VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+              `INSERT INTO contractor_pm_assignments (project_id, contractor_pm_id)
+               VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2))
                ON CONFLICT DO NOTHING`,
-              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+              [projectId, a.email]
             );
           } else if (role.startsWith("Consultant")) {
             await client.query(
-              `INSERT INTO consultant_pm_assignments 
-               (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative) 
-               VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
+              `INSERT INTO consultant_pm_assignments (project_id, consultant_pm_id)
+               VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2))
                ON CONFLICT DO NOTHING`,
-              [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+              [projectId, a.email]
             );
           }
         } else {
           // Team Member assignment
           await client.query(
-            `INSERT INTO team_member_assignments 
-             (project_id, team_member_id, company_name, title, position, telephone, task, representative) 
-             VALUES ($1, (SELECT id FROM team_members WHERE email=$2), $3,$4,$5,$6,$7,$8)
+            `INSERT INTO team_member_assignments (project_id, team_member_id)
+             VALUES ($1, (SELECT id FROM team_members WHERE email=$2))
              ON CONFLICT DO NOTHING`,
-            [projectId, a.email, a.company_name, a.title, a.position, a.telephone, a.task, a.representative]
+            [projectId, a.email]
           );
         }
       }
