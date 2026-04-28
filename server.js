@@ -2479,6 +2479,14 @@ app.post("/assign", async (req, res) => {
     try {
       switch (assignment.role) {
         case "Client Project Manager":
+          // Ensure user exists in client_project_managers
+          await client.query(
+            `INSERT INTO client_project_managers (email, verified)
+             VALUES ($1, true)
+             ON CONFLICT (email) DO NOTHING`,
+            [assignment.email]
+          );
+
           insertQuery = `
             INSERT INTO client_pm_assignments 
             (project_id, client_pm_id, company_name, title, position, telephone, task, representative)
@@ -2498,6 +2506,13 @@ app.post("/assign", async (req, res) => {
           break;
 
         case "Contractor Project Manager":
+          await client.query(
+            `INSERT INTO contractor_project_managers (email, verified)
+             VALUES ($1, true)
+             ON CONFLICT (email) DO NOTHING`,
+            [assignment.email]
+          );
+
           insertQuery = `
             INSERT INTO contractor_pm_assignments 
             (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative)
@@ -2517,6 +2532,13 @@ app.post("/assign", async (req, res) => {
           break;
 
         case "Consultant Project Manager":
+          await client.query(
+            `INSERT INTO consultant_project_managers (email, verified)
+             VALUES ($1, true)
+             ON CONFLICT (email) DO NOTHING`,
+            [assignment.email]
+          );
+
           insertQuery = `
             INSERT INTO consultant_pm_assignments 
             (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative)
@@ -2536,6 +2558,13 @@ app.post("/assign", async (req, res) => {
           break;
 
         case "Team Member":
+          await client.query(
+            `INSERT INTO team_members (email, verified)
+             VALUES ($1, true)
+             ON CONFLICT (email) DO NOTHING`,
+            [assignment.email]
+          );
+
           insertQuery = `
             INSERT INTO team_member_assignments 
             (project_id, team_member_id, company_name, title, position, telephone, task, representative, assigned_part, assigned_by)
