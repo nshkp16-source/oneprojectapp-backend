@@ -2474,7 +2474,7 @@ app.post("/assign", async (req, res) => {
     }
 
     const client = await pool.connect();
-    let insertQuery, roleLabel;
+    let insertQuery, roleLabel, params;
 
     try {
       switch (assignment.role) {
@@ -2484,6 +2484,16 @@ app.post("/assign", async (req, res) => {
             (project_id, client_pm_id, company_name, title, position, telephone, task, representative)
             VALUES ($1, (SELECT id FROM client_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
             RETURNING client_pm_id AS assigned_id`;
+          params = [
+            projectId,
+            assignment.email,
+            assignment.company_name,
+            assignment.title,
+            assignment.position,
+            assignment.telephone,
+            assignment.task,
+            assignment.representative
+          ];
           roleLabel = "Client";
           break;
 
@@ -2493,6 +2503,16 @@ app.post("/assign", async (req, res) => {
             (project_id, contractor_pm_id, company_name, title, position, telephone, task, representative)
             VALUES ($1, (SELECT id FROM contractor_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
             RETURNING contractor_pm_id AS assigned_id`;
+          params = [
+            projectId,
+            assignment.email,
+            assignment.company_name,
+            assignment.title,
+            assignment.position,
+            assignment.telephone,
+            assignment.task,
+            assignment.representative
+          ];
           roleLabel = "Contractor";
           break;
 
@@ -2502,6 +2522,16 @@ app.post("/assign", async (req, res) => {
             (project_id, consultant_pm_id, company_name, title, position, telephone, task, representative)
             VALUES ($1, (SELECT id FROM consultant_project_managers WHERE email=$2), $3,$4,$5,$6,$7,$8)
             RETURNING consultant_pm_id AS assigned_id`;
+          params = [
+            projectId,
+            assignment.email,
+            assignment.company_name,
+            assignment.title,
+            assignment.position,
+            assignment.telephone,
+            assignment.task,
+            assignment.representative
+          ];
           roleLabel = "Consultant";
           break;
 
@@ -2511,6 +2541,22 @@ app.post("/assign", async (req, res) => {
             (project_id, team_member_id, company_name, title, position, telephone, task, representative, assigned_part, assigned_by)
             VALUES ($1, (SELECT id FROM team_members WHERE email=$2), $3,$4,$5,$6,$7,$8,$9,$10)
             RETURNING team_member_id AS assigned_id`;
+          params = [
+            projectId,
+            assignment.email,
+            assignment.company_name,
+            assignment.title,
+            assignment.position,
+            assignment.telephone,
+            assignment.task,
+            assignment.representative,
+            assignment.assigned_part || (
+              jwtRole.startsWith("Client") ? "Client" :
+              jwtRole.startsWith("Contractor") ? "Contractor" :
+              jwtRole.startsWith("Consultant") ? "Consultant" : null
+            ),
+            assignment.assigned_by || userId
+          ];
           roleLabel = "TeamMember";
           break;
 
@@ -2518,23 +2564,7 @@ app.post("/assign", async (req, res) => {
           return res.status(400).json({ success: false, error: "Unsupported role" });
       }
 
-      const result = await client.query(insertQuery, [
-        projectId,
-        assignment.email,
-        assignment.company_name,
-        assignment.title,
-        assignment.position,
-        assignment.telephone,
-        assignment.task,
-        assignment.representative,
-        assignment.assigned_part || (
-          jwtRole.startsWith("Client") ? "Client" :
-          jwtRole.startsWith("Contractor") ? "Contractor" :
-          jwtRole.startsWith("Consultant") ? "Consultant" : null
-        ),
-        assignment.assigned_by || userId
-      ]);
-
+      const result = await client.query(insertQuery, params);
       const assignedId = result.rows[0]?.assigned_id;
 
       res.json({
