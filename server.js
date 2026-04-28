@@ -2389,7 +2389,6 @@ app.post("/assign-team", async (req, res) => {
     try {
       for (const a of assignments) {
         if (a.role === "Project Manager") {
-          // Insert PM assignment depending on role
           if (role.startsWith("Client")) {
             await client.query(
               `INSERT INTO client_pm_assignments (project_id, client_pm_id)
@@ -2413,7 +2412,6 @@ app.post("/assign-team", async (req, res) => {
             );
           }
         } else {
-          // Team Member assignment
           await client.query(
             `INSERT INTO team_member_assignments (project_id, team_member_id)
              VALUES ($1, (SELECT id FROM team_members WHERE email=$2))
@@ -2423,7 +2421,7 @@ app.post("/assign-team", async (req, res) => {
         }
       }
 
-      // ✅ Return role + project context so frontend can redirect correctly
+      // ✅ Return role + project context + redirectSource
       res.json({
         success: true,
         message: "Assignments saved",
