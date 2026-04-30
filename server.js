@@ -2445,12 +2445,14 @@ app.post("/assign-team", async (req, res) => {
 
       res.json({
         success: true,
-        message: hasPM ? "PM already assigned" : "Assignments saved",
+        message: hasPM 
+          ? 'PM is already assigned. <a href="edit-information.html">Click here</a> to edit information.' 
+          : 'Assignments saved',
         role,
         projectId,
         hasPM,
         redirectSource: role.toLowerCase().replace(/\s+/g, "-") + "-dashboard"
-    });
+     });
 
     } catch (err) {
       console.error("Error saving assignments:", err);
