@@ -1988,6 +1988,24 @@ app.post("/client/login", async (req, res) => {
   }
 });
 
+// Public route for profile picture upload during account creation
+app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded." });
+    }
+
+    // Render or storage service will give you a permanent URL
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+
+    // ✅ Return URL only, do not save to DB yet
+    res.json({ url: fileUrl });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ error: "Failed to upload profile picture." });
+  }
+});
+
 // ============ FETCH CLIENT PROFILE PICTURE ============
 app.post("/client/profile-picture", async (req, res) => {
   const { email } = req.body;
