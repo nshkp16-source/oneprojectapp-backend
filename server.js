@@ -1989,19 +1989,18 @@ app.post("/client/login", async (req, res) => {
 });
 
 // Public route for profile picture upload during account creation
-app.post("/client/upload-picture", upload.single("profile_picture"), async (req, res) => {
+app.post("/account/upload-picture", upload.single("profile_picture"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded." });
+    if (!req.file) return res.status(400).json({ error: "No file uploaded." });
+    if (!req.file.mimetype.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files allowed." });
     }
 
-    // Render or storage service will give you a permanent URL
     const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-
-    // ✅ Return URL only, do not save to DB yet
+    // ✅ Return URL only — do not save to DB yet
     res.json({ url: fileUrl });
   } catch (err) {
-    console.error("Upload error:", err);
+    console.error("Public upload error:", err);
     res.status(500).json({ error: "Failed to upload profile picture." });
   }
 });
