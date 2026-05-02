@@ -1922,7 +1922,7 @@ app.post("/client-project-manager/project-details", authenticateToken, async (re
   }
 });
 
-/// ============ TEAM MEMBER DASHBOARD ROUTES (JWT-based, Schema-Aligned) =============
+// ============ TEAM MEMBER DASHBOARD ROUTES (JWT-based, Schema-Aligned) =============
 
 // Fetch team member profile basics
 app.get("/team-member/profile", authenticateToken, async (req, res) => {
@@ -2018,7 +2018,9 @@ app.post("/team-member/projects", authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at,
-              tma.position, tma.representative, tma.assigned_part, tma.assigned_by
+              tma.position, tma.title, tma.task, tma.representative,
+              tma.assigned_part, tma.assigned_by,
+              CONCAT(tma.assigned_part, ' Team Member – ', tma.position) AS role_display
        FROM team_member_assignments tma
        JOIN projects p ON tma.project_id = p.id
        WHERE tma.team_member_id=$1`,
@@ -2044,7 +2046,9 @@ app.post("/team-member/project-details", authenticateToken, async (req, res) => 
 
     const result = await pool.query(
       `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at,
-              tma.position, tma.representative, tma.assigned_part, tma.assigned_by
+              tma.position, tma.title, tma.task, tma.representative,
+              tma.assigned_part, tma.assigned_by,
+              CONCAT(tma.assigned_part, ' Team Member – ', tma.position) AS role_display
        FROM team_member_assignments tma
        JOIN projects p ON tma.project_id = p.id
        WHERE tma.team_member_id=$1 AND p.id=$2`,
