@@ -1922,7 +1922,7 @@ app.post("/client-project-manager/project-details", authenticateToken, async (re
   }
 });
 
-// ============ TEAM MEMBER DASHBOARD ROUTES (JWT-based, Schema-Aligned) =============
+/// ============ TEAM MEMBER DASHBOARD ROUTES (JWT-based, Schema-Aligned) =============
 
 // Fetch team member profile basics
 app.get("/team-member/profile", authenticateToken, async (req, res) => {
@@ -2007,8 +2007,8 @@ app.post("/team-member/delete-picture", authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch all tasks assigned to this team member
-app.post("/team-member/tasks", authenticateToken, async (req, res) => {
+// Fetch all projects assigned to this team member
+app.post("/team-member/projects", authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== "Team Member") {
       return res.status(403).json({ error: "Access denied: Team Member only route" });
@@ -2017,46 +2017,48 @@ app.post("/team-member/tasks", authenticateToken, async (req, res) => {
     const teamMemberId = req.user.user_id;
 
     const result = await pool.query(
-      `SELECT t.id, t.title, t.description, t.status, t.deadline, t.project_id
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at,
+              tma.position, tma.representative, tma.assigned_part, tma.assigned_by
        FROM team_member_assignments tma
-       JOIN tasks t ON tma.task_id = t.id
+       JOIN projects p ON tma.project_id = p.id
        WHERE tma.team_member_id=$1`,
       [teamMemberId]
     );
 
-    res.json({ tasks: result.rows });
+    res.json({ projects: result.rows });
   } catch (err) {
-    console.error("Fetch team member tasks error:", err);
-    res.status(500).json({ error: "Failed to fetch team member tasks" });
+    console.error("Fetch team member projects error:", err);
+    res.status(500).json({ error: "Failed to fetch team member projects" });
   }
 });
 
-// Fetch task details for a specific team member assignment
-app.post("/team-member/task-details", authenticateToken, async (req, res) => {
+// Fetch project details for a specific team member assignment
+app.post("/team-member/project-details", authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== "Team Member") {
       return res.status(403).json({ error: "Access denied: Team Member only route" });
     }
 
     const teamMemberId = req.user.user_id;
-    const { taskId } = req.body;
+    const { projectId } = req.body;
 
     const result = await pool.query(
-      `SELECT t.id, t.title, t.description, t.status, t.deadline, t.project_id
+      `SELECT p.id, p.name, p.location, p.contract_reference, p.created_at,
+              tma.position, tma.representative, tma.assigned_part, tma.assigned_by
        FROM team_member_assignments tma
-       JOIN tasks t ON tma.task_id = t.id
-       WHERE tma.team_member_id=$1 AND t.id=$2`,
-      [teamMemberId, taskId]
+       JOIN projects p ON tma.project_id = p.id
+       WHERE tma.team_member_id=$1 AND p.id=$2`,
+      [teamMemberId, projectId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Task not found or not assigned to team member" });
+      return res.status(404).json({ error: "Project not found or not assigned to team member" });
     }
 
-    res.json({ task: result.rows[0] });
+    res.json({ project: result.rows[0] });
   } catch (err) {
-    console.error("Fetch team member task details error:", err);
-    res.status(500).json({ error: "Failed to fetch task details" });
+    console.error("Fetch team member project details error:", err);
+    res.status(500).json({ error: "Failed to fetch project details" });
   }
 });
 
