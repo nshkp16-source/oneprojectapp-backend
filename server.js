@@ -1513,8 +1513,8 @@ app.post("/consultant/project-details", authenticateToken, async (req, res) => {
 // Fetch consultant PM profile basics
 app.get("/consultant-project-manager/profile", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Consultant PM") {
-      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    if (req.user.role !== "Consultant Project Manager") {
+      return res.status(403).json({ error: "Access denied: Consultant Project Manager only route" });
     }
 
     const consultantPMId = req.user.user_id;
@@ -1526,7 +1526,7 @@ app.get("/consultant-project-manager/profile", authenticateToken, async (req, re
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Consultant PM not found" });
+      return res.status(404).json({ error: "Consultant Project Manager not found" });
     }
 
     const consultantPM = result.rows[0];
@@ -1544,8 +1544,8 @@ app.get("/consultant-project-manager/profile", authenticateToken, async (req, re
 // Upload consultant PM profile picture
 app.post("/consultant-project-manager/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    if (req.user.role !== "Consultant PM") {
-      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    if (req.user.role !== "Consultant Project Manager") {
+      return res.status(403).json({ error: "Access denied: Consultant Project Manager only route" });
     }
 
     const consultantPMId = req.user.user_id;
@@ -1574,8 +1574,8 @@ app.post("/consultant-project-manager/upload-picture", authenticateToken, upload
 // Delete consultant PM profile picture
 app.post("/consultant-project-manager/delete-picture", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Consultant PM") {
-      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    if (req.user.role !== "Consultant Project Manager") {
+      return res.status(403).json({ error: "Access denied: Consultant Project Manager only route" });
     }
 
     const consultantPMId = req.user.user_id;
@@ -1596,8 +1596,8 @@ app.post("/consultant-project-manager/delete-picture", authenticateToken, async 
 // Fetch all projects assigned to this consultant PM
 app.post("/consultant-project-manager/projects", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Consultant PM") {
-      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    if (req.user.role !== "Consultant Project Manager") {
+      return res.status(403).json({ error: "Access denied: Consultant Project Manager only route" });
     }
 
     const consultantPMId = req.user.user_id;
@@ -1620,8 +1620,8 @@ app.post("/consultant-project-manager/projects", authenticateToken, async (req, 
 // Fetch project details for a specific consultant PM assignment
 app.post("/consultant-project-manager/project-details", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Consultant PM") {
-      return res.status(403).json({ error: "Access denied: Consultant PM only route" });
+    if (req.user.role !== "Consultant Project Manager") {
+      return res.status(403).json({ error: "Access denied: Consultant Project Manager only route" });
     }
 
     const consultantPMId = req.user.user_id;
