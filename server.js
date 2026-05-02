@@ -1922,6 +1922,144 @@ app.post("/client-project-manager/project-details", authenticateToken, async (re
   }
 });
 
+// ============ TEAM MEMBER DASHBOARD ROUTES (JWT-based, Schema-Aligned) =============
+
+// Fetch team member profile basics
+app.get("/team-member/profile", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Team Member") {
+      return res.status(403).json({ error: "Access denied: Team Member only route" });
+    }
+
+    const teamMemberId = req.user.user_id;
+    const teamMemberEmail = req.user.email;
+
+    const result = await pool.query(
+      "SELECT email, profile_picture FROM team_members WHERE id=$1 AND email=$2",
+      [teamMemberId, teamMemberEmail]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Team Member not found" });
+    }
+
+    const teamMember = result.rows[0];
+    res.json({
+      email: teamMember.email,
+      role: req.user.role,
+      profile_picture: teamMember.profile_picture
+    });
+  } catch (err) {
+    console.error("Fetch team member profile error:", err);
+    res.status(500).json({ error: "Failed to fetch team member profile" });
+  }
+});
+
+// Upload team member profile picture
+app.post("/team-member/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
+  try {
+    if (req.user.role !== "Team Member") {
+      return res.status(403).json({ error: "Access denied: Team Member only route" });
+    }
+
+    const teamMemberId = req.user.user_id;
+    const teamMemberEmail = req.user.email;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded or file too large." });
+    }
+    if (!req.file.mimetype.startsWith("image/")) {
+      return res.status(400).json({ error: "Only image files allowed." });
+    }
+
+    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    await pool.query(
+      "UPDATE team_members SET profile_picture=$1 WHERE id=$2 AND email=$3",
+      [fileUrl, teamMemberId, teamMemberEmail]
+    );
+
+    res.json({ success: true, url: fileUrl });
+  } catch (err) {
+    console.error("Upload team member picture error:", err);
+    res.status(500).json({ error: "Failed to upload team member picture" });
+  }
+});
+
+// Delete team member profile picture
+app.post("/team-member/delete-picture", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Team Member") {
+      return res.status(403).json({ error: "Access denied: Team Member only route" });
+    }
+
+    const teamMemberId = req.user.user_id;
+    const teamMemberEmail = req.user.email;
+
+    await pool.query(
+      "UPDATE team_members SET profile_picture=NULL WHERE id=$1 AND email=$2",
+      [teamMemberId, teamMemberEmail]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete team member picture error:", err);
+    res.status(500).json({ error: "Failed to delete team member picture" });
+  }
+});
+
+// Fetch all tasks assigned to this team member
+app.post("/team-member/tasks", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Team Member") {
+      return res.status(403).json({ error: "Access denied: Team Member only route" });
+    }
+
+    const teamMemberId = req.user.user_id;
+
+    const result = await pool.query(
+      `SELECT t.id, t.title, t.description, t.status, t.deadline, t.project_id
+       FROM team_member_assignments tma
+       JOIN tasks t ON tma.task_id = t.id
+       WHERE tma.team_member_id=$1`,
+      [teamMemberId]
+    );
+
+    res.json({ tasks: result.rows });
+  } catch (err) {
+    console.error("Fetch team member tasks error:", err);
+    res.status(500).json({ error: "Failed to fetch team member tasks" });
+  }
+});
+
+// Fetch task details for a specific team member assignment
+app.post("/team-member/task-details", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "Team Member") {
+      return res.status(403).json({ error: "Access denied: Team Member only route" });
+    }
+
+    const teamMemberId = req.user.user_id;
+    const { taskId } = req.body;
+
+    const result = await pool.query(
+      `SELECT t.id, t.title, t.description, t.status, t.deadline, t.project_id
+       FROM team_member_assignments tma
+       JOIN tasks t ON tma.task_id = t.id
+       WHERE tma.team_member_id=$1 AND t.id=$2`,
+      [teamMemberId, taskId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Task not found or not assigned to team member" });
+    }
+
+    res.json({ task: result.rows[0] });
+  } catch (err) {
+    console.error("Fetch team member task details error:", err);
+    res.status(500).json({ error: "Failed to fetch task details" });
+  }
+});
+
 // 19. ============ CLIENT ROUTES =============
 
 // Check if client email exists (for new account creation)
