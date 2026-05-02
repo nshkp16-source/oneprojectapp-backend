@@ -782,21 +782,21 @@ app.post("/login", async (req, res) => {
         emailColumn = "email";
         selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
-      case "Client Project Manager":
+      case "ClientPM":
         table = "client_project_managers";
         assignmentTable = "client_pm_assignments";
         foreignKey = "client_pm_id";
         emailColumn = "email";
         selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
-      case "Contractor Project Manager":
+      case "ContractorPM":
         table = "contractor_project_managers";
         assignmentTable = "contractor_pm_assignments";
         foreignKey = "contractor_pm_id";
         emailColumn = "email";
         selectFields = "id, email, password_hash, verified, profile_picture, created_at";
         break;
-      case "Consultant Project Manager":
+      case "ConsultantPM":
         table = "consultant_project_managers";
         assignmentTable = "consultant_pm_assignments";
         foreignKey = "consultant_pm_id";
