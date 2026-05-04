@@ -1648,14 +1648,14 @@ app.post("/consultant-project-manager/project-details", authenticateToken, async
 
 // ============ CONTRACTOR PROJECT MANAGER PROFILE ROUTES (JWT-based, Schema-Aligned) =============
 
-// Fetch Contractor PM profile basics
+// Fetch contractor PM profile basics
 app.get("/contractor-project-manager/profile", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Contractor PM") {
-      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    if (req.user.role !== "Contractor Project Manager") {
+      return res.status(403).json({ error: "Access denied: Contractor Project Manager only route" });
     }
 
-    const contractorPMId = req.user.user_id;
+    const contractortPMId = req.user.user_id;
     const contractorPMEmail = req.user.email;
 
     const result = await pool.query(
@@ -1664,7 +1664,7 @@ app.get("/contractor-project-manager/profile", authenticateToken, async (req, re
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Contractor PM not found" });
+      return res.status(404).json({ error: "Contractor Project Manager not found" });
     }
 
     const contractorPM = result.rows[0];
@@ -1674,16 +1674,16 @@ app.get("/contractor-project-manager/profile", authenticateToken, async (req, re
       profile_picture: contractorPM.profile_picture
     });
   } catch (err) {
-    console.error("Fetch Contractor PM profile error:", err);
-    res.status(500).json({ error: "Failed to fetch Contractor PM profile" });
+    console.error("Fetch contractor PM profile error:", err);
+    res.status(500).json({ error: "Failed to fetch contractor PM profile" });
   }
 });
 
-// Upload Contractor PM profile picture
+// Upload contractor PM profile picture
 app.post("/contractor-project-manager/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    if (req.user.role !== "Contractor PM") {
-      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    if (req.user.role !== "Contractor Project Manager") {
+      return res.status(403).json({ error: "Access denied: Contractor Project Manager only route" });
     }
 
     const contractorPMId = req.user.user_id;
@@ -1704,16 +1704,16 @@ app.post("/contractor-project-manager/upload-picture", authenticateToken, upload
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
-    console.error("Upload Contractor PM picture error:", err);
-    res.status(500).json({ error: "Failed to upload Contractor PM picture" });
+    console.error("Upload contractor PM picture error:", err);
+    res.status(500).json({ error: "Failed to upload contractor PM picture" });
   }
 });
 
-// Delete Contractor PM profile picture
+// Delete contractor PM profile picture
 app.post("/contractor-project-manager/delete-picture", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Contractor PM") {
-      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    if (req.user.role !== "Contractor Project Manager") {
+      return res.status(403).json({ error: "Access denied: Contractor Project Manager only route" });
     }
 
     const contractorPMId = req.user.user_id;
@@ -1726,16 +1726,16 @@ app.post("/contractor-project-manager/delete-picture", authenticateToken, async 
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Delete Contractor PM picture error:", err);
-    res.status(500).json({ error: "Failed to delete Contractor PM picture" });
+    console.error("Delete contractor PM picture error:", err);
+    res.status(500).json({ error: "Failed to delete contractor PM picture" });
   }
 });
 
-// Fetch all projects assigned to this Contractor PM
+// Fetch all projects assigned to this contractor PM
 app.post("/contractor-project-manager/projects", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Contractor PM") {
-      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    if (req.user.role !== "Contractor Project Manager") {
+      return res.status(403).json({ error: "Access denied: Contractor Project Manager only route" });
     }
 
     const contractorPMId = req.user.user_id;
@@ -1750,16 +1750,16 @@ app.post("/contractor-project-manager/projects", authenticateToken, async (req, 
 
     res.json({ projects: result.rows });
   } catch (err) {
-    console.error("Fetch Contractor PM projects error:", err);
-    res.status(500).json({ error: "Failed to fetch Contractor PM projects" });
+    console.error("Fetch contractor PM projects error:", err);
+    res.status(500).json({ error: "Failed to fetch contractor PM projects" });
   }
 });
 
-// Fetch project details for a specific Contractor PM assignment
+// Fetch project details for a specific contractor PM assignment
 app.post("/contractor-project-manager/project-details", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Contractor PM") {
-      return res.status(403).json({ error: "Access denied: Contractor PM only route" });
+    if (req.user.role !== "Contractor Project Manager") {
+      return res.status(403).json({ error: "Access denied: Contractor Project Manager only route" });
     }
 
     const contractorPMId = req.user.user_id;
@@ -1774,23 +1774,23 @@ app.post("/contractor-project-manager/project-details", authenticateToken, async
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Project not found or not assigned to Contractor PM" });
+      return res.status(404).json({ error: "Project not found or not assigned to contractor PM" });
     }
 
     res.json({ project: result.rows[0] });
   } catch (err) {
-    console.error("Fetch Contractor PM project details error:", err);
+    console.error("Fetch contractor PM project details error:", err);
     res.status(500).json({ error: "Failed to fetch project details" });
   }
 });
 
 // ============ CLIENT PROJECT MANAGER PROFILE ROUTES (JWT-based, Schema-Aligned) =============
 
-// Fetch Client PM profile basics
+// Fetch client PM profile basics
 app.get("/client-project-manager/profile", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Client PM") {
-      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    if (req.user.role !== "Client Project Manager") {
+      return res.status(403).json({ error: "Access denied: Client Project Manager only route" });
     }
 
     const clientPMId = req.user.user_id;
@@ -1802,7 +1802,7 @@ app.get("/client-project-manager/profile", authenticateToken, async (req, res) =
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Client PM not found" });
+      return res.status(404).json({ error: "Client Project Manager not found" });
     }
 
     const clientPM = result.rows[0];
@@ -1812,16 +1812,16 @@ app.get("/client-project-manager/profile", authenticateToken, async (req, res) =
       profile_picture: clientPM.profile_picture
     });
   } catch (err) {
-    console.error("Fetch Client PM profile error:", err);
-    res.status(500).json({ error: "Failed to fetch Client PM profile" });
+    console.error("Fetch client PM profile error:", err);
+    res.status(500).json({ error: "Failed to fetch client PM profile" });
   }
 });
 
-// Upload Client PM profile picture
+// Upload client PM profile picture
 app.post("/client-project-manager/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    if (req.user.role !== "Client PM") {
-      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    if (req.user.role !== "Client Project Manager") {
+      return res.status(403).json({ error: "Access denied: Client Project Manager only route" });
     }
 
     const clientPMId = req.user.user_id;
@@ -1842,16 +1842,16 @@ app.post("/client-project-manager/upload-picture", authenticateToken, upload.sin
 
     res.json({ success: true, url: fileUrl });
   } catch (err) {
-    console.error("Upload Client PM picture error:", err);
-    res.status(500).json({ error: "Failed to upload Client PM picture" });
+    console.error("Upload client PM picture error:", err);
+    res.status(500).json({ error: "Failed to upload client PM picture" });
   }
 });
 
-// Delete Client PM profile picture
+// Delete client PM profile picture
 app.post("/client-project-manager/delete-picture", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Client PM") {
-      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    if (req.user.role !== "Client Project Manager") {
+      return res.status(403).json({ error: "Access denied: Client Project Manager only route" });
     }
 
     const clientPMId = req.user.user_id;
@@ -1864,16 +1864,16 @@ app.post("/client-project-manager/delete-picture", authenticateToken, async (req
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Delete Client PM picture error:", err);
-    res.status(500).json({ error: "Failed to delete Client PM picture" });
+    console.error("Delete client PM picture error:", err);
+    res.status(500).json({ error: "Failed to delete client PM picture" });
   }
 });
 
-// Fetch all projects assigned to this Client PM
+// Fetch all projects assigned to this client PM
 app.post("/client-project-manager/projects", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Client PM") {
-      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    if (req.user.role !== "Client Project Manager") {
+      return res.status(403).json({ error: "Access denied: Client Project Manager only route" });
     }
 
     const clientPMId = req.user.user_id;
@@ -1888,16 +1888,16 @@ app.post("/client-project-manager/projects", authenticateToken, async (req, res)
 
     res.json({ projects: result.rows });
   } catch (err) {
-    console.error("Fetch Client PM projects error:", err);
-    res.status(500).json({ error: "Failed to fetch Client PM projects" });
+    console.error("Fetch client PM projects error:", err);
+    res.status(500).json({ error: "Failed to fetch client PM projects" });
   }
 });
 
-// Fetch project details for a specific Client PM assignment
+// Fetch project details for a specific client PM assignment
 app.post("/client-project-manager/project-details", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Client PM") {
-      return res.status(403).json({ error: "Access denied: Client PM only route" });
+    if (req.user.role !== "Client Project Manager") {
+      return res.status(403).json({ error: "Access denied: Client Project Manager only route" });
     }
 
     const clientPMId = req.user.user_id;
@@ -1912,12 +1912,12 @@ app.post("/client-project-manager/project-details", authenticateToken, async (re
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Project not found or not assigned to Client PM" });
+      return res.status(404).json({ error: "Project not found or not assigned to client PM" });
     }
 
     res.json({ project: result.rows[0] });
   } catch (err) {
-    console.error("Fetch Client PM project details error:", err);
+    console.error("Fetch client PM project details error:", err);
     res.status(500).json({ error: "Failed to fetch project details" });
   }
 });
