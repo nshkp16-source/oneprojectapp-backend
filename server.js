@@ -2793,6 +2793,131 @@ app.post("/assign", async (req, res) => {
   }
 });
 
+//CONTRACTOR DASHBOARD
+
+// ============= GET PROJECT RECORDS =============
+app.get('/api/project-records', authenticateToken, async (req, res) => {
+  const { table, project_id } = req.query;
+  const { user_id, role } = req.user; // from JWT
+
+  if (!table || !project_id) {
+    return res.status(400).json({ error: 'Missing table or project_id' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id, title, description, issued_date, status, uploaded_by, role
+       FROM ${table}
+       WHERE project_id = $1
+       ORDER BY issued_date DESC`,
+      [project_id]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ============= GET DOCUMENT DETAIL =============
+app.get('/api/document-detail', authenticateToken, async (req, res) => {
+  const { table, record_id, project_id } = req.query;
+
+  if (!table || !record_id || !project_id) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+
+  try {
+    // Document itself
+    const docResult = await pool.query(
+      `SELECT id, title, description, status, issued_date, uploaded_by, role
+       FROM ${table}
+       WHERE id = $1 AND project_id = $2`,
+      [record_id, project_id]
+    );
+    if (docResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    const document = docResult.rows[0];
+
+    // Viewers
+    const viewersResult = await pool.query(
+      `SELECT viewer_id, viewer_role, viewed_at
+       FROM document_viewers
+       WHERE document_review_id IN (
+         SELECT id FROM document_reviews
+         WHERE record_type = $1 AND record_id = $2
+       )`,
+      [table.replace('_records',''), record_id]
+    );
+
+    // Reviews
+    const reviewsResult = await pool.query(
+      `SELECT reviewer_id, reviewer_role, action, action_date,
+              short_description, rejection_reason, letter_body
+       FROM document_reviews
+       WHERE record_type = $1 AND record_id = $2
+       ORDER BY action_date DESC`,
+      [table.replace('_records',''), record_id]
+    );
+
+    res.json({
+      ...document,
+      viewers: viewersResult.rows,
+      reviews: reviewsResult.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ============= ADD NEW DOCUMENT =============
+app.post('/api/project-records/add', authenticateToken, async (req, res) => {
+  const { table } = req.query;
+  const { project_id, title, description } = req.body;
+  const file = req.file; // assuming multer for file upload
+  const { user_id, role } = req.user;
+
+  if (!table || !project_id || !title) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO ${table} (project_id, title, description, file_path, uploaded_by, role, status, review_required)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending_review', true)
+       RETURNING id`,
+      [project_id, title, description, file ? file.path : null, user_id, role]
+    );
+
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (err) {
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ============= ADD COMMENT / REVIEW =============
+app.post('/api/document-reviews/comment', authenticateToken, async (req, res) => {
+  const { record_type, record_id, short_description } = req.body;
+  const { user_id, role } = req.user;
+
+  if (!record_type || !record_id || !short_description) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO document_reviews (record_type, record_id, reviewer_id, reviewer_role, action, short_description)
+       VALUES ($1, $2, $3, $4, 'commented', $5)`,
+      [record_type, record_id, user_id, role, short_description]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
