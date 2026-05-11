@@ -2796,7 +2796,7 @@ app.post("/assign", async (req, res) => {
 //CONTRACTOR DASHBOARD
 
 //----------ROUTE: ADD RECORD--------------
-route.post('/records/add-record', authenticateJWT, upload.single('document'), async (req, res) => {
+app.post('/records/add-record', authenticateJWT, upload.single('document'), async (req, res) => {
   try {
     const { title, description, projectId, category, categoryLabel, tableName } = req.body;
     const uploadedBy = req.user.id;   // from JWT payload
