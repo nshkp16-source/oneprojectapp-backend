@@ -2872,16 +2872,15 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
   try {
     await client.query('BEGIN');
 
-    const { title, description, projectId, category, categoryLabel, recordKind } = req.body;
-    const uploadedBy = req.user.user_id;   // ✅ from JWT payload
-    const role = req.user.role;            // ✅ from JWT payload
+    const { title, description, projectId, category, recordKind } = req.body;
+    const uploadedBy = req.user.user_id;
+    const role = req.user.role;
     const filePath = req.file ? req.file.path : null;
 
     if (!projectId) {
       return res.status(400).json({ success: false, message: 'No active project selected.' });
     }
 
-    // ✅ Map category to SQL table and record_type
     const categoryMap = {
       'contractual-legal': { table: 'contractual_records', type: 'contractual' },
       'administrative-instructional': { table: 'administrative_records', type: 'administrative' },
@@ -2889,13 +2888,12 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
       'operational-performance': { table: 'operational_records', type: 'operational' },
       'financial': { table: 'financial_records', type: 'financial' }
     };
-
     const resolved = categoryMap[category];
     if (!resolved) {
       return res.status(400).json({ success: false, message: 'Invalid category.' });
     }
 
-    // 1️⃣ Insert into correct record table
+    // Insert record
     const recordResult = await client.query(
       `INSERT INTO ${resolved.table} 
        (project_id, title, description, file_path, uploaded_by, role, record_kind)
@@ -2905,7 +2903,7 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
     );
     const recordId = recordResult.rows[0].id;
 
-    // 2️⃣ Insert pending review (no_action initially)
+    // Insert review
     const reviewResult = await client.query(
       `INSERT INTO document_reviews 
        (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -2915,7 +2913,7 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
     );
     const reviewId = reviewResult.rows[0].id;
 
-    // 3️⃣ Insert notification tied to review
+    // Insert notification
     await client.query(
       `INSERT INTO notifications 
        (document_review_id, project_id, record_type, record_kind, added_by_id, added_by_role)
@@ -2923,7 +2921,7 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
       [reviewId, projectId, resolved.type, recordKind || 'new', uploadedBy, role]
     );
 
-    // 4️⃣ Get unread count for badge (from notification_views)
+    // Get unread count
     const countResult = await client.query(
       'SELECT COUNT(*) FROM notification_views WHERE project_id = $1',
       [projectId]
@@ -2931,13 +2929,7 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
     const unreadCount = countResult.rows[0].count;
 
     await client.query('COMMIT');
-    res.json({
-      success: true,
-      message: 'Record added successfully',
-      recordId,
-      reviewId,
-      unreadCount
-    });
+    res.json({ success: true, message: 'Record added successfully', recordId, reviewId, unreadCount });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Add record error:', err);
