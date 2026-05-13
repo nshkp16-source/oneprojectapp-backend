@@ -2867,11 +2867,14 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 //CONTRACTOR DASHBOARD
 
 // ---------- ROUTE: ADD RECORD --------------
-app.post('/records/add-record', authenticateToken, upload.single('document'), async (req, res) => {
+app.post('/records', authenticateToken, upload.single('attachment'), async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { title, description, projectId, category, tableName } = req.body;
-    const uploadedBy = req.user.user_id;   // from JWT payload
-    const role = req.user.role;            // from JWT payload
+    await client.query('BEGIN');
+
+    const { title, description, projectId, category, categoryLabel, recordKind } = req.body;
+    const uploadedBy = req.user.user_id;   // ✅ from JWT payload
+    const role = req.user.role;            // ✅ from JWT payload
     const filePath = req.file ? req.file.path : null;
 
     if (!projectId) {
@@ -2887,49 +2890,47 @@ app.post('/records/add-record', authenticateToken, upload.single('document'), as
       'financial': { table: 'financial_records', type: 'financial' }
     };
 
-    const resolved = tableName ? { table: tableName, type: category } : categoryMap[category];
+    const resolved = categoryMap[category];
     if (!resolved) {
       return res.status(400).json({ success: false, message: 'Invalid category.' });
     }
 
-    // ✅ Insert into correct table
-    const recordResult = await pool.query(
-      `INSERT INTO ${resolved.table} (project_id, title, description, file_path, uploaded_by, role)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [projectId, title, description, filePath, uploadedBy, role]
+    // 1️⃣ Insert into correct record table
+    const recordResult = await client.query(
+      `INSERT INTO ${resolved.table} 
+       (project_id, title, description, file_path, uploaded_by, role, record_kind)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       RETURNING id`,
+      [projectId, title, description, filePath, uploadedBy, role, recordKind || 'new']
     );
     const recordId = recordResult.rows[0].id;
 
-    // ✅ Insert pending review
-    const reviewResult = await pool.query(
-      `INSERT INTO document_reviews (record_type, record_id, reviewer_id, reviewer_role, action)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-      [resolved.type, recordId, uploadedBy, 'Consultant', 'pending_review']
+    // 2️⃣ Insert pending review (no_action initially)
+    const reviewResult = await client.query(
+      `INSERT INTO document_reviews 
+       (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING id`,
+      [resolved.type, recordId, recordKind || 'new', uploadedBy, role, 'no_action']
     );
     const reviewId = reviewResult.rows[0].id;
 
-    // ✅ Insert notification tied to review
-    await pool.query(
-      `INSERT INTO notifications (document_review_id, project_id, recipient_id, recipient_role, subject, body, message)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [
-        reviewId,
-        projectId,
-        uploadedBy,
-        'Consultant',
-        'New Document Requires Review',
-        `Contractor uploaded document ${title}. Please review.`,
-        `Document ${title} requires your review.`
-      ]
+    // 3️⃣ Insert notification tied to review
+    await client.query(
+      `INSERT INTO notifications 
+       (document_review_id, project_id, record_type, record_kind, added_by_id, added_by_role)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [reviewId, projectId, resolved.type, recordKind || 'new', uploadedBy, role]
     );
 
-    // ✅ Get unread count for badge
-    const countResult = await pool.query(
-      'SELECT COUNT(*) FROM notifications WHERE project_id = $1 AND read = false',
+    // 4️⃣ Get unread count for badge (from notification_views)
+    const countResult = await client.query(
+      'SELECT COUNT(*) FROM notification_views WHERE project_id = $1',
       [projectId]
     );
     const unreadCount = countResult.rows[0].count;
 
+    await client.query('COMMIT');
     res.json({
       success: true,
       message: 'Record added successfully',
@@ -2938,8 +2939,11 @@ app.post('/records/add-record', authenticateToken, upload.single('document'), as
       unreadCount
     });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('Add record error:', err);
     res.status(500).json({ success: false, message: 'Server error: ' + err.message });
+  } finally {
+    client.release();
   }
 });
 
