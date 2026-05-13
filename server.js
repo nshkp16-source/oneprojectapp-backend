@@ -2866,22 +2866,20 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 
 //CONTRACTOR DASHBOARD
 
-// ---------- ROUTE: ADD RECORD --------------
+// ============ ADD RECORD ROUTE (JWT-based) ============
 app.post("/records", authenticateToken, upload.single("attachment"), async (req, res) => {
-  const client = await pool.connect();
   try {
-    await client.query("BEGIN");
-
+    // ✅ JWT already verified by authenticateToken middleware
+    const { user_id: userId, role } = req.user;
     const { title, description, projectId, category, recordKind } = req.body;
-    const uploadedBy = req.user.user_id;
-    const role = req.user.role;
     const filePath = req.file ? req.file.path : null;
 
+    // ✅ Validate payload
     if (!projectId || !title || !category) {
-      await client.query("ROLLBACK");
       return res.status(400).json({ success: false, error: "Invalid payload" });
     }
 
+    // ✅ Map category to correct table/type
     const categoryMap = {
       "contractual-legal": { table: "contractual_records", type: "contractual" },
       "administrative-instructional": { table: "administrative_records", type: "administrative" },
@@ -2891,59 +2889,71 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     };
     const resolved = categoryMap[category];
     if (!resolved) {
-      await client.query("ROLLBACK");
       return res.status(400).json({ success: false, error: "Invalid category" });
     }
 
-    // Insert record
-    const recordResult = await client.query(
-      `INSERT INTO ${resolved.table}
-       (project_id, title, description, file_path, uploaded_by, role, record_kind)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       RETURNING id`,
-      [projectId, title, description, filePath, uploadedBy, role, recordKind || "new"]
-    );
-    const recordId = recordResult.rows[0]?.id;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-    // Insert review
-    const reviewResult = await client.query(
-      `INSERT INTO document_reviews
-       (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       RETURNING id`,
-      [resolved.type, recordId, recordKind || "new", uploadedBy, role, "no_action"]
-    );
-    const reviewId = reviewResult.rows[0]?.id;
+      // 1️⃣ Insert record
+      const recordResult = await client.query(
+        `INSERT INTO ${resolved.table}
+         (project_id, title, description, file_path, uploaded_by, role, record_kind)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         RETURNING id`,
+        [projectId, title, description, filePath, userId, role, recordKind || "new"]
+      );
+      const recordId = recordResult.rows[0]?.id;
 
-    // Insert notification
-    await client.query(
-      `INSERT INTO notifications
-       (document_review_id, project_id, record_type, record_kind, added_by_id, added_by_role)
-       VALUES ($1,$2,$3,$4,$5,$6)`,
-      [reviewId, projectId, resolved.type, recordKind || "new", uploadedBy, role]
-    );
+      // 2️⃣ Insert review
+      const reviewResult = await client.query(
+        `INSERT INTO document_reviews
+         (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING id`,
+        [resolved.type, recordId, recordKind || "new", userId, role, "no_action"]
+      );
+      const reviewId = reviewResult.rows[0]?.id;
 
-    // Get unread count
-    const countResult = await client.query(
-      "SELECT COUNT(*) FROM notification_views WHERE project_id = $1",
-      [projectId]
-    );
-    const unreadCount = countResult.rows[0]?.count || 0;
+      // 3️⃣ Insert notification
+      await client.query(
+        `INSERT INTO notifications
+         (document_review_id, project_id, record_type, record_kind, added_by_id, added_by_role)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [reviewId, projectId, resolved.type, recordKind || "new", userId, role]
+      );
 
-    await client.query("COMMIT");
-    res.json({
-      success: true,
-      message: "Record added successfully",
-      recordId,
-      reviewId,
-      unreadCount
-    });
+      // 4️⃣ Get unread count
+      const countResult = await client.query(
+        "SELECT COUNT(*) FROM notification_views WHERE project_id=$1",
+        [projectId]
+      );
+      const unreadCount = countResult.rows[0]?.count || 0;
+
+      await client.query("COMMIT");
+
+      // ✅ Consistent JSON response
+      res.json({
+        success: true,
+        message: "Record saved",
+        role,
+        projectId,
+        recordId,
+        reviewId,
+        unreadCount,
+        redirectSource: role.toLowerCase().replace(/\s+/g, "-") + "-dashboard"
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error("Error saving record:", err);
+      res.status(500).json({ success: false, error: "Server error" });
+    } finally {
+      client.release();
+    }
   } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("Add record error:", err);
+    console.error("Add record route error:", err);
     res.status(500).json({ success: false, error: "Server error" });
-  } finally {
-    client.release();
   }
 });
 
