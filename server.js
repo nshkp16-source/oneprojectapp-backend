@@ -2866,7 +2866,7 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 
 //CONTRACTOR DASHBOARD
 
-//----------ROUTE: ADD RECORD--------------
+// ---------- ROUTE: ADD RECORD --------------
 app.post('/records/add-record', authenticateToken, upload.single('document'), async (req, res) => {
   try {
     const { title, description, projectId, category, categoryLabel, tableName } = req.body;
@@ -2878,31 +2878,71 @@ app.post('/records/add-record', authenticateToken, upload.single('document'), as
       return res.status(400).json({ success: false, message: 'No active project selected.' });
     }
 
-    // ✅ Map category to SQL table
+    // ✅ Map category to SQL table and record_type
     const categoryMap = {
-      'contractual-legal': 'contractual_records',
-      'administrative-instructional': 'administrative_records',
-      'safety-compliance': 'safety_records',
-      'operational-performance': 'operational_records',
-      'financial': 'financial_records'
+      'contractual-legal': { table: 'contractual_records', type: 'contractual' },
+      'administrative-instructional': { table: 'administrative_records', type: 'administrative' },
+      'safety-compliance': { table: 'safety_records', type: 'safety' },
+      'operational-performance': { table: 'operational_records', type: 'operational' },
+      'financial': { table: 'financial_records', type: 'financial' }
     };
 
-    const resolvedTable = tableName || categoryMap[category];
-    if (!resolvedTable) {
+    const resolved = tableName ? { table: tableName, type: category } : categoryMap[category];
+    if (!resolved) {
       return res.status(400).json({ success: false, message: 'Invalid category.' });
     }
 
     // ✅ Insert into correct table
-    const query = `
-      INSERT INTO ${resolvedTable} 
+    const recordQuery = `
+      INSERT INTO ${resolved.table} 
         (project_id, title, description, file_path, uploaded_by, role) 
       VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING id;
     `;
-    const values = [projectId, title, description, filePath, uploadedBy, role];
-    const result = await pool.query(query, values);
+    const recordValues = [projectId, title, description, filePath, uploadedBy, role];
+    const recordResult = await pool.query(recordQuery, recordValues);
+    const recordId = recordResult.rows[0].id;
 
-    res.json({ success: true, recordId: result.rows[0].id });
+    // ✅ Insert pending review
+    const reviewQuery = `
+      INSERT INTO document_reviews (record_type, record_id, reviewer_id, reviewer_role, action)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id;
+    `;
+    const reviewValues = [resolved.type, recordId, uploadedBy, 'Consultant', 'pending_review'];
+    const reviewResult = await pool.query(reviewQuery, reviewValues);
+    const reviewId = reviewResult.rows[0].id;
+
+    // ✅ Insert notification tied to review
+    const notifQuery = `
+      INSERT INTO notifications (document_review_id, project_id, recipient_id, recipient_role, subject, body, message)
+      VALUES ($1, $2, $3, $4, $5, $6, $7);
+    `;
+    const notifValues = [
+      reviewId,
+      projectId,
+      uploadedBy,
+      'Consultant',
+      'New Document Requires Review',
+      `Contractor uploaded document ${title}. Please review.`,
+      `Document ${title} requires your review.`
+    ];
+    await pool.query(notifQuery, notifValues);
+
+    // ✅ Get unread count for badge
+    const countResult = await pool.query(
+      'SELECT COUNT(*) FROM notifications WHERE project_id = $1 AND read = false',
+      [projectId]
+    );
+    const unreadCount = countResult.rows[0].count;
+
+    res.json({
+      success: true,
+      message: 'Record added successfully',
+      recordId,
+      reviewId,
+      unreadCount
+    });
   } catch (err) {
     console.error('Add record error:', err);
     res.status(500).json({ success: false, message: 'Server error: ' + err.message });
