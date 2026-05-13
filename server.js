@@ -2869,14 +2869,13 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 // ============ ADD RECORD ROUTE (JWT-based) ============
 app.post("/records", authenticateToken, upload.single("attachment"), async (req, res) => {
   try {
-    // ✅ JWT already verified by authenticateToken middleware
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, category, recordKind } = req.body;
     const filePath = req.file ? req.file.path : null;
 
     // ✅ Validate payload
     if (!projectId || !title || !category) {
-      return res.status(400).json({ success: false, error: "Invalid payload" });
+      return res.status(400).json({ success: false, message: "Invalid payload" });
     }
 
     // ✅ Map category to correct table/type
@@ -2889,7 +2888,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     };
     const resolved = categoryMap[category];
     if (!resolved) {
-      return res.status(400).json({ success: false, error: "Invalid category" });
+      return res.status(400).json({ success: false, message: "Invalid category" });
     }
 
     const client = await pool.connect();
@@ -2936,7 +2935,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       // ✅ Consistent JSON response
       res.json({
         success: true,
-        message: "Record saved",
+        message: "Record saved successfully",
         role,
         projectId,
         recordId,
@@ -2947,13 +2946,13 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     } catch (err) {
       await client.query("ROLLBACK");
       console.error("Error saving record:", err);
-      res.status(500).json({ success: false, error: "Server error" });
+      res.status(500).json({ success: false, message: "Server error while saving record" });
     } finally {
       client.release();
     }
   } catch (err) {
     console.error("Add record route error:", err);
-    res.status(500).json({ success: false, error: "Server error" });
+    res.status(500).json({ success: false, message: "Server error in add record route" });
   }
 });
 
