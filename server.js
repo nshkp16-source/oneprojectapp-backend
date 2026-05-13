@@ -2867,73 +2867,81 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 //CONTRACTOR DASHBOARD
 
 // ---------- ROUTE: ADD RECORD --------------
-app.post('/records', authenticateToken, upload.single('attachment'), async (req, res) => {
+app.post("/records", authenticateToken, upload.single("attachment"), async (req, res) => {
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    await client.query("BEGIN");
 
     const { title, description, projectId, category, recordKind } = req.body;
     const uploadedBy = req.user.user_id;
     const role = req.user.role;
     const filePath = req.file ? req.file.path : null;
 
-    if (!projectId) {
-      return res.status(400).json({ success: false, message: 'No active project selected.' });
+    if (!projectId || !title || !category) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "Invalid payload" });
     }
 
     const categoryMap = {
-      'contractual-legal': { table: 'contractual_records', type: 'contractual' },
-      'administrative-instructional': { table: 'administrative_records', type: 'administrative' },
-      'safety-compliance': { table: 'safety_records', type: 'safety' },
-      'operational-performance': { table: 'operational_records', type: 'operational' },
-      'financial': { table: 'financial_records', type: 'financial' }
+      "contractual-legal": { table: "contractual_records", type: "contractual" },
+      "administrative-instructional": { table: "administrative_records", type: "administrative" },
+      "safety-compliance": { table: "safety_records", type: "safety" },
+      "operational-performance": { table: "operational_records", type: "operational" },
+      "financial": { table: "financial_records", type: "financial" }
     };
     const resolved = categoryMap[category];
     if (!resolved) {
-      return res.status(400).json({ success: false, message: 'Invalid category.' });
+      await client.query("ROLLBACK");
+      return res.status(400).json({ success: false, error: "Invalid category" });
     }
 
-    // 1️⃣ Insert record
+    // Insert record
     const recordResult = await client.query(
       `INSERT INTO ${resolved.table}
        (project_id, title, description, file_path, uploaded_by, role, record_kind)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id`,
-      [projectId, title, description, filePath, uploadedBy, role, recordKind || 'new']
+      [projectId, title, description, filePath, uploadedBy, role, recordKind || "new"]
     );
-    const recordId = recordResult.rows[0].id;
+    const recordId = recordResult.rows[0]?.id;
 
-    // 2️⃣ Insert placeholder review
+    // Insert review
     const reviewResult = await client.query(
       `INSERT INTO document_reviews
        (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING id`,
-      [resolved.type, recordId, recordKind || 'new', uploadedBy, role, 'no_action']
+      [resolved.type, recordId, recordKind || "new", uploadedBy, role, "no_action"]
     );
-    const reviewId = reviewResult.rows[0].id;
+    const reviewId = reviewResult.rows[0]?.id;
 
-    // 3️⃣ Insert notification
+    // Insert notification
     await client.query(
       `INSERT INTO notifications
        (document_review_id, project_id, record_type, record_kind, added_by_id, added_by_role)
        VALUES ($1,$2,$3,$4,$5,$6)`,
-      [reviewId, projectId, resolved.type, recordKind || 'new', uploadedBy, role]
+      [reviewId, projectId, resolved.type, recordKind || "new", uploadedBy, role]
     );
 
-    // 4️⃣ Get unread count
+    // Get unread count
     const countResult = await client.query(
-      'SELECT COUNT(*) FROM notification_views WHERE project_id = $1',
+      "SELECT COUNT(*) FROM notification_views WHERE project_id = $1",
       [projectId]
     );
-    const unreadCount = countResult.rows[0].count;
+    const unreadCount = countResult.rows[0]?.count || 0;
 
-    await client.query('COMMIT');
-    res.json({ success: true, message: 'Record added successfully', recordId, reviewId, unreadCount });
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      message: "Record added successfully",
+      recordId,
+      reviewId,
+      unreadCount
+    });
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Add record error:', err);
-    res.status(500).json({ success: false, message: 'Server error: ' + err.message });
+    await client.query("ROLLBACK");
+    console.error("Add record error:", err);
+    res.status(500).json({ success: false, error: "Server error" });
   } finally {
     client.release();
   }
