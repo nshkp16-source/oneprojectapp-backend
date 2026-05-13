@@ -2893,9 +2893,9 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
       return res.status(400).json({ success: false, message: 'Invalid category.' });
     }
 
-    // Insert record
+    // 1️⃣ Insert record
     const recordResult = await client.query(
-      `INSERT INTO ${resolved.table} 
+      `INSERT INTO ${resolved.table}
        (project_id, title, description, file_path, uploaded_by, role, record_kind)
        VALUES ($1,$2,$3,$4,$5,$6,$7)
        RETURNING id`,
@@ -2903,9 +2903,9 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
     );
     const recordId = recordResult.rows[0].id;
 
-    // Insert review
+    // 2️⃣ Insert placeholder review
     const reviewResult = await client.query(
-      `INSERT INTO document_reviews 
+      `INSERT INTO document_reviews
        (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING id`,
@@ -2913,15 +2913,15 @@ app.post('/records', authenticateToken, upload.single('attachment'), async (req,
     );
     const reviewId = reviewResult.rows[0].id;
 
-    // Insert notification
+    // 3️⃣ Insert notification
     await client.query(
-      `INSERT INTO notifications 
+      `INSERT INTO notifications
        (document_review_id, project_id, record_type, record_kind, added_by_id, added_by_role)
        VALUES ($1,$2,$3,$4,$5,$6)`,
       [reviewId, projectId, resolved.type, recordKind || 'new', uploadedBy, role]
     );
 
-    // Get unread count
+    // 4️⃣ Get unread count
     const countResult = await client.query(
       'SELECT COUNT(*) FROM notification_views WHERE project_id = $1',
       [projectId]
