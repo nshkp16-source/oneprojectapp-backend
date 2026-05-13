@@ -2807,6 +2807,63 @@ app.post("/assign", async (req, res) => {
   }
 });
 
+// DASHBOARD-----------------------------
+
+// GET notifications for a project
+app.get('/notifications', authenticateToken, async (req, res) => {
+  const { projectId } = req.query;
+
+  try {
+    const result = await pool.query(
+      'SELECT * FROM notifications WHERE project_id = $1 ORDER BY created_at DESC',
+      [projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        success: true,
+        notifications: [],
+        message: "No notifications in database."
+      });
+    }
+
+    res.json({
+      success: true,
+      notifications: result.rows,
+      message: "Notifications fetched successfully."
+    });
+  } catch (err) {
+    console.error("Fetch notifications error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error fetching notifications."
+    });
+  }
+});
+
+// PUT mark notification as read
+app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await pool.query(
+      'UPDATE notifications SET read = true, read_at = NOW() WHERE id = $1',
+      [id]
+    );
+
+    res.json({
+      success: true,
+      message: "Notification marked as read."
+    });
+  } catch (err) {
+    console.error("Mark as read error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error marking notification as read."
+    });
+  }
+});
+
 //CONTRACTOR DASHBOARD
 
 //----------ROUTE: ADD RECORD--------------
