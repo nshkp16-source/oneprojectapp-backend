@@ -2869,7 +2869,7 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 // ---------- ROUTE: ADD RECORD --------------
 app.post('/records/add-record', authenticateToken, upload.single('document'), async (req, res) => {
   try {
-    const { title, description, projectId, category, categoryLabel, tableName } = req.body;
+    const { title, description, projectId, category, tableName } = req.body;
     const uploadedBy = req.user.user_id;   // from JWT payload
     const role = req.user.role;            // from JWT payload
     const filePath = req.file ? req.file.path : null;
@@ -2893,41 +2893,35 @@ app.post('/records/add-record', authenticateToken, upload.single('document'), as
     }
 
     // ✅ Insert into correct table
-    const recordQuery = `
-      INSERT INTO ${resolved.table} 
-        (project_id, title, description, file_path, uploaded_by, role) 
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id;
-    `;
-    const recordValues = [projectId, title, description, filePath, uploadedBy, role];
-    const recordResult = await pool.query(recordQuery, recordValues);
+    const recordResult = await pool.query(
+      `INSERT INTO ${resolved.table} (project_id, title, description, file_path, uploaded_by, role)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [projectId, title, description, filePath, uploadedBy, role]
+    );
     const recordId = recordResult.rows[0].id;
 
     // ✅ Insert pending review
-    const reviewQuery = `
-      INSERT INTO document_reviews (record_type, record_id, reviewer_id, reviewer_role, action)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING id;
-    `;
-    const reviewValues = [resolved.type, recordId, uploadedBy, 'Consultant', 'pending_review'];
-    const reviewResult = await pool.query(reviewQuery, reviewValues);
+    const reviewResult = await pool.query(
+      `INSERT INTO document_reviews (record_type, record_id, reviewer_id, reviewer_role, action)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [resolved.type, recordId, uploadedBy, 'Consultant', 'pending_review']
+    );
     const reviewId = reviewResult.rows[0].id;
 
     // ✅ Insert notification tied to review
-    const notifQuery = `
-      INSERT INTO notifications (document_review_id, project_id, recipient_id, recipient_role, subject, body, message)
-      VALUES ($1, $2, $3, $4, $5, $6, $7);
-    `;
-    const notifValues = [
-      reviewId,
-      projectId,
-      uploadedBy,
-      'Consultant',
-      'New Document Requires Review',
-      `Contractor uploaded document ${title}. Please review.`,
-      `Document ${title} requires your review.`
-    ];
-    await pool.query(notifQuery, notifValues);
+    await pool.query(
+      `INSERT INTO notifications (document_review_id, project_id, recipient_id, recipient_role, subject, body, message)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        reviewId,
+        projectId,
+        uploadedBy,
+        'Consultant',
+        'New Document Requires Review',
+        `Contractor uploaded document ${title}. Please review.`,
+        `Document ${title} requires your review.`
+      ]
+    );
 
     // ✅ Get unread count for badge
     const countResult = await pool.query(
