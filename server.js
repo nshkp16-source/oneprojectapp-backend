@@ -19,13 +19,27 @@ app.use(cors());
 
 // ✅ Multer setup
 const upload = multer({
-  limits: { fileSize: 500 * 1024 },
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
   storage: multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
       cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
     }
-  })
+  }),
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      'image/png',
+      'image/jpeg',
+      'application/pdf',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    ];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Unsupported file type'), false);
+    }
+  }
 });
 
 // ✅ Serve uploads folder publicly
