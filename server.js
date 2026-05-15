@@ -2869,16 +2869,18 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 // ============ ADD RECORD ROUTE (JWT-based) ============
 app.post("/records", authenticateToken, upload.single("attachment"), async (req, res) => {
   try {
+    // 1️⃣ JWT authentication
     const { user_id: userId, role } = req.user;
+
+    // 2️⃣ Payload validation
     const { title, description, projectId, category, recordKind } = req.body;
     const filePath = req.file ? req.file.path : null;
 
-    // ✅ Validate payload
     if (!projectId || !title || !category) {
       return res.status(400).json({ success: false, message: "Invalid payload" });
     }
 
-    // ✅ Map category to correct table/type
+    // 3️⃣ Category mapping
     const categoryMap = {
       "contractual-legal": { table: "contractual_records", type: "contractual" },
       "administrative-instructional": { table: "administrative_records", type: "administrative" },
@@ -2895,7 +2897,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     try {
       await client.query("BEGIN");
 
-      // 1️⃣ Insert record
+      // 4️⃣ Insert record
       const recordResult = await client.query(
         `INSERT INTO ${resolved.table}
          (project_id, title, description, file_path, uploaded_by, role, record_kind)
@@ -2905,7 +2907,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       );
       const recordId = recordResult.rows[0]?.id;
 
-      // 2️⃣ Insert review
+      // 5️⃣ Insert stub review (pending, no_action)
       const reviewResult = await client.query(
         `INSERT INTO document_reviews
          (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -2915,7 +2917,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       );
       const reviewId = reviewResult.rows[0]?.id;
 
-      // 3️⃣ Insert notification
+      // 6️⃣ Insert notification stub
       await client.query(
         `INSERT INTO notifications
          (document_review_id, project_id, record_type, record_kind, added_by_id, added_by_role)
@@ -2923,25 +2925,15 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
         [reviewId, projectId, resolved.type, recordKind || "new", userId, role]
       );
 
-      // 4️⃣ Get unread count
-      const countResult = await client.query(
-        "SELECT COUNT(*) FROM notification_views WHERE project_id=$1",
-        [projectId]
-      );
-      const unreadCount = countResult.rows[0]?.count || 0;
-
       await client.query("COMMIT");
 
-      // ✅ Consistent JSON response
+      // 7️⃣ Respond
       res.json({
         success: true,
         message: "Record saved successfully",
-        role,
         projectId,
         recordId,
-        reviewId,
-        unreadCount,
-        redirectSource: role.toLowerCase().replace(/\s+/g, "-") + "-dashboard"
+        reviewId
       });
     } catch (err) {
       await client.query("ROLLBACK");
