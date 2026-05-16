@@ -2809,23 +2809,39 @@ app.post("/assign", async (req, res) => {
 
 // DASHBOARD-----------------------------
 
-// GET notifications for a project
+// GET notifications for a project/user
 app.get('/notifications', authenticateToken, async (req, res) => {
-  const { projectId } = req.query;
+  const { projectId, userId } = req.query;
 
   try {
     const result = await pool.query(
-      'SELECT * FROM notifications WHERE project_id = $1 ORDER BY created_at DESC',
-      [projectId]
+      `
+      SELECT n.id,
+             n.record_type AS concept,
+             rr.record_id,
+             r.title,
+             u.name AS poster_name,
+             u.role AS poster_role,
+             u.position AS poster_position,
+             COALESCE(nv.viewed_at IS NOT NULL, false) AS read
+      FROM notifications n
+      JOIN reply_relationships rr ON n.reply_relationship_id = rr.id
+      JOIN document_reviews dr ON n.document_review_id = dr.id
+      JOIN users u ON n.added_by_id = u.id
+      JOIN (
+        SELECT id, title, project_id FROM contractual_records
+        UNION ALL SELECT id, title, project_id FROM administrative_records
+        UNION ALL SELECT id, title, project_id FROM safety_records
+        UNION ALL SELECT id, title, project_id FROM operational_records
+        UNION ALL SELECT id, title, project_id FROM financial_records
+      ) r ON rr.record_id = r.id AND r.project_id = n.project_id
+      LEFT JOIN notification_views nv ON nv.notification_id = n.id AND nv.user_id = $2
+      WHERE n.project_id = $1
+        AND n.added_by_id <> $2
+      ORDER BY n.id DESC
+      `,
+      [projectId, userId]
     );
-
-    if (result.rows.length === 0) {
-      return res.json({
-        success: true,
-        notifications: [],
-        message: "No notifications in database."
-      });
-    }
 
     res.json({
       success: true,
@@ -2841,14 +2857,17 @@ app.get('/notifications', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT mark notification as read
+// PUT mark notification as read (save read receipt)
 app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
   const { id } = req.params;
+  const { projectId, userId, userRole } = req.query;
 
   try {
     await pool.query(
-      'UPDATE notifications SET read = true, read_at = NOW() WHERE id = $1',
-      [id]
+      `INSERT INTO notification_views (notification_id, project_id, user_id, user_role, viewed_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT DO NOTHING`,
+      [id, projectId, userId, userRole]
     );
 
     res.json({
