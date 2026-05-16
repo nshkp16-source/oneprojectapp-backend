@@ -2967,9 +2967,9 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
   }
 });
 
-// ============= DOCUMENT DETAIL ROUTE =============
-app.post('/api/document-detail', authenticateJWT, async (req, res) => {
-  const { docId, projectId, category } = req.body;
+// ============= FETCH TAB RECORDS ROUTE =============
+app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
+  const { projectId, category } = req.body;
 
   const tableMap = {
     contractual: 'contractual_records',
@@ -2983,43 +2983,45 @@ app.post('/api/document-detail', authenticateJWT, async (req, res) => {
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
-    const record = await db.oneOrNone(`
+    const records = await pool.any(`
       SELECT r.id, r.title, r.description, r.file_path,
              r.issued_date AS date_recorded,
              r.role AS uploader_role,
              r.status, r.record_kind
       FROM ${table} r
-      WHERE r.project_id = $1 AND r.id = $2
-    `, [projectId, docId]);
+      WHERE r.project_id = $1
+      ORDER BY r.issued_date DESC
+    `, [projectId]);
 
-    if (!record) return res.status(404).json({ error: 'Record not found' });
+    // For each record, fetch reviews + viewers
+    const enriched = await Promise.all(records.map(async (rec) => {
+      const reviews = await pool.any(`
+        SELECT reviewer_role, action, action_date, short_description, rejection_reason
+        FROM document_reviews
+        WHERE record_type = $1 AND record_id = $2
+        ORDER BY action_date DESC
+      `, [category, rec.id]);
 
-    // Fetch reviews
-    const reviews = await db.any(`
-      SELECT reviewer_role, action, action_date, short_description, rejection_reason
-      FROM document_reviews
-      WHERE record_type = $1 AND record_id = $2
-      ORDER BY action_date DESC
-    `, [category, docId]);
+      const viewers = await pool.any(`
+        SELECT nv.user_id AS viewer_id, nv.user_role AS viewer_role, nv.viewed_at
+        FROM notifications n
+        JOIN notification_views nv ON nv.notification_id = n.id
+        WHERE n.project_id = $1 AND n.record_type = $2 AND n.record_id = $3
+        ORDER BY nv.viewed_at DESC
+      `, [projectId, category, rec.id]);
 
-    // Fetch viewers (read receipts)
-    const viewers = await db.any(`
-      SELECT nv.user_id AS viewer_id, nv.user_role AS viewer_role, nv.viewed_at
-      FROM notifications n
-      JOIN notification_views nv ON nv.notification_id = n.id
-      WHERE n.project_id = $1 AND n.record_type = $2 AND n.record_id = $3
-      ORDER BY nv.viewed_at DESC
-    `, [projectId, category, docId]);
+      return {
+        ...rec,
+        record_content_name: category,
+        reviews,
+        viewers
+      };
+    }));
 
-    res.json({
-      ...record,
-      record_content_name: category,
-      reviews,
-      viewers
-    });
+    res.json(enriched);
   } catch (err) {
-    console.error('Document detail error:', err);
-    res.status(500).json({ error: 'Failed to fetch document detail' });
+    console.error('Fetch tab records error:', err);
+    res.status(500).json({ error: 'Failed to fetch records' });
   }
 });
 
