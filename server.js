@@ -2970,7 +2970,6 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
 // ============= FETCH TAB RECORDS ROUTE =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, category } = req.body;
-
   const tableMap = {
     contractual: 'contractual_records',
     administrative: 'administrative_records',
@@ -2978,13 +2977,11 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     operational: 'operational_records',
     financial: 'financial_records'
   };
-
   const table = tableMap[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
-    // Main records query
-    const query = `
+    const { rows: records } = await pool.query(`
       SELECT r.id, r.title, r.description, r.file_path,
              r.issued_date AS date_recorded,
              r.role AS uploader_role,
@@ -2992,12 +2989,11 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       FROM ${table} r
       WHERE r.project_id = $1
       ORDER BY r.issued_date DESC
-    `;
-    const { rows: records } = await pool.query(query, [projectId]);
+    `, [projectId]);
 
-    // Enrich each record
     const enriched = await Promise.all(records.map(async (rec) => {
-      // Reviews (match schema: only reviewer_role, action, action_date)
+
+      // ✅ Only columns that exist in document_reviews
       const { rows: reviews } = await pool.query(`
         SELECT reviewer_role, action, action_date
         FROM document_reviews
@@ -3005,14 +3001,14 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
-      // Viewers
+      // ✅ Only columns that exist in notifications + notification_views
       const { rows: viewers } = await pool.query(`
         SELECT nv.user_id AS viewer_id, nv.user_role AS viewer_role, nv.viewed_at
-        FROM notifications n
-        JOIN notification_views nv ON nv.notification_id = n.id
-        WHERE n.project_id = $1 AND n.record_type = $2 AND n.record_id = $3
+        FROM notification_views nv
+        JOIN notifications n ON nv.notification_id = n.id
+        WHERE n.project_id = $1 AND n.record_type = $2
         ORDER BY nv.viewed_at DESC
-      `, [projectId, category, rec.id]);
+      `, [projectId, category]);
 
       return { ...rec, record_content_name: category, reviews, viewers };
     }));
