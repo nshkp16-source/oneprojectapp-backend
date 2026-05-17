@@ -2970,17 +2970,20 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
 // ============= FETCH TAB RECORDS ROUTE =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, category } = req.body;
+
   const tableMap = {
-    contractual: 'contractual_records',
+    contractual:    'contractual_records',
     administrative: 'administrative_records',
-    safety: 'safety_records',
-    operational: 'operational_records',
-    financial: 'financial_records'
+    safety:         'safety_records',
+    operational:    'operational_records',
+    financial:      'financial_records'
   };
+
   const table = tableMap[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
+    // ✅ Fetch records — only 'new' kind, not comments/replies
     const { rows: records } = await pool.query(`
       SELECT r.id, r.title, r.description, r.file_path,
              r.issued_date AS date_recorded,
@@ -2988,12 +2991,12 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
              r.status, r.record_kind
       FROM ${table} r
       WHERE r.project_id = $1
+        AND r.record_kind = 'new'
       ORDER BY r.issued_date DESC
     `, [projectId]);
 
+    // ✅ Enrich each record with reviews only
     const enriched = await Promise.all(records.map(async (rec) => {
-
-      // ✅ Only columns that exist in document_reviews
       const { rows: reviews } = await pool.query(`
         SELECT reviewer_role, action, action_date
         FROM document_reviews
@@ -3001,22 +3004,106 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
-      // ✅ Only columns that exist in notifications + notification_views
-      const { rows: viewers } = await pool.query(`
-        SELECT nv.user_id AS viewer_id, nv.user_role AS viewer_role, nv.viewed_at
-        FROM notification_views nv
-        JOIN notifications n ON nv.notification_id = n.id
-        WHERE n.project_id = $1 AND n.record_type = $2
-        ORDER BY nv.viewed_at DESC
-      `, [projectId, category]);
-
-      return { ...rec, record_content_name: category, reviews, viewers };
+      return { ...rec, reviews };
     }));
 
     res.json({ records: enriched });
+
   } catch (err) {
     console.error('Fetch tab records error:', err);
     res.status(500).json({ error: 'Failed to fetch records' });
+  }
+});
+
+// ============= APPROVE / REJECT RECORD =============
+app.post('/api/review-record', authenticateToken, async (req, res) => {
+  const { projectId, recordId, category, action } = req.body;
+
+  const tableMap = {
+    contractual:    'contractual_records',
+    administrative: 'administrative_records',
+    safety:         'safety_records',
+    operational:    'operational_records',
+    financial:      'financial_records'
+  };
+
+  const table = tableMap[category];
+  if (!table) return res.status(400).json({ error: 'Invalid category' });
+  if (!['approved', 'rejected'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
+
+  try {
+    // ✅ Update status on the record itself
+    await pool.query(`
+      UPDATE ${table}
+      SET status = $1
+      WHERE id = $2 AND project_id = $3
+    `, [action, recordId, projectId]);
+
+    // ✅ Insert into document_reviews
+    const reviewerRole = req.user.role; // from authenticateToken
+    const reviewerId   = req.user.id;
+
+    await pool.query(`
+      INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
+      VALUES ($1, $2, 'new', $3, $4, $5)
+    `, [category, recordId, reviewerId, reviewerRole, action]);
+
+    res.json({ success: true, message: `Record ${action} successfully.` });
+
+  } catch (err) {
+    console.error('Review record error:', err);
+    res.status(500).json({ error: 'Failed to process review.' });
+  }
+});
+
+
+// ============= DOWNLOAD ATTACHED FILE =============
+app.get('/api/download-file', authenticateToken, async (req, res) => {
+  const { recordId, category } = req.query;
+
+  const tableMap = {
+    contractual:    'contractual_records',
+    administrative: 'administrative_records',
+    safety:         'safety_records',
+    operational:    'operational_records',
+    financial:      'financial_records'
+  };
+
+  const table = tableMap[category];
+  if (!table) return res.status(400).json({ error: 'Invalid category' });
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT file_path FROM ${table}
+      WHERE id = $1
+    `, [recordId]);
+
+    if (!rows.length || !rows[0].file_path) {
+      return res.status(404).json({ error: 'File not found.' });
+    }
+
+    const filePath = rows[0].file_path;
+
+    // ✅ If file_path is a URL (e.g. Cloudinary, S3, Supabase storage)
+    // just redirect to it — browser handles the download
+    if (filePath.startsWith('http')) {
+      return res.redirect(filePath);
+    }
+
+    // ✅ If file_path is a local disk path
+    const fs   = require('fs');
+    const path = require('path');
+    const abs  = path.resolve(filePath);
+
+    if (!fs.existsSync(abs)) {
+      return res.status(404).json({ error: 'File does not exist on server.' });
+    }
+
+    res.download(abs);
+
+  } catch (err) {
+    console.error('Download file error:', err);
+    res.status(500).json({ error: 'Failed to download file.' });
   }
 });
 
