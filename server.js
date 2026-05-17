@@ -2967,7 +2967,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
   }
 });
 
-// ============= FETCH TAB RECORDS ROUTE =============
+// ============= FETCH TAB RECORDS =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, category } = req.body;
 
@@ -2983,7 +2983,6 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
-    // ✅ Fetch records — only 'new' kind, not comments/replies
     const { rows: records } = await pool.query(`
       SELECT r.id, r.title, r.description, r.file_path,
              r.issued_date AS date_recorded,
@@ -2995,7 +2994,8 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       ORDER BY r.issued_date DESC
     `, [projectId]);
 
-    // ✅ Enrich each record with reviews only
+    const userId = req.user.id;
+
     const enriched = await Promise.all(records.map(async (rec) => {
       const { rows: reviews } = await pool.query(`
         SELECT reviewer_role, action, action_date
@@ -3004,7 +3004,20 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
-      return { ...rec, reviews };
+      // ✅ Check if current user has viewed this record
+      const { rows: viewed } = await pool.query(`
+        SELECT 1 FROM notification_views nv
+        JOIN notifications n ON nv.notification_id = n.id
+        WHERE n.project_id = $1 AND n.record_type = $2
+          AND nv.user_id = $3
+          AND n.document_review_id IN (
+            SELECT id FROM document_reviews
+            WHERE record_id = $4 AND record_type = $5
+          )
+        LIMIT 1
+      `, [projectId, category, userId, rec.id, category]);
+
+      return { ...rec, reviews, is_viewed: viewed.length > 0 };
     }));
 
     res.json({ records: enriched });
@@ -3015,9 +3028,53 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   }
 });
 
+
+// ============= MARK RECORD AS VIEWED =============
+app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
+  const { projectId, recordId, category } = req.body;
+  const userId   = req.user.id;
+  const userRole = req.user.role;
+
+  try {
+    const { rows: notifs } = await pool.query(`
+      SELECT id FROM notifications
+      WHERE project_id = $1 AND record_type = $2
+        AND document_review_id IN (
+          SELECT id FROM document_reviews
+          WHERE record_id = $3 AND record_type = $4
+        )
+      LIMIT 1
+    `, [projectId, category, recordId, category]);
+
+    if (notifs.length > 0) {
+      const notificationId = notifs[0].id;
+
+      const { rows: existing } = await pool.query(`
+        SELECT id FROM notification_views
+        WHERE notification_id = $1 AND user_id = $2
+      `, [notificationId, userId]);
+
+      if (existing.length === 0) {
+        await pool.query(`
+          INSERT INTO notification_views (notification_id, project_id, user_id, user_role)
+          VALUES ($1, $2, $3, $4)
+        `, [notificationId, projectId, userId, userRole]);
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Mark viewed error:', err);
+    res.status(500).json({ error: 'Failed to mark as viewed.' });
+  }
+});
+
+
 // ============= APPROVE / REJECT RECORD =============
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, category, action } = req.body;
+  const reviewerId   = req.user.id;
+  const reviewerRole = req.user.role;
 
   const tableMap = {
     contractual:    'contractual_records',
@@ -3029,24 +3086,50 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 
   const table = tableMap[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
-  if (!['approved', 'rejected'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
+  if (!['approved', 'rejected'].includes(action)) {
+    return res.status(400).json({ error: 'Invalid action. Must be approved or rejected.' });
+  }
 
   try {
+    // ✅ Check if this user already has a review row for this record
+    const { rows: existing } = await pool.query(`
+      SELECT id, action FROM document_reviews
+      WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3
+      LIMIT 1
+    `, [category, recordId, reviewerId]);
+
+    if (existing.length > 0) {
+      const previousAction = existing[0].action;
+
+      // ✅ If already approved or rejected — block any change
+      if (['approved', 'rejected'].includes(previousAction)) {
+        return res.status(409).json({
+          error: `No further action allowed. You already ${previousAction} this record.`
+        });
+      }
+
+      // ✅ If previous action was comment or no_action — update to new action
+      await pool.query(`
+        UPDATE document_reviews
+        SET action = $1, action_date = NOW()
+        WHERE id = $2
+      `, [action, existing[0].id]);
+
+    } else {
+      // ✅ No existing row — insert new review
+      await pool.query(`
+        INSERT INTO document_reviews
+          (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
+        VALUES ($1, $2, 'new', $3, $4, $5)
+      `, [category, recordId, reviewerId, reviewerRole, action]);
+    }
+
     // ✅ Update status on the record itself
     await pool.query(`
       UPDATE ${table}
       SET status = $1
       WHERE id = $2 AND project_id = $3
     `, [action, recordId, projectId]);
-
-    // ✅ Insert into document_reviews
-    const reviewerRole = req.user.role; // from authenticateToken
-    const reviewerId   = req.user.id;
-
-    await pool.query(`
-      INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
-      VALUES ($1, $2, 'new', $3, $4, $5)
-    `, [category, recordId, reviewerId, reviewerRole, action]);
 
     res.json({ success: true, message: `Record ${action} successfully.` });
 
@@ -3057,7 +3140,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 });
 
 
-// ============= DOWNLOAD ATTACHED FILE =============
+// ============= DOWNLOAD FILE =============
 app.get('/api/download-file', authenticateToken, async (req, res) => {
   const { recordId, category } = req.query;
 
@@ -3074,8 +3157,7 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 
   try {
     const { rows } = await pool.query(`
-      SELECT file_path FROM ${table}
-      WHERE id = $1
+      SELECT file_path FROM ${table} WHERE id = $1
     `, [recordId]);
 
     if (!rows.length || !rows[0].file_path) {
@@ -3084,13 +3166,12 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 
     const filePath = rows[0].file_path;
 
-    // ✅ If file_path is a URL (e.g. Cloudinary, S3, Supabase storage)
-    // just redirect to it — browser handles the download
+    // ✅ If stored as a URL (Cloudinary, S3, Supabase)
     if (filePath.startsWith('http')) {
       return res.redirect(filePath);
     }
 
-    // ✅ If file_path is a local disk path
+    // ✅ If stored on local disk
     const fs   = require('fs');
     const path = require('path');
     const abs  = path.resolve(filePath);
