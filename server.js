@@ -2969,78 +2969,49 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
 
 // ============= FETCH TAB RECORDS ROUTE =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
-  const { projectId, search } = req.body;
-
-  if (!projectId) {
-    return res.status(400).json({ error: 'ProjectId is required' });
-  }
+  const { projectId, category } = req.body;
+  const tableMap = {
+    contractual: 'contractual_records',
+    administrative: 'administrative_records',
+    safety: 'safety_records',
+    operational: 'operational_records',
+    financial: 'financial_records'
+  };
+  const table = tableMap[category];
+  if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
-    // List of all record tables
-    const tables = [
-      { type: 'contractual', table: 'contractual_records' },
-      { type: 'administrative', table: 'administrative_records' },
-      { type: 'safety', table: 'safety_records' },
-      { type: 'operational', table: 'operational_records' },
-      { type: 'financial', table: 'financial_records' }
-    ];
+    let query = `
+      SELECT r.id, r.title, r.description, r.file_path,
+             r.issued_date AS date_recorded,
+             r.role AS uploader_role,
+             r.status, r.record_kind
+      FROM ${table} r
+      WHERE r.project_id = $1
+      ORDER BY r.issued_date DESC
+    `;
+    const { rows: records } = await pool.query(query, [projectId]);
 
-    // Collect records from all tables
-    let allRecords = [];
+    const enriched = await Promise.all(records.map(async (rec) => {
+      const { rows: reviews } = await pool.query(`
+        SELECT reviewer_role, action, action_date, short_description, rejection_reason
+        FROM document_reviews
+        WHERE record_type = $1 AND record_id = $2
+        ORDER BY action_date DESC
+      `, [category, rec.id]);
 
-    for (const { type, table } of tables) {
-      let query = `
-        SELECT r.id, r.title, r.description, r.file_path,
-               r.issued_date AS date_recorded,
-               r.role AS uploader_role,
-               r.status, r.record_kind
-        FROM ${table} r
-        WHERE r.project_id = $1
-      `;
-      const params = [projectId];
+      const { rows: viewers } = await pool.query(`
+        SELECT nv.user_id AS viewer_id, nv.user_role AS viewer_role, nv.viewed_at
+        FROM notifications n
+        JOIN notification_views nv ON nv.notification_id = n.id
+        WHERE n.project_id = $1 AND n.record_type = $2 AND n.record_id = $3
+        ORDER BY nv.viewed_at DESC
+      `, [projectId, category, rec.id]);
 
-      if (search) {
-        query += ` AND (LOWER(r.title) LIKE LOWER($2) OR LOWER(r.description) LIKE LOWER($2))`;
-        params.push(`%${search}%`);
-      }
+      return { ...rec, record_content_name: category, reviews, viewers };
+    }));
 
-      query += ` ORDER BY r.issued_date DESC`;
-
-      const result = await pool.query(query, params);
-      const records = result.rows;
-
-      // Enrich each record with reviews + viewers
-      const enriched = await Promise.all(records.map(async (rec) => {
-        const reviewsResult = await pool.query(`
-          SELECT reviewer_role, action, action_date, short_description, rejection_reason
-          FROM document_reviews
-          WHERE record_type = $1 AND record_id = $2
-          ORDER BY action_date DESC
-        `, [type, rec.id]);
-
-        const viewersResult = await pool.query(`
-          SELECT nv.user_id AS viewer_id, nv.user_role AS viewer_role, nv.viewed_at
-          FROM notifications n
-          JOIN notification_views nv ON nv.notification_id = n.id
-          WHERE n.project_id = $1 AND n.record_type = $2 AND n.record_id = $3
-          ORDER BY nv.viewed_at DESC
-        `, [projectId, type, rec.id]);
-
-        return {
-          ...rec,
-          record_content_name: type,
-          reviews: reviewsResult.rows,
-          viewers: viewersResult.rows
-        };
-      }));
-
-      allRecords = allRecords.concat(enriched);
-    }
-
-    // Sort all records by date across categories
-    allRecords.sort((a, b) => new Date(b.date_recorded) - new Date(a.date_recorded));
-
-    res.json({ records: allRecords });
+    res.json({ records: enriched });
   } catch (err) {
     console.error('Fetch tab records error:', err);
     res.status(500).json({ error: 'Failed to fetch records' });
