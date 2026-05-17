@@ -2888,18 +2888,16 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 // ============ ADD RECORD ROUTE ============
 app.post("/records", authenticateToken, upload.single("attachment"), async (req, res) => {
   try {
-    // 1️⃣ JWT authentication
     const { user_id: userId, role } = req.user;
 
-    // 2️⃣ Payload validation
-    const { title, description, projectId, category, recordKind, commentTiedId } = req.body;
+    const { title, description, projectId, category } = req.body;
     const filePath = req.file ? req.file.path : null;
 
+    // ✅ Validation
     if (!projectId || !title || !category) {
-      return res.status(400).json({ success: false, message: "Invalid payload" });
+      return res.status(400).json({ success: false, message: "projectId, title and category are required" });
     }
 
-    // 3️⃣ Category mapping
     const categoryMap = {
       "contractual-legal":            { table: "contractual_records",    type: "contractual"    },
       "administrative-instructional": { table: "administrative_records", type: "administrative" },
@@ -2913,88 +2911,39 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       return res.status(400).json({ success: false, message: "Invalid category" });
     }
 
-    const kind = recordKind || "new";
-
-    // 4️⃣ Validate comment/reply must have commentTiedId
-    if ((kind === "comment" || kind === "reply") && !commentTiedId) {
-      return res.status(400).json({ success: false, message: "commentTiedId is required for comment or reply" });
-    }
-
-    // 5️⃣ New documents must not have commentTiedId
-    if (kind === "new" && commentTiedId) {
-      return res.status(400).json({ success: false, message: "New records cannot have commentTiedId" });
-    }
-
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      // 6️⃣ Insert into category record table
+      // ✅ Step 1 — Insert new record
       const recordResult = await client.query(
         `INSERT INTO ${resolved.table}
            (project_id, title, description, file_path, uploaded_by, role, record_kind, comment_tied_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         VALUES ($1, $2, $3, $4, $5, $6, 'new', NULL)
          RETURNING id`,
-        [
-          projectId,
-          title,
-          description || null,
-          filePath,
-          userId,
-          role,
-          kind,
-          kind === "new" ? null : commentTiedId
-        ]
+        [projectId, title, description || null, filePath, userId, role]
       );
 
       const recordId = recordResult.rows[0]?.id;
       if (!recordId) throw new Error("Record insert failed — no id returned");
 
-      // 7️⃣ Insert notification
-      // notifications links directly to record_id — no document_review_id needed
-      let notificationResult;
+      // ✅ Step 2 — Insert notification for this new record
+      const notifResult = await client.query(
+        `INSERT INTO notifications
+           (project_id, record_id, record_type, record_kind, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, 'new', $4, $5)
+         RETURNING id`,
+        [projectId, recordId, resolved.type, userId, role]
+      );
 
-      if (kind === "new") {
-        // Simple notification — no reply relationship
-        notificationResult = await client.query(
-          `INSERT INTO notifications
-             (project_id, record_id, record_type, record_kind, added_by_id, added_by_role)
-           VALUES ($1, $2, $3, $4, $5, $6)
-           RETURNING id`,
-          [projectId, recordId, resolved.type, kind, userId, role]
-        );
-
-      } else {
-        // Comment or reply — create reply_relationship first
-        const rrResult = await client.query(
-          `INSERT INTO reply_relationships
-             (record_id, record_type, reviewer_id, reviewer_role, comment_tied_id)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING id`,
-          [recordId, resolved.type, userId, role, commentTiedId]
-        );
-
-        const replyRelationshipId = rrResult.rows[0]?.id;
-
-        // Then insert notification with reply_relationship_id
-        notificationResult = await client.query(
-          `INSERT INTO notifications
-             (project_id, record_id, record_type, record_kind, added_by_id, added_by_role, reply_relationship_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           RETURNING id`,
-          [projectId, recordId, resolved.type, kind, userId, role, replyRelationshipId]
-        );
-      }
-
-      const notificationId = notificationResult.rows[0]?.id;
+      const notificationId = notifResult.rows[0]?.id;
+      if (!notificationId) throw new Error("Notification insert failed — no id returned");
 
       await client.query("COMMIT");
 
-      // 8️⃣ Respond
       res.json({
         success: true,
         message: "Record saved successfully",
-        projectId,
         recordId,
         notificationId
       });
