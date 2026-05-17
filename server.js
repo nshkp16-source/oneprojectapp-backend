@@ -2970,6 +2970,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
 // ============= FETCH TAB RECORDS ROUTE =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, category } = req.body;
+
   const tableMap = {
     contractual: 'contractual_records',
     administrative: 'administrative_records',
@@ -2977,11 +2978,13 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     operational: 'operational_records',
     financial: 'financial_records'
   };
+
   const table = tableMap[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
-    let query = `
+    // Main records query
+    const query = `
       SELECT r.id, r.title, r.description, r.file_path,
              r.issued_date AS date_recorded,
              r.role AS uploader_role,
@@ -2992,14 +2995,17 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     `;
     const { rows: records } = await pool.query(query, [projectId]);
 
+    // Enrich each record
     const enriched = await Promise.all(records.map(async (rec) => {
+      // Reviews (match schema: only reviewer_role, action, action_date)
       const { rows: reviews } = await pool.query(`
-        SELECT reviewer_role, action, action_date, short_description, rejection_reason
+        SELECT reviewer_role, action, action_date
         FROM document_reviews
         WHERE record_type = $1 AND record_id = $2
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
+      // Viewers
       const { rows: viewers } = await pool.query(`
         SELECT nv.user_id AS viewer_id, nv.user_role AS viewer_role, nv.viewed_at
         FROM notifications n
