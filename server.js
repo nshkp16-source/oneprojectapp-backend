@@ -2989,11 +2989,11 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       ORDER BY r.issued_date DESC
     `, [projectId]);
 
-    const userId = req.user.id;
+    // ✅ Fix: use correct JWT field
+    const userId = req.user.user_id || req.user.id;
 
     const enriched = await Promise.all(records.map(async (rec) => {
 
-      // ✅ Fetch reviews — only approved/rejected actions for review history display
       const { rows: reviews } = await pool.query(`
         SELECT reviewer_role, action, action_date
         FROM document_reviews
@@ -3003,17 +3003,23 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
-      // ✅ Check if current user has viewed this record
-      // New schema: viewed = has a row in document_reviews for this user and record
-      const { rows: viewed } = await pool.query(`
-        SELECT 1 FROM document_reviews
-        WHERE record_type = $1
-          AND record_id = $2
-          AND reviewer_id = $3
-        LIMIT 1
-      `, [category, rec.id, userId]);
+      // ✅ is_viewed: true if this user has any row in document_reviews for this record
+      // uploader always sees their own record as viewed
+      const isUploader = String(rec.uploaded_by) === String(userId);
+      let isViewed = isUploader;
 
-      return { ...rec, reviews, is_viewed: viewed.length > 0 };
+      if (!isUploader) {
+        const { rows: viewed } = await pool.query(`
+          SELECT 1 FROM document_reviews
+          WHERE record_type = $1
+            AND record_id = $2
+            AND reviewer_id = $3
+          LIMIT 1
+        `, [category, rec.id, userId]);
+        isViewed = viewed.length > 0;
+      }
+
+      return { ...rec, reviews, is_viewed: isViewed };
     }));
 
     res.json({ records: enriched });
@@ -3026,11 +3032,11 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
 
 
 // ============= MARK RECORD AS VIEWED =============
-// New schema: inserts into document_reviews with action='no_action'
-// UNIQUE constraint prevents duplicates automatically
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, category } = req.body;
-  const reviewerId   = req.user.id;
+
+  // ✅ Fix: use correct JWT field
+  const reviewerId   = req.user.user_id || req.user.id;
   const reviewerRole = req.user.role;
 
   const tableMap = {
@@ -3045,8 +3051,17 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Invalid category' });
   }
 
+  // ✅ Skip if uploader — they don't need a view record
   try {
-    // ✅ INSERT OR IGNORE — UNIQUE(record_type, record_id, reviewer_id) prevents duplicates
+    const { rows: rec } = await pool.query(`
+      SELECT uploaded_by FROM ${tableMap[category]} WHERE id = $1
+    `, [recordId]);
+
+    if (rec.length > 0 && String(rec[0].uploaded_by) === String(reviewerId)) {
+      return res.json({ success: true, skipped: true });
+    }
+
+    // ✅ Insert read receipt — ON CONFLICT DO NOTHING prevents duplicates
     await pool.query(`
       INSERT INTO document_reviews
         (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -3065,7 +3080,9 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 // ============= APPROVE / REJECT RECORD =============
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, category, action } = req.body;
-  const reviewerId   = req.user.id;
+
+  // ✅ Fix: use correct JWT field
+  const reviewerId   = req.user.user_id || req.user.id;
   const reviewerRole = req.user.role;
 
   const tableMap = {
@@ -3079,11 +3096,10 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
   const table = tableMap[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
   if (!['approved', 'rejected'].includes(action)) {
-    return res.status(400).json({ error: 'Invalid action. Must be approved or rejected.' });
+    return res.status(400).json({ error: 'Invalid action.' });
   }
 
   try {
-    // ✅ Check if this user already has a review row for this record
     const { rows: existing } = await pool.query(`
       SELECT id, action FROM document_reviews
       WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3
@@ -3092,23 +3108,18 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 
     if (existing.length > 0) {
       const previousAction = existing[0].action;
-
-      // ✅ Already approved or rejected — block permanently
       if (['approved', 'rejected'].includes(previousAction)) {
         return res.status(409).json({
           error: `No further action allowed. You already ${previousAction} this record.`
         });
       }
-
-      // ✅ Was no_action (just viewed) — upgrade to approve/reject
+      // Upgrade from no_action to approve/reject
       await pool.query(`
         UPDATE document_reviews
         SET action = $1, action_date = NOW()
         WHERE id = $2
       `, [action, existing[0].id]);
-
     } else {
-      // ✅ No existing row — insert fresh review
       await pool.query(`
         INSERT INTO document_reviews
           (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -3116,10 +3127,8 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       `, [category, recordId, reviewerId, reviewerRole, action]);
     }
 
-    // ✅ Update status on the record itself
     await pool.query(`
-      UPDATE ${table}
-      SET status = $1
+      UPDATE ${table} SET status = $1
       WHERE id = $2 AND project_id = $3
     `, [action, recordId, projectId]);
 
@@ -3160,18 +3169,36 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 
     // ✅ If stored as a URL (Cloudinary, S3, Supabase)
     if (filePath.startsWith('http')) {
-      return res.redirect(filePath);
+      // Fetch the file and pipe it back so the auth token
+      // is not exposed and browser triggers a real download
+      const https  = await import('https');
+      const http   = await import('http');
+      const client = filePath.startsWith('https') ? https : http;
+
+      client.get(filePath, (fileStream) => {
+        const fileName = filePath.split('/').pop() || 'download';
+        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+        res.setHeader('Content-Type', fileStream.headers['content-type'] || 'application/octet-stream');
+        fileStream.pipe(res);
+      }).on('error', (err) => {
+        console.error('File fetch error:', err);
+        res.status(500).json({ error: 'Failed to fetch file from storage.' });
+      });
+      return;
     }
 
-    // ✅ If stored on local disk
-    const fs   = require('fs');
-    const path = require('path');
-    const abs  = path.resolve(filePath);
+    // ✅ If stored on local disk — use fs and path as ES imports
+    const { existsSync }  = await import('fs');
+    const { resolve }     = await import('path');
+    const abs             = resolve(filePath);
 
-    if (!fs.existsSync(abs)) {
+    if (!existsSync(abs)) {
       return res.status(404).json({ error: 'File does not exist on server.' });
     }
 
+    // ✅ Force browser to download, not open
+    const fileName = abs.split('/').pop() || 'download';
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.download(abs);
 
   } catch (err) {
