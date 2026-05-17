@@ -2992,25 +2992,26 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     const userId = req.user.id;
 
     const enriched = await Promise.all(records.map(async (rec) => {
+
+      // ✅ Fetch reviews — only approved/rejected actions for review history display
       const { rows: reviews } = await pool.query(`
         SELECT reviewer_role, action, action_date
         FROM document_reviews
-        WHERE record_type = $1 AND record_id = $2
+        WHERE record_type = $1
+          AND record_id = $2
+          AND action IN ('approved', 'rejected', 'comment')
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
       // ✅ Check if current user has viewed this record
+      // New schema: viewed = has a row in document_reviews for this user and record
       const { rows: viewed } = await pool.query(`
-        SELECT 1 FROM notification_views nv
-        JOIN notifications n ON nv.notification_id = n.id
-        WHERE n.project_id = $1 AND n.record_type = $2
-          AND nv.user_id = $3
-          AND n.document_review_id IN (
-            SELECT id FROM document_reviews
-            WHERE record_id = $4 AND record_type = $5
-          )
+        SELECT 1 FROM document_reviews
+        WHERE record_type = $1
+          AND record_id = $2
+          AND reviewer_id = $3
         LIMIT 1
-      `, [projectId, category, userId, rec.id, category]);
+      `, [category, rec.id, userId]);
 
       return { ...rec, reviews, is_viewed: viewed.length > 0 };
     }));
@@ -3025,37 +3026,33 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
 
 
 // ============= MARK RECORD AS VIEWED =============
+// New schema: inserts into document_reviews with action='no_action'
+// UNIQUE constraint prevents duplicates automatically
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
-  const { projectId, recordId, category } = req.body;
-  const userId   = req.user.id;
-  const userRole = req.user.role;
+  const { recordId, category } = req.body;
+  const reviewerId   = req.user.id;
+  const reviewerRole = req.user.role;
+
+  const tableMap = {
+    contractual:    'contractual_records',
+    administrative: 'administrative_records',
+    safety:         'safety_records',
+    operational:    'operational_records',
+    financial:      'financial_records'
+  };
+
+  if (!tableMap[category]) {
+    return res.status(400).json({ error: 'Invalid category' });
+  }
 
   try {
-    const { rows: notifs } = await pool.query(`
-      SELECT id FROM notifications
-      WHERE project_id = $1 AND record_type = $2
-        AND document_review_id IN (
-          SELECT id FROM document_reviews
-          WHERE record_id = $3 AND record_type = $4
-        )
-      LIMIT 1
-    `, [projectId, category, recordId, category]);
-
-    if (notifs.length > 0) {
-      const notificationId = notifs[0].id;
-
-      const { rows: existing } = await pool.query(`
-        SELECT id FROM notification_views
-        WHERE notification_id = $1 AND user_id = $2
-      `, [notificationId, userId]);
-
-      if (existing.length === 0) {
-        await pool.query(`
-          INSERT INTO notification_views (notification_id, project_id, user_id, user_role)
-          VALUES ($1, $2, $3, $4)
-        `, [notificationId, projectId, userId, userRole]);
-      }
-    }
+    // ✅ INSERT OR IGNORE — UNIQUE(record_type, record_id, reviewer_id) prevents duplicates
+    await pool.query(`
+      INSERT INTO document_reviews
+        (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
+      VALUES ($1, $2, 'new', $3, $4, 'no_action')
+      ON CONFLICT (record_type, record_id, reviewer_id) DO NOTHING
+    `, [category, recordId, reviewerId, reviewerRole]);
 
     res.json({ success: true });
   } catch (err) {
@@ -3096,14 +3093,14 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     if (existing.length > 0) {
       const previousAction = existing[0].action;
 
-      // ✅ If already approved or rejected — block any change
+      // ✅ Already approved or rejected — block permanently
       if (['approved', 'rejected'].includes(previousAction)) {
         return res.status(409).json({
           error: `No further action allowed. You already ${previousAction} this record.`
         });
       }
 
-      // ✅ If previous action was comment or no_action — update to new action
+      // ✅ Was no_action (just viewed) — upgrade to approve/reject
       await pool.query(`
         UPDATE document_reviews
         SET action = $1, action_date = NOW()
@@ -3111,7 +3108,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       `, [action, existing[0].id]);
 
     } else {
-      // ✅ No existing row — insert new review
+      // ✅ No existing row — insert fresh review
       await pool.query(`
         INSERT INTO document_reviews
           (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
