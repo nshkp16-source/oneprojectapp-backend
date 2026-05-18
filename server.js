@@ -21,20 +21,19 @@ app.use(cors());
 // ✅ Cloudinary auto-config (uses CLOUDINARY_URL from Render env)
 cloudinary.config({ secure: true });
 
-// ✅ Multer for profile pictures (local disk)
-const profileUpload = multer({
-  limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB limit
+// ✅ Multer setup (for profile pictures and local images)
+const upload = multer({
+  limits: { fileSize: 500 * 1024 }, // 500 KB limit
   storage: multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
       cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
     }
-  }),
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) cb(null, true);
-    else cb(new Error("Only images allowed for profile picture"), false);
-  }
+  })
 });
+
+// ✅ Serve uploads folder publicly
+app.use("/uploads", express.static("uploads"));
 
 // ✅ Multer for attachments (Cloudinary, images + docs)
 const attachmentUpload = multer({
