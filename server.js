@@ -212,9 +212,42 @@ app.post("/commit-account", async (req, res) => {
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
+    // ✅ Upload client profile picture to Cloudinary if file/base64 provided
+    let clientPictureUrl = null;
+    let clientPictureId = null;
+
+    if (client.profile_picture && client.profile_picture.startsWith("data:image")) {
+      // Handle base64 image string
+      const result = await cloudinary.uploader.upload(client.profile_picture, {
+        folder: "oneprojectapp/clients",
+        resource_type: "image"
+      });
+      clientPictureUrl = result.secure_url;
+      clientPictureId = result.public_id;
+    } else if (client.profile_picture && client.profile_picture_file) {
+      // Handle raw file buffer (if frontend sends multipart)
+      const bufferStream = Readable.from(client.profile_picture_file.buffer);
+      const result = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          { folder: "oneprojectapp/clients", resource_type: "image" },
+          (error, result) => error ? reject(error) : resolve(result)
+        );
+        bufferStream.pipe(uploadStream);
+      });
+      clientPictureUrl = result.secure_url;
+      clientPictureId = result.public_id;
+    } else {
+      // If frontend already passed Cloudinary URL + ID
+      clientPictureUrl = client.profile_picture || null;
+      clientPictureId = client.profile_picture_id || null;
+    }
+
+    // ✅ Insert client with Cloudinary profile picture URL + public_id
     const clientResult = await pool.query(
-      `INSERT INTO clients (company_name, company_email, representative, title, telephone, password_hash, verified, created_at, profile_picture) 
-       VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7)
+      `INSERT INTO clients (
+         company_name, company_email, representative, title, telephone,
+         password_hash, verified, created_at, profile_picture, profile_picture_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7,$8)
        ON CONFLICT (company_email) DO UPDATE SET 
          company_name=EXCLUDED.company_name,
          representative=EXCLUDED.representative,
@@ -222,6 +255,7 @@ app.post("/commit-account", async (req, res) => {
          telephone=EXCLUDED.telephone,
          password_hash=EXCLUDED.password_hash,
          profile_picture=EXCLUDED.profile_picture,
+         profile_picture_id=EXCLUDED.profile_picture_id,
          verified=true
        RETURNING id, company_email;`,
       [
@@ -231,11 +265,13 @@ app.post("/commit-account", async (req, res) => {
         client.title,
         client.telephone,
         hashedPassword,
-        client.profile_picture || null
+        clientPictureUrl,
+        clientPictureId
       ]
     );
     const client_id = clientResult.rows[0].id;
 
+    // ✅ Project creation logic unchanged
     const projectResult = await pool.query(
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1,$2,$3,$4,NOW())
@@ -252,6 +288,7 @@ app.post("/commit-account", async (req, res) => {
         )
       ).rows[0].id;
 
+    // ✅ Helper to add role users (contractor, consultant, PMs, team members)
     async function addRoleUser(user, tableName, assignmentTable, fkColumn) {
       if (!user?.email) return;
 
@@ -264,11 +301,31 @@ app.post("/commit-account", async (req, res) => {
       if (existing.rows.length > 0) {
         role_id = existing.rows[0].id;
       } else {
+        // Upload role user picture if provided
+        let rolePictureUrl = null;
+        let rolePictureId = null;
+        if (user.profile_picture && user.profile_picture.startsWith("data:image")) {
+          const result = await cloudinary.uploader.upload(user.profile_picture, {
+            folder: `oneprojectapp/${tableName}`,
+            resource_type: "image"
+          });
+          rolePictureUrl = result.secure_url;
+          rolePictureId = result.public_id;
+        } else {
+          rolePictureUrl = user.profile_picture || null;
+          rolePictureId = user.profile_picture_id || null;
+        }
+
         const roleResult = await pool.query(
-          `INSERT INTO ${tableName} (email, password_hash, verified, profile_picture, created_at)
-           VALUES ($1,$2,true,$3,NOW())
+          `INSERT INTO ${tableName} (email, password_hash, verified, profile_picture, profile_picture_id, created_at)
+           VALUES ($1,$2,true,$3,$4,NOW())
            RETURNING id;`,
-          [user.email, user.password_hash || null, user.profile_picture || null]
+          [
+            user.email,
+            user.password_hash || null,
+            rolePictureUrl,
+            rolePictureId
+          ]
         );
         role_id = roleResult.rows[0].id;
       }
@@ -2250,23 +2307,6 @@ app.post("/client/login", async (req, res) => {
   } catch (err) {
     console.error("Login error:", err);
     res.status(500).json({ success: false, error: "Server error" });
-  }
-});
-
-// Public route for profile picture upload during account creation
-app.post("/account/upload-picture", upload.single("profile_picture"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded." });
-    if (!req.file.mimetype.startsWith("image/")) {
-      return res.status(400).json({ error: "Only image files allowed." });
-    }
-
-    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
-    // ✅ Return URL only — do not save to DB yet
-    res.json({ url: fileUrl });
-  } catch (err) {
-    console.error("Public upload error:", err);
-    res.status(500).json({ error: "Failed to upload profile picture." });
   }
 });
 
