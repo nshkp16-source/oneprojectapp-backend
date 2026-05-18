@@ -1183,7 +1183,7 @@ app.get("/client/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// Upload client profile picture
+// Upload client profile picture → Cloudinary
 app.post("/client/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
     if (req.user.role !== "Client") {
@@ -1200,20 +1200,33 @@ app.post("/client/upload-picture", authenticateToken, upload.single("profile_pic
       return res.status(400).json({ error: "Only image files allowed." });
     }
 
-    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    // ✅ Stream to Cloudinary
+    const bufferStream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "oneprojectapp/clients", resource_type: "image" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      bufferStream.pipe(uploadStream);
+    });
+
+    // ✅ Save both secure_url and public_id
     await pool.query(
-      "UPDATE clients SET profile_picture=$1 WHERE id=$2 AND company_email=$3",
-      [fileUrl, clientId, clientEmail]
+      "UPDATE clients SET profile_picture=$1, profile_picture_id=$2 WHERE id=$3 AND company_email=$4",
+      [result.secure_url, result.public_id, clientId, clientEmail]
     );
 
-    res.json({ success: true, url: fileUrl });
+    res.json({ success: true, url: result.secure_url });
   } catch (err) {
     console.error("Upload client picture error:", err);
     res.status(500).json({ error: "Failed to upload client picture" });
   }
 });
 
-// Delete client profile picture
+// Delete client profile picture → Cloudinary + DB
 app.post("/client/delete-picture", authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== "Client") {
@@ -1223,8 +1236,21 @@ app.post("/client/delete-picture", authenticateToken, async (req, res) => {
     const clientEmail = req.user.email;
     const clientId = req.user.user_id;
 
+    // Fetch public_id from DB
+    const result = await pool.query(
+      "SELECT profile_picture_id FROM clients WHERE id=$1 AND company_email=$2",
+      [clientId, clientEmail]
+    );
+
+    if (result.rows.length > 0 && result.rows[0].profile_picture_id) {
+      const publicId = result.rows[0].profile_picture_id;
+      // ✅ Delete from Cloudinary
+      await cloudinary.uploader.destroy(publicId);
+    }
+
+    // ✅ Clear DB fields
     await pool.query(
-      "UPDATE clients SET profile_picture=NULL WHERE id=$1 AND company_email=$2",
+      "UPDATE clients SET profile_picture=NULL, profile_picture_id=NULL WHERE id=$1 AND company_email=$2",
       [clientId, clientEmail]
     );
 
