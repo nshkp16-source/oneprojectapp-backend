@@ -204,29 +204,23 @@ app.post("/verify-code", async (req, res) => {
 });
 
 // 3. Commit Account (save client, project, role users, assignments)
-app.post("/commit-account", async (req, res) => {
-  const { client, project, contractor, consultant, teamMember, contractorPM, consultantPM } = req.body;
-
+app.post("/commit-account", upload.single("clientPicture"), async (req, res) => {
   try {
+    // Parse projectDetails JSON from FormData
+    const { contractor, consultant, teamMember, contractorPM, consultantPM } = JSON.parse(req.body.projectDetails);
+    const client = JSON.parse(req.body.projectDetails).client;
+    const project = JSON.parse(req.body.projectDetails).project;
+
     const hashedPassword = client.password_hash
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
-    // ✅ Upload client profile picture to Cloudinary if file/base64 provided
+    // ✅ Upload client profile picture to Cloudinary if file provided
     let clientPictureUrl = null;
     let clientPictureId = null;
 
-    if (client.profile_picture && client.profile_picture.startsWith("data:image")) {
-      // Handle base64 image string
-      const result = await cloudinary.uploader.upload(client.profile_picture, {
-        folder: "oneprojectapp/clients",
-        resource_type: "image"
-      });
-      clientPictureUrl = result.secure_url;
-      clientPictureId = result.public_id;
-    } else if (client.profile_picture && client.profile_picture_file) {
-      // Handle raw file buffer (if frontend sends multipart)
-      const bufferStream = Readable.from(client.profile_picture_file.buffer);
+    if (req.file) {
+      const bufferStream = Readable.from(req.file.buffer);
       const result = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
           { folder: "oneprojectapp/clients", resource_type: "image" },
@@ -237,7 +231,6 @@ app.post("/commit-account", async (req, res) => {
       clientPictureUrl = result.secure_url;
       clientPictureId = result.public_id;
     } else {
-      // If frontend already passed Cloudinary URL + ID
       clientPictureUrl = client.profile_picture || null;
       clientPictureId = client.profile_picture_id || null;
     }
@@ -304,7 +297,7 @@ app.post("/commit-account", async (req, res) => {
         // Upload role user picture if provided
         let rolePictureUrl = null;
         let rolePictureId = null;
-        if (user.profile_picture && user.profile_picture.startsWith("data:image")) {
+        if (user.profile_picture && !user.profile_picture_id) {
           const result = await cloudinary.uploader.upload(user.profile_picture, {
             folder: `oneprojectapp/${tableName}`,
             resource_type: "image"
@@ -347,6 +340,7 @@ app.post("/commit-account", async (req, res) => {
       );
     }
 
+    // ✅ Add all role users
     await addRoleUser(contractor, "contractors", "contractor_assignments", "contractor_id");
     await addRoleUser(consultant, "consultants", "consultant_assignments", "consultant_id");
     await addRoleUser(teamMember, "team_members", "team_member_assignments", "team_member_id");
@@ -376,6 +370,8 @@ app.post("/commit-account", async (req, res) => {
       message: "Account, project, and assignments saved successfully.",
       clientId: client_id,
       projectId: project_id,
+      clientPictureUrl,
+      clientPictureId,
       accessToken,
       refreshToken
     });
