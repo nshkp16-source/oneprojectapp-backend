@@ -1,12 +1,10 @@
 // server.js
-// server.js
 import express from 'express';
 import multer from "multer";
 import { Pool } from 'pg';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import nodemailerSendgrid from 'nodemailer-sendgrid';
-import fetch from "node-fetch";
 import pkg from 'uuid';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -26,28 +24,10 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// ✅ Disk storage — profile pictures only
-const uploadDisk = multer({
-  limits: { fileSize: 5 * 1024 * 1024 },
-  storage: multer.diskStorage({
-    destination: "uploads/",
-    filename: (req, file, cb) => {
-      cb(null, Date.now() + "-" + file.originalname.replace(/\s+/g, "-"));
-    }
-  }),
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg'];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files allowed for profile pictures'), false);
-    }
-  }
-});
-
-// ✅ Memory storage — record attachments → Cloudinary
+// ✅ ONE Multer instance — memory storage for everything
+// Both profile pictures and attachments go to Cloudinary
 const upload = multer({
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
   storage: multer.memoryStorage(),
   fileFilter: (req, file, cb) => {
     const allowedTypes = [
@@ -68,14 +48,12 @@ const upload = multer({
   }
 });
 
-// ✅ Serve uploads folder for profile pictures
-app.use("/uploads", express.static("uploads"));
-
-// ✅ JWT middleware — defined ONCE
+// ✅ JWT middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
   if (!token) return res.status(401).json({ error: "No token provided" });
+
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) {
       console.error("JWT verification error:", err);
@@ -90,30 +68,70 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// ✅ Neon DB — defined ONCE
+// 🔹 Neon DB connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// ✅ SendGrid — defined ONCE
+// 🔹 SendGrid setup
 const transporter = nodemailer.createTransport(
   nodemailerSendgrid({ apiKey: process.env.SENDGRID_API_KEY })
 );
 
-// ✅ Profile picture route — uses uploadDisk
-app.post("/api/profile-picture", authenticateToken, uploadDisk.single("picture"), async (req, res) => {
+// ✅ Profile picture route — now Cloudinary
+app.post("/api/profile-picture", authenticateToken, upload.single("picture"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const filePath = `/uploads/${req.file.filename}`;
+
+    const bufferStream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "oneprojectapp/profile_pictures", resource_type: "image" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      bufferStream.pipe(uploadStream);
+    });
+
     await pool.query(
-      `UPDATE clients SET profile_picture = $1 WHERE id = $2`,
-      [filePath, req.user.user_id]
+      `UPDATE clients SET profile_picture=$1 WHERE id=$2`,
+      [result.secure_url, req.user.user_id]
     );
-    res.json({ success: true, url: filePath });
+
+    res.json({ success: true, url: result.secure_url, storage: "cloudinary" });
   } catch (err) {
     console.error("Profile pic error:", err);
     res.status(500).json({ error: "Failed to upload profile picture" });
+  }
+});
+
+// ✅ Attachment route — also Cloudinary
+app.post("/api/upload-attachment", authenticateToken, upload.single("attachment"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const bufferStream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "oneprojectapp/attachments", resource_type: "auto" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      bufferStream.pipe(uploadStream);
+    });
+
+    // Example: save Cloudinary URL into DB file_path column
+    // await pool.query(`INSERT INTO contractual_records (project_id, file_path) VALUES ($1,$2)`, [req.user.project_id, result.secure_url]);
+
+    res.json({ success: true, url: result.secure_url, storage: "cloudinary" });
+  } catch (err) {
+    console.error("Attachment upload error:", err);
+    res.status(500).json({ error: "Failed to upload attachment" });
   }
 });
 
@@ -1454,7 +1472,7 @@ app.get("/consultant/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// Upload consultant profile picture
+// Upload consultant profile picture → Cloudinary
 app.post("/consultant/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
     if (req.user.role !== "Consultant") {
@@ -1471,20 +1489,33 @@ app.post("/consultant/upload-picture", authenticateToken, upload.single("profile
       return res.status(400).json({ error: "Only image files allowed." });
     }
 
-    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    // ✅ Stream to Cloudinary
+    const bufferStream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "oneprojectapp/consultants", resource_type: "image" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      bufferStream.pipe(uploadStream);
+    });
+
+    // ✅ Save both secure_url and public_id
     await pool.query(
-      "UPDATE consultants SET profile_picture=$1 WHERE id=$2 AND email=$3",
-      [fileUrl, consultantId, consultantEmail]
+      "UPDATE consultants SET profile_picture=$1, profile_picture_id=$2 WHERE id=$3 AND email=$4",
+      [result.secure_url, result.public_id, consultantId, consultantEmail]
     );
 
-    res.json({ success: true, url: fileUrl });
+    res.json({ success: true, url: result.secure_url });
   } catch (err) {
     console.error("Upload consultant picture error:", err);
     res.status(500).json({ error: "Failed to upload consultant picture" });
   }
 });
 
-// Delete consultant profile picture
+// Delete consultant profile picture → Cloudinary + DB
 app.post("/consultant/delete-picture", authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== "Consultant") {
@@ -1494,8 +1525,21 @@ app.post("/consultant/delete-picture", authenticateToken, async (req, res) => {
     const consultantId = req.user.user_id;
     const consultantEmail = req.user.email;
 
+    // Fetch public_id from DB
+    const result = await pool.query(
+      "SELECT profile_picture_id FROM consultants WHERE id=$1 AND email=$2",
+      [consultantId, consultantEmail]
+    );
+
+    if (result.rows.length > 0 && result.rows[0].profile_picture_id) {
+      const publicId = result.rows[0].profile_picture_id;
+      // ✅ Delete from Cloudinary
+      await cloudinary.uploader.destroy(publicId);
+    }
+
+    // ✅ Clear DB fields
     await pool.query(
-      "UPDATE consultants SET profile_picture=NULL WHERE id=$1 AND email=$2",
+      "UPDATE consultants SET profile_picture=NULL, profile_picture_id=NULL WHERE id=$1 AND email=$2",
       [consultantId, consultantEmail]
     );
 
