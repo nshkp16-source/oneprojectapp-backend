@@ -28,12 +28,15 @@ const upload = multer({
   }),
   fileFilter: (req, file, cb) => {
     const allowedTypes = [
-      'image/png',
-      'image/jpeg',
-      'application/pdf',
-      'application/vnd.ms-excel',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    ];
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'application/pdf',
+  'application/msword',                                                      // .doc
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
+  'application/vnd.ms-excel',                                                // .xls
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'        // .xlsx
+];
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
@@ -2982,6 +2985,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       SELECT r.id, r.title, r.description, r.file_path,
              r.issued_date AS date_recorded,
              r.role AS uploader_role,
+             r.uploaded_by,
              r.status, r.record_kind
       FROM ${table} r
       WHERE r.project_id = $1
@@ -2989,7 +2993,6 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       ORDER BY r.issued_date DESC
     `, [projectId]);
 
-    // ✅ Fix: use correct JWT field
     const userId = req.user.user_id || req.user.id;
 
     const enriched = await Promise.all(records.map(async (rec) => {
@@ -3003,8 +3006,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
-      // ✅ is_viewed: true if this user has any row in document_reviews for this record
-      // uploader always sees their own record as viewed
+      // ✅ Uploader always sees their own record as viewed
       const isUploader = String(rec.uploaded_by) === String(userId);
       let isViewed = isUploader;
 
@@ -3034,8 +3036,6 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
 // ============= MARK RECORD AS VIEWED =============
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, category } = req.body;
-
-  // ✅ Fix: use correct JWT field
   const reviewerId   = req.user.user_id || req.user.id;
   const reviewerRole = req.user.role;
 
@@ -3051,8 +3051,8 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Invalid category' });
   }
 
-  // ✅ Skip if uploader — they don't need a view record
   try {
+    // ✅ Skip insert if user is the uploader
     const { rows: rec } = await pool.query(`
       SELECT uploaded_by FROM ${tableMap[category]} WHERE id = $1
     `, [recordId]);
@@ -3061,7 +3061,7 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
       return res.json({ success: true, skipped: true });
     }
 
-    // ✅ Insert read receipt — ON CONFLICT DO NOTHING prevents duplicates
+    // ✅ Insert read receipt — conflict ignored due to UNIQUE constraint
     await pool.query(`
       INSERT INTO document_reviews
         (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -3080,8 +3080,6 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 // ============= APPROVE / REJECT RECORD =============
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, category, action } = req.body;
-
-  // ✅ Fix: use correct JWT field
   const reviewerId   = req.user.user_id || req.user.id;
   const reviewerRole = req.user.role;
 
@@ -3108,18 +3106,23 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 
     if (existing.length > 0) {
       const previousAction = existing[0].action;
+
+      // ✅ Already approved or rejected — block permanently
       if (['approved', 'rejected'].includes(previousAction)) {
         return res.status(409).json({
           error: `No further action allowed. You already ${previousAction} this record.`
         });
       }
-      // Upgrade from no_action to approve/reject
+
+      // ✅ Was no_action (viewed) — upgrade to approve/reject
       await pool.query(`
         UPDATE document_reviews
         SET action = $1, action_date = NOW()
         WHERE id = $2
       `, [action, existing[0].id]);
+
     } else {
+      // ✅ No row yet — insert fresh
       await pool.query(`
         INSERT INTO document_reviews
           (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -3127,6 +3130,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       `, [category, recordId, reviewerId, reviewerRole, action]);
     }
 
+    // ✅ Update status on the record
     await pool.query(`
       UPDATE ${table} SET status = $1
       WHERE id = $2 AND project_id = $3
@@ -3166,38 +3170,23 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
     }
 
     const filePath = rows[0].file_path;
+    const fileName = filePath.split('/').pop() || 'download';
 
-    // ✅ If stored as a URL (Cloudinary, S3, Supabase)
+    // ✅ Cloud URL — return as JSON so frontend handles download
+    // avoids CORS issues with piping and redirect
     if (filePath.startsWith('http')) {
-      // Fetch the file and pipe it back so the auth token
-      // is not exposed and browser triggers a real download
-      const https  = await import('https');
-      const http   = await import('http');
-      const client = filePath.startsWith('https') ? https : http;
-
-      client.get(filePath, (fileStream) => {
-        const fileName = filePath.split('/').pop() || 'download';
-        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-        res.setHeader('Content-Type', fileStream.headers['content-type'] || 'application/octet-stream');
-        fileStream.pipe(res);
-      }).on('error', (err) => {
-        console.error('File fetch error:', err);
-        res.status(500).json({ error: 'Failed to fetch file from storage.' });
-      });
-      return;
+      return res.json({ url: filePath, fileName });
     }
 
-    // ✅ If stored on local disk — use fs and path as ES imports
-    const { existsSync }  = await import('fs');
-    const { resolve }     = await import('path');
-    const abs             = resolve(filePath);
+    // ✅ Local disk — ES module safe imports
+    const { existsSync } = await import('fs');
+    const { resolve }    = await import('path');
+    const abs            = resolve(filePath);
 
     if (!existsSync(abs)) {
       return res.status(404).json({ error: 'File does not exist on server.' });
     }
 
-    // ✅ Force browser to download, not open
-    const fileName = abs.split('/').pop() || 'download';
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.download(abs);
 
