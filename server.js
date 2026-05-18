@@ -206,12 +206,21 @@ app.post("/verify-code", async (req, res) => {
 // 3. Commit Account (save client, project, role users, assignments)
 app.post("/commit-account", upload.single("clientPicture"), async (req, res) => {
   try {
-    // Parse projectDetails JSON from FormData
-    const { contractor, consultant, teamMember, contractorPM, consultantPM } = JSON.parse(req.body.projectDetails);
-    const client = JSON.parse(req.body.projectDetails).client;
-    const project = JSON.parse(req.body.projectDetails).project;
+    // Safely parse projectDetails JSON from FormData
+    let projectDetails = {};
+    try {
+      if (req.body.projectDetails) {
+        projectDetails = JSON.parse(req.body.projectDetails);
+      }
+    } catch (parseErr) {
+      console.error("Invalid projectDetails JSON:", parseErr.message);
+      return res.status(400).json({ success: false, error: "Invalid project details format." });
+    }
 
-    const hashedPassword = client.password_hash
+    const { contractor, consultant, teamMember, contractorPM, consultantPM, client, project } = projectDetails;
+
+    // Hash client password if provided
+    const hashedPassword = client?.password_hash
       ? await bcrypt.hash(client.password_hash, 10)
       : null;
 
@@ -220,6 +229,7 @@ app.post("/commit-account", upload.single("clientPicture"), async (req, res) => 
     let clientPictureId = null;
 
     if (req.file) {
+      // File uploaded via FormData
       const bufferStream = Readable.from(req.file.buffer);
       const result = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
@@ -230,9 +240,18 @@ app.post("/commit-account", upload.single("clientPicture"), async (req, res) => 
       });
       clientPictureUrl = result.secure_url;
       clientPictureId = result.public_id;
+    } else if (req.body.clientPictureBase64) {
+      // Fallback: base64 string sent in FormData
+      const result = await cloudinary.uploader.upload(req.body.clientPictureBase64, {
+        folder: "oneprojectapp/clients",
+        resource_type: "image"
+      });
+      clientPictureUrl = result.secure_url;
+      clientPictureId = result.public_id;
     } else {
-      clientPictureUrl = client.profile_picture || null;
-      clientPictureId = client.profile_picture_id || null;
+      // Optional: no picture provided
+      clientPictureUrl = null;
+      clientPictureId = null;
     }
 
     // ✅ Insert client with Cloudinary profile picture URL + public_id
@@ -252,11 +271,11 @@ app.post("/commit-account", upload.single("clientPicture"), async (req, res) => 
          verified=true
        RETURNING id, company_email;`,
       [
-        client.company_name,
-        client.company_email,
-        client.representative,
-        client.title,
-        client.telephone,
+        client?.company_name || null,
+        client?.company_email || null,
+        client?.representative || null,
+        client?.title || null,
+        client?.telephone || null,
         hashedPassword,
         clientPictureUrl,
         clientPictureId
@@ -269,7 +288,7 @@ app.post("/commit-account", upload.single("clientPicture"), async (req, res) => 
       `INSERT INTO projects (name, location, contract_reference, client_id, created_at)
        VALUES ($1,$2,$3,$4,NOW())
        ON CONFLICT (name, client_id) DO NOTHING RETURNING id;`,
-      [project.name, project.location, project.contract_reference, client_id]
+      [project?.name || null, project?.location || null, project?.contract_reference || null, client_id]
     );
 
     let project_id =
@@ -277,7 +296,7 @@ app.post("/commit-account", upload.single("clientPicture"), async (req, res) => 
       (
         await pool.query(
           `SELECT id FROM projects WHERE name=$1 AND client_id=$2`,
-          [project.name, client_id]
+          [project?.name || null, client_id]
         )
       ).rows[0].id;
 
