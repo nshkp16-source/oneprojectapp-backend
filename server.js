@@ -5,11 +5,12 @@ import { Pool } from 'pg';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
 import nodemailerSendgrid from 'nodemailer-sendgrid';
-import fetch from "node-fetch";
 import pkg from 'uuid';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from "crypto";
+import { v2 as cloudinary } from 'cloudinary';
+import { Readable } from 'stream';
 
 const { v4: uuidv4 } = pkg;
 
@@ -17,9 +18,12 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// ✅ Multer setup
-const upload = multer({
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+// ✅ Cloudinary auto-config (uses CLOUDINARY_URL from Render env)
+cloudinary.config({ secure: true });
+
+// ✅ Multer for profile pictures (local disk)
+const profileUpload = multer({
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB limit
   storage: multer.diskStorage({
     destination: "uploads/",
     filename: (req, file, cb) => {
@@ -27,16 +31,26 @@ const upload = multer({
     }
   }),
   fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith("image/")) cb(null, true);
+    else cb(new Error("Only images allowed for profile picture"), false);
+  }
+});
+
+// ✅ Multer for attachments (Cloudinary, images + docs)
+const attachmentUpload = multer({
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  storage: multer.memoryStorage(), // ✅ store in memory not disk
+  fileFilter: (req, file, cb) => {
     const allowedTypes = [
-  'image/png',
-  'image/jpeg',
-  'image/jpg',
-  'application/pdf',
-  'application/msword',                                                      // .doc
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
-  'application/vnd.ms-excel',                                                // .xls
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'        // .xlsx
-];
+      'image/png',
+      'image/jpeg',
+      'image/jpg',
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    ];
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
@@ -48,23 +62,21 @@ const upload = multer({
 // ✅ Serve uploads folder publicly
 app.use("/uploads", express.static("uploads"));
 
-// ✅ JWT middleware (corrected)
+// ✅ JWT middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
   if (!token) return res.status(401).json({ error: "No token provided" });
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {   // <-- changed here
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) {
       console.error("JWT verification error:", err);
       return res.status(403).json({ error: "Invalid or expired token" });
     }
 
-    // Attach decoded payload to request
     req.user = {
-      user_id: decoded.sub,   // JWT "sub" is the user id
+      user_id: decoded.sub,
       role: decoded.role,
-      // Use company_email for Clients, email for others
       email: decoded.companyEmail || decoded.email
     };
 
@@ -82,6 +94,43 @@ const pool = new Pool({
 const transporter = nodemailer.createTransport(
   nodemailerSendgrid({ apiKey: process.env.SENDGRID_API_KEY })
 );
+
+// ✅ Route: Profile picture (local disk)
+app.post("/api/profile-picture", authenticateToken, profileUpload.single("picture"), async (req, res) => {
+  try {
+    const filePath = `/uploads/${req.file.filename}`;
+    await pool.query(`UPDATE clients SET profile_picture=$1 WHERE id=$2`, [filePath, req.user.user_id]);
+    res.json({ success: true, url: filePath, storage: "local" });
+  } catch (err) {
+    console.error("Profile pic error:", err);
+    res.status(500).json({ error: "Failed to upload profile picture" });
+  }
+});
+
+// ✅ Route: Attachments (Cloudinary, images + docs)
+app.post("/api/upload-attachment", authenticateToken, attachmentUpload.single("attachment"), async (req, res) => {
+  try {
+    const bufferStream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "oneprojectapp", resource_type: "auto" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      bufferStream.pipe(uploadStream);
+    });
+
+    // Example: save Cloudinary URL into DB file_path column
+    // await pool.query(`INSERT INTO contractual_records (project_id, file_path) VALUES ($1,$2)`, [req.user.project_id, result.secure_url]);
+
+    res.json({ success: true, url: result.secure_url, storage: "cloudinary" });
+  } catch (err) {
+    console.error("Attachment upload error:", err);
+    res.status(500).json({ error: "Failed to upload attachment" });
+  }
+});
 
 // -------------------- ROUTES --------------------
 // Root route
@@ -2892,11 +2941,8 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 app.post("/records", authenticateToken, upload.single("attachment"), async (req, res) => {
   try {
     const { user_id: userId, role } = req.user;
-
     const { title, description, projectId, category } = req.body;
-    const filePath = req.file ? req.file.path : null;
 
-    // ✅ Validation
     if (!projectId || !title || !category) {
       return res.status(400).json({ success: false, message: "projectId, title and category are required" });
     }
@@ -2914,11 +2960,37 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       return res.status(400).json({ success: false, message: "Invalid category" });
     }
 
+    // ✅ Upload file to Cloudinary if attached
+    let filePath = null;
+    if (req.file) {
+      try {
+        const uploadResult = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              folder:        'oneproject/records',
+              resource_type: 'auto',
+              public_id:     `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}`
+            },
+            (error, result) => {
+              if (error) reject(error);
+              else resolve(result);
+            }
+          );
+          // ✅ Pipe buffer from memory storage into cloudinary stream
+          Readable.from(req.file.buffer).pipe(stream);
+        });
+        filePath = uploadResult.secure_url; // ✅ https://res.cloudinary.com/...
+        console.log('File uploaded to Cloudinary:', filePath);
+      } catch (uploadErr) {
+        console.error('Cloudinary upload error:', uploadErr);
+        return res.status(500).json({ success: false, message: 'File upload failed' });
+      }
+    }
+
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      // ✅ Step 1 — Insert new record
       const recordResult = await client.query(
         `INSERT INTO ${resolved.table}
            (project_id, title, description, file_path, uploaded_by, role, record_kind, comment_tied_id)
@@ -2930,7 +3002,6 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       const recordId = recordResult.rows[0]?.id;
       if (!recordId) throw new Error("Record insert failed — no id returned");
 
-      // ✅ Step 2 — Insert notification for this new record
       const notifResult = await client.query(
         `INSERT INTO notifications
            (project_id, record_id, record_type, record_kind, added_by_id, added_by_role)
@@ -2964,6 +3035,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     res.status(500).json({ success: false, message: "Server error in add record route" });
   }
 });
+
 
 // ============= FETCH TAB RECORDS =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
@@ -3006,7 +3078,6 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
-      // ✅ Uploader always sees their own record as viewed
       const isUploader = String(rec.uploaded_by) === String(userId);
       let isViewed = isUploader;
 
@@ -3052,7 +3123,6 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   }
 
   try {
-    // ✅ Skip insert if user is the uploader
     const { rows: rec } = await pool.query(`
       SELECT uploaded_by FROM ${tableMap[category]} WHERE id = $1
     `, [recordId]);
@@ -3061,7 +3131,6 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
       return res.json({ success: true, skipped: true });
     }
 
-    // ✅ Insert read receipt — conflict ignored due to UNIQUE constraint
     await pool.query(`
       INSERT INTO document_reviews
         (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -3107,14 +3176,12 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     if (existing.length > 0) {
       const previousAction = existing[0].action;
 
-      // ✅ Already approved or rejected — block permanently
       if (['approved', 'rejected'].includes(previousAction)) {
         return res.status(409).json({
           error: `No further action allowed. You already ${previousAction} this record.`
         });
       }
 
-      // ✅ Was no_action (viewed) — upgrade to approve/reject
       await pool.query(`
         UPDATE document_reviews
         SET action = $1, action_date = NOW()
@@ -3122,7 +3189,6 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       `, [action, existing[0].id]);
 
     } else {
-      // ✅ No row yet — insert fresh
       await pool.query(`
         INSERT INTO document_reviews
           (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -3130,7 +3196,6 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       `, [category, recordId, reviewerId, reviewerRole, action]);
     }
 
-    // ✅ Update status on the record
     await pool.query(`
       UPDATE ${table} SET status = $1
       WHERE id = $2 AND project_id = $3
@@ -3172,16 +3237,21 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
     const filePath = rows[0].file_path;
     const fileName = filePath.split('/').pop() || 'download';
 
-    // ✅ Cloud URL — return as JSON so frontend handles download
-    // avoids CORS issues with piping and redirect
+    // ✅ Cloudinary or any cloud URL — return as JSON
     if (filePath.startsWith('http')) {
       return res.json({ url: filePath, fileName });
     }
 
-    // ✅ Local disk — ES module safe imports
+    // ✅ Local disk fallback (dev only)
     const { existsSync } = await import('fs');
     const { resolve }    = await import('path');
-    const abs            = resolve(filePath);
+
+    // ✅ Handle bare filename — prefix uploads/ if missing
+    const resolvedPath = filePath.startsWith('uploads/')
+      ? filePath
+      : `uploads/${filePath}`;
+
+    const abs = resolve(resolvedPath);
 
     if (!existsSync(abs)) {
       return res.status(404).json({ error: 'File does not exist on server.' });
