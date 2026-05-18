@@ -3376,6 +3376,63 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
   }
 });
 
+// ============= DELETE RECORD =============
+app.delete('/api/delete-record', authenticateToken, async (req, res) => {
+  const { projectId, recordId, category } = req.body;
+  const userId = req.user.user_id || req.user.id;
+
+  const tableMap = {
+    contractual:    'contractual_records',
+    administrative: 'administrative_records',
+    safety:         'safety_records',
+    operational:    'operational_records',
+    financial:      'financial_records'
+  };
+
+  const table = tableMap[category];
+  if (!table) return res.status(400).json({ error: 'Invalid category' });
+
+  try {
+    // ✅ Only the uploader can delete
+    const { rows } = await pool.query(
+      `SELECT uploaded_by FROM ${table} WHERE id = $1 AND project_id = $2`,
+      [recordId, projectId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Record not found.' });
+    }
+
+    if (String(rows[0].uploaded_by) !== String(userId)) {
+      return res.status(403).json({ error: 'Only the uploader can delete this record.' });
+    }
+
+    // ✅ Delete reviews first (no FK cascade set)
+    await pool.query(
+      `DELETE FROM document_reviews WHERE record_type = $1 AND record_id = $2`,
+      [category, recordId]
+    );
+
+    // ✅ Delete notification
+    await pool.query(
+      `DELETE FROM notifications WHERE record_id = $1 AND record_type = $2`,
+      [recordId, category]
+    );
+
+    // ✅ Delete the record itself
+    await pool.query(
+      `DELETE FROM ${table} WHERE id = $1 AND project_id = $2`,
+      [recordId, projectId]
+    );
+
+    res.json({ success: true, message: 'Record deleted successfully.' });
+
+  } catch (err) {
+    console.error('Delete record error:', err);
+    res.status(500).json({ error: 'Failed to delete record.' });
+  }
+});
+
 // -------------------- ERROR HANDLING --------------------
 app.use((err, req, res, next) => {
   console.error('Unexpected error:', err);
