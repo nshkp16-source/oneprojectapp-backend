@@ -1404,7 +1404,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
 // Fetch contractor profile basics
 app.get("/contractor/profile", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Contractor") {
+    if (req.user.role !== "Consultant") {
       return res.status(403).json({ error: "Access denied: Contractor only route" });
     }
 
@@ -1413,7 +1413,7 @@ app.get("/contractor/profile", authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       "SELECT email, profile_picture FROM contractors WHERE id=$1 AND email=$2",
-      [contractorId, contractorEmail]
+      [consultantId, contractorEmail]
     );
 
     if (result.rows.length === 0) {
@@ -1432,7 +1432,7 @@ app.get("/contractor/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// Upload contractor profile picture
+// Upload contractor profile picture → Cloudinary
 app.post("/contractor/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
     if (req.user.role !== "Contractor") {
@@ -1449,20 +1449,33 @@ app.post("/contractor/upload-picture", authenticateToken, upload.single("profile
       return res.status(400).json({ error: "Only image files allowed." });
     }
 
-    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    // ✅ Stream to Cloudinary
+    const bufferStream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "oneprojectapp/contractors", resource_type: "image" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      bufferStream.pipe(uploadStream);
+    });
+
+    // ✅ Save both secure_url and public_id
     await pool.query(
-      "UPDATE contractors SET profile_picture=$1 WHERE id=$2 AND email=$3",
-      [fileUrl, contractorId, contractorEmail]
+      "UPDATE contractors SET profile_picture=$1, profile_picture_id=$2 WHERE id=$3 AND email=$4",
+      [result.secure_url, result.public_id, contractorId, contractorEmail]
     );
 
-    res.json({ success: true, url: fileUrl });
+    res.json({ success: true, url: result.secure_url });
   } catch (err) {
     console.error("Upload contractor picture error:", err);
     res.status(500).json({ error: "Failed to upload contractor picture" });
   }
 });
 
-// Delete contractor profile picture
+// Delete contractor profile picture → Cloudinary + DB
 app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
   try {
     if (req.user.role !== "Contractor") {
@@ -1472,8 +1485,21 @@ app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
     const contractorId = req.user.user_id;
     const contractorEmail = req.user.email;
 
+    // Fetch public_id from DB
+    const result = await pool.query(
+      "SELECT profile_picture_id FROM contractors WHERE id=$1 AND email=$2",
+      [contractorId, contractorEmail]
+    );
+
+    if (result.rows.length > 0 && result.rows[0].profile_picture_id) {
+      const publicId = result.rows[0].profile_picture_id;
+      // ✅ Delete from Cloudinary
+      await cloudinary.uploader.destroy(publicId);
+    }
+
+    // ✅ Clear DB fields
     await pool.query(
-      "UPDATE contractors SET profile_picture=NULL WHERE id=$1 AND email=$2",
+      "UPDATE contractors SET profile_picture=NULL, profile_picture_id=NULL WHERE id=$1 AND email=$2",
       [contractorId, contractorEmail]
     );
 
@@ -1484,10 +1510,10 @@ app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
   }
 });
 
-// Fetch all projects assigned to this contractor
+// Fetch all projects assigned to this consultant
 app.post("/contractor/projects", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Contractor") {
+    if (req.user.role !== "Consultant") {
       return res.status(403).json({ error: "Access denied: Contractor only route" });
     }
 
@@ -1498,7 +1524,7 @@ app.post("/contractor/projects", authenticateToken, async (req, res) => {
        FROM contractor_assignments ca
        JOIN projects p ON ca.project_id = p.id
        WHERE ca.contractor_id=$1`,
-      [contractorId]
+      [consultantId]
     );
 
     res.json({ projects: result.rows });
