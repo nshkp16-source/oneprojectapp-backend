@@ -3098,6 +3098,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
 
     // ✅ Upload file to Cloudinary if attached
     let filePath = null;
+    let attachmentId = null;
     if (req.file) {
       try {
         const uploadResult = await new Promise((resolve, reject) => {
@@ -3112,10 +3113,10 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
               else resolve(result);
             }
           );
-          // ✅ Pipe buffer from memory storage into cloudinary stream
           Readable.from(req.file.buffer).pipe(stream);
         });
-        filePath = uploadResult.secure_url; // ✅ https://res.cloudinary.com/...
+        filePath = uploadResult.secure_url;      // ✅ Cloudinary URL
+        attachmentId = uploadResult.public_id;   // ✅ Cloudinary public_id
         console.log('File uploaded to Cloudinary:', filePath);
       } catch (uploadErr) {
         console.error('Cloudinary upload error:', uploadErr);
@@ -3127,17 +3128,19 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     try {
       await client.query("BEGIN");
 
+      // ✅ Insert record with attachment_id
       const recordResult = await client.query(
         `INSERT INTO ${resolved.table}
-           (project_id, title, description, file_path, uploaded_by, role, record_kind, comment_tied_id)
-         VALUES ($1, $2, $3, $4, $5, $6, 'new', NULL)
-         RETURNING id`,
-        [projectId, title, description || null, filePath, userId, role]
+           (project_id, title, description, file_path, attachment_id, uploaded_by, role, record_kind, comment_tied_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'new', NULL)
+         RETURNING id, attachment_id`,
+        [projectId, title, description || null, filePath, attachmentId, userId, role]
       );
 
       const recordId = recordResult.rows[0]?.id;
       if (!recordId) throw new Error("Record insert failed — no id returned");
 
+      // ✅ Insert notification
       const notifResult = await client.query(
         `INSERT INTO notifications
            (project_id, record_id, record_type, record_kind, added_by_id, added_by_role)
@@ -3155,7 +3158,8 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
         success: true,
         message: "Record saved successfully",
         recordId,
-        notificationId
+        notificationId,
+        attachmentId // ✅ return attachmentId so frontend can track/delete later
       });
 
     } catch (err) {
@@ -3171,7 +3175,6 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     res.status(500).json({ success: false, message: "Server error in add record route" });
   }
 });
-
 
 // ============= FETCH TAB RECORDS =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
