@@ -1513,7 +1513,7 @@ app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
 // Fetch all projects assigned to this consultant
 app.post("/contractor/projects", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Consultant") {
+    if (req.user.role !== "Contractor") {
       return res.status(403).json({ error: "Access denied: Contractor only route" });
     }
 
