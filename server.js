@@ -3188,6 +3188,28 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
   }
 });
 
+// GET /api/me → return current user info
+app.get('/api/me', authenticateToken, async (req, res) => {
+  try {
+    // The JWT middleware (authenticateToken) attaches decoded payload to req.user
+    const { id, role, email } = req.user;
+
+    // If you want to fetch fresh info from DB:
+    // const userRecord = await db.users.findByPk(id);
+    // return res.json({ id: userRecord.id, role: userRecord.role, email: userRecord.email });
+
+    // Otherwise, just return what’s in the token
+    res.json({
+      id,
+      role,
+      email
+    });
+  } catch (err) {
+    console.error('Error in /api/me:', err);
+    res.status(500).json({ error: 'Failed to fetch user info' });
+  }
+});
+
 // ============= FETCH TAB RECORDS =============
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, category } = req.body;
@@ -3256,7 +3278,6 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   }
 });
 
-
 // ============= MARK RECORD AS VIEWED =============
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, category } = req.body;
@@ -3297,7 +3318,6 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to mark as viewed.' });
   }
 });
-
 
 // ============= APPROVE / ACCEPT / REJECT / COMMENT =============
 app.post('/api/review-record', authenticateToken, async (req, res) => {
