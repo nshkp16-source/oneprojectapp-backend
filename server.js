@@ -3077,7 +3077,7 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
 app.post("/records", authenticateToken, upload.single("attachment"), async (req, res) => {
   try {
     const { user_id: userId, role } = req.user;
-    const { title, description, projectId, category } = req.body;
+    const { title, description, projectId, category, noticeTiedId } = req.body;
 
     if (!projectId || !title || !category) {
       return res.status(400).json({ success: false, message: "projectId, title and category are required" });
@@ -3097,7 +3097,7 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
     }
 
     // ✅ Upload file to Cloudinary if attached
-    let filePath = null;
+    let filePath     = null;
     let attachmentId = null;
     if (req.file) {
       try {
@@ -3115,8 +3115,8 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
           );
           Readable.from(req.file.buffer).pipe(stream);
         });
-        filePath = uploadResult.secure_url;      // ✅ Cloudinary URL
-        attachmentId = uploadResult.public_id;   // ✅ Cloudinary public_id
+        filePath     = uploadResult.secure_url;
+        attachmentId = uploadResult.public_id;
         console.log('File uploaded to Cloudinary:', filePath);
       } catch (uploadErr) {
         console.error('Cloudinary upload error:', uploadErr);
@@ -3124,29 +3124,40 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       }
     }
 
+    // ✅ Determine record_kind — 'notice' if noticeTiedId is provided, else 'new'
+    const recordKind    = noticeTiedId ? 'notice' : 'new';
+    const noticeTiedVal = noticeTiedId ? Number(noticeTiedId) : null;
+
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      // ✅ Insert record with attachment_id
+      // ✅ notice_tied_id matches the schema column name (was comment_tied_id)
       const recordResult = await client.query(
         `INSERT INTO ${resolved.table}
-           (project_id, title, description, file_path, attachment_id, uploaded_by, role, record_kind, comment_tied_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'new', NULL)
+           (project_id, title, description, file_path, attachment_id,
+            uploaded_by, role, record_kind, notice_tied_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING id, attachment_id`,
-        [projectId, title, description || null, filePath, attachmentId, userId, role]
+        [projectId, title, description || null, filePath, attachmentId,
+         userId, role, recordKind, noticeTiedVal]
       );
 
       const recordId = recordResult.rows[0]?.id;
       if (!recordId) throw new Error("Record insert failed — no id returned");
 
-      // ✅ Insert notification
+      // ✅ entity_id / entity_type match the notifications schema columns
+      // ✅ message is NOT NULL in schema — generate a default one
+      const notifMessage = noticeTiedId
+        ? `New notice of determination issued by ${role} (tied to record #${noticeTiedVal})`
+        : `New ${resolved.type} record added by ${role}: "${title}"`;
+
       const notifResult = await client.query(
         `INSERT INTO notifications
-           (project_id, record_id, record_type, record_kind, added_by_id, added_by_role)
-         VALUES ($1, $2, $3, 'new', $4, $5)
+           (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id`,
-        [projectId, recordId, resolved.type, userId, role]
+        [projectId, recordId, resolved.type, notifMessage, userId, role]
       );
 
       const notificationId = notifResult.rows[0]?.id;
@@ -3155,11 +3166,12 @@ app.post("/records", authenticateToken, upload.single("attachment"), async (req,
       await client.query("COMMIT");
 
       res.json({
-        success: true,
-        message: "Record saved successfully",
+        success:        true,
+        message:        "Record saved successfully",
         recordId,
         notificationId,
-        attachmentId // ✅ return attachmentId so frontend can track/delete later
+        attachmentId,
+        recordKind,
       });
 
     } catch (err) {
