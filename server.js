@@ -1412,7 +1412,7 @@ app.get("/contractor/profile", authenticateToken, async (req, res) => {
     const contractorEmail = req.user.email;
 
     const result = await pool.query(
-      "SELECT email, profile_picture FROM contractor WHERE id=$1 AND email=$2",
+      "SELECT email, profile_picture FROM contractors WHERE id=$1 AND email=$2",
       [contractorId, contractorEmail]
     );
 
@@ -1453,7 +1453,7 @@ app.post("/contractor/upload-picture", authenticateToken, upload.single("profile
     const bufferStream = Readable.from(req.file.buffer);
     const result = await new Promise((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
-        { folder: "oneprojectapp/contractor", resource_type: "image" },
+        { folder: "oneprojectapp/contractors", resource_type: "image" },
         (error, result) => {
           if (error) reject(error);
           else resolve(result);
@@ -1464,7 +1464,7 @@ app.post("/contractor/upload-picture", authenticateToken, upload.single("profile
 
     // ✅ Save both secure_url and public_id
     await pool.query(
-      "UPDATE contractor SET profile_picture=$1, profile_picture_id=$2 WHERE id=$3 AND email=$4",
+      "UPDATE contractors SET profile_picture=$1, profile_picture_id=$2 WHERE id=$3 AND email=$4",
       [result.secure_url, result.public_id, contractorId, contractorEmail]
     );
 
@@ -1487,7 +1487,7 @@ app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
 
     // Fetch public_id from DB
     const result = await pool.query(
-      "SELECT profile_picture_id FROM contractor WHERE id=$1 AND email=$2",
+      "SELECT profile_picture_id FROM contractors WHERE id=$1 AND email=$2",
       [contractorId, contractorEmail]
     );
 
@@ -1499,7 +1499,7 @@ app.post("/contractor/delete-picture", authenticateToken, async (req, res) => {
 
     // ✅ Clear DB fields
     await pool.query(
-      "UPDATE contractor SET profile_picture=NULL, profile_picture_id=NULL WHERE id=$1 AND email=$2",
+      "UPDATE contractors SET profile_picture=NULL, profile_picture_id=NULL WHERE id=$1 AND email=$2",
       [contractorId, contractorEmail]
     );
 
