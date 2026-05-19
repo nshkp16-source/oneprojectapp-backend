@@ -1404,7 +1404,7 @@ app.post("/client/project-details", authenticateToken, async (req, res) => {
 // Fetch contractor profile basics
 app.get("/contractor/profile", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Consultant") {
+    if (req.user.role !== "Contractor") {
       return res.status(403).json({ error: "Access denied: Contractor only route" });
     }
 
@@ -1413,7 +1413,7 @@ app.get("/contractor/profile", authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       "SELECT email, profile_picture FROM contractors WHERE id=$1 AND email=$2",
-      [consultantId, contractorEmail]
+      [contractorId, contractorEmail]
     );
 
     if (result.rows.length === 0) {
