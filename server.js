@@ -3185,7 +3185,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     administrative: 'administrative_records',
     safety:         'safety_records',
     operational:    'operational_records',
-    financial:      'financial_records'
+    financial:      'financial_records',
   };
 
   const table = tableMap[category];
@@ -3194,10 +3194,12 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   try {
     const { rows: records } = await pool.query(`
       SELECT r.id, r.title, r.description, r.file_path,
-             r.issued_date AS date_recorded,
-             r.role AS uploader_role,
+             r.issued_date     AS date_recorded,
+             r.role            AS uploader_role,
              r.uploaded_by,
-             r.status, r.record_kind
+             r.status,
+             r.record_kind,
+             r.notice_tied_id
       FROM ${table} r
       WHERE r.project_id = $1
         AND r.record_kind = 'new'
@@ -3207,13 +3209,13 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     const userId = req.user.user_id || req.user.id;
 
     const enriched = await Promise.all(records.map(async (rec) => {
-
+      // ✅ Include reviewer_id so frontend computeButtonState can match it
       const { rows: reviews } = await pool.query(`
-        SELECT reviewer_role, action, action_date
+        SELECT reviewer_id, reviewer_role, action, action_date, comment
         FROM document_reviews
         WHERE record_type = $1
-          AND record_id = $2
-          AND action IN ('approved', 'rejected', 'comment')
+          AND record_id   = $2
+          AND action IN ('approved', 'accepted', 'rejected', 'comment', 'no_action')
         ORDER BY action_date DESC
       `, [category, rec.id]);
 
@@ -3224,7 +3226,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         const { rows: viewed } = await pool.query(`
           SELECT 1 FROM document_reviews
           WHERE record_type = $1
-            AND record_id = $2
+            AND record_id   = $2
             AND reviewer_id = $3
           LIMIT 1
         `, [category, rec.id, userId]);
@@ -3254,7 +3256,7 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     administrative: 'administrative_records',
     safety:         'safety_records',
     operational:    'operational_records',
-    financial:      'financial_records'
+    financial:      'financial_records',
   };
 
   if (!tableMap[category]) {
@@ -3285,9 +3287,9 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 });
 
 
-// ============= APPROVE / REJECT RECORD =============
+// ============= APPROVE / ACCEPT / REJECT / COMMENT =============
 app.post('/api/review-record', authenticateToken, async (req, res) => {
-  const { projectId, recordId, category, action } = req.body;
+  const { projectId, recordId, category, action, comment } = req.body;
   const reviewerId   = req.user.user_id || req.user.id;
   const reviewerRole = req.user.role;
 
@@ -3296,15 +3298,63 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     administrative: 'administrative_records',
     safety:         'safety_records',
     operational:    'operational_records',
-    financial:      'financial_records'
+    financial:      'financial_records',
   };
 
   const table = tableMap[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
-  if (!['approved', 'rejected'].includes(action)) {
+
+  // ✅ Allow comment for all roles; restrict workflow actions to decision makers
+  const workflowActions = ['approved', 'accepted', 'rejected'];
+  const isWorkflowAction = workflowActions.includes(action);
+  const isCommentAction  = action === 'comment';
+
+  if (!isWorkflowAction && !isCommentAction) {
     return res.status(400).json({ error: 'Invalid action.' });
   }
 
+  if (isCommentAction) {
+    if (!comment || !comment.trim()) {
+      return res.status(400).json({ error: 'Comment text is required.' });
+    }
+    // ✅ Comments use their own INSERT — they don't conflict with the
+    //    unique (record_type, record_id, reviewer_id) row used for workflow.
+    //    We allow multiple comments by not using ON CONFLICT DO NOTHING
+    //    but instead insert a fresh row (drop the UNIQUE constraint concern
+    //    by always inserting a comment as a new row with a distinct action).
+    //
+    //    Since the UNIQUE constraint prevents a second row per reviewer,
+    //    we UPDATE the existing row's comment if one exists, or INSERT fresh.
+    const { rows: existing } = await pool.query(`
+      SELECT id, action FROM document_reviews
+      WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3
+      LIMIT 1
+    `, [category, recordId, reviewerId]);
+
+    try {
+      if (existing.length > 0) {
+        // Reviewer already has a row — append comment without overwriting
+        // a workflow action they may have already taken
+        await pool.query(`
+          UPDATE document_reviews
+          SET comment = $1, action_date = NOW()
+          WHERE id = $2
+        `, [comment.trim(), existing[0].id]);
+      } else {
+        await pool.query(`
+          INSERT INTO document_reviews
+            (record_type, record_id, record_kind, reviewer_id, reviewer_role, action, comment)
+          VALUES ($1, $2, 'new', $3, $4, 'comment', $5)
+        `, [category, recordId, reviewerId, reviewerRole, comment.trim()]);
+      }
+      return res.json({ success: true, message: 'Comment submitted successfully.' });
+    } catch (err) {
+      console.error('Comment error:', err);
+      return res.status(500).json({ error: 'Failed to submit comment.' });
+    }
+  }
+
+  // ── Workflow action (approved / accepted / rejected) ──────────────
   try {
     const { rows: existing } = await pool.query(`
       SELECT id, action FROM document_reviews
@@ -3314,19 +3364,17 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 
     if (existing.length > 0) {
       const previousAction = existing[0].action;
-
-      if (['approved', 'rejected'].includes(previousAction)) {
+      if (workflowActions.includes(previousAction)) {
         return res.status(409).json({
           error: `No further action allowed. You already ${previousAction} this record.`
         });
       }
-
+      // Reviewer had a 'no_action' or 'comment' row — upgrade to workflow action
       await pool.query(`
         UPDATE document_reviews
         SET action = $1, action_date = NOW()
         WHERE id = $2
       `, [action, existing[0].id]);
-
     } else {
       await pool.query(`
         INSERT INTO document_reviews
@@ -3335,10 +3383,34 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       `, [category, recordId, reviewerId, reviewerRole, action]);
     }
 
+    // ✅ Map action to the correct status value per CHECK constraints
+    const statusMap = {
+      approved: (uploaderRole) => {
+        // step-1 approver is always consultant or client depending on uploader
+        return uploaderRole === 'contractor'
+          ? 'pending_client_acceptance'
+          : uploaderRole === 'consultant'
+          ? 'pending_contractor_acceptance'
+          : 'pending_contractor_acceptance'; // client-uploaded
+      },
+      accepted: () => 'approved_record',
+      rejected: () => 'rejected',
+    };
+
+    // Fetch uploader role to determine correct next status
+    const { rows: recRows } = await pool.query(`
+      SELECT role FROM ${table} WHERE id = $1 AND project_id = $2
+    `, [recordId, projectId]);
+
+    const uploaderRole = recRows[0]?.role || '';
+    const newStatus    = typeof statusMap[action] === 'function'
+      ? statusMap[action](uploaderRole)
+      : statusMap[action];
+
     await pool.query(`
       UPDATE ${table} SET status = $1
       WHERE id = $2 AND project_id = $3
-    `, [action, recordId, projectId]);
+    `, [newStatus, recordId, projectId]);
 
     res.json({ success: true, message: `Record ${action} successfully.` });
 
@@ -3358,7 +3430,7 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
     administrative: 'administrative_records',
     safety:         'safety_records',
     operational:    'operational_records',
-    financial:      'financial_records'
+    financial:      'financial_records',
   };
 
   const table = tableMap[category];
@@ -3376,16 +3448,13 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
     const filePath = rows[0].file_path;
     const fileName = filePath.split('/').pop() || 'download';
 
-    // ✅ Cloudinary or any cloud URL — return as JSON
     if (filePath.startsWith('http')) {
       return res.json({ url: filePath, fileName });
     }
 
-    // ✅ Local disk fallback (dev only)
     const { existsSync } = await import('fs');
     const { resolve }    = await import('path');
 
-    // ✅ Handle bare filename — prefix uploads/ if missing
     const resolvedPath = filePath.startsWith('uploads/')
       ? filePath
       : `uploads/${filePath}`;
@@ -3405,6 +3474,7 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
   }
 });
 
+
 // ============= DELETE RECORD =============
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, category } = req.body;
@@ -3415,14 +3485,13 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
     administrative: 'administrative_records',
     safety:         'safety_records',
     operational:    'operational_records',
-    financial:      'financial_records'
+    financial:      'financial_records',
   };
 
   const table = tableMap[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
-    // ✅ Only the uploader can delete
     const { rows } = await pool.query(
       `SELECT uploaded_by FROM ${table} WHERE id = $1 AND project_id = $2`,
       [recordId, projectId]
@@ -3436,19 +3505,17 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Only the uploader can delete this record.' });
     }
 
-    // ✅ Delete reviews first (no FK cascade set)
     await pool.query(
       `DELETE FROM document_reviews WHERE record_type = $1 AND record_id = $2`,
       [category, recordId]
     );
 
-    // ✅ Delete notification
+    // ✅ Use correct column names matching the notifications schema
     await pool.query(
-      `DELETE FROM notifications WHERE record_id = $1 AND record_type = $2`,
+      `DELETE FROM notifications WHERE entity_id = $1 AND entity_type = $2`,
       [recordId, category]
     );
 
-    // ✅ Delete the record itself
     await pool.query(
       `DELETE FROM ${table} WHERE id = $1 AND project_id = $2`,
       [recordId, projectId]
