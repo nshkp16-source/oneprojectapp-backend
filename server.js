@@ -3210,51 +3210,73 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================
+//  ROLE HELPER  (mirrors frontend getSide exactly)
+//  Returns: 'contractor' | 'consultant' | 'client' | null
+// ============================================================
+function getSide(role) {
+  const r = (role || '').toLowerCase().replace(/\s/g, '_');
+  if (r === 'contractor' || r === 'contractor_pm') return 'contractor';
+  if (r === 'consultant' || r === 'consultant_pm') return 'consultant';
+  if (r === 'client'     || r === 'client_pm')     return 'client';
+  return null; // team_member or unknown
+}
+
+function isDecisionMaker(role) {
+  return getSide(role) !== null;
+}
+
+const TABLE_MAP = {
+  contractual:    'contractual_records',
+  administrative: 'administrative_records',
+  safety:         'safety_records',
+  operational:    'operational_records',
+  financial:      'financial_records',
+};
+
 // ============= FETCH TAB RECORDS =============
+// Returns 'new', 'notice', AND 'rejection_notice' records.
+// Frontend needs all three kinds to render the full list.
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, category } = req.body;
-
-  const tableMap = {
-    contractual:    'contractual_records',
-    administrative: 'administrative_records',
-    safety:         'safety_records',
-    operational:    'operational_records',
-    financial:      'financial_records',
-  };
-
-  const table = tableMap[category];
+  const table = TABLE_MAP[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
     const { rows: records } = await pool.query(`
-      SELECT r.id, r.title, r.description, r.file_path,
-             r.issued_date     AS date_recorded,
-             r.role            AS uploader_role,
-             r.uploaded_by,
-             r.status,
-             r.record_kind,
-             r.notice_tied_id
+      SELECT
+        r.id,
+        r.title,
+        r.description,
+        r.file_path,
+        r.issued_date     AS date_recorded,
+        r.role            AS uploader_role,
+        r.uploaded_by,
+        r.status,
+        r.record_kind,
+        r.notice_tied_id
       FROM ${table} r
       WHERE r.project_id = $1
-        AND r.record_kind = 'new'
+        AND r.record_kind IN ('new', 'notice', 'rejection_notice')
       ORDER BY r.issued_date DESC
     `, [projectId]);
 
     const userId = req.user.user_id || req.user.id;
 
     const enriched = await Promise.all(records.map(async (rec) => {
-      // ✅ Include reviewer_id so frontend computeButtonState can match it
+      // Fetch all review rows for this record.
+      // reviewer_id is included so frontend computeButtonState can match it.
       const { rows: reviews } = await pool.query(`
         SELECT reviewer_id, reviewer_role, action, action_date, comment
         FROM document_reviews
         WHERE record_type = $1
           AND record_id   = $2
           AND action IN ('approved', 'accepted', 'rejected', 'comment', 'no_action')
-        ORDER BY action_date DESC
+        ORDER BY action_date ASC
       `, [category, rec.id]);
 
       const isUploader = String(rec.uploaded_by) === String(userId);
-      let isViewed = isUploader;
+      let isViewed = isUploader; // uploaders are always considered to have seen it
 
       if (!isUploader) {
         const { rows: viewed } = await pool.query(`
@@ -3278,33 +3300,29 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   }
 });
 
+
 // ============= MARK RECORD AS VIEWED =============
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, category } = req.body;
   const reviewerId   = req.user.user_id || req.user.id;
   const reviewerRole = req.user.role;
 
-  const tableMap = {
-    contractual:    'contractual_records',
-    administrative: 'administrative_records',
-    safety:         'safety_records',
-    operational:    'operational_records',
-    financial:      'financial_records',
-  };
-
-  if (!tableMap[category]) {
+  if (!TABLE_MAP[category]) {
     return res.status(400).json({ error: 'Invalid category' });
   }
 
   try {
+    // Skip if the viewer is the uploader
     const { rows: rec } = await pool.query(`
-      SELECT uploaded_by FROM ${tableMap[category]} WHERE id = $1
+      SELECT uploaded_by FROM ${TABLE_MAP[category]} WHERE id = $1
     `, [recordId]);
 
     if (rec.length > 0 && String(rec[0].uploaded_by) === String(reviewerId)) {
       return res.json({ success: true, skipped: true });
     }
 
+    // Insert a 'no_action' row only if the reviewer has no row yet.
+    // If they already have a row (comment / workflow action) leave it alone.
     await pool.query(`
       INSERT INTO document_reviews
         (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
@@ -3319,24 +3337,38 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   }
 });
 
-// ============= APPROVE / ACCEPT / REJECT / COMMENT =============
+
+// ============= REVIEW RECORD (approve / accept / reject / comment) =============
+//
+//  Rules enforced here (mirrors frontend logic):
+//
+//  COMMENT:
+//    - Available to ALL roles including team_member.
+//    - Does NOT change record status.
+//    - One comment row per reviewer (UNIQUE constraint).
+//    - If reviewer already has a row:
+//        * If their action is 'no_action' → upgrade action to 'comment',
+//          set the comment text.
+//        * If their action is already 'comment' → update comment text only
+//          (one comment per reviewer, last wins).
+//        * If their action is a workflow action (approved/accepted/rejected) →
+//          update the comment field alongside the existing action.
+//          This lets a decision maker leave a note with their decision.
+//
+//  WORKFLOW (approved / accepted / rejected):
+//    - Decision makers ONLY (contractor, consultant, client, and their PMs).
+//    - Changes record status.
+//    - Once a workflow action is recorded it CANNOT be changed.
+//
+// ============================================================
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, category, action, comment } = req.body;
   const reviewerId   = req.user.user_id || req.user.id;
   const reviewerRole = req.user.role;
 
-  const tableMap = {
-    contractual:    'contractual_records',
-    administrative: 'administrative_records',
-    safety:         'safety_records',
-    operational:    'operational_records',
-    financial:      'financial_records',
-  };
-
-  const table = tableMap[category];
+  const table = TABLE_MAP[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
-  // ✅ Allow comment for all roles; restrict workflow actions to decision makers
   const workflowActions = ['approved', 'accepted', 'rejected'];
   const isWorkflowAction = workflowActions.includes(action);
   const isCommentAction  = action === 'comment';
@@ -3345,48 +3377,67 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Invalid action.' });
   }
 
+  // ── Guard: only decision makers may take workflow actions ────────────
+  if (isWorkflowAction && !isDecisionMaker(reviewerRole)) {
+    return res.status(403).json({
+      error: 'Only decision makers can approve, accept, or reject records.'
+    });
+  }
+
+  // ── COMMENT ──────────────────────────────────────────────────────────
   if (isCommentAction) {
     if (!comment || !comment.trim()) {
       return res.status(400).json({ error: 'Comment text is required.' });
     }
-    // ✅ Comments use their own INSERT — they don't conflict with the
-    //    unique (record_type, record_id, reviewer_id) row used for workflow.
-    //    We allow multiple comments by not using ON CONFLICT DO NOTHING
-    //    but instead insert a fresh row (drop the UNIQUE constraint concern
-    //    by always inserting a comment as a new row with a distinct action).
-    //
-    //    Since the UNIQUE constraint prevents a second row per reviewer,
-    //    we UPDATE the existing row's comment if one exists, or INSERT fresh.
-    const { rows: existing } = await pool.query(`
-      SELECT id, action FROM document_reviews
-      WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3
-      LIMIT 1
-    `, [category, recordId, reviewerId]);
 
     try {
+      const { rows: existing } = await pool.query(`
+        SELECT id, action FROM document_reviews
+        WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3
+        LIMIT 1
+      `, [category, recordId, reviewerId]);
+
       if (existing.length > 0) {
-        // Reviewer already has a row — append comment without overwriting
-        // a workflow action they may have already taken
-        await pool.query(`
-          UPDATE document_reviews
-          SET comment = $1, action_date = NOW()
-          WHERE id = $2
-        `, [comment.trim(), existing[0].id]);
+        const currentAction = existing[0].action;
+
+        if (workflowActions.includes(currentAction)) {
+          // Decision maker already acted — just attach/update comment alongside action
+          // Does NOT touch the action column or record status
+          await pool.query(`
+            UPDATE document_reviews
+            SET comment = $1, action_date = NOW()
+            WHERE id = $2
+          `, [comment.trim(), existing[0].id]);
+
+        } else {
+          // Row exists with 'no_action' or prior 'comment' — update to 'comment' + text
+          await pool.query(`
+            UPDATE document_reviews
+            SET action = 'comment', comment = $1, action_date = NOW()
+            WHERE id = $2
+          `, [comment.trim(), existing[0].id]);
+        }
+
       } else {
+        // No row yet — insert fresh comment row
+        // Team member's action is 'comment', not a workflow action
         await pool.query(`
           INSERT INTO document_reviews
             (record_type, record_id, record_kind, reviewer_id, reviewer_role, action, comment)
           VALUES ($1, $2, 'new', $3, $4, 'comment', $5)
         `, [category, recordId, reviewerId, reviewerRole, comment.trim()]);
       }
+
+      // Comments NEVER change record status — return immediately
       return res.json({ success: true, message: 'Comment submitted successfully.' });
+
     } catch (err) {
       console.error('Comment error:', err);
       return res.status(500).json({ error: 'Failed to submit comment.' });
     }
   }
 
-  // ── Workflow action (approved / accepted / rejected) ──────────────
+  // ── WORKFLOW ACTION (approved / accepted / rejected) ─────────────────
   try {
     const { rows: existing } = await pool.query(`
       SELECT id, action FROM document_reviews
@@ -3396,17 +3447,21 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 
     if (existing.length > 0) {
       const previousAction = existing[0].action;
+
+      // Block if a workflow action already exists — it is final
       if (workflowActions.includes(previousAction)) {
         return res.status(409).json({
           error: `No further action allowed. You already ${previousAction} this record.`
         });
       }
-      // Reviewer had a 'no_action' or 'comment' row — upgrade to workflow action
+
+      // Upgrade 'no_action' or 'comment' row to the workflow action
       await pool.query(`
         UPDATE document_reviews
         SET action = $1, action_date = NOW()
         WHERE id = $2
       `, [action, existing[0].id]);
+
     } else {
       await pool.query(`
         INSERT INTO document_reviews
@@ -3415,29 +3470,41 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       `, [category, recordId, reviewerId, reviewerRole, action]);
     }
 
-    // ✅ Map action to the correct status value per CHECK constraints
-    const statusMap = {
-      approved: (uploaderRole) => {
-        // step-1 approver is always consultant or client depending on uploader
-        return uploaderRole === 'contractor'
-          ? 'pending_client_acceptance'
-          : uploaderRole === 'consultant'
-          ? 'pending_contractor_acceptance'
-          : 'pending_contractor_acceptance'; // client-uploaded
-      },
-      accepted: () => 'approved_record',
-      rejected: () => 'rejected',
-    };
-
-    // Fetch uploader role to determine correct next status
+    // ── Compute next status ───────────────────────────────────────────
+    // Fetch uploader role to determine the correct next status.
+    // Use getSide() to normalise PM variants (contractor_pm → contractor).
     const { rows: recRows } = await pool.query(`
       SELECT role FROM ${table} WHERE id = $1 AND project_id = $2
     `, [recordId, projectId]);
 
-    const uploaderRole = recRows[0]?.role || '';
-    const newStatus    = typeof statusMap[action] === 'function'
-      ? statusMap[action](uploaderRole)
-      : statusMap[action];
+    if (!recRows.length) {
+      return res.status(404).json({ error: 'Record not found.' });
+    }
+
+    const uploaderSide = getSide(recRows[0].role); // normalised side
+
+    let newStatus;
+
+    if (action === 'rejected') {
+      newStatus = 'rejected';
+
+    } else if (action === 'accepted') {
+      // Step 2 always results in final approval
+      newStatus = 'approved_record';
+
+    } else {
+      // action === 'approved' (step 1)
+      // Next status depends on who uploaded:
+      //   contractor uploaded → needs client acceptance next
+      //   consultant uploaded → needs contractor acceptance next
+      //   client uploaded     → needs contractor acceptance next
+      const step2StatusMap = {
+        contractor: 'pending_client_acceptance',
+        consultant: 'pending_contractor_acceptance',
+        client:     'pending_contractor_acceptance',
+      };
+      newStatus = step2StatusMap[uploaderSide] || 'pending_review';
+    }
 
     await pool.query(`
       UPDATE ${table} SET status = $1
@@ -3456,16 +3523,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 // ============= DOWNLOAD FILE =============
 app.get('/api/download-file', authenticateToken, async (req, res) => {
   const { recordId, category } = req.query;
-
-  const tableMap = {
-    contractual:    'contractual_records',
-    administrative: 'administrative_records',
-    safety:         'safety_records',
-    operational:    'operational_records',
-    financial:      'financial_records',
-  };
-
-  const table = tableMap[category];
+  const table = TABLE_MAP[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
@@ -3511,16 +3569,7 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, category } = req.body;
   const userId = req.user.user_id || req.user.id;
-
-  const tableMap = {
-    contractual:    'contractual_records',
-    administrative: 'administrative_records',
-    safety:         'safety_records',
-    operational:    'operational_records',
-    financial:      'financial_records',
-  };
-
-  const table = tableMap[category];
+  const table  = TABLE_MAP[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
   try {
@@ -3537,12 +3586,12 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Only the uploader can delete this record.' });
     }
 
+    // Clean up reviews and notifications first, then the record
     await pool.query(
       `DELETE FROM document_reviews WHERE record_type = $1 AND record_id = $2`,
       [category, recordId]
     );
 
-    // ✅ Use correct column names matching the notifications schema
     await pool.query(
       `DELETE FROM notifications WHERE entity_id = $1 AND entity_type = $2`,
       [recordId, category]
