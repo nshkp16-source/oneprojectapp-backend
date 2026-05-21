@@ -2174,15 +2174,15 @@ app.get("/team-member/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// Upload team member profile picture
-app.post("/team-member/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
+// Upload teammember profile picture → Cloudinary
+app.post("/teammember/upload-picture", authenticateToken, upload.single("profile_picture"), async (req, res) => {
   try {
-    if (req.user.role !== "Team Member") {
-      return res.status(403).json({ error: "Access denied: Team Member only route" });
+    if (req.user.role !== "teammember") {
+      return res.status(403).json({ error: "Access denied: team member only route" });
     }
 
-    const teamMemberId = req.user.user_id;
-    const teamMemberEmail = req.user.email;
+    const teammemberId = req.user.user_id;
+    const teammemberEmail = req.user.email;
 
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded or file too large." });
@@ -2191,37 +2191,63 @@ app.post("/team-member/upload-picture", authenticateToken, upload.single("profil
       return res.status(400).json({ error: "Only image files allowed." });
     }
 
-    const fileUrl = `https://oneprojectapp-backend.onrender.com/uploads/${req.file.filename}`;
+    // ✅ Stream to Cloudinary
+    const bufferStream = Readable.from(req.file.buffer);
+    const result = await new Promise((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder: "oneprojectapp/teammembers", resource_type: "image" },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result);
+        }
+      );
+      bufferStream.pipe(uploadStream);
+    });
+
+    // ✅ Save both secure_url and public_id
     await pool.query(
-      "UPDATE team_members SET profile_picture=$1 WHERE id=$2 AND email=$3",
-      [fileUrl, teamMemberId, teamMemberEmail]
+      "UPDATE teammembers SET profile_picture=$1, profile_picture_id=$2 WHERE id=$3 AND email=$4",
+      [result.secure_url, result.public_id, teammemberId, teammemberEmail]
     );
 
-    res.json({ success: true, url: fileUrl });
+    res.json({ success: true, url: result.secure_url });
   } catch (err) {
-    console.error("Upload team member picture error:", err);
+    console.error("Upload teammember picture error:", err);
     res.status(500).json({ error: "Failed to upload team member picture" });
   }
 });
 
-// Delete team member profile picture
-app.post("/team-member/delete-picture", authenticateToken, async (req, res) => {
+// Delete teammember profile picture → Cloudinary + DB
+app.post("/teammember/delete-picture", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== "Team Member") {
-      return res.status(403).json({ error: "Access denied: Team Member only route" });
+    if (req.user.role !== "Consultant") {
+      return res.status(403).json({ error: "Access denied: team member only route" });
     }
 
-    const teamMemberId = req.user.user_id;
-    const teamMemberEmail = req.user.email;
+    const teammemberId = req.user.user_id;
+    const teammemberEmail = req.user.email;
 
+    // Fetch public_id from DB
+    const result = await pool.query(
+      "SELECT profile_picture_id FROM consultants WHERE id=$1 AND email=$2",
+      [teammemberId, teammemberEmail]
+    );
+
+    if (result.rows.length > 0 && result.rows[0].profile_picture_id) {
+      const publicId = result.rows[0].profile_picture_id;
+      // ✅ Delete from Cloudinary
+      await cloudinary.uploader.destroy(publicId);
+    }
+
+    // ✅ Clear DB fields
     await pool.query(
-      "UPDATE team_members SET profile_picture=NULL WHERE id=$1 AND email=$2",
-      [teamMemberId, teamMemberEmail]
+      "UPDATE consultants SET profile_picture=NULL, profile_picture_id=NULL WHERE id=$1 AND email=$2",
+      [teammemberId, teammemberEmail]
     );
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Delete team member picture error:", err);
+    console.error("Delete teammember picture error:", err);
     res.status(500).json({ error: "Failed to delete team member picture" });
   }
 });
