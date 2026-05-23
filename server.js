@@ -4041,6 +4041,344 @@ export default function scheduleRoutes({ pool, cloudinary, upload, authenticateT
  
  
   // ============================================================
+//  SCHEDULE MODULE — Backend Routes
+//  No imports — everything injected from server.js
+//
+//  Mount in server.js:
+//    import scheduleRoutes from './schedule-routes.js';
+//    app.use(scheduleRoutes({ express, Readable, pool, cloudinary, upload, authenticateToken }));
+// ============================================================
+ 
+// ── Day-count helper ──
+function daysBetween(startStr, endStr) {
+  if (!startStr || !endStr) return 0;
+  return Math.max(
+    0,
+    Math.round((new Date(endStr) - new Date(startStr)) / 86400000) + 1
+  );
+}
+ 
+export default function scheduleRoutes({ express, Readable, pool, cloudinary, upload, authenticateToken }) {
+ 
+  const router = express.Router();
+ 
+  // ── Cloudinary upload helper (same pattern as server.js) ──
+  function uploadToCloudinary(buffer, originalName, folder) {
+    return new Promise((resolve, reject) => {
+      const bufferStream = Readable.from(buffer);
+      const uploadStream = cloudinary.uploader.upload_stream(
+        { folder, resource_type: 'auto', public_id: `${Date.now()}_${originalName}` },
+        (error, result) => (error ? reject(error) : resolve(result))
+      );
+      bufferStream.pipe(uploadStream);
+    });
+  }
+ 
+ 
+  // ============================================================
+  //  GET /api/get-schedule
+  //  openSchedulePanel() calls this on entry.
+  //  Returns null schedule if none exists yet (→ Section 1).
+  //  Returns full schedule + milestones + entries (→ Section 3).
+  // ============================================================
+  router.get('/api/get-schedule', authenticateToken, async (req, res) => {
+    const projectId = parseInt(req.query.projectId, 10);
+    if (!projectId)
+      return res.status(400).json({ error: 'Valid integer projectId is required' });
+ 
+    try {
+      const schedRow = await pool.query(
+        `SELECT * FROM project_schedules WHERE project_id = $1 LIMIT 1`,
+        [projectId]
+      );
+ 
+      if (!schedRow.rows.length) {
+        return res.json({ schedule: null });
+      }
+ 
+      const sched = schedRow.rows[0];
+ 
+      const msRows = await pool.query(
+        `SELECT
+           m.*,
+           COALESCE(
+             json_agg(
+               json_build_object(
+                 'date',       e.report_date,
+                 'qty',        e.qty_executed,
+                 'remarks',    e.remarks,
+                 'cumulative', e.cumulative_after_entry
+               ) ORDER BY e.report_date
+             ) FILTER (WHERE e.id IS NOT NULL),
+             '[]'
+           ) AS entries,
+           COALESCE(
+             json_agg(DISTINCT
+               jsonb_build_object(
+                 'fileName', a.file_name,
+                 'url',      a.cloudinary_url,
+                 'publicId', a.cloudinary_public_id
+               )
+             ) FILTER (WHERE a.id IS NOT NULL),
+             '[]'
+           ) AS attachments
+         FROM milestones m
+         LEFT JOIN milestone_progress_entries e ON e.milestone_id = m.id
+         LEFT JOIN milestone_attachments a      ON a.milestone_id = m.id
+         WHERE m.schedule_id = $1
+         GROUP BY m.id
+         ORDER BY m.sort_order`,
+        [sched.id]
+      );
+ 
+      return res.json({
+        schedule: {
+          id: sched.id,
+          timeline: {
+            start:    sched.planned_start,
+            finish:   sched.planned_finish,
+            duration: sched.total_duration,
+          },
+          milestones: msRows.rows.map(ms => ({
+            id:              ms.id,
+            title:           ms.title,
+            description:     ms.description,
+            start:           ms.planned_start,
+            end:             ms.planned_end,
+            quantity:        ms.quantity,
+            unit:            ms.unit,
+            dep:             ms.depends_on || 'None',
+            weight_pct:      ms.weight_pct,
+            float_days:      ms.float_days,
+            is_critical:     ms.is_critical,
+            executed:        ms.executed,
+            progress_pct:    ms.progress_pct,
+            activity_status: ms.activity_status,
+            completed_at:    ms.completed_at,
+            entries:         ms.entries,
+            fileName:        ms.attachments?.[0]?.fileName || null,
+            attachmentUrl:   ms.attachments?.[0]?.url      || null,
+          })),
+        },
+      });
+    } catch (err) {
+      console.error('[GET /api/get-schedule]', err);
+      res.status(500).json({ error: 'Failed to load schedule' });
+    }
+  });
+ 
+ 
+  // ============================================================
+  //  POST /api/save-schedule
+  //  sfSave button in openProjectScheduleForm().
+  //  Body: multipart/form-data
+  //    projectId     : integer (as string from FormData)
+  //    timeline      : JSON string { start, finish, duration }
+  //    milestones    : JSON string [ { id(temp), title, desc,
+  //                                    start, end, qty, unit, dep … } ]
+  //    file_<tempId> : file (optional, one per milestone)
+  // ============================================================
+  router.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res) => {
+    const projectId = parseInt(req.body.projectId, 10);
+    if (!projectId)
+      return res.status(400).json({ error: 'Valid integer projectId is required' });
+ 
+    let tl, rawMilestones;
+    try {
+      tl            = JSON.parse(req.body.timeline);
+      rawMilestones = JSON.parse(req.body.milestones);
+    } catch {
+      return res.status(400).json({ error: 'Invalid JSON in timeline or milestones' });
+    }
+ 
+    if (!tl || !rawMilestones)
+      return res.status(400).json({ error: 'timeline and milestones are required' });
+ 
+    // Map "file_<tempId>" → multer file object
+    const fileMap = {};
+    (req.files || []).forEach(f => {
+      fileMap[f.fieldname.replace(/^file_/, '')] = f;
+    });
+ 
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+ 
+      // 1. Upsert project_schedules
+      const schedRes = await client.query(
+        `INSERT INTO project_schedules
+           (project_id, planned_start, planned_finish, total_duration,
+            created_by_user_id, created_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (project_id) DO UPDATE SET
+           planned_start  = EXCLUDED.planned_start,
+           planned_finish = EXCLUDED.planned_finish,
+           total_duration = EXCLUDED.total_duration,
+           updated_at     = now()
+         RETURNING *`,
+        [
+          projectId,           // INTEGER — matches projects.id SERIAL
+          tl.start,
+          tl.finish,
+          tl.duration,
+          req.user.user_id,    // INTEGER — from JWT decoded.sub
+          req.user.role,
+        ]
+      );
+      const schedId = schedRes.rows[0].id; // UUID — internal PK
+ 
+      // 2. Delete existing milestones (cascades to attachments + progress entries)
+      await client.query(
+        `DELETE FROM milestones WHERE schedule_id = $1`,
+        [schedId]
+      );
+ 
+      // 3. Compute proportional weight_pct from durations
+      const totalDur = rawMilestones.reduce(
+        (sum, ms) => sum + Math.max(1, daysBetween(ms.start, ms.end)),
+        0
+      );
+ 
+      // 4. Insert each milestone
+      const tempToReal = {}; // temp frontend id → real UUID
+      const insertedMs  = [];
+ 
+      for (let i = 0; i < rawMilestones.length; i++) {
+        const ms     = rawMilestones[i];
+        const dur    = Math.max(1, daysBetween(ms.start, ms.end));
+        const floatD = Math.max(0, daysBetween(ms.end, tl.finish));
+        const weight = totalDur > 0 ? (dur / totalDur) * 100 : 0;
+ 
+        // Resolve dependency UUID from already-inserted milestones
+        const depRealId =
+          ms.dep && ms.dep !== 'None' && tempToReal[ms.dep]
+            ? tempToReal[ms.dep]
+            : null;
+ 
+        const msRes = await client.query(
+          `INSERT INTO milestones
+             (schedule_id, project_id, title, description, sort_order,
+              planned_start, planned_end, duration_days, float_days,
+              is_critical, weight_pct, quantity, unit, depends_on,
+              created_by_user_id, created_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+           RETURNING *`,
+          [
+            schedId,                               // UUID
+            projectId,                             // INTEGER
+            ms.title,
+            ms.desc || ms.description || null,
+            i,
+            ms.start,
+            ms.end,
+            dur,
+            floatD,
+            floatD === 0,                          // is_critical
+            weight.toFixed(2),
+            parseFloat(ms.qty || ms.quantity) || 0,
+            ms.unit || null,
+            depRealId,                             // UUID or null
+            req.user.user_id,                      // INTEGER
+            req.user.role,
+          ]
+        );
+ 
+        const realId = msRes.rows[0].id;
+        tempToReal[ms.id] = realId;
+        insertedMs.push({ ...msRes.rows[0], tempId: ms.id });
+      }
+ 
+      // 5. Upload milestone attachments to Cloudinary
+      for (const ms of insertedMs) {
+        const file = fileMap[ms.tempId];
+        if (!file) continue;
+ 
+        try {
+          const cdResult = await uploadToCloudinary(
+            file.buffer,
+            file.originalname,
+            `oneprojectapp/schedules/${projectId}/milestones`
+          );
+          await client.query(
+            `INSERT INTO milestone_attachments
+               (milestone_id, file_name, file_size, mime_type,
+                cloudinary_public_id, cloudinary_url,
+                uploaded_by_user_id, uploaded_by_role)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              ms.id,                // UUID
+              file.originalname,
+              file.size,
+              file.mimetype,
+              cdResult.public_id,
+              cdResult.secure_url,
+              req.user.user_id,     // INTEGER
+              req.user.role,
+            ]
+          );
+        } catch (cdErr) {
+          console.error('Cloudinary upload failed for milestone', ms.id, cdErr);
+          // non-fatal — skip attachment, keep transaction alive
+        }
+      }
+ 
+      await client.query('COMMIT');
+ 
+      // 6. Re-fetch and return fresh schedule (same shape as GET)
+      const freshMs = await pool.query(
+        `SELECT m.*,
+           '[]'::json AS entries,
+           COALESCE(
+             json_agg(DISTINCT jsonb_build_object(
+               'fileName', a.file_name,
+               'url',      a.cloudinary_url
+             )) FILTER (WHERE a.id IS NOT NULL),
+             '[]'
+           ) AS attachments
+         FROM milestones m
+         LEFT JOIN milestone_attachments a ON a.milestone_id = m.id
+         WHERE m.schedule_id = $1
+         GROUP BY m.id
+         ORDER BY m.sort_order`,
+        [schedId]
+      );
+ 
+      return res.json({
+        success: true,
+        schedule: {
+          id: schedId,
+          timeline: { start: tl.start, finish: tl.finish, duration: tl.duration },
+          milestones: freshMs.rows.map(ms => ({
+            id:              ms.id,
+            title:           ms.title,
+            description:     ms.description,
+            start:           ms.planned_start,
+            end:             ms.planned_end,
+            quantity:        ms.quantity,
+            unit:            ms.unit,
+            dep:             ms.depends_on || 'None',
+            weight_pct:      ms.weight_pct,
+            float_days:      ms.float_days,
+            is_critical:     ms.is_critical,
+            executed:        ms.executed,
+            progress_pct:    ms.progress_pct,
+            activity_status: ms.activity_status,
+            entries:         [],
+            fileName:        ms.attachments?.[0]?.fileName || null,
+            attachmentUrl:   ms.attachments?.[0]?.url      || null,
+          })),
+        },
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('[POST /api/save-schedule]', err);
+      res.status(500).json({ error: 'Failed to save schedule' });
+    } finally {
+      client.release();
+    }
+  });
+ 
+  // ============================================================
   //  POST /api/report-progress
   //  submitDailyProgress() — logs one day's execution quantity.
   //  Body: multipart/form-data
@@ -4065,7 +4403,7 @@ export default function scheduleRoutes({ pool, cloudinary, upload, authenticateT
     try {
       await client.query('BEGIN');
  
-      // Lock milestone — project_id is INTEGER
+      // Lock milestone row — project_id is INTEGER
       const msRes = await client.query(
         `SELECT * FROM milestones WHERE id = $1 AND project_id = $2 FOR UPDATE`,
         [milestoneId, projectId]
@@ -4087,9 +4425,8 @@ export default function scheduleRoutes({ pool, cloudinary, upload, authenticateT
           error: `Cannot exceed planned quantity. Remaining: ${(planned - prevExecuted).toFixed(3)} ${ms.unit || ''}`,
         });
  
-      const newPct = planned > 0 ? Math.min(100, (newExecuted / planned) * 100) : 0;
-      // Stays in_progress until user explicitly calls /complete-milestone
-      const newStatus = 'in_progress';
+      const newPct    = planned > 0 ? Math.min(100, (newExecuted / planned) * 100) : 0;
+      const newStatus = 'in_progress'; // only /complete-milestone sets 'completed'
  
       // Upsert — one entry per milestone per day
       const entryRes = await client.query(
@@ -4107,14 +4444,14 @@ export default function scheduleRoutes({ pool, cloudinary, upload, authenticateT
            reported_by_role         = EXCLUDED.reported_by_role
          RETURNING *`,
         [
-          milestoneId,          // UUID
-          projectId,            // INTEGER
+          milestoneId,         // UUID
+          projectId,           // INTEGER
           reportDate,
           qty,
           newExecuted,
           newPct.toFixed(2),
           remarks || null,
-          req.user.user_id,     // INTEGER
+          req.user.user_id,    // INTEGER
           req.user.role,
         ]
       );
@@ -4146,13 +4483,13 @@ export default function scheduleRoutes({ pool, cloudinary, upload, authenticateT
                 uploaded_by_user_id, uploaded_by_role)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
             [
-              entry.id,              // UUID
+              entry.id,            // UUID
               req.file.originalname,
               req.file.size,
               req.file.mimetype,
               cdResult.public_id,
               cdResult.secure_url,
-              req.user.user_id,      // INTEGER
+              req.user.user_id,    // INTEGER
               req.user.role,
             ]
           );
