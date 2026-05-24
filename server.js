@@ -950,44 +950,106 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 
 // ─── Review record ────────────────────────────────────────────────────────────
 app.post('/api/review-record', authenticateToken, async (req, res) => {
-  const {projectId,recordId,category,action,comment}=req.body;
-  const reviewerId=req.user.user_id||req.user.id;
-  const reviewerRole=req.user.role;
-  const table=TABLE_MAP[category];
-  if (!table) return res.status(400).json({error:'Invalid category'});
-  const workflowActions=['approved','accepted','rejected'];
-  const isWorkflow=workflowActions.includes(action);
-  const isComment=action==='comment';
-  if (!isWorkflow&&!isComment) return res.status(400).json({error:'Invalid action.'});
-  if (isWorkflow&&!isDecisionMaker(reviewerRole)) return res.status(403).json({error:'Only decision makers can approve, accept, or reject records.'});
+  const { projectId, recordId, category, action, comment, actorType } = req.body;
+  const reviewerId   = req.user.user_id || req.user.id;
+  const reviewerRole = req.user.role;
+  const table        = TABLE_MAP[category];
+  if (!table) return res.status(400).json({ error: 'Invalid category' });
+
+  // Allowed workflow actions in the DB constraint
+  const workflowActions = ['approved', 'accepted', 'rejected'];
+  const isComment       = action === 'comment';
+  const isWorkflow      = workflowActions.includes(action);
+
+  if (!isWorkflow && !isComment)
+    return res.status(400).json({ error: 'Invalid action.' });
+
+  // Decision makers do workflow; team members do action col without status change
+  const isDecisionMakerActor = isDecisionMaker(reviewerRole) && actorType !== 'team_member';
+
+  // Team members and non-decision-makers cannot trigger status changes
+  if (isWorkflow && !isDecisionMakerActor && !isDecisionMaker(reviewerRole))
+    return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
+
   try {
-    const {rows:existing}=await pool.query('SELECT id,action FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 LIMIT 1',[category,recordId,reviewerId]);
+    const { rows: existing } = await pool.query(
+      'SELECT id, action, comment FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 LIMIT 1',
+      [category, recordId, reviewerId]
+    );
+
     if (isComment) {
-      if (!comment?.trim()) return res.status(400).json({error:'Comment text is required.'});
-      if (existing.length>0){
-        if (workflowActions.includes(existing[0].action)){await pool.query('UPDATE document_reviews SET comment=$1,action_date=NOW() WHERE id=$2',[comment.trim(),existing[0].id]);}
-        else{await pool.query("UPDATE document_reviews SET action='comment',comment=$1,action_date=NOW() WHERE id=$2",[comment.trim(),existing[0].id]);}
+      // Save/update comment text only — never changes action or record status
+      if (!comment?.trim()) return res.status(400).json({ error: 'Comment text is required.' });
+      if (existing.length > 0) {
+        await pool.query(
+          'UPDATE document_reviews SET comment=$1, action_date=NOW() WHERE id=$2',
+          [comment.trim(), existing[0].id]
+        );
       } else {
-        await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,action,comment) VALUES ($1,$2,'new',$3,$4,'comment',$5)`,[category,recordId,reviewerId,reviewerRole,comment.trim()]);
+        // Insert with action='no_action' — satisfies DB constraint, comment stored separately
+        await pool.query(
+          `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action, comment)
+           VALUES ($1, $2, 'new', $3, $4, 'no_action', $5)`,
+          [category, recordId, reviewerId, reviewerRole, comment.trim()]
+        );
       }
-      return res.json({success:true,message:'Comment submitted successfully.'});
+      return res.json({ success: true, message: 'Comment saved.' });
     }
-    if (existing.length>0){
-      if (workflowActions.includes(existing[0].action)) return res.status(409).json({error:`You already ${existing[0].action} this record.`});
-      await pool.query('UPDATE document_reviews SET action=$1,action_date=NOW() WHERE id=$2',[action,existing[0].id]);
+
+    // ── Workflow / team action ──
+    if (existing.length > 0) {
+      // Prevent double workflow actions from decision makers
+      if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
+        return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
+      }
+      await pool.query(
+        'UPDATE document_reviews SET action=$1, action_date=NOW() WHERE id=$2',
+        [action, existing[0].id]
+      );
     } else {
-      await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,action) VALUES ($1,$2,'new',$3,$4,$5)`,[category,recordId,reviewerId,reviewerRole,action]);
+      await pool.query(
+        `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
+         VALUES ($1, $2, 'new', $3, $4, $5)`,
+        [category, recordId, reviewerId, reviewerRole, action]
+      );
     }
-    const {rows:recRows}=await pool.query(`SELECT role FROM ${table} WHERE id=$1 AND project_id=$2`,[recordId,projectId]);
-    if (!recRows.length) return res.status(404).json({error:'Record not found.'});
-    const uploaderSide=getSide(recRows[0].role);
-    let newStatus;
-    if (action==='rejected'){newStatus='rejected';}
-    else if (action==='accepted'){newStatus='approved_record';}
-    else{const step2Map={contractor:'pending_client_acceptance',consultant:'pending_contractor_acceptance',client:'pending_contractor_acceptance'};newStatus=step2Map[uploaderSide]||'pending_review';}
-    await pool.query(`UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`,[newStatus,recordId,projectId]);
-    res.json({success:true,message:`Record ${action} successfully.`});
-  } catch(err){console.error('Review record error:',err);res.status(500).json({error:'Failed to process review.'});}
+
+    // ── Update record status — ONLY for decision maker workflow actions ──
+    if (isDecisionMakerActor) {
+      const { rows: recRows } = await pool.query(
+        `SELECT role FROM ${table} WHERE id=$1 AND project_id=$2`,
+        [recordId, projectId]
+      );
+      if (!recRows.length) return res.status(404).json({ error: 'Record not found.' });
+
+      const uploaderSide = getSide(recRows[0].role);
+      let newStatus;
+      if (action === 'rejected') {
+        newStatus = 'rejected';
+      } else if (action === 'accepted') {
+        newStatus = 'approved_record';
+      } else {
+        // 'approved' — step 1 done, advance to step 2 pending
+        const step2Map = {
+          contractor: 'pending_client_acceptance',
+          consultant: 'pending_contractor_acceptance',
+          client:     'pending_contractor_acceptance',
+        };
+        newStatus = step2Map[uploaderSide] || 'pending_review';
+      }
+
+      await pool.query(
+        `UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`,
+        [newStatus, recordId, projectId]
+      );
+    }
+    // Team member actions: action column updated above, status column untouched
+
+    res.json({ success: true, message: `Action '${action}' recorded successfully.` });
+  } catch (err) {
+    console.error('Review record error:', err);
+    res.status(500).json({ error: 'Failed to process review.' });
+  }
 });
 
 // ─── Download file ────────────────────────────────────────────────────────────
