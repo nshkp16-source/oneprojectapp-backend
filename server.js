@@ -1152,47 +1152,49 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         : [];
 
       // ── btn_state ─────────────────────────────────────────────────────────
-      let btnState     = 'none';
-      let pendingRole  = null;
-      let approveLabel = null;
+let btnState     = 'none';
+let pendingRole  = null;
+let approveLabel = null;
 
-      if (isUploader) {
-        btnState = 'uploader';
-      } else if (isLocked) {
-        btnState = 'locked';
-      } else if (!userIsDM) {
-        btnState = 'team_member';
-      } else if (userSide === uploaderSide) {
-        btnState = 'uploader';
+if (isUploader) {
+  btnState = 'uploader';
+} else if (isLocked) {
+  btnState = 'locked';
+} else if (!userIsDM) {
+  btnState = 'team_member';
+} else if (userSide === uploaderSide) {
+  // Same side as uploader but not the uploader themselves — no action
+  btnState = 'none';
+} else {
+  const workflowActions = ['approved', 'accepted', 'rejected'];
+  const alreadyActed    = myReviewRow && workflowActions.includes(myReviewRow.action);
+
+  if (alreadyActed) {
+    btnState = 'acted';
+  } else if (steps) {
+    const myStep = steps.find(s => s.side === userSide);
+    if (!myStep) {
+      btnState = 'none';
+    } else if (myStep.step === 2) {
+      const step1     = steps.find(s => s.step === 1);
+      const step1Done = annotatedReviews.some(
+        r => getSide(r.reviewer_role) === step1.side &&
+             (r.action === 'approved' || r.action === 'accepted')
+      );
+      if (!step1Done) {
+        btnState    = 'awaiting';
+        pendingRole = step1.side;
       } else {
-        const workflowActions = ['approved', 'accepted', 'rejected'];
-        const alreadyActed    = myReviewRow && workflowActions.includes(myReviewRow.action);
-
-        if (alreadyActed) {
-          btnState = 'acted';
-        } else if (steps) {
-          const myStep = steps.find(s => s.side === userSide);
-          if (!myStep) {
-            btnState = 'none';
-          } else if (myStep.step === 2) {
-            const step1     = steps.find(s => s.step === 1);
-            const step1Done = annotatedReviews.some(
-              r => getSide(r.reviewer_role) === step1.side &&
-                   (r.action === 'approved' || r.action === 'accepted')
-            );
-            if (!step1Done) {
-              btnState    = 'awaiting';
-              pendingRole = step1.side;
-            } else {
-              btnState     = 'can_approve';
-              approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
-            }
-          } else {
-            btnState     = 'can_approve';
-            approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
-          }
-        }
+        btnState     = 'can_approve';
+        approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
       }
+    } else {
+      // step 1
+      btnState     = 'can_approve';
+      approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
+    }
+  }
+}
 
       return {
         ...rec,
@@ -1214,7 +1216,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     console.error('Fetch tab records error:', err);
     res.status(500).json({ error: 'Failed to fetch records.' });
   }
-});
+});  // ← this closes fetch-tab-records
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MARK RECORD VIEWED
