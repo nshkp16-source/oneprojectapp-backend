@@ -53,7 +53,6 @@ function uploadToCloudinary(buffer, folder, resourceType = 'auto') {
   });
 }
 
-// Schedule-scoped Cloudinary helper
 function scheduleCloudinaryUpload(buffer, originalName, folder) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
@@ -100,12 +99,17 @@ const TABLE_MAP = {
   financial:      'financial_records',
 };
 
+// FIX: normalise spaces AND underscores so all role variants match.
+// Backend JWT emits: 'Contractor', 'Contractor Project Manager',
+//   'Consultant', 'Consultant Project Manager',
+//   'Client', 'Client Project Manager', 'Team Member'
 function getSide(role) {
-  const r = (role || '').toLowerCase().replace(/\s/g, '_');
+  if (!role) return null;
+  const r = role.toLowerCase().replace(/[\s_-]+/g, '_');
   if (r === 'contractor' || r === 'contractor_project_manager') return 'contractor';
   if (r === 'consultant' || r === 'consultant_project_manager') return 'consultant';
   if (r === 'client'     || r === 'client_project_manager')     return 'client';
-  return null;
+  return null; // 'team_member' → null
 }
 
 function isDecisionMaker(role) { return getSide(role) !== null; }
@@ -788,10 +792,6 @@ app.get('/api/me', authenticateToken, (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS
-//  Frontend calls:
-//    GET /notifications?projectId=&userId=
-//    PUT /notifications/:id/read?projectId=&userId=&userRole=
-//    GET /notifications/unreadCount?projectId=       ← NEW
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/notifications', authenticateToken, async (req, res) => {
   const {projectId,userId}=req.query;
@@ -817,7 +817,6 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
   } catch(err){console.error('Mark as read error:',err);res.status(500).json({success:false,message:'Server error.'});}
 });
 
-// NEW: unread count for notification badge
 app.get('/notifications/unreadCount', authenticateToken, async (req, res) => {
   const {projectId}=req.query;
   const userId=req.user.user_id;
@@ -837,13 +836,8 @@ app.get('/notifications/unreadCount', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  RECORDS
-//  Frontend calls:
-//    POST /api/add-record      ← tabs.js record form
-//    POST /records/add-record  ← tabs.js meeting minutes
-//    POST /records             ← original route (kept for compat)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Shared record-save logic extracted so both /api/add-record and /records can use it
 async function handleAddRecord(req, res) {
   try {
     const {user_id:userId,role}=req.user;
@@ -856,7 +850,6 @@ async function handleAddRecord(req, res) {
       'safety-compliance':            {table:'safety_records',         type:'safety'},
       'operational-performance':      {table:'operational_records',    type:'operational'},
       'financial':                    {table:'financial_records',      type:'financial'},
-      // tabs.js sends shorthand keys too
       'contractual':                  {table:'contractual_records',    type:'contractual'},
       'administrative':               {table:'administrative_records', type:'administrative'},
       'safety':                       {table:'safety_records',         type:'safety'},
@@ -879,9 +872,13 @@ async function handleAddRecord(req, res) {
       } catch(uploadErr){console.error('Cloudinary upload error:',uploadErr);return res.status(500).json({success:false,message:'File upload failed'});}
     }
 
-    const recordKind=noticeTiedId?'notice':'new';
-    const noticeTied=noticeTiedId?Number(noticeTiedId):null;
-    const notifMsg=noticeTiedId?`New notice of determination issued by ${role} (tied to record #${noticeTied})`:`New ${resolved.type} record added by ${role}: "${title}"`;
+    // FIX: respect the recordKind the frontend sent ('new', 'notice', 'rejection_notice')
+    // Fall back to inferring from noticeTiedId only when recordKind is not provided.
+    const recordKind = req.body.recordKind || (noticeTiedId ? 'notice' : 'new');
+    const noticeTied = noticeTiedId ? Number(noticeTiedId) : null;
+    const notifMsg = noticeTiedId
+      ? `New ${recordKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
+      : `New ${resolved.type} record added by ${role}: "${title}"`;
 
     const client=await pool.connect();
     try {
@@ -902,50 +899,110 @@ async function handleAddRecord(req, res) {
   } catch(err){console.error('Add record route error:',err);res.status(500).json({success:false,message:'Server error'});}
 }
 
-// POST /api/add-record  ← used by tabs.js openAddRecordPanel form submission
 app.post('/api/add-record', authenticateToken, upload.single('attachment'), handleAddRecord);
-
-// POST /records  ← original route kept for backward compatibility
 app.post('/records', authenticateToken, upload.single('attachment'), handleAddRecord);
 
 // ─── Fetch tab records ────────────────────────────────────────────────────────
+// FIX: joins team_member_assignments to return reviewer_email and reviewer_position
+// for team member rows so the frontend viewers section can display them.
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
-  const {projectId,category}=req.body;
-  const table=TABLE_MAP[category];
-  if (!table) return res.status(400).json({error:'Invalid category'});
+  const {projectId, category} = req.body;
+  const table = TABLE_MAP[category];
+  if (!table) return res.status(400).json({error: 'Invalid category'});
   try {
-    const {rows:records}=await pool.query(
-      `SELECT r.id,r.title,r.description,r.file_path,r.issued_date AS date_recorded,r.role AS uploader_role,r.uploaded_by,r.status,r.record_kind,r.notice_tied_id
-       FROM ${table} r WHERE r.project_id=$1 AND r.record_kind IN ('new','notice','rejection_notice') ORDER BY r.issued_date DESC`,
+    const {rows: records} = await pool.query(
+      `SELECT r.id, r.title, r.description, r.file_path,
+              r.issued_date AS date_recorded, r.role AS uploader_role,
+              r.uploaded_by, r.status, r.record_kind, r.notice_tied_id
+       FROM ${table} r
+       WHERE r.project_id = $1
+         AND r.record_kind IN ('new', 'notice', 'rejection_notice')
+       ORDER BY r.issued_date DESC`,
       [projectId]
     );
-    const userId=req.user.user_id||req.user.id;
-    const enriched=await Promise.all(records.map(async rec=>{
-      const {rows:reviews}=await pool.query(
-        `SELECT reviewer_id,reviewer_role,action,action_date,comment FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND action IN ('approved','accepted','rejected','comment','no_action') ORDER BY action_date ASC`,
-        [category,rec.id]
+
+    const userId = req.user.user_id || req.user.id;
+
+    const enriched = await Promise.all(records.map(async rec => {
+      // FIX: for team member reviewers, join their email and position from
+      // team_member_assignments so the frontend viewers section can display them.
+      const {rows: reviews} = await pool.query(
+        `SELECT
+           dr.reviewer_id,
+           dr.reviewer_role,
+           dr.action,
+           dr.action_date,
+           dr.comment,
+           -- email: for team members join team_members table
+           CASE
+             WHEN dr.reviewer_role = 'Team Member'
+             THEN (SELECT tm.email FROM team_members tm WHERE tm.id = dr.reviewer_id LIMIT 1)
+             ELSE NULL
+           END AS reviewer_email,
+           -- position: from their project assignment row
+           CASE
+             WHEN dr.reviewer_role = 'Team Member'
+             THEN (SELECT ta.position FROM team_member_assignments ta
+                   WHERE ta.team_member_id = dr.reviewer_id
+                     AND ta.project_id = $3
+                   LIMIT 1)
+             ELSE NULL
+           END AS reviewer_position
+         FROM document_reviews dr
+         WHERE dr.record_type = $1
+           AND dr.record_id = $2
+           AND dr.action IN ('approved', 'accepted', 'rejected', 'no_action')
+         ORDER BY dr.action_date ASC`,
+        [category, rec.id, projectId]
       );
-      const isUploader=String(rec.uploaded_by)===String(userId);
-      let isViewed=isUploader;
-      if (!isUploader){const {rows:viewed}=await pool.query('SELECT 1 FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 LIMIT 1',[category,rec.id,userId]);isViewed=viewed.length>0;}
-      return {...rec,reviews,is_viewed:isViewed};
+
+      // is_viewed: true if uploader OR already has a document_reviews row
+      const isUploader = String(rec.uploaded_by) === String(userId);
+      let isViewed = isUploader;
+      if (!isUploader) {
+        const {rows: viewed} = await pool.query(
+          'SELECT 1 FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 LIMIT 1',
+          [category, rec.id, userId]
+        );
+        isViewed = viewed.length > 0;
+      }
+
+      return {...rec, reviews, is_viewed: isViewed};
     }));
-    res.json({records:enriched});
-  } catch(err){console.error('Fetch tab records error:',err);res.status(500).json({error:'Failed to fetch records'});}
+
+    res.json({records: enriched});
+  } catch(err) {
+    console.error('Fetch tab records error:', err);
+    res.status(500).json({error: 'Failed to fetch records'});
+  }
 });
 
 // ─── Mark record viewed ───────────────────────────────────────────────────────
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
-  const {recordId,category}=req.body;
-  const reviewerId=req.user.user_id||req.user.id;
-  const reviewerRole=req.user.role;
-  if (!TABLE_MAP[category]) return res.status(400).json({error:'Invalid category'});
+  const {recordId, category} = req.body;
+  const reviewerId   = req.user.user_id || req.user.id;
+  const reviewerRole = req.user.role;
+  if (!TABLE_MAP[category]) return res.status(400).json({error: 'Invalid category'});
   try {
-    const {rows:rec}=await pool.query(`SELECT uploaded_by FROM ${TABLE_MAP[category]} WHERE id=$1`,[recordId]);
-    if (rec.length>0&&String(rec[0].uploaded_by)===String(reviewerId)) return res.json({success:true,skipped:true});
-    await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,action) VALUES ($1,$2,'new',$3,$4,'no_action') ON CONFLICT (record_type,record_id,reviewer_id) DO NOTHING`,[category,recordId,reviewerId,reviewerRole]);
-    res.json({success:true});
-  } catch(err){console.error('Mark viewed error:',err);res.status(500).json({error:'Failed to mark as viewed.'});}
+    const {rows: rec} = await pool.query(
+      `SELECT uploaded_by FROM ${TABLE_MAP[category]} WHERE id=$1`,
+      [recordId]
+    );
+    // Skip if the caller is the uploader — they don't need a view record
+    if (rec.length > 0 && String(rec[0].uploaded_by) === String(reviewerId)) {
+      return res.json({success: true, skipped: true});
+    }
+    await pool.query(
+      `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
+       VALUES ($1, $2, 'new', $3, $4, 'no_action')
+       ON CONFLICT (record_type, record_id, reviewer_id) DO NOTHING`,
+      [category, recordId, reviewerId, reviewerRole]
+    );
+    res.json({success: true});
+  } catch(err) {
+    console.error('Mark viewed error:', err);
+    res.status(500).json({error: 'Failed to mark as viewed.'});
+  }
 });
 
 // ─── Review record ────────────────────────────────────────────────────────────
@@ -956,19 +1013,19 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
   const table        = TABLE_MAP[category];
   if (!table) return res.status(400).json({ error: 'Invalid category' });
 
-  // Allowed workflow actions in the DB constraint
-  const workflowActions = ['approved', 'accepted', 'rejected'];
-  const isComment       = action === 'comment';
-  const isWorkflow      = workflowActions.includes(action);
+  const workflowActions    = ['approved', 'accepted', 'rejected'];
+  const isComment          = action === 'comment';
+  const isWorkflow         = workflowActions.includes(action);
 
   if (!isWorkflow && !isComment)
     return res.status(400).json({ error: 'Invalid action.' });
 
-  // Decision makers do workflow; team members do action col without status change
+  // A decision maker acting as 'team_member' (actorType override) should NOT
+  // advance the workflow. Only genuine decision-maker workflow calls do.
   const isDecisionMakerActor = isDecisionMaker(reviewerRole) && actorType !== 'team_member';
 
-  // Team members and non-decision-makers cannot trigger status changes
-  if (isWorkflow && !isDecisionMakerActor && !isDecisionMaker(reviewerRole))
+  // Team members cannot trigger workflow status changes
+  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member')
     return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
 
   try {
@@ -978,7 +1035,6 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     );
 
     if (isComment) {
-      // Save/update comment text only — never changes action or record status
       if (!comment?.trim()) return res.status(400).json({ error: 'Comment text is required.' });
       if (existing.length > 0) {
         await pool.query(
@@ -986,7 +1042,6 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
           [comment.trim(), existing[0].id]
         );
       } else {
-        // Insert with action='no_action' — satisfies DB constraint, comment stored separately
         await pool.query(
           `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action, comment)
            VALUES ($1, $2, 'new', $3, $4, 'no_action', $5)`,
@@ -996,9 +1051,9 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       return res.json({ success: true, message: 'Comment saved.' });
     }
 
-    // ── Workflow / team action ──
+    // ── Workflow / team member action ──
     if (existing.length > 0) {
-      // Prevent double workflow actions from decision makers
+      // Prevent decision makers from double-acting
       if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
         return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
       }
@@ -1014,7 +1069,8 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       );
     }
 
-    // ── Update record status — ONLY for decision maker workflow actions ──
+    // ── Update record status — ONLY for genuine decision maker workflow actions ──
+    // Team member actions (actorType='team_member') deliberately skip this block.
     if (isDecisionMakerActor) {
       const { rows: recRows } = await pool.query(
         `SELECT role FROM ${table} WHERE id=$1 AND project_id=$2`,
@@ -1029,13 +1085,13 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       } else if (action === 'accepted') {
         newStatus = 'approved_record';
       } else {
-        // 'approved' — step 1 done, advance to step 2 pending
-        const step2Map = {
+        // 'approved' = step 1 done; advance to waiting for step 2
+        const step2StatusMap = {
           contractor: 'pending_client_acceptance',
           consultant: 'pending_contractor_acceptance',
           client:     'pending_contractor_acceptance',
         };
-        newStatus = step2Map[uploaderSide] || 'pending_review';
+        newStatus = step2StatusMap[uploaderSide] || 'pending_review';
       }
 
       await pool.query(
@@ -1043,7 +1099,6 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
         [newStatus, recordId, projectId]
       );
     }
-    // Team member actions: action column updated above, status column untouched
 
     res.json({ success: true, message: `Action '${action}' recorded successfully.` });
   } catch (err) {
@@ -1086,14 +1141,7 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MEETING ROUTES
-//  Frontend calls:
-//    POST /records/schedule-meeting
-//    POST /records/meetings
-//    POST /records/meeting-detail
-//    POST /records/add-record  (meeting minutes)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// POST /records/schedule-meeting
 app.post('/records/schedule-meeting', authenticateToken, async (req, res) => {
   const {projectId,title,dateTime,participants,agenda}=req.body;
   if (!projectId||!title||!dateTime||!participants||!agenda)
@@ -1108,9 +1156,8 @@ app.post('/records/schedule-meeting', authenticateToken, async (req, res) => {
   } catch(err){console.error('Schedule meeting error:',err);res.status(500).json({success:false,message:'Failed to schedule meeting.'});}
 });
 
-// POST /records/meetings
 app.post('/records/meetings', authenticateToken, async (req, res) => {
-  const {projectId,type}=req.body;  // type: 'minutes' | 'scheduled'
+  const {projectId,type}=req.body;
   if (!projectId) return res.status(400).json({success:false,message:'projectId is required.'});
   try {
     const meetingType = type==='scheduled' ? 'scheduled' : 'minutes';
@@ -1123,7 +1170,6 @@ app.post('/records/meetings', authenticateToken, async (req, res) => {
   } catch(err){console.error('Meetings list error:',err);res.status(500).json({success:false,message:'Failed to fetch meetings.'});}
 });
 
-// POST /records/meeting-detail
 app.post('/records/meeting-detail', authenticateToken, async (req, res) => {
   const {meetingId,projectId}=req.body;
   if (!meetingId) return res.status(400).json({success:false,message:'meetingId is required.'});
@@ -1137,12 +1183,10 @@ app.post('/records/meeting-detail', authenticateToken, async (req, res) => {
   } catch(err){console.error('Meeting detail error:',err);res.status(500).json({success:false,message:'Failed to fetch meeting detail.'});}
 });
 
-// POST /records/add-record  ← meeting minutes
 app.post('/records/add-record', authenticateToken, upload.array('documents', 5), async (req, res) => {
   const {title,details,projectId,category,date}=req.body;
   if (!title||!details||!projectId) return res.status(400).json({success:false,message:'title, details and projectId are required.'});
   try {
-    // Upload any attached files to Cloudinary
     const attachmentUrls=[];
     for (const file of (req.files||[])) {
       try {
@@ -1162,8 +1206,6 @@ app.post('/records/add-record', authenticateToken, upload.array('documents', 5),
 // ─────────────────────────────────────────────────────────────────────────────
 //  SCHEDULE MODULE
 // ─────────────────────────────────────────────────────────────────────────────
-
-// GET /api/get-schedule  — returns baseline + extension milestones
 app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   const projectId=parseInt(req.query.projectId,10);
   if (!projectId) return res.status(400).json({error:'Valid integer projectId is required'});
@@ -1171,8 +1213,6 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     const schedRow=await pool.query('SELECT * FROM project_schedules WHERE project_id=$1 LIMIT 1',[projectId]);
     if (!schedRow.rows.length) return res.json({schedule:null});
     const sched=schedRow.rows[0];
-
-    // Baseline milestones
     const msRows=await pool.query(
       `SELECT m.*,
          COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,
@@ -1183,8 +1223,6 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
        WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`,
       [sched.id]
     );
-
-    // Extension (additional) milestones
     const amRows=await pool.query(
       `SELECT am.*,
          COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,
@@ -1195,33 +1233,11 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
        WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`,
       [sched.id]
     );
-
-    const mapMs=(ms,isExt)=>({
-      id:ms.id, title:ms.title, description:ms.description,
-      start:ms.planned_start, end:ms.planned_end,
-      quantity:ms.quantity, unit:ms.unit,
-      dep:ms.depends_on||ms.depends_on_baseline||'None',
-      weight_pct:ms.weight_pct, float_days:ms.float_days, is_critical:ms.is_critical,
-      executed:ms.executed, progress_pct:ms.progress_pct,
-      activity_status:ms.activity_status, completed_at:ms.completed_at,
-      entries:ms.entries,
-      fileName:ms.attachments?.[0]?.fileName||null,
-      attachmentUrl:ms.attachments?.[0]?.url||null,
-      isExtension:isExt,
-    });
-
-    res.json({
-      schedule:{
-        id:sched.id,
-        timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},
-        milestones:           msRows.rows.map(ms=>mapMs(ms,false)),
-        extension_milestones: amRows.rows.map(ms=>mapMs(ms,true)),
-      },
-    });
+    const mapMs=(ms,isExt)=>({id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt});
+    res.json({schedule:{id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true))}});
   } catch(err){console.error('[GET /api/get-schedule]',err);res.status(500).json({error:'Failed to load schedule'});}
 });
 
-// POST /api/save-schedule
 app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res) => {
   const projectId=parseInt(req.body.projectId,10);
   if (!projectId) return res.status(400).json({error:'Valid integer projectId is required'});
@@ -1265,10 +1281,7 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       if (!file) continue;
       try {
         const cdResult=await scheduleCloudinaryUpload(file.buffer,file.originalname,`oneprojectapp/schedules/${projectId}/milestones`);
-        await client.query(
-          `INSERT INTO milestone_attachments (milestone_id,file_name,file_size,mime_type,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [ms.id,file.originalname,file.size,file.mimetype,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]
-        );
+        await client.query(`INSERT INTO milestone_attachments (milestone_id,file_name,file_size,mime_type,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,[ms.id,file.originalname,file.size,file.mimetype,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]);
       } catch(cdErr){console.error('Cloudinary upload failed for milestone',ms.id,cdErr);}
     }
     await client.query('COMMIT');
@@ -1279,20 +1292,11 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
        WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`,
       [schedId]
     );
-    res.json({
-      success:true,
-      schedule:{
-        id:schedId,
-        timeline:{start:tl.start,finish:tl.finish,duration:tl.duration},
-        milestones:freshMs.rows.map(ms=>({id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:[],fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null})),
-        extension_milestones:[],
-      },
-    });
+    res.json({success:true,schedule:{id:schedId,timeline:{start:tl.start,finish:tl.finish,duration:tl.duration},milestones:freshMs.rows.map(ms=>({id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:[],fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null})),extension_milestones:[]}});
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/save-schedule]',err);res.status(500).json({error:'Failed to save schedule'});}
   finally{client.release();}
 });
 
-// POST /api/report-progress  — baseline milestones
 app.post('/api/report-progress', authenticateToken, upload.single('attachment'), async (req, res) => {
   const projectId=parseInt(req.body.projectId,10);
   const {milestoneId,reportDate,remarks}=req.body;
@@ -1335,7 +1339,6 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
   finally{client.release();}
 });
 
-// POST /api/complete-milestone
 app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
   const projectId=parseInt(req.body.projectId,10);
   const {milestoneId,isExtensionMilestone}=req.body;
@@ -1358,7 +1361,6 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
   finally{client.release();}
 });
 
-// POST /api/save-extension
 app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res) => {
   const projectId=parseInt(req.body.projectId,10);
   if (!projectId) return res.status(400).json({error:'Valid integer projectId is required'});
@@ -1418,7 +1420,6 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
   finally{client.release();}
 });
 
-// POST /api/report-additional-progress  — extension milestones
 app.post('/api/report-additional-progress', authenticateToken, upload.single('attachment'), async (req, res) => {
   const projectId=parseInt(req.body.projectId,10);
   const {milestoneId,reportDate,remarks}=req.body;
