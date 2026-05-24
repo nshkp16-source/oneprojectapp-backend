@@ -24,14 +24,13 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ─── Multer (memory storage) ──────────────────────────────────────────────────
+// ─── Multer ───────────────────────────────────────────────────────────────────
 const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
   storage: multer.memoryStorage(),
   fileFilter: (_req, file, cb) => {
     const allowed = [
-      'image/png', 'image/jpeg', 'image/jpg',
-      'application/pdf',
+      'image/png','image/jpeg','image/jpg','application/pdf',
       'application/msword',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       'application/vnd.ms-excel',
@@ -42,7 +41,7 @@ const upload = multer({
   },
 });
 
-// ─── Cloudinary upload helper ─────────────────────────────────────────────────
+// ─── Cloudinary helpers ───────────────────────────────────────────────────────
 function uploadToCloudinary(buffer, folder, resourceType = 'auto') {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
@@ -90,14 +89,28 @@ const transporter = nodemailer.createTransport(
   nodemailerSendgrid({ apiKey: process.env.SENDGRID_API_KEY })
 );
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-const TABLE_MAP = {
-  contractual:    'contractual_records',
-  administrative: 'administrative_records',
-  safety:         'safety_records',
-  operational:    'operational_records',
-  financial:      'financial_records',
-};
+// =============================================================================
+//  CORE HELPERS
+//
+//  IMPORTANT: The frontend sends recordType as the DB table name directly
+//  (e.g. 'contractual_records'). TABLE_MAP is used to validate that the
+//  value received is a known table — never to translate a tab key.
+// =============================================================================
+
+// All valid record table names. Used to whitelist frontend input.
+const VALID_RECORD_TABLES = new Set([
+  'contractual_records',
+  'administrative_records',
+  'safety_records',
+  'operational_records',
+  'financial_records',
+]);
+
+// Validates recordType from frontend and returns it if safe, or null.
+function resolveTable(recordType) {
+  if (!recordType || !VALID_RECORD_TABLES.has(recordType)) return null;
+  return recordType;
+}
 
 function getSide(role) {
   if (!role) return null;
@@ -128,13 +141,36 @@ function roleTableMap(role) {
   }
 }
 
+// Fetches all user IDs assigned to a project so notifications can be
+// fanned out to every recipient row in notification_recipients.
+async function getProjectMemberUserIds(projectId, excludeUserId) {
+  const queries = [
+    pool.query('SELECT client_id AS user_id FROM projects WHERE id=$1', [projectId]),
+    pool.query('SELECT contractor_id  AS user_id FROM contractor_assignments  WHERE project_id=$1', [projectId]),
+    pool.query('SELECT consultant_id  AS user_id FROM consultant_assignments  WHERE project_id=$1', [projectId]),
+    pool.query('SELECT client_pm_id   AS user_id FROM client_pm_assignments   WHERE project_id=$1', [projectId]),
+    pool.query('SELECT contractor_pm_id AS user_id FROM contractor_pm_assignments WHERE project_id=$1', [projectId]),
+    pool.query('SELECT consultant_pm_id AS user_id FROM consultant_pm_assignments WHERE project_id=$1', [projectId]),
+    pool.query('SELECT team_member_id AS user_id FROM team_member_assignments WHERE project_id=$1', [projectId]),
+  ];
+  const results = await Promise.all(queries);
+  const ids = new Set();
+  for (const r of results) {
+    for (const row of r.rows) {
+      const id = String(row.user_id);
+      if (id && id !== String(excludeUserId)) ids.add(Number(id));
+    }
+  }
+  return [...ids];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ROOT
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.send('Backend is running successfully!'));
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GENERIC PROFILE PICTURE / ATTACHMENT ROUTES
+//  GENERIC PROFILE / ATTACHMENT ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/profile-picture', authenticateToken, upload.single('picture'), async (req, res) => {
   try {
@@ -160,9 +196,8 @@ app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AUTH ROUTES
+//  AUTH ROUTES  (unchanged from original)
 // ─────────────────────────────────────────────────────────────────────────────
-
 app.post('/finalize-account', async (req, res) => {
   const { clientEmail } = req.body;
   try {
@@ -498,10 +533,12 @@ app.post('/cleanup-tokens', async (req, res) => {
   } catch(err){console.error('Cleanup error:',err);res.status(500).json({success:false,error:'Failed to cleanup tokens.'});}
 });
 
-setInterval(async()=>{
-  try{const r=await pool.query('DELETE FROM email_tokens WHERE expires_at<NOW() AND verified=false');if(r.rowCount>0)console.log(`Scheduled cleanup: ${r.rowCount} expired tokens deleted.`);}
-  catch(err){console.error('Scheduled cleanup error:',err);}
-},3*60*1000);
+setInterval(async () => {
+  try {
+    const r=await pool.query('DELETE FROM email_tokens WHERE expires_at<NOW() AND verified=false');
+    if(r.rowCount>0) console.log(`Scheduled cleanup: ${r.rowCount} expired tokens deleted.`);
+  } catch(err){console.error('Scheduled cleanup error:',err);}
+}, 3*60*1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  PROFILE ROUTES
@@ -788,11 +825,9 @@ app.get('/api/me', authenticateToken, (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS
+//  is_read lives on notification_recipients — never on notifications itself.
+//  The frontend receives is_read from the JOIN below, which is correct.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// ── Unread count ──────────────────────────────────────────────────────────────
-// Frontend calls: GET /notifications/unread-count?projectId=X
-// Returns: { count }
 app.get('/notifications/unread-count', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
   const userId = req.user.user_id;
@@ -813,11 +848,8 @@ app.get('/notifications/unread-count', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Fetch notifications for the requesting user ───────────────────────────────
-// Frontend calls: GET /notifications?projectId=X
-// User identity comes from JWT — no userId query param needed.
-// Returns: { notifications: [ { id, entity_type, entity_id, message,
-//                                added_by_role, created_at, is_read } ] }
+// Returns notifications for the current user with is_read from the
+// recipient row — not from the notifications table.
 app.get('/notifications', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
   const userId = req.user.user_id;
@@ -845,7 +877,6 @@ app.get('/notifications', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Mark individual notification read ────────────────────────────────────────
 app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const userId = req.user.user_id;
@@ -863,9 +894,6 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Mark all read (bulk) ──────────────────────────────────────────────────────
-// Frontend calls: POST /notifications/mark-all-read
-// Body: { projectId, notificationIds: [id, ...] }
 app.post('/notifications/mark-all-read', authenticateToken, async (req, res) => {
   const { notificationIds } = req.body;
   const userId = req.user.user_id;
@@ -889,111 +917,151 @@ app.post('/notifications/mark-all-read', authenticateToken, async (req, res) => 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  RECORDS
+//  ADD RECORD
+//
+//  Frontend sends:  recordType = 'contractual_records'  (DB table name)
+//  We validate it against VALID_RECORD_TABLES and use it directly.
+//  No category-to-table translation needed here.
 // ─────────────────────────────────────────────────────────────────────────────
-
 async function handleAddRecord(req, res) {
   try {
-    const {user_id:userId,role}=req.user;
-    const {title,description,projectId,category,noticeTiedId}=req.body;
-    if (!projectId||!title||!category) return res.status(400).json({success:false,message:'projectId, title and category are required'});
+    const { user_id: userId, role } = req.user;
+    const { title, description, projectId, noticeTiedId, recordKind } = req.body;
 
-    const categoryMap={
-      'contractual-legal':            {table:'contractual_records',    type:'contractual'},
-      'administrative-instructional': {table:'administrative_records', type:'administrative'},
-      'safety-compliance':            {table:'safety_records',         type:'safety'},
-      'operational-performance':      {table:'operational_records',    type:'operational'},
-      'financial':                    {table:'financial_records',      type:'financial'},
-      'contractual':                  {table:'contractual_records',    type:'contractual'},
-      'administrative':               {table:'administrative_records', type:'administrative'},
-      'safety':                       {table:'safety_records',         type:'safety'},
-      'operational':                  {table:'operational_records',    type:'operational'},
-    };
-    const resolved=categoryMap[category];
-    if (!resolved) return res.status(400).json({success:false,message:'Invalid category'});
+    // ── recordType comes from the frontend as the DB table name directly ──
+    const table = resolveTable(req.body.recordType);
+    if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
+    if (!projectId || !title) return res.status(400).json({ success: false, message: 'projectId and title are required.' });
 
-    let filePath=null, attachmentId=null;
+    // ── Verify project membership ──────────────────────────────────────────
+    const memberCheck = await pool.query(
+      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
+       UNION ALL
+       SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
+       LIMIT 1`,
+      [projectId, userId, role]
+    );
+    if (!memberCheck.rows.length) {
+      return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
+    }
+
+    let filePath = null, attachmentId = null;
     if (req.file) {
       try {
-        const r=await new Promise((resolve,reject)=>{
-          const stream=cloudinary.uploader.upload_stream(
-            {folder:'oneproject/records',resource_type:'auto',public_id:`${Date.now()}-${req.file.originalname.replace(/\s+/g,'-')}`},
-            (err,result)=>err?reject(err):resolve(result)
+        const r = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
+            (err, result) => err ? reject(err) : resolve(result)
           );
           Readable.from(req.file.buffer).pipe(stream);
         });
-        filePath=r.secure_url; attachmentId=r.public_id;
-      } catch(uploadErr){console.error('Cloudinary upload error:',uploadErr);return res.status(500).json({success:false,message:'File upload failed'});}
+        filePath = r.secure_url; attachmentId = r.public_id;
+      } catch (uploadErr) {
+        console.error('Cloudinary upload error:', uploadErr);
+        return res.status(500).json({ success: false, message: 'File upload failed.' });
+      }
     }
 
-    const recordKind = req.body.recordKind || (noticeTiedId ? 'notice' : 'new');
-    const noticeTied = noticeTiedId ? Number(noticeTiedId) : null;
-    const notifMsg = noticeTiedId
-      ? `New ${recordKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
-      : `New ${resolved.type} record added by ${role}: "${title}"`;
+    const resolvedKind = recordKind || (noticeTiedId ? 'notice' : 'new');
+    const noticeTied   = noticeTiedId ? Number(noticeTiedId) : null;
 
-    const client=await pool.connect();
+    // ── If this is a notice, verify the parent record exists ──────────────
+    if (noticeTied) {
+      const parentCheck = await pool.query(
+        `SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`,
+        [noticeTied, projectId]
+      );
+      if (!parentCheck.rows.length) {
+        return res.status(400).json({ success: false, message: 'The parent record this notice is tied to no longer exists.' });
+      }
+    }
+
+    const dbClient = await pool.connect();
     try {
-      await client.query('BEGIN');
-      const recRes=await client.query(
-        `INSERT INTO ${resolved.table} (project_id,title,description,file_path,attachment_id,uploaded_by,role,record_kind,notice_tied_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-        [projectId,title,description||null,filePath,attachmentId,userId,role,recordKind,noticeTied]
+      await dbClient.query('BEGIN');
+
+      const recRes = await dbClient.query(
+        `INSERT INTO ${table} (project_id, title, description, file_path, attachment_id, uploaded_by, role, record_kind, notice_tied_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [projectId, title, description || null, filePath, attachmentId, userId, role, resolvedKind, noticeTied]
       );
-      const recordId=recRes.rows[0].id;
-      const notifRes=await client.query(
-        `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [projectId,recordId,resolved.type,notifMsg,userId,role]
+      const recordId = recRes.rows[0].id;
+
+      const notifMsg = noticeTied
+        ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
+        : `New record added by ${role}: "${title}"`;
+
+      const notifRes = await dbClient.query(
+        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [projectId, recordId, table, notifMsg, userId, role]
       );
-      await client.query('COMMIT');
-      res.json({success:true,message:'Record saved.',recordId,notificationId:notifRes.rows[0].id,attachmentId,recordKind});
-    } catch(err){await client.query('ROLLBACK');console.error('Error saving record:',err);res.status(500).json({success:false,message:'Server error saving record'});}
-    finally{client.release();}
-  } catch(err){console.error('Add record route error:',err);res.status(500).json({success:false,message:'Server error'});}
+      const notificationId = notifRes.rows[0].id;
+
+      // ── Fan notification out to every project member except the uploader ─
+      const recipientIds = await getProjectMemberUserIds(projectId, userId);
+      if (recipientIds.length > 0) {
+        const recipientValues = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
+        await dbClient.query(
+          `INSERT INTO notification_recipients (notification_id, user_id)
+           VALUES ${recipientValues}
+           ON CONFLICT (notification_id, user_id) DO NOTHING`,
+          [notificationId, ...recipientIds]
+        );
+      }
+
+      await dbClient.query('COMMIT');
+      res.json({ success: true, message: 'Record saved.', recordId, notificationId, attachmentId, recordKind: resolvedKind });
+    } catch (err) {
+      await dbClient.query('ROLLBACK');
+      console.error('Error saving record:', err);
+      res.status(500).json({ success: false, message: 'Server error saving record.' });
+    } finally {
+      dbClient.release();
+    }
+  } catch (err) {
+    console.error('Add record route error:', err);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
 }
 
 app.post('/api/add-record', authenticateToken, upload.single('attachment'), handleAddRecord);
-app.post('/records', authenticateToken, upload.single('attachment'), handleAddRecord);
+app.post('/records',        authenticateToken, upload.single('attachment'), handleAddRecord);
 
-// ─── Fetch tab records ────────────────────────────────────────────────────────
-// Computes every per-user field the frontend needs so the client never
-// has to run role-logic locally:
+// ─────────────────────────────────────────────────────────────────────────────
+//  FETCH TAB RECORDS
 //
-//   is_uploader       bool   — current user uploaded this record
-//   is_viewed         bool   — current user has a document_reviews row
-//   is_locked         bool   — record is fully accepted (no more actions)
-//   is_decision_maker bool   — current user is a DM role (not team_member)
-//   btn_state         string — 'uploader'|'locked'|'team_member'|'acted'|
-//                              'awaiting'|'can_approve'
-//   pending_role      string — set when btn_state === 'awaiting'
-//   approve_label     string — 'Approve'|'Accept', set when btn_state === 'can_approve'
-//   my_review         object — { action, comment } for the requesting user
-//   workflow_steps    array  — [{ label, status }] for the workflow visual
-//   reviews[].is_decision_maker bool
+//  Frontend sends: recordType = 'contractual_records'  (DB table name)
+//  We use it directly as both the table to query AND as record_type in
+//  document_reviews — they are the same value.
+// ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
-  const { projectId, category } = req.body;
-  const table = TABLE_MAP[category];
-  if (!table) return res.status(400).json({ error: 'Invalid category' });
+  const { projectId, recordType } = req.body;
 
-  const userId      = req.user.user_id;
-  const userRole    = req.user.role;
-  const userSide    = getSide(userRole);
-  const userIsDM    = isDecisionMaker(userRole);
+  // recordType IS the table name — validate it
+  const table = resolveTable(recordType);
+  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+
+  const userId   = req.user.user_id;
+  const userRole = req.user.role;
+  const userSide = getSide(userRole);
+  const userIsDM = isDecisionMaker(userRole);
 
   try {
     const { rows: records } = await pool.query(
       `SELECT r.id, r.title, r.description, r.file_path,
-              r.issued_date AS date_recorded, r.role AS uploader_role,
+              r.issued_date, r.role AS uploader_role,
               r.uploaded_by, r.status, r.record_kind, r.notice_tied_id
        FROM ${table} r
        WHERE r.project_id = $1
-         AND r.record_kind IN ('new', 'notice', 'rejection_notice')
        ORDER BY r.issued_date DESC`,
       [projectId]
     );
 
     const enriched = await Promise.all(records.map(async rec => {
 
-      // ── All reviews for this record ────────────────────────────────────────
+      // ── All reviews for this record ───────────────────────────────────────
+      // record_type in document_reviews matches the table name exactly
       const { rows: reviews } = await pool.query(
         `SELECT
            dr.reviewer_id,
@@ -1001,53 +1069,41 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
            dr.action,
            dr.action_date,
            dr.comment,
-           CASE
-             WHEN dr.reviewer_role = 'Team Member'
-             THEN (SELECT tm.email FROM team_members tm WHERE tm.id = dr.reviewer_id LIMIT 1)
-             ELSE NULL
-           END AS reviewer_email,
-           CASE
-             WHEN dr.reviewer_role = 'Team Member'
-             THEN (SELECT ta.position FROM team_member_assignments ta
-                   WHERE ta.team_member_id = dr.reviewer_id
-                     AND ta.project_id = $3
-                   LIMIT 1)
-             ELSE NULL
-           END AS reviewer_position
+           dr.reviewer_email,
+           dr.reviewer_position
          FROM document_reviews dr
          WHERE dr.record_type = $1
            AND dr.record_id   = $2
-           AND dr.action IN ('approved', 'accepted', 'rejected', 'no_action')
          ORDER BY dr.action_date ASC`,
-        [category, rec.id, projectId]
+        [table, rec.id]   // ← table name used here directly
       );
 
-      // Annotate each review row with is_decision_maker
       const annotatedReviews = reviews.map(r => ({
         ...r,
         is_decision_maker: isDecisionMaker(r.reviewer_role),
       }));
 
-      // ── is_uploader / is_viewed ────────────────────────────────────────────
+      // ── is_uploader / is_viewed ───────────────────────────────────────────
       const isUploader = String(rec.uploaded_by) === String(userId);
       let isViewed = isUploader;
       if (!isUploader) {
         const { rows: viewed } = await pool.query(
-          'SELECT 1 FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 LIMIT 1',
-          [category, rec.id, userId]
+          `SELECT 1 FROM document_reviews
+           WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3 LIMIT 1`,
+          [table, rec.id, userId]
         );
         isViewed = viewed.length > 0;
       }
 
-      // ── my_review ──────────────────────────────────────────────────────────
+      // ── my_review ─────────────────────────────────────────────────────────
       const myReviewRow = reviews.find(r => String(r.reviewer_id) === String(userId));
       const myReview    = myReviewRow
         ? { action: myReviewRow.action, comment: myReviewRow.comment || '' }
         : {};
 
-      // ── is_locked ──────────────────────────────────────────────────────────
-      const uploaderSide  = getSide(rec.uploader_role);
-      const step2SideMap  = {
+      // ── is_locked ─────────────────────────────────────────────────────────
+      const uploaderSide = getSide(rec.uploader_role);
+      const step2SideMap = {
         contractor: 'client',
         consultant: 'contractor',
         client:     'contractor',
@@ -1076,7 +1132,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       };
       const steps = uploaderSide ? stepMap[uploaderSide] : null;
 
-      // ── workflow_steps (for the visual) ────────────────────────────────────
+      // ── workflow_steps ────────────────────────────────────────────────────
       const workflowSteps = steps
         ? steps.map(s => {
             const doneReview = annotatedReviews.find(
@@ -1095,39 +1151,30 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
           })
         : [];
 
-      // ── btn_state ──────────────────────────────────────────────────────────
+      // ── btn_state ─────────────────────────────────────────────────────────
       let btnState     = 'none';
       let pendingRole  = null;
       let approveLabel = null;
 
       if (isUploader) {
         btnState = 'uploader';
-
       } else if (isLocked) {
         btnState = 'locked';
-
       } else if (!userIsDM) {
         btnState = 'team_member';
-
       } else if (userSide === uploaderSide) {
-        // Same side as uploader — no review role
         btnState = 'uploader';
-
       } else {
         const workflowActions = ['approved', 'accepted', 'rejected'];
         const alreadyActed    = myReviewRow && workflowActions.includes(myReviewRow.action);
 
         if (alreadyActed) {
           btnState = 'acted';
-
         } else if (steps) {
           const myStep = steps.find(s => s.side === userSide);
-
           if (!myStep) {
             btnState = 'none';
-
           } else if (myStep.step === 2) {
-            // Must wait for step 1 first
             const step1     = steps.find(s => s.step === 1);
             const step1Done = annotatedReviews.some(
               r => getSide(r.reviewer_role) === step1.side &&
@@ -1140,9 +1187,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
               btnState     = 'can_approve';
               approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
             }
-
           } else {
-            // Step 1 reviewer — always their turn first
             btnState     = 'can_approve';
             approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
           }
@@ -1167,112 +1212,174 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     res.json({ records: enriched });
   } catch (err) {
     console.error('Fetch tab records error:', err);
-    res.status(500).json({ error: 'Failed to fetch records' });
+    res.status(500).json({ error: 'Failed to fetch records.' });
   }
 });
 
-// ─── Mark record viewed ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  MARK RECORD VIEWED
+//
+//  Frontend sends: recordType = 'contractual_records'
+//  Used directly as record_type in document_reviews.
+// ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
-  const {recordId, category} = req.body;
+  const { recordId, projectId, recordType } = req.body;
   const reviewerId   = req.user.user_id;
   const reviewerRole = req.user.role;
-  if (!TABLE_MAP[category]) return res.status(400).json({error: 'Invalid category'});
+
+  const table = resolveTable(recordType);
+  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+
   try {
-    const {rows: rec} = await pool.query(
-      `SELECT uploaded_by FROM ${TABLE_MAP[category]} WHERE id=$1`,
-      [recordId]
+    // ── Verify the record exists ───────────────────────────────────────────
+    const { rows: rec } = await pool.query(
+      `SELECT uploaded_by FROM ${table} WHERE id = $1 AND project_id = $2`,
+      [recordId, projectId]
     );
-    if (rec.length > 0 && String(rec[0].uploaded_by) === String(reviewerId)) {
-      return res.json({success: true, skipped: true});
+    if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
+
+    // Uploaders don't get a viewed row
+    if (String(rec[0].uploaded_by) === String(reviewerId)) {
+      return res.json({ success: true, skipped: true });
     }
-    await pool.query(
-      `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
-       VALUES ($1, $2, 'new', $3, $4, 'no_action')
-       ON CONFLICT (record_type, record_id, reviewer_id) DO NOTHING`,
-      [category, recordId, reviewerId, reviewerRole]
+
+    // Reviewer email and position for the review row
+    const assignRow = await pool.query(
+      `SELECT av.role_email AS email, av.position
+       FROM assignments_view av
+       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3
+       LIMIT 1`,
+      [projectId, reviewerId, reviewerRole]
     );
-    res.json({success: true});
-  } catch(err) {
+    const reviewerEmail    = assignRow.rows[0]?.email    || null;
+    const reviewerPosition = assignRow.rows[0]?.position || null;
+
+    await pool.query(
+      `INSERT INTO document_reviews
+         (record_type, record_id, record_kind, reviewer_id, reviewer_role,
+          reviewer_email, reviewer_position, action)
+       VALUES ($1, $2, 'new', $3, $4, $5, $6, 'no_action')
+       ON CONFLICT (record_type, record_id, reviewer_id) DO NOTHING`,
+      [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
     console.error('Mark viewed error:', err);
-    res.status(500).json({error: 'Failed to mark as viewed.'});
+    res.status(500).json({ error: 'Failed to mark as viewed.' });
   }
 });
 
-// ─── Review record ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  REVIEW RECORD
+//
+//  Frontend sends: recordType = 'contractual_records'
+//
+//  Critical enforcement:
+//  1. Validate recordType against whitelist
+//  2. Verify the record exists in that table for this project — return 400
+//     if not, so no ghost rows are ever created in document_reviews
+//  3. Reviewer email + position come from assignments_view, never from
+//     the frontend
+// ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/review-record', authenticateToken, async (req, res) => {
-  const { projectId, recordId, category, action, comment, actorType } = req.body;
+  const { projectId, recordId, recordType, action, comment, actorType } = req.body;
   const reviewerId   = req.user.user_id;
   const reviewerRole = req.user.role;
-  const table        = TABLE_MAP[category];
-  if (!table) return res.status(400).json({ error: 'Invalid category' });
 
-  const workflowActions = ['approved', 'accepted', 'rejected'];
-  const isComment       = action === 'comment';
-  const isWorkflow      = workflowActions.includes(action);
+  const table = resolveTable(recordType);
+  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
 
-  if (!isWorkflow && !isComment && action !== 'no_action')
-    return res.status(400).json({ error: 'Invalid action.' });
-
+  const workflowActions     = ['approved', 'accepted', 'rejected'];
+  const isWorkflow          = workflowActions.includes(action);
   const isDecisionMakerActor = isDecisionMaker(reviewerRole) && actorType !== 'team_member';
 
-  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member')
+  if (!isWorkflow && action !== 'no_action') {
+    return res.status(400).json({ error: 'Invalid action.' });
+  }
+  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') {
     return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
+  }
 
   try {
+    // ── ENFORCE: record must exist before any review row is written ────────
+    const { rows: recRows } = await pool.query(
+      `SELECT id, role, uploaded_by FROM ${table} WHERE id = $1 AND project_id = $2`,
+      [recordId, projectId]
+    );
+    if (!recRows.length) {
+      return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
+    }
+    const rec = recRows[0];
+
+    // ── Reviewer identity from DB — never from frontend ───────────────────
+    const assignRow = await pool.query(
+      `SELECT av.role_email AS email, av.position
+       FROM assignments_view av
+       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3
+       LIMIT 1`,
+      [projectId, reviewerId, reviewerRole]
+    );
+    const reviewerEmail    = assignRow.rows[0]?.email    || null;
+    const reviewerPosition = assignRow.rows[0]?.position || null;
+
+    // ── Check for existing review row ─────────────────────────────────────
     const { rows: existing } = await pool.query(
-      'SELECT id, action, comment FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 LIMIT 1',
-      [category, recordId, reviewerId]
+      `SELECT id, action FROM document_reviews
+       WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3 LIMIT 1`,
+      [table, recordId, reviewerId]
     );
 
-    if (isComment) {
-      if (!comment?.trim()) return res.status(400).json({ error: 'Comment text is required.' });
+    // ── Handle comment-only (no_action with comment text) ─────────────────
+    if (action === 'no_action' && comment?.trim()) {
       if (existing.length > 0) {
         await pool.query(
-          'UPDATE document_reviews SET comment=$1, action_date=NOW() WHERE id=$2',
+          `UPDATE document_reviews SET comment = $1, action_date = NOW() WHERE id = $2`,
           [comment.trim(), existing[0].id]
         );
       } else {
         await pool.query(
-          `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action, comment)
-           VALUES ($1, $2, 'new', $3, $4, 'no_action', $5)`,
-          [category, recordId, reviewerId, reviewerRole, comment.trim()]
+          `INSERT INTO document_reviews
+             (record_type, record_id, record_kind, reviewer_id, reviewer_role,
+              reviewer_email, reviewer_position, action, comment)
+           VALUES ($1, $2, 'new', $3, $4, $5, $6, 'no_action', $7)`,
+          [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, comment.trim()]
         );
       }
       return res.json({ success: true, message: 'Comment saved.' });
     }
 
-    // ── Workflow / team member action ──────────────────────────────────────
+    // ── Workflow / team-member action ─────────────────────────────────────
     if (existing.length > 0) {
       if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
         return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
       }
       await pool.query(
-        'UPDATE document_reviews SET action=$1, action_date=NOW() WHERE id=$2',
-        [action, existing[0].id]
+        `UPDATE document_reviews
+         SET action = $1, action_date = NOW(), comment = COALESCE($2, comment)
+         WHERE id = $3`,
+        [action, comment?.trim() || null, existing[0].id]
       );
     } else {
       await pool.query(
-        `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, action)
-         VALUES ($1, $2, 'new', $3, $4, $5)`,
-        [category, recordId, reviewerId, reviewerRole, action]
+        `INSERT INTO document_reviews
+           (record_type, record_id, record_kind, reviewer_id, reviewer_role,
+            reviewer_email, reviewer_position, action, comment)
+         VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8)`,
+        [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, action, comment?.trim() || null]
       );
     }
 
-    // ── Advance record status — only for genuine DM workflow actions ───────
-    if (isDecisionMakerActor) {
-      const { rows: recRows } = await pool.query(
-        `SELECT role FROM ${table} WHERE id=$1 AND project_id=$2`,
-        [recordId, projectId]
-      );
-      if (!recRows.length) return res.status(404).json({ error: 'Record not found.' });
-
-      const uploaderSide = getSide(recRows[0].role);
+    // ── Advance record status for genuine DM workflow actions ─────────────
+    if (isDecisionMakerActor && isWorkflow) {
+      const uploaderSide = getSide(rec.role);
       let newStatus;
       if (action === 'rejected') {
         newStatus = 'rejected';
       } else if (action === 'accepted') {
         newStatus = 'approved_record';
       } else {
+        // 'approved' — advance to step 2
         const step2StatusMap = {
           contractor: 'pending_client_acceptance',
           consultant: 'pending_contractor_acceptance',
@@ -1280,11 +1387,38 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
         };
         newStatus = step2StatusMap[uploaderSide] || 'pending_review';
       }
-
       await pool.query(
-        `UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`,
+        `UPDATE ${table} SET status = $1 WHERE id = $2 AND project_id = $3`,
         [newStatus, recordId, projectId]
       );
+
+      // ── Notify other project members of the review action ─────────────
+      const notifMsg = `${reviewerRole} ${action} record "${rec.role}" #${recordId}`;
+      const dbClient = await pool.connect();
+      try {
+        await dbClient.query('BEGIN');
+        const notifRes = await dbClient.query(
+          `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [projectId, recordId, table, notifMsg, reviewerId, reviewerRole]
+        );
+        const notificationId = notifRes.rows[0].id;
+        const recipientIds   = await getProjectMemberUserIds(projectId, reviewerId);
+        if (recipientIds.length > 0) {
+          const vals = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
+          await dbClient.query(
+            `INSERT INTO notification_recipients (notification_id, user_id)
+             VALUES ${vals} ON CONFLICT (notification_id, user_id) DO NOTHING`,
+            [notificationId, ...recipientIds]
+          );
+        }
+        await dbClient.query('COMMIT');
+      } catch (notifErr) {
+        await dbClient.query('ROLLBACK');
+        console.error('Notification insert error (non-fatal):', notifErr);
+      } finally {
+        dbClient.release();
+      }
     }
 
     res.json({ success: true, message: `Action '${action}' recorded successfully.` });
@@ -1294,40 +1428,63 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
   }
 });
 
-// ─── Download file ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  DOWNLOAD FILE
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/download-file', authenticateToken, async (req, res) => {
-  const {recordId,category}=req.query;
-  const table=TABLE_MAP[category];
-  if (!table) return res.status(400).json({error:'Invalid category'});
+  const { recordId, recordType } = req.query;
+  const table = resolveTable(recordType);
+  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
-    const {rows}=await pool.query(`SELECT file_path FROM ${table} WHERE id=$1`,[recordId]);
-    if (!rows.length||!rows[0].file_path) return res.status(404).json({error:'File not found.'});
-    const filePath=rows[0].file_path;
-    const fileName=filePath.split('/').pop()||'download';
-    if (filePath.startsWith('http')) return res.json({url:filePath,fileName});
-    res.status(404).json({error:'File not accessible.'});
-  } catch(err){console.error('Download file error:',err);res.status(500).json({error:'Failed to download file.'});}
-});
-
-// ─── Delete record ────────────────────────────────────────────────────────────
-app.delete('/api/delete-record', authenticateToken, async (req, res) => {
-  const {projectId,recordId,category}=req.body;
-  const userId=req.user.user_id;
-  const table=TABLE_MAP[category];
-  if (!table) return res.status(400).json({error:'Invalid category'});
-  try {
-    const {rows}=await pool.query(`SELECT uploaded_by FROM ${table} WHERE id=$1 AND project_id=$2`,[recordId,projectId]);
-    if (!rows.length) return res.status(404).json({error:'Record not found.'});
-    if (String(rows[0].uploaded_by)!==String(userId)) return res.status(403).json({error:'Only the uploader can delete this record.'});
-    await pool.query('DELETE FROM document_reviews WHERE record_type=$1 AND record_id=$2',[category,recordId]);
-    await pool.query('DELETE FROM notifications WHERE entity_id=$1 AND entity_type=$2',[recordId,category]);
-    await pool.query(`DELETE FROM ${table} WHERE id=$1 AND project_id=$2`,[recordId,projectId]);
-    res.json({success:true,message:'Record deleted successfully.'});
-  } catch(err){console.error('Delete record error:',err);res.status(500).json({error:'Failed to delete record.'});}
+    const { rows } = await pool.query(`SELECT file_path FROM ${table} WHERE id = $1`, [recordId]);
+    if (!rows.length || !rows[0].file_path) return res.status(404).json({ error: 'File not found.' });
+    const filePath = rows[0].file_path;
+    const fileName = filePath.split('/').pop() || 'download';
+    if (filePath.startsWith('http')) return res.json({ url: filePath, fileName });
+    res.status(404).json({ error: 'File not accessible.' });
+  } catch (err) {
+    console.error('Download file error:', err);
+    res.status(500).json({ error: 'Failed to download file.' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MEETING ROUTES
+//  DELETE RECORD
+// ─────────────────────────────────────────────────────────────────────────────
+app.delete('/api/delete-record', authenticateToken, async (req, res) => {
+  const { projectId, recordId, recordType } = req.body;
+  const userId = req.user.user_id;
+  const table  = resolveTable(recordType);
+  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT uploaded_by FROM ${table} WHERE id = $1 AND project_id = $2`,
+      [recordId, projectId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Record not found.' });
+    if (String(rows[0].uploaded_by) !== String(userId)) {
+      return res.status(403).json({ error: 'Only the uploader can delete this record.' });
+    }
+    // Clean up reviews and notifications before deleting the record
+    await pool.query(
+      `DELETE FROM notification_recipients
+       WHERE notification_id IN (
+         SELECT id FROM notifications WHERE entity_id = $1 AND entity_type = $2
+       )`,
+      [recordId, table]
+    );
+    await pool.query('DELETE FROM notifications WHERE entity_id = $1 AND entity_type = $2', [recordId, table]);
+    await pool.query('DELETE FROM document_reviews WHERE record_type = $1 AND record_id = $2', [table, recordId]);
+    await pool.query(`DELETE FROM ${table} WHERE id = $1 AND project_id = $2`, [recordId, projectId]);
+    res.json({ success: true, message: 'Record deleted successfully.' });
+  } catch (err) {
+    console.error('Delete record error:', err);
+    res.status(500).json({ error: 'Failed to delete record.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MEETING ROUTES  (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/records/schedule-meeting', authenticateToken, async (req, res) => {
   const {projectId,title,dateTime,participants,agenda}=req.body;
@@ -1370,8 +1527,8 @@ app.post('/records/meeting-detail', authenticateToken, async (req, res) => {
   } catch(err){console.error('Meeting detail error:',err);res.status(500).json({success:false,message:'Failed to fetch meeting detail.'});}
 });
 
-app.post('/records/add-record', authenticateToken, upload.array('documents', 5), async (req, res) => {
-  const {title,details,projectId,category,date}=req.body;
+app.post('/records/add-meeting-minute', authenticateToken, upload.array('documents', 5), async (req, res) => {
+  const {title,details,projectId,date}=req.body;
   if (!title||!details||!projectId) return res.status(400).json({success:false,message:'title, details and projectId are required.'});
   try {
     const attachmentUrls=[];
@@ -1391,7 +1548,7 @@ app.post('/records/add-record', authenticateToken, upload.array('documents', 5),
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SCHEDULE MODULE
+//  SCHEDULE MODULE  (unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   const projectId=parseInt(req.query.projectId,10);
@@ -1652,21 +1809,21 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
 // ─────────────────────────────────────────────────────────────────────────────
 //  GLOBAL ERROR HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
-app.use((err,_req,res,_next)=>{
-  console.error('Unexpected error:',err);
-  res.status(500).json({error:'Internal server error'});
+app.use((err, _req, res, _next) => {
+  console.error('Unexpected error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  START
 // ─────────────────────────────────────────────────────────────────────────────
-const PORT=process.env.PORT||3000;
-app.listen(PORT,()=>console.log(`Backend running on port ${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 
-setInterval(()=>{
+setInterval(() => {
   fetch('https://oneprojectapp-backend.onrender.com/')
-    .then(r=>console.log('Keep-alive ping:',r.status))
-    .catch(err=>console.error('Keep-alive error:',err));
-},14*60*1000);
+    .then(r => console.log('Keep-alive ping:', r.status))
+    .catch(err => console.error('Keep-alive error:', err));
+}, 14 * 60 * 1000);
 
 export default app;
