@@ -91,13 +91,8 @@ const transporter = nodemailer.createTransport(
 
 // =============================================================================
 //  CORE HELPERS
-//
-//  IMPORTANT: The frontend sends recordType as the DB table name directly
-//  (e.g. 'contractual_records'). TABLE_MAP is used to validate that the
-//  value received is a known table — never to translate a tab key.
 // =============================================================================
 
-// All valid record table names. Used to whitelist frontend input.
 const VALID_RECORD_TABLES = new Set([
   'contractual_records',
   'administrative_records',
@@ -106,7 +101,6 @@ const VALID_RECORD_TABLES = new Set([
   'financial_records',
 ]);
 
-// Validates recordType from frontend and returns it if safe, or null.
 function resolveTable(recordType) {
   if (!recordType || !VALID_RECORD_TABLES.has(recordType)) return null;
   return recordType;
@@ -141,8 +135,6 @@ function roleTableMap(role) {
   }
 }
 
-// Fetches all user IDs assigned to a project so notifications can be
-// fanned out to every recipient row in notification_recipients.
 async function getProjectMemberUserIds(projectId, excludeUserId) {
   const queries = [
     pool.query('SELECT client_id AS user_id FROM projects WHERE id=$1', [projectId]),
@@ -196,7 +188,7 @@ app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AUTH ROUTES  (unchanged from original)
+//  AUTH ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/finalize-account', async (req, res) => {
   const { clientEmail } = req.body;
@@ -825,8 +817,9 @@ app.get('/api/me', authenticateToken, (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS
-//  is_read lives on notification_recipients — never on notifications itself.
-//  The frontend receives is_read from the JOIN below, which is correct.
+//  ── FIX: uses LEFT JOIN so users see all project notifications even if
+//     no recipient row exists yet. Auto-creates missing rows on GET.
+//     Upsert on mark-read so rows are never missing.
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/notifications/unread-count', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
@@ -835,10 +828,11 @@ app.get('/notifications/unread-count', authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT COUNT(*) AS count
        FROM notifications n
-       JOIN notification_recipients nr ON nr.notification_id = n.id
+       LEFT JOIN notification_recipients nr
+         ON nr.notification_id = n.id AND nr.user_id = $2
        WHERE n.project_id = $1
-         AND nr.user_id   = $2
-         AND nr.is_read   = false`,
+         AND n.added_by_id != $2
+         AND (nr.is_read = false OR nr.id IS NULL)`,
       [projectId, userId]
     );
     res.json({ count: parseInt(result.rows[0].count, 10) });
@@ -848,29 +842,34 @@ app.get('/notifications/unread-count', authenticateToken, async (req, res) => {
   }
 });
 
-// Returns notifications for the current user with is_read from the
-// recipient row — not from the notifications table.
 app.get('/notifications', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
   const userId = req.user.user_id;
   try {
-    const result = await pool.query(
-      `SELECT
-         n.id,
-         n.entity_type,
-         n.entity_id,
-         n.message,
-         n.added_by_role,
-         n.created_at,
-         nr.is_read
+    const { rows: notifs } = await pool.query(
+      `SELECT n.id, n.entity_type, n.entity_id, n.message,
+              n.added_by_role, n.created_at,
+              COALESCE(nr.is_read, false) AS is_read
        FROM notifications n
-       JOIN notification_recipients nr ON nr.notification_id = n.id
+       LEFT JOIN notification_recipients nr
+         ON nr.notification_id = n.id AND nr.user_id = $2
        WHERE n.project_id = $1
-         AND nr.user_id   = $2
+         AND n.added_by_id != $2
        ORDER BY n.created_at DESC`,
       [projectId, userId]
     );
-    res.json({ notifications: result.rows });
+
+    // Auto-insert missing recipient rows so badge/panel always works
+    for (const n of notifs) {
+      await pool.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+         VALUES ($1, $2, false)
+         ON CONFLICT (notification_id, user_id) DO NOTHING`,
+        [n.id, userId]
+      );
+    }
+
+    res.json({ notifications: notifs });
   } catch (err) {
     console.error('Fetch notifications error:', err);
     res.status(500).json({ notifications: [] });
@@ -882,9 +881,10 @@ app.put('/notifications/:id/read', authenticateToken, async (req, res) => {
   const userId = req.user.user_id;
   try {
     await pool.query(
-      `UPDATE notification_recipients
-       SET is_read = true, read_at = NOW()
-       WHERE notification_id = $1 AND user_id = $2`,
+      `INSERT INTO notification_recipients (notification_id, user_id, is_read, read_at)
+       VALUES ($1, $2, true, NOW())
+       ON CONFLICT (notification_id, user_id)
+       DO UPDATE SET is_read = true, read_at = NOW()`,
       [id, userId]
     );
     res.json({ success: true });
@@ -901,15 +901,16 @@ app.post('/notifications/mark-all-read', authenticateToken, async (req, res) => 
     return res.json({ success: true, updated: 0 });
   }
   try {
-    const result = await pool.query(
-      `UPDATE notification_recipients
-       SET is_read = true, read_at = NOW()
-       WHERE user_id = $1
-         AND notification_id = ANY($2::int[])
-         AND is_read = false`,
-      [userId, notificationIds]
-    );
-    res.json({ success: true, updated: result.rowCount });
+    for (const notifId of notificationIds) {
+      await pool.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, is_read, read_at)
+         VALUES ($1, $2, true, NOW())
+         ON CONFLICT (notification_id, user_id)
+         DO UPDATE SET is_read = true, read_at = NOW()`,
+        [notifId, userId]
+      );
+    }
+    res.json({ success: true, updated: notificationIds.length });
   } catch (err) {
     console.error('Mark all read error:', err);
     res.status(500).json({ success: false });
@@ -918,22 +919,16 @@ app.post('/notifications/mark-all-read', authenticateToken, async (req, res) => 
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ADD RECORD
-//
-//  Frontend sends:  recordType = 'contractual_records'  (DB table name)
-//  We validate it against VALID_RECORD_TABLES and use it directly.
-//  No category-to-table translation needed here.
 // ─────────────────────────────────────────────────────────────────────────────
 async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
 
-    // ── recordType comes from the frontend as the DB table name directly ──
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
     if (!projectId || !title) return res.status(400).json({ success: false, message: 'projectId and title are required.' });
 
-    // ── Verify project membership ──────────────────────────────────────────
     const memberCheck = await pool.query(
       `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
        UNION ALL
@@ -965,7 +960,6 @@ async function handleAddRecord(req, res) {
     const resolvedKind = recordKind || (noticeTiedId ? 'notice' : 'new');
     const noticeTied   = noticeTiedId ? Number(noticeTiedId) : null;
 
-    // ── If this is a notice, verify the parent record exists ──────────────
     if (noticeTied) {
       const parentCheck = await pool.query(
         `SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`,
@@ -998,7 +992,6 @@ async function handleAddRecord(req, res) {
       );
       const notificationId = notifRes.rows[0].id;
 
-      // ── Fan notification out to every project member except the uploader ─
       const recipientIds = await getProjectMemberUserIds(projectId, userId);
       if (recipientIds.length > 0) {
         const recipientValues = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
@@ -1030,6 +1023,10 @@ app.post('/records',        authenticateToken, upload.single('attachment'), hand
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  FETCH TAB RECORDS
+//  ── FIX: isUploader checks both ID and role side to prevent cross-table
+//     ID collisions (Contractor ID=1 vs Consultant ID=1 are different people)
+//  ── FIX: my_issued_notice — hides notice button after notice is issued
+//  ── FIX: tied_record_title — shows parent record title on notices
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, recordType } = req.body;
@@ -1076,7 +1073,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         is_decision_maker: isDecisionMaker(r.reviewer_role),
       }));
 
-      // ── is_uploader — must match BOTH id AND side to avoid cross-table ID collisions ──
+      // ── is_uploader: match BOTH id AND side — prevents cross-table ID collisions ──
       const uploaderSide = getSide(rec.uploader_role);
       const isUploader   = String(rec.uploaded_by) === String(userId)
                         && getSide(rec.uploader_role) === getSide(userRole);
@@ -1091,6 +1088,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         isViewed = viewed.length > 0;
       }
 
+      // ── my_review: also match side to avoid cross-table collision ──
       const myReviewRow = reviews.find(r => String(r.reviewer_id) === String(userId)
                                          && getSide(r.reviewer_role) === getSide(userRole));
       const myReview    = myReviewRow
@@ -1155,6 +1153,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       } else if (!userIsDM) {
         btnState = 'team_member';
       } else if (userSide === uploaderSide) {
+        // Same side as uploader but not the uploader — no workflow action
         btnState = 'none';
       } else {
         const workflowActions = ['approved', 'accepted', 'rejected'];
@@ -1186,6 +1185,27 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         }
       }
 
+      // ── Check if current user already issued a notice tied to this record ──
+      const { rows: myNotices } = await pool.query(
+        `SELECT id, title FROM ${table}
+         WHERE notice_tied_id = $1
+           AND project_id = $2
+           AND uploaded_by = $3
+           AND role = $4`,
+        [rec.id, projectId, userId, userRole]
+      );
+      const myIssuedNotice = myNotices.length > 0 ? myNotices[0] : null;
+
+      // ── Fetch tied record title if this is a notice ──
+      let tiedRecordTitle = null;
+      if (rec.notice_tied_id) {
+        const { rows: tied } = await pool.query(
+          `SELECT title FROM ${table} WHERE id = $1`,
+          [rec.notice_tied_id]
+        );
+        tiedRecordTitle = tied[0]?.title || null;
+      }
+
       return {
         ...rec,
         reviews:           annotatedReviews,
@@ -1198,6 +1218,8 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         approve_label:     approveLabel,
         my_review:         myReview,
         workflow_steps:    workflowSteps,
+        my_issued_notice:  myIssuedNotice,
+        tied_record_title: tiedRecordTitle,
       };
     }));
 
@@ -1210,6 +1232,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MARK RECORD VIEWED
+//  ── FIX: skips uploader check using both ID and role side
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, projectId, recordType } = req.body;
@@ -1226,7 +1249,7 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     );
     if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
 
-    // ── Skip if viewer is the uploader — match both ID and side ──
+    // Skip if viewer is the uploader — match both ID and side
     if (String(rec[0].uploaded_by) === String(reviewerId)
       && getSide(rec[0].role) === getSide(reviewerRole)) {
       return res.json({ success: true, skipped: true });
@@ -1260,6 +1283,7 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  REVIEW RECORD
+//  ── FIX: blocks uploader from reviewing own record using ID + side
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType, action, comment, actorType } = req.body;
@@ -1290,7 +1314,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     }
     const rec = recRows[0];
 
-    // ── Block uploader from reviewing their own record — match both ID and side ──
+    // Block uploader from reviewing own record — match both ID and side
     if (String(rec.uploaded_by) === String(reviewerId)
       && getSide(rec.role) === getSide(reviewerRole)) {
       return res.status(403).json({ error: 'You cannot review your own record.' });
@@ -1404,7 +1428,8 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to process review.' });
   }
 });
-//─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  DOWNLOAD FILE
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/download-file', authenticateToken, async (req, res) => {
@@ -1426,6 +1451,7 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DELETE RECORD
+//  ── FIX: checks both ID and role side to prevent cross-table ID collisions
 // ─────────────────────────────────────────────────────────────────────────────
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType } = req.body;
@@ -1434,14 +1460,15 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
     const { rows } = await pool.query(
-      `SELECT uploaded_by FROM ${table} WHERE id = $1 AND project_id = $2`,
+      `SELECT uploaded_by, role FROM ${table} WHERE id = $1 AND project_id = $2`,
       [recordId, projectId]
     );
     if (!rows.length) return res.status(404).json({ error: 'Record not found.' });
-    if (String(rows[0].uploaded_by) !== String(userId)) {
+    // Check both ID and side to prevent cross-table ID collision false positives
+    if (String(rows[0].uploaded_by) !== String(userId)
+      || getSide(rows[0].role) !== getSide(req.user.role)) {
       return res.status(403).json({ error: 'Only the uploader can delete this record.' });
     }
-    // Clean up reviews and notifications before deleting the record
     await pool.query(
       `DELETE FROM notification_recipients
        WHERE notification_id IN (
@@ -1460,7 +1487,7 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MEETING ROUTES  (unchanged)
+//  MEETING ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/records/schedule-meeting', authenticateToken, async (req, res) => {
   const {projectId,title,dateTime,participants,agenda}=req.body;
@@ -1524,7 +1551,7 @@ app.post('/records/add-meeting-minute', authenticateToken, upload.array('documen
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SCHEDULE MODULE  (unchanged)
+//  SCHEDULE MODULE
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   const projectId=parseInt(req.query.projectId,10);
