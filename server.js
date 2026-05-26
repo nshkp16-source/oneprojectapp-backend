@@ -41,6 +41,16 @@ const upload = multer({
   },
 });
 
+// Images-only multer for milestone photos — defined here so all routes can use it
+const photoUpload = multer({
+  limits:     { fileSize: 10 * 1024 * 1024 },
+  storage:    multer.memoryStorage(),
+  fileFilter: (_req, file, cb) => {
+    const ok = file.mimetype.startsWith('image/');
+    cb(ok ? null : new Error('Images only'), ok);
+  },
+});
+
 // ─── Cloudinary helpers ───────────────────────────────────────────────────────
 function uploadToCloudinary(buffer, folder, resourceType = 'auto') {
   return new Promise((resolve, reject) => {
@@ -70,7 +80,7 @@ function authenticateToken(req, res, next) {
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).json({ error: 'Invalid or expired token' });
     req.user = {
-      user_id: decoded.sub,
+      user_id: parseInt(decoded.sub, 10),   // INTEGER — matches SERIAL ids in all role tables
       role:    decoded.role,
       email:   decoded.companyEmail || decoded.email,
     };
@@ -817,9 +827,6 @@ app.get('/api/me', authenticateToken, (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS
-//  ── FIX: uses LEFT JOIN so users see all project notifications even if
-//     no recipient row exists yet. Auto-creates missing rows on GET.
-//     Upsert on mark-read so rows are never missing.
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/notifications/unread-count', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
@@ -858,8 +865,6 @@ app.get('/notifications', authenticateToken, async (req, res) => {
        ORDER BY n.created_at DESC`,
       [projectId, userId]
     );
-
-    // Auto-insert missing recipient rows so badge/panel always works
     for (const n of notifs) {
       await pool.query(
         `INSERT INTO notification_recipients (notification_id, user_id, is_read)
@@ -868,7 +873,6 @@ app.get('/notifications', authenticateToken, async (req, res) => {
         [n.id, userId]
       );
     }
-
     res.json({ notifications: notifs });
   } catch (err) {
     console.error('Fetch notifications error:', err);
@@ -973,25 +977,21 @@ async function handleAddRecord(req, res) {
     const dbClient = await pool.connect();
     try {
       await dbClient.query('BEGIN');
-
       const recRes = await dbClient.query(
         `INSERT INTO ${table} (project_id, title, description, file_path, attachment_id, uploaded_by, role, record_kind, notice_tied_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
         [projectId, title, description || null, filePath, attachmentId, userId, role, resolvedKind, noticeTied]
       );
       const recordId = recRes.rows[0].id;
-
       const notifMsg = noticeTied
         ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
         : `New record added by ${role}: "${title}"`;
-
       const notifRes = await dbClient.query(
         `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
         [projectId, recordId, table, notifMsg, userId, role]
       );
       const notificationId = notifRes.rows[0].id;
-
       const recipientIds = await getProjectMemberUserIds(projectId, userId);
       if (recipientIds.length > 0) {
         const recipientValues = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
@@ -1002,7 +1002,6 @@ async function handleAddRecord(req, res) {
           [notificationId, ...recipientIds]
         );
       }
-
       await dbClient.query('COMMIT');
       res.json({ success: true, message: 'Record saved.', recordId, notificationId, attachmentId, recordKind: resolvedKind });
     } catch (err) {
@@ -1023,22 +1022,15 @@ app.post('/records',        authenticateToken, upload.single('attachment'), hand
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  FETCH TAB RECORDS
-//  ── FIX: isUploader checks both ID and role side to prevent cross-table
-//     ID collisions (Contractor ID=1 vs Consultant ID=1 are different people)
-//  ── FIX: my_issued_notice — hides notice button after notice is issued
-//  ── FIX: tied_record_title — shows parent record title on notices
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, recordType } = req.body;
-
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-
   const userId   = req.user.user_id;
   const userRole = req.user.role;
   const userSide = getSide(userRole);
   const userIsDM = isDecisionMaker(userRole);
-
   try {
     const { rows: records } = await pool.query(
       `SELECT r.id, r.title, r.description, r.file_path,
@@ -1049,35 +1041,22 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
        ORDER BY r.issued_date DESC`,
       [projectId]
     );
-
     const enriched = await Promise.all(records.map(async rec => {
-
       const { rows: reviews } = await pool.query(
-        `SELECT
-           dr.reviewer_id,
-           dr.reviewer_role,
-           dr.action,
-           dr.action_date,
-           dr.comment,
-           dr.reviewer_email,
-           dr.reviewer_position
+        `SELECT dr.reviewer_id, dr.reviewer_role, dr.action, dr.action_date,
+                dr.comment, dr.reviewer_email, dr.reviewer_position
          FROM document_reviews dr
-         WHERE dr.record_type = $1
-           AND dr.record_id   = $2
+         WHERE dr.record_type = $1 AND dr.record_id = $2
          ORDER BY dr.action_date ASC`,
         [table, rec.id]
       );
-
       const annotatedReviews = reviews.map(r => ({
         ...r,
         is_decision_maker: isDecisionMaker(r.reviewer_role),
       }));
-
-      // ── is_uploader: match BOTH id AND side — prevents cross-table ID collisions ──
       const uploaderSide = getSide(rec.uploader_role);
       const isUploader   = String(rec.uploaded_by) === String(userId)
                         && getSide(rec.uploader_role) === getSide(userRole);
-
       let isViewed = isUploader;
       if (!isUploader) {
         const { rows: viewed } = await pool.query(
@@ -1087,26 +1066,16 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         );
         isViewed = viewed.length > 0;
       }
-
-      // ── my_review: also match side to avoid cross-table collision ──
       const myReviewRow = reviews.find(r => String(r.reviewer_id) === String(userId)
                                          && getSide(r.reviewer_role) === getSide(userRole));
       const myReview    = myReviewRow
         ? { action: myReviewRow.action, comment: myReviewRow.comment || '' }
         : {};
-
-      const step2SideMap = {
-        contractor: 'client',
-        consultant: 'contractor',
-        client:     'contractor',
-      };
+      const step2SideMap = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
       const step2Side = step2SideMap[uploaderSide];
       const isLocked  =
         rec.status === 'approved_record' ||
-        annotatedReviews.some(
-          r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted'
-        );
-
+        annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
       const stepMap = {
         contractor: [
           { side: 'consultant', step: 1, label: 'Consultant Approval', action: 'approved' },
@@ -1122,16 +1091,10 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ],
       };
       const steps = uploaderSide ? stepMap[uploaderSide] : null;
-
       const workflowSteps = steps
         ? steps.map(s => {
-            const doneReview = annotatedReviews.find(
-              r => getSide(r.reviewer_role) === s.side &&
-                   (r.action === 'approved' || r.action === 'accepted')
-            );
-            const rejectedReview = annotatedReviews.find(
-              r => getSide(r.reviewer_role) === s.side && r.action === 'rejected'
-            );
+            const doneReview     = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
+            const rejectedReview = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && r.action === 'rejected');
             let status;
             if (isLocked)            status = 'locked';
             else if (doneReview)     status = 'done';
@@ -1140,12 +1103,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
             return { label: s.label, status };
           })
         : [];
-
-      // ── btn_state ─────────────────────────────────────────────────────────
-      let btnState     = 'none';
-      let pendingRole  = null;
-      let approveLabel = null;
-
+      let btnState = 'none', pendingRole = null, approveLabel = null;
       if (isUploader) {
         btnState = 'uploader';
       } else if (isLocked) {
@@ -1153,12 +1111,10 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       } else if (!userIsDM) {
         btnState = 'team_member';
       } else if (userSide === uploaderSide) {
-        // Same side as uploader but not the uploader — no workflow action
         btnState = 'none';
       } else {
         const workflowActions = ['approved', 'accepted', 'rejected'];
         const alreadyActed    = myReviewRow && workflowActions.includes(myReviewRow.action);
-
         if (alreadyActed) {
           btnState = 'acted';
         } else if (steps) {
@@ -1167,45 +1123,28 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
             btnState = 'none';
           } else if (myStep.step === 2) {
             const step1     = steps.find(s => s.step === 1);
-            const step1Done = annotatedReviews.some(
-              r => getSide(r.reviewer_role) === step1.side &&
-                   (r.action === 'approved' || r.action === 'accepted')
-            );
+            const step1Done = annotatedReviews.some(r => getSide(r.reviewer_role) === step1.side && (r.action === 'approved' || r.action === 'accepted'));
             if (!step1Done) {
-              btnState    = 'awaiting';
-              pendingRole = step1.side;
+              btnState = 'awaiting'; pendingRole = step1.side;
             } else {
-              btnState     = 'can_approve';
-              approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
+              btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
             }
           } else {
-            btnState     = 'can_approve';
-            approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
+            btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
           }
         }
       }
-
-      // ── Check if current user already issued a notice tied to this record ──
       const { rows: myNotices } = await pool.query(
         `SELECT id, title FROM ${table}
-         WHERE notice_tied_id = $1
-           AND project_id = $2
-           AND uploaded_by = $3
-           AND role = $4`,
+         WHERE notice_tied_id = $1 AND project_id = $2 AND uploaded_by = $3 AND role = $4`,
         [rec.id, projectId, userId, userRole]
       );
       const myIssuedNotice = myNotices.length > 0 ? myNotices[0] : null;
-
-      // ── Fetch tied record title if this is a notice ──
       let tiedRecordTitle = null;
       if (rec.notice_tied_id) {
-        const { rows: tied } = await pool.query(
-          `SELECT title FROM ${table} WHERE id = $1`,
-          [rec.notice_tied_id]
-        );
+        const { rows: tied } = await pool.query(`SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]);
         tiedRecordTitle = tied[0]?.title || null;
       }
-
       return {
         ...rec,
         reviews:           annotatedReviews,
@@ -1222,7 +1161,6 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         tied_record_title: tiedRecordTitle,
       };
     }));
-
     res.json({ records: enriched });
   } catch (err) {
     console.error('Fetch tab records error:', err);
@@ -1232,39 +1170,29 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MARK RECORD VIEWED
-//  ── FIX: skips uploader check using both ID and role side
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, projectId, recordType } = req.body;
   const reviewerId   = req.user.user_id;
   const reviewerRole = req.user.role;
-
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-
   try {
     const { rows: rec } = await pool.query(
       `SELECT uploaded_by, role FROM ${table} WHERE id = $1 AND project_id = $2`,
       [recordId, projectId]
     );
     if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
-
-    // Skip if viewer is the uploader — match both ID and side
-    if (String(rec[0].uploaded_by) === String(reviewerId)
-      && getSide(rec[0].role) === getSide(reviewerRole)) {
+    if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) {
       return res.json({ success: true, skipped: true });
     }
-
     const assignRow = await pool.query(
-      `SELECT av.role_email AS email, av.position
-       FROM assignments_view av
-       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3
-       LIMIT 1`,
+      `SELECT av.role_email AS email, av.position FROM assignments_view av
+       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3 LIMIT 1`,
       [projectId, reviewerId, reviewerRole]
     );
     const reviewerEmail    = assignRow.rows[0]?.email    || null;
     const reviewerPosition = assignRow.rows[0]?.position || null;
-
     await pool.query(
       `INSERT INTO document_reviews
          (record_type, record_id, record_kind, reviewer_id, reviewer_role,
@@ -1273,7 +1201,6 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
        ON CONFLICT (record_type, record_id, reviewer_id) DO NOTHING`,
       [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition]
     );
-
     res.json({ success: true });
   } catch (err) {
     console.error('Mark viewed error:', err);
@@ -1283,97 +1210,69 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  REVIEW RECORD
-//  ── FIX: blocks uploader from reviewing own record using ID + side
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType, action, comment, actorType } = req.body;
   const reviewerId   = req.user.user_id;
   const reviewerRole = req.user.role;
-
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-
   const workflowActions      = ['approved', 'accepted', 'rejected'];
   const isWorkflow           = workflowActions.includes(action);
   const isDecisionMakerActor = isDecisionMaker(reviewerRole) && actorType !== 'team_member';
-
-  if (!isWorkflow && action !== 'no_action') {
-    return res.status(400).json({ error: 'Invalid action.' });
-  }
+  if (!isWorkflow && action !== 'no_action') return res.status(400).json({ error: 'Invalid action.' });
   if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') {
     return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
   }
-
   try {
     const { rows: recRows } = await pool.query(
       `SELECT id, role, uploaded_by FROM ${table} WHERE id = $1 AND project_id = $2`,
       [recordId, projectId]
     );
-    if (!recRows.length) {
-      return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
-    }
+    if (!recRows.length) return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
     const rec = recRows[0];
-
-    // Block uploader from reviewing own record — match both ID and side
-    if (String(rec.uploaded_by) === String(reviewerId)
-      && getSide(rec.role) === getSide(reviewerRole)) {
+    if (String(rec.uploaded_by) === String(reviewerId) && getSide(rec.role) === getSide(reviewerRole)) {
       return res.status(403).json({ error: 'You cannot review your own record.' });
     }
-
     const assignRow = await pool.query(
-      `SELECT av.role_email AS email, av.position
-       FROM assignments_view av
-       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3
-       LIMIT 1`,
+      `SELECT av.role_email AS email, av.position FROM assignments_view av
+       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3 LIMIT 1`,
       [projectId, reviewerId, reviewerRole]
     );
     const reviewerEmail    = assignRow.rows[0]?.email    || null;
     const reviewerPosition = assignRow.rows[0]?.position || null;
-
     const { rows: existing } = await pool.query(
       `SELECT id, action FROM document_reviews
        WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3 LIMIT 1`,
       [table, recordId, reviewerId]
     );
-
     if (action === 'no_action' && comment?.trim()) {
       if (existing.length > 0) {
-        await pool.query(
-          `UPDATE document_reviews SET comment = $1, action_date = NOW() WHERE id = $2`,
-          [comment.trim(), existing[0].id]
-        );
+        await pool.query(`UPDATE document_reviews SET comment = $1, action_date = NOW() WHERE id = $2`, [comment.trim(), existing[0].id]);
       } else {
         await pool.query(
-          `INSERT INTO document_reviews
-             (record_type, record_id, record_kind, reviewer_id, reviewer_role,
-              reviewer_email, reviewer_position, action, comment)
+          `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action, comment)
            VALUES ($1, $2, 'new', $3, $4, $5, $6, 'no_action', $7)`,
           [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, comment.trim()]
         );
       }
       return res.json({ success: true, message: 'Comment saved.' });
     }
-
     if (existing.length > 0) {
       if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
         return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
       }
       await pool.query(
-        `UPDATE document_reviews
-         SET action = $1, action_date = NOW(), comment = COALESCE($2, comment)
-         WHERE id = $3`,
+        `UPDATE document_reviews SET action = $1, action_date = NOW(), comment = COALESCE($2, comment) WHERE id = $3`,
         [action, comment?.trim() || null, existing[0].id]
       );
     } else {
       await pool.query(
-        `INSERT INTO document_reviews
-           (record_type, record_id, record_kind, reviewer_id, reviewer_role,
-            reviewer_email, reviewer_position, action, comment)
+        `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action, comment)
          VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8)`,
         [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, action, comment?.trim() || null]
       );
     }
-
     if (isDecisionMakerActor && isWorkflow) {
       const uploaderSide = getSide(rec.role);
       let newStatus;
@@ -1382,18 +1281,10 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       } else if (action === 'accepted') {
         newStatus = 'approved_record';
       } else {
-        const step2StatusMap = {
-          contractor: 'pending_client_acceptance',
-          consultant: 'pending_contractor_acceptance',
-          client:     'pending_contractor_acceptance',
-        };
+        const step2StatusMap = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' };
         newStatus = step2StatusMap[uploaderSide] || 'pending_review';
       }
-      await pool.query(
-        `UPDATE ${table} SET status = $1 WHERE id = $2 AND project_id = $3`,
-        [newStatus, recordId, projectId]
-      );
-
+      await pool.query(`UPDATE ${table} SET status = $1 WHERE id = $2 AND project_id = $3`, [newStatus, recordId, projectId]);
       const notifMsg = `${reviewerRole} ${action} record "${rec.role}" #${recordId}`;
       const dbClient = await pool.connect();
       try {
@@ -1408,8 +1299,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
         if (recipientIds.length > 0) {
           const vals = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
           await dbClient.query(
-            `INSERT INTO notification_recipients (notification_id, user_id)
-             VALUES ${vals} ON CONFLICT (notification_id, user_id) DO NOTHING`,
+            `INSERT INTO notification_recipients (notification_id, user_id) VALUES ${vals} ON CONFLICT (notification_id, user_id) DO NOTHING`,
             [notificationId, ...recipientIds]
           );
         }
@@ -1421,7 +1311,6 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
         dbClient.release();
       }
     }
-
     res.json({ success: true, message: `Action '${action}' recorded successfully.` });
   } catch (err) {
     console.error('Review record error:', err);
@@ -1451,7 +1340,6 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DELETE RECORD
-//  ── FIX: checks both ID and role side to prevent cross-table ID collisions
 // ─────────────────────────────────────────────────────────────────────────────
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType } = req.body;
@@ -1464,16 +1352,11 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
       [recordId, projectId]
     );
     if (!rows.length) return res.status(404).json({ error: 'Record not found.' });
-    // Check both ID and side to prevent cross-table ID collision false positives
-    if (String(rows[0].uploaded_by) !== String(userId)
-      || getSide(rows[0].role) !== getSide(req.user.role)) {
+    if (String(rows[0].uploaded_by) !== String(userId) || getSide(rows[0].role) !== getSide(req.user.role)) {
       return res.status(403).json({ error: 'Only the uploader can delete this record.' });
     }
     await pool.query(
-      `DELETE FROM notification_recipients
-       WHERE notification_id IN (
-         SELECT id FROM notifications WHERE entity_id = $1 AND entity_type = $2
-       )`,
+      `DELETE FROM notification_recipients WHERE notification_id IN (SELECT id FROM notifications WHERE entity_id = $1 AND entity_type = $2)`,
       [recordId, table]
     );
     await pool.query('DELETE FROM notifications WHERE entity_id = $1 AND entity_type = $2', [recordId, table]);
@@ -1551,19 +1434,8 @@ app.post('/records/add-meeting-minute', authenticateToken, upload.array('documen
 });
 
 // =============================================================================
-//  SCHEDULE MODULE — FULL COMBINED ROUTES
-//  Paste this block into server.js in place of all previous schedule routes.
-//  Uses: pool, authenticateToken, upload, photoUpload, cloudinary,
-//        Readable, scheduleCloudinaryUpload, daysBetween
-//        — all already defined above in server.js.
-//
-//  KEY FIXES vs old version:
-//    • project_id  → INTEGER  (parseInt, matches projects.id SERIAL)
-//    • user id columns → INTEGER (req.user.user_id parsed in authenticateToken)
-//    • photo DELETE → direct integer compare, no String() coercion
-//    • no REFERENCES users(id) anywhere — multi-role system has no users table
+//  SCHEDULE MODULE
 // =============================================================================
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GET /api/get-schedule
@@ -1571,7 +1443,6 @@ app.post('/records/add-meeting-minute', authenticateToken, upload.array('documen
 app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   const projectId = parseInt(req.query.projectId, 10);
   if (!projectId) return res.status(400).json({ error: 'Valid integer projectId is required' });
-
   try {
     const schedRow = await pool.query(
       'SELECT * FROM project_schedules WHERE project_id = $1 LIMIT 1',
@@ -1579,113 +1450,50 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     );
     if (!schedRow.rows.length) return res.json({ schedule: null });
     const sched = schedRow.rows[0];
-
     const msRows = await pool.query(
-      `SELECT
-         m.*,
-         COALESCE(
-           json_agg(
-             json_build_object(
-               'date',       e.report_date,
-               'qty',        e.qty_executed,
-               'remarks',    e.remarks,
-               'cumulative', e.cumulative_after_entry
-             ) ORDER BY e.report_date
-           ) FILTER (WHERE e.id IS NOT NULL),
-           '[]'
-         ) AS entries,
-         COALESCE(
-           json_agg(
-             DISTINCT jsonb_build_object(
-               'fileName',  a.file_name,
-               'url',       a.cloudinary_url,
-               'publicId',  a.cloudinary_public_id
-             )
-           ) FILTER (WHERE a.id IS NOT NULL),
-           '[]'
-         ) AS attachments
+      `SELECT m.*,
+         COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,
+         COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments
        FROM milestones m
        LEFT JOIN milestone_progress_entries e ON e.milestone_id = m.id
        LEFT JOIN milestone_attachments      a ON a.milestone_id = m.id
        WHERE m.schedule_id = $1
-       GROUP BY m.id
-       ORDER BY m.sort_order`,
+       GROUP BY m.id ORDER BY m.sort_order`,
       [sched.id]
     );
-
     const amRows = await pool.query(
-      `SELECT
-         am.*,
-         COALESCE(
-           json_agg(
-             json_build_object(
-               'date',       e.report_date,
-               'qty',        e.qty_executed,
-               'remarks',    e.remarks,
-               'cumulative', e.cumulative_after_entry
-             ) ORDER BY e.report_date
-           ) FILTER (WHERE e.id IS NOT NULL),
-           '[]'
-         ) AS entries,
-         COALESCE(
-           json_agg(
-             DISTINCT jsonb_build_object(
-               'fileName', a.file_name,
-               'url',      a.cloudinary_url
-             )
-           ) FILTER (WHERE a.id IS NOT NULL),
-           '[]'
-         ) AS attachments
+      `SELECT am.*,
+         COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,
+         COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments
        FROM additional_milestones am
-       LEFT JOIN additional_milestone_progress_entries e
-         ON e.additional_milestone_id = am.id
-       LEFT JOIN additional_milestone_attachments a
-         ON a.additional_milestone_id = am.id
+       LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id = am.id
+       LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id = am.id
        WHERE am.schedule_id = $1
-       GROUP BY am.id
-       ORDER BY am.sort_order`,
+       GROUP BY am.id ORDER BY am.sort_order`,
       [sched.id]
     );
-
     const extRows = await pool.query(
-      `SELECT id, extension_days, new_planned_finish, reason,
-              extension_type, status, created_at
-       FROM schedule_extensions
-       WHERE schedule_id = $1
-       ORDER BY created_at ASC`,
+      `SELECT id, extension_days, new_planned_finish, reason, extension_type, status, created_at
+       FROM schedule_extensions WHERE schedule_id = $1 ORDER BY created_at ASC`,
       [sched.id]
     );
-
     const mapMs = (ms, isExt) => ({
-      id:              ms.id,
-      title:           ms.title,
-      description:     ms.description,
-      start:           ms.planned_start,
-      end:             ms.planned_end,
-      quantity:        ms.quantity,
-      unit:            ms.unit,
-      dep:             ms.depends_on || ms.depends_on_baseline || 'None',
-      weight_pct:      ms.weight_pct,
-      float_days:      ms.float_days,
-      is_critical:     ms.is_critical,
-      executed:        ms.executed,
-      progress_pct:    ms.progress_pct,
-      activity_status: ms.activity_status,
-      completed_at:    ms.completed_at,
-      entries:         ms.entries,
-      fileName:        ms.attachments?.[0]?.fileName || null,
-      attachmentUrl:   ms.attachments?.[0]?.url      || null,
-      isExtension:     isExt,
+      id: ms.id, title: ms.title, description: ms.description,
+      start: ms.planned_start, end: ms.planned_end,
+      quantity: ms.quantity, unit: ms.unit,
+      dep: ms.depends_on || ms.depends_on_baseline || 'None',
+      weight_pct: ms.weight_pct, float_days: ms.float_days, is_critical: ms.is_critical,
+      executed: ms.executed, progress_pct: ms.progress_pct,
+      activity_status: ms.activity_status, completed_at: ms.completed_at,
+      entries: ms.entries,
+      fileName: ms.attachments?.[0]?.fileName || null,
+      attachmentUrl: ms.attachments?.[0]?.url || null,
+      isExtension: isExt,
     });
-
     res.json({
       schedule: {
-        id:       sched.id,
-        timeline: {
-          start:    sched.planned_start,
-          finish:   sched.planned_finish,
-          duration: sched.total_duration,
-        },
+        id: sched.id,
+        timeline: { start: sched.planned_start, finish: sched.planned_finish, duration: sched.total_duration },
         milestones:           msRows.rows.map(ms => mapMs(ms, false)),
         extension_milestones: amRows.rows.map(ms => mapMs(ms, true)),
         extensions:           extRows.rows,
@@ -1697,14 +1505,12 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   }
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  POST /api/save-schedule
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res) => {
   const projectId = parseInt(req.body.projectId, 10);
   if (!projectId) return res.status(400).json({ error: 'Valid integer projectId is required' });
-
   let tl, rawMilestones, newIds, editedIds, unchangedIds, deletedIds;
   try {
     tl            = JSON.parse(req.body.timeline);
@@ -1716,229 +1522,102 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
   } catch {
     return res.status(400).json({ error: 'Invalid JSON in timeline, milestones, or id lists' });
   }
-
   const fileMap = {};
-  (req.files || []).forEach(f => {
-    fileMap[f.fieldname.replace(/^file_/, '')] = f;
-  });
-
+  (req.files || []).forEach(f => { fileMap[f.fieldname.replace(/^file_/, '')] = f; });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // 1. Upsert schedule header
-    //    created_by_user_id → INTEGER (no FK, matches any role table id)
+    // created_by_user_id → INTEGER (no FK)
     const schedRes = await client.query(
-      `INSERT INTO project_schedules
-         (project_id, planned_start, planned_finish, total_duration,
-          created_by_user_id, created_by_role)
+      `INSERT INTO project_schedules (project_id, planned_start, planned_finish, total_duration, created_by_user_id, created_by_role)
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (project_id) DO UPDATE
-         SET planned_start  = EXCLUDED.planned_start,
-             planned_finish = EXCLUDED.planned_finish,
-             total_duration = EXCLUDED.total_duration,
-             updated_at     = now()
+         SET planned_start = EXCLUDED.planned_start, planned_finish = EXCLUDED.planned_finish,
+             total_duration = EXCLUDED.total_duration, updated_at = now()
        RETURNING *`,
       [projectId, tl.start, tl.finish, tl.duration, req.user.user_id, req.user.role]
     );
     const schedId = schedRes.rows[0].id;
-
-    // 2. Delete milestones the user removed — skip any that have progress
     for (const dbId of deletedIds) {
-      const check = await client.query(
-        'SELECT executed FROM milestones WHERE id = $1 AND schedule_id = $2',
-        [dbId, schedId]
-      );
+      const check = await client.query('SELECT executed FROM milestones WHERE id = $1 AND schedule_id = $2', [dbId, schedId]);
       if (!check.rows.length) continue;
-      if (parseFloat(check.rows[0].executed) > 0) {
-        console.warn(`[save-schedule] Skipping delete of milestone ${dbId}: has recorded progress`);
-        continue;
-      }
-      await client.query(
-        'DELETE FROM milestones WHERE id = $1 AND schedule_id = $2',
-        [dbId, schedId]
-      );
+      if (parseFloat(check.rows[0].executed) > 0) { console.warn(`[save-schedule] Skipping delete of milestone ${dbId}: has recorded progress`); continue; }
+      await client.query('DELETE FROM milestones WHERE id = $1 AND schedule_id = $2', [dbId, schedId]);
     }
-
-    // 3. Weight denominator
-    const totalDur = rawMilestones.reduce(
-      (sum, ms) => sum + Math.max(1, daysBetween(ms.start, ms.end)), 0
-    );
-
-    // 4. temp-id → real UUID map
+    const totalDur = rawMilestones.reduce((sum, ms) => sum + Math.max(1, daysBetween(ms.start, ms.end)), 0);
     const tempToReal = {};
-    for (const ms of rawMilestones) {
-      if (!newIds.has(ms.id)) tempToReal[ms.id] = ms.id;
-    }
-
-    // 5. Process milestones
+    for (const ms of rawMilestones) { if (!newIds.has(ms.id)) tempToReal[ms.id] = ms.id; }
     const needsAttachment = [];
-
     for (let i = 0; i < rawMilestones.length; i++) {
       const ms    = rawMilestones[i];
       const dur   = Math.max(1, daysBetween(ms.start, ms.end));
       const float = Math.max(0, daysBetween(ms.end, tl.finish));
       const w     = totalDur > 0 ? (dur / totalDur) * 100 : 0;
-      const depId = ms.dep && ms.dep !== 'None' && tempToReal[ms.dep]
-        ? tempToReal[ms.dep]
-        : null;
-
+      const depId = ms.dep && ms.dep !== 'None' && tempToReal[ms.dep] ? tempToReal[ms.dep] : null;
       if (newIds.has(ms.id)) {
-        // INSERT
         // project_id → INTEGER, created_by_user_id → INTEGER (no FK)
         const ins = await client.query(
-          `INSERT INTO milestones
-             (schedule_id, project_id, title, description, sort_order,
-              planned_start, planned_end, duration_days, float_days,
-              is_critical, weight_pct, quantity, unit, depends_on,
-              created_by_user_id, created_by_role)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-           RETURNING id`,
-          [
-            schedId, projectId,
-            ms.title, ms.desc || ms.description || null,
-            i, ms.start, ms.end, dur, float,
-            float === 0, w.toFixed(2),
-            parseFloat(ms.qty || ms.quantity) || 0,
-            ms.unit || null, depId,
-            req.user.user_id, req.user.role,
-          ]
+          `INSERT INTO milestones (schedule_id, project_id, title, description, sort_order, planned_start, planned_end, duration_days, float_days, is_critical, weight_pct, quantity, unit, depends_on, created_by_user_id, created_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+          [schedId, projectId, ms.title, ms.desc || ms.description || null, i, ms.start, ms.end, dur, float, float === 0, w.toFixed(2), parseFloat(ms.qty || ms.quantity) || 0, ms.unit || null, depId, req.user.user_id, req.user.role]
         );
         const realId = ins.rows[0].id;
         tempToReal[ms.id] = realId;
         if (fileMap[ms.id]) needsAttachment.push({ realId, tempId: ms.id });
-
       } else if (editedIds.has(ms.id)) {
-        // UPDATE metadata only — never touch executed / progress_pct / activity_status
         await client.query(
-          `UPDATE milestones
-           SET title         = $1,
-               description   = $2,
-               sort_order    = $3,
-               planned_start = $4,
-               planned_end   = $5,
-               duration_days = $6,
-               float_days    = $7,
-               is_critical   = $8,
-               weight_pct    = $9,
-               quantity      = $10,
-               unit          = $11,
-               depends_on    = $12,
-               updated_at    = now()
+          `UPDATE milestones SET title=$1, description=$2, sort_order=$3, planned_start=$4, planned_end=$5, duration_days=$6, float_days=$7, is_critical=$8, weight_pct=$9, quantity=$10, unit=$11, depends_on=$12, updated_at=now()
            WHERE id = $13 AND schedule_id = $14`,
-          [
-            ms.title, ms.desc || ms.description || null,
-            i, ms.start, ms.end, dur, float,
-            float === 0, w.toFixed(2),
-            parseFloat(ms.qty || ms.quantity) || 0,
-            ms.unit || null, depId,
-            ms.id, schedId,
-          ]
+          [ms.title, ms.desc || ms.description || null, i, ms.start, ms.end, dur, float, float === 0, w.toFixed(2), parseFloat(ms.qty || ms.quantity) || 0, ms.unit || null, depId, ms.id, schedId]
         );
         if (fileMap[ms.id]) needsAttachment.push({ realId: ms.id, tempId: ms.id });
-
       } else if (unchangedIds.has(ms.id)) {
-        // Unchanged — refresh sort_order only
-        await client.query(
-          'UPDATE milestones SET sort_order = $1 WHERE id = $2 AND schedule_id = $3',
-          [i, ms.id, schedId]
-        );
+        await client.query('UPDATE milestones SET sort_order = $1 WHERE id = $2 AND schedule_id = $3', [i, ms.id, schedId]);
       }
     }
-
-    // 6. Upload attachments
-    //    uploaded_by_user_id → INTEGER (no FK)
+    // uploaded_by_user_id → INTEGER (no FK)
     for (const { realId, tempId } of needsAttachment) {
       const file = fileMap[tempId];
       if (!file) continue;
       try {
-        const cdResult = await scheduleCloudinaryUpload(
-          file.buffer, file.originalname,
-          `oneprojectapp/schedules/${projectId}/milestones`
-        );
+        const cdResult = await scheduleCloudinaryUpload(file.buffer, file.originalname, `oneprojectapp/schedules/${projectId}/milestones`);
         await client.query(
-          `INSERT INTO milestone_attachments
-             (milestone_id, file_name, file_size, mime_type,
-              cloudinary_public_id, cloudinary_url,
-              uploaded_by_user_id, uploaded_by_role)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-           ON CONFLICT (cloudinary_public_id) DO NOTHING`,
-          [
-            realId,
-            file.originalname, file.size, file.mimetype,
-            cdResult.public_id, cdResult.secure_url,
-            req.user.user_id, req.user.role,
-          ]
+          `INSERT INTO milestone_attachments (milestone_id, file_name, file_size, mime_type, cloudinary_public_id, cloudinary_url, uploaded_by_user_id, uploaded_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (cloudinary_public_id) DO NOTHING`,
+          [realId, file.originalname, file.size, file.mimetype, cdResult.public_id, cdResult.secure_url, req.user.user_id, req.user.role]
         );
-      } catch (cdErr) {
-        console.error('[save-schedule] Cloudinary upload failed for milestone', realId, cdErr);
-      }
+      } catch (cdErr) { console.error('[save-schedule] Cloudinary upload failed for milestone', realId, cdErr); }
     }
-
     await client.query('COMMIT');
-
-    // 7. Return fresh milestone list
     const freshMs = await pool.query(
-      `SELECT
-         m.*,
-         COALESCE(
-           json_agg(
-             json_build_object(
-               'date',       e.report_date,
-               'qty',        e.qty_executed,
-               'remarks',    e.remarks,
-               'cumulative', e.cumulative_after_entry
-             ) ORDER BY e.report_date
-           ) FILTER (WHERE e.id IS NOT NULL),
-           '[]'
-         ) AS entries,
-         COALESCE(
-           json_agg(
-             DISTINCT jsonb_build_object(
-               'fileName',  a.file_name,
-               'url',       a.cloudinary_url,
-               'publicId',  a.cloudinary_public_id
-             )
-           ) FILTER (WHERE a.id IS NOT NULL),
-           '[]'
-         ) AS attachments
+      `SELECT m.*,
+         COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,
+         COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments
        FROM milestones m
        LEFT JOIN milestone_progress_entries e ON e.milestone_id = m.id
        LEFT JOIN milestone_attachments      a ON a.milestone_id = m.id
        WHERE m.schedule_id = $1
-       GROUP BY m.id
-       ORDER BY m.sort_order`,
+       GROUP BY m.id ORDER BY m.sort_order`,
       [schedId]
     );
-
     res.json({
       success: true,
       schedule: {
-        id:       schedId,
+        id: schedId,
         timeline: { start: tl.start, finish: tl.finish, duration: tl.duration },
         milestones: freshMs.rows.map(ms => ({
-          id:              ms.id,
-          title:           ms.title,
-          description:     ms.description,
-          start:           ms.planned_start,
-          end:             ms.planned_end,
-          quantity:        ms.quantity,
-          unit:            ms.unit,
-          dep:             ms.depends_on || 'None',
-          weight_pct:      ms.weight_pct,
-          float_days:      ms.float_days,
-          is_critical:     ms.is_critical,
-          executed:        ms.executed,
-          progress_pct:    ms.progress_pct,
-          activity_status: ms.activity_status,
-          entries:         ms.entries,
-          fileName:        ms.attachments?.[0]?.fileName || null,
-          attachmentUrl:   ms.attachments?.[0]?.url      || null,
+          id: ms.id, title: ms.title, description: ms.description,
+          start: ms.planned_start, end: ms.planned_end,
+          quantity: ms.quantity, unit: ms.unit, dep: ms.depends_on || 'None',
+          weight_pct: ms.weight_pct, float_days: ms.float_days, is_critical: ms.is_critical,
+          executed: ms.executed, progress_pct: ms.progress_pct, activity_status: ms.activity_status,
+          entries: ms.entries,
+          fileName: ms.attachments?.[0]?.fileName || null,
+          attachmentUrl: ms.attachments?.[0]?.url || null,
         })),
         extension_milestones: [],
       },
     });
-
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[POST /api/save-schedule]', err);
@@ -1948,7 +1627,6 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
   }
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  POST /api/report-progress
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1956,117 +1634,58 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
   const projectId = parseInt(req.body.projectId, 10);
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
-
   if (!projectId || !milestoneId || !reportDate || !qty || qty <= 0) {
-    return res.status(400).json({
-      error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required',
-    });
+    return res.status(400).json({ error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required' });
   }
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // milestoneId → UUID, projectId → INTEGER
-    const msRes = await client.query(
-      'SELECT * FROM milestones WHERE id = $1 AND project_id = $2 FOR UPDATE',
-      [milestoneId, projectId]
-    );
+    const msRes = await client.query('SELECT * FROM milestones WHERE id = $1 AND project_id = $2 FOR UPDATE', [milestoneId, projectId]);
     if (!msRes.rows.length) return res.status(404).json({ error: 'Milestone not found' });
     const ms = msRes.rows[0];
-
-    if (ms.activity_status === 'completed') {
-      return res.status(409).json({ error: 'Milestone is already completed' });
-    }
-
-    const planned     = parseFloat(ms.quantity) || 0;
-    const prevExec    = parseFloat(ms.executed)  || 0;
+    if (ms.activity_status === 'completed') return res.status(409).json({ error: 'Milestone is already completed' });
+    const planned = parseFloat(ms.quantity) || 0;
+    const prevExec = parseFloat(ms.executed) || 0;
     const newExecuted = prevExec + qty;
-
     if (planned > 0 && newExecuted > planned) {
-      return res.status(422).json({
-        error: `Cannot exceed planned quantity of ${planned} ${ms.unit || ''}. Remaining: ${(planned - prevExec).toFixed(3)}`,
-      });
+      return res.status(422).json({ error: `Cannot exceed planned quantity of ${planned} ${ms.unit || ''}. Remaining: ${(planned - prevExec).toFixed(3)}` });
     }
-
     const newPct = planned > 0 ? Math.min(100, (newExecuted / planned) * 100) : 0;
-
     // reported_by_user_id → INTEGER (no FK)
     const entryRes = await client.query(
-      `INSERT INTO milestone_progress_entries
-         (milestone_id, project_id, report_date, qty_executed,
-          cumulative_after_entry, progress_pct_after_entry,
-          remarks, reported_by_user_id, reported_by_role)
+      `INSERT INTO milestone_progress_entries (milestone_id, project_id, report_date, qty_executed, cumulative_after_entry, progress_pct_after_entry, remarks, reported_by_user_id, reported_by_role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (milestone_id, report_date) DO UPDATE
-         SET qty_executed             = milestone_progress_entries.qty_executed + EXCLUDED.qty_executed,
-             cumulative_after_entry   = EXCLUDED.cumulative_after_entry,
+         SET qty_executed = milestone_progress_entries.qty_executed + EXCLUDED.qty_executed,
+             cumulative_after_entry = EXCLUDED.cumulative_after_entry,
              progress_pct_after_entry = EXCLUDED.progress_pct_after_entry,
-             remarks                  = COALESCE(EXCLUDED.remarks, milestone_progress_entries.remarks),
-             reported_by_user_id      = EXCLUDED.reported_by_user_id,
-             reported_by_role         = EXCLUDED.reported_by_role
+             remarks = COALESCE(EXCLUDED.remarks, milestone_progress_entries.remarks),
+             reported_by_user_id = EXCLUDED.reported_by_user_id,
+             reported_by_role = EXCLUDED.reported_by_role
        RETURNING *`,
-      [milestoneId, projectId, reportDate, qty,
-       newExecuted, newPct.toFixed(2),
-       remarks || null, req.user.user_id, req.user.role]
+      [milestoneId, projectId, reportDate, qty, newExecuted, newPct.toFixed(2), remarks || null, req.user.user_id, req.user.role]
     );
-
     await client.query(
-      `UPDATE milestones
-       SET executed        = $1,
-           progress_pct    = $2,
-           activity_status = 'in_progress',
-           updated_at      = now()
-       WHERE id = $3`,
+      `UPDATE milestones SET executed=$1, progress_pct=$2, activity_status='in_progress', updated_at=now() WHERE id=$3`,
       [newExecuted, newPct.toFixed(2), milestoneId]
     );
-
     if (req.file) {
       try {
-        const cdResult = await scheduleCloudinaryUpload(
-          req.file.buffer, req.file.originalname,
-          `oneprojectapp/schedules/${projectId}/progress`
-        );
-        // uploaded_by_user_id → INTEGER (no FK)
+        const cdResult = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, `oneprojectapp/schedules/${projectId}/progress`);
         await client.query(
-          `INSERT INTO progress_entry_attachments
-             (progress_entry_id, file_name, file_size, mime_type,
-              cloudinary_public_id, cloudinary_url,
-              uploaded_by_user_id, uploaded_by_role)
+          `INSERT INTO progress_entry_attachments (progress_entry_id, file_name, file_size, mime_type, cloudinary_public_id, cloudinary_url, uploaded_by_user_id, uploaded_by_role)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [
-            entryRes.rows[0].id,
-            req.file.originalname, req.file.size, req.file.mimetype,
-            cdResult.public_id, cdResult.secure_url,
-            req.user.user_id, req.user.role,
-          ]
+          [entryRes.rows[0].id, req.file.originalname, req.file.size, req.file.mimetype, cdResult.public_id, cdResult.secure_url, req.user.user_id, req.user.role]
         );
-      } catch (cdErr) {
-        console.error('[report-progress] Attachment upload failed:', cdErr);
-      }
+      } catch (cdErr) { console.error('[report-progress] Attachment upload failed:', cdErr); }
     }
-
     await client.query('COMMIT');
-
     const allEntries = await pool.query(
-      `SELECT report_date AS date, qty_executed AS qty, remarks,
-              cumulative_after_entry AS cumulative
-       FROM milestone_progress_entries
-       WHERE milestone_id = $1
-       ORDER BY report_date`,
+      `SELECT report_date AS date, qty_executed AS qty, remarks, cumulative_after_entry AS cumulative
+       FROM milestone_progress_entries WHERE milestone_id = $1 ORDER BY report_date`,
       [milestoneId]
     );
-
-    res.json({
-      success: true,
-      milestone: {
-        id:              milestoneId,
-        executed:        newExecuted,
-        progress_pct:    parseFloat(newPct.toFixed(2)),
-        activity_status: 'in_progress',
-        entries:         allEntries.rows,
-      },
-    });
+    res.json({ success: true, milestone: { id: milestoneId, executed: newExecuted, progress_pct: parseFloat(newPct.toFixed(2)), activity_status: 'in_progress', entries: allEntries.rows } });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[POST /api/report-progress]', err);
@@ -2076,7 +1695,6 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
   }
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  POST /api/report-additional-progress
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2084,116 +1702,58 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
   const projectId = parseInt(req.body.projectId, 10);
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
-
   if (!projectId || !milestoneId || !reportDate || !qty || qty <= 0) {
-    return res.status(400).json({
-      error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required',
-    });
+    return res.status(400).json({ error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required' });
   }
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    const msRes = await client.query(
-      'SELECT * FROM additional_milestones WHERE id = $1 AND project_id = $2 FOR UPDATE',
-      [milestoneId, projectId]
-    );
+    const msRes = await client.query('SELECT * FROM additional_milestones WHERE id = $1 AND project_id = $2 FOR UPDATE', [milestoneId, projectId]);
     if (!msRes.rows.length) return res.status(404).json({ error: 'Additional milestone not found' });
     const ms = msRes.rows[0];
-
-    if (ms.activity_status === 'completed') {
-      return res.status(409).json({ error: 'Milestone is already completed' });
-    }
-
-    const planned     = parseFloat(ms.quantity) || 0;
-    const prevExec    = parseFloat(ms.executed)  || 0;
+    if (ms.activity_status === 'completed') return res.status(409).json({ error: 'Milestone is already completed' });
+    const planned = parseFloat(ms.quantity) || 0;
+    const prevExec = parseFloat(ms.executed) || 0;
     const newExecuted = prevExec + qty;
-
     if (planned > 0 && newExecuted > planned) {
-      return res.status(422).json({
-        error: `Cannot exceed planned quantity. Remaining: ${(planned - prevExec).toFixed(3)} ${ms.unit || ''}`,
-      });
+      return res.status(422).json({ error: `Cannot exceed planned quantity. Remaining: ${(planned - prevExec).toFixed(3)} ${ms.unit || ''}` });
     }
-
     const newPct = planned > 0 ? Math.min(100, (newExecuted / planned) * 100) : 0;
-
     // reported_by_user_id → INTEGER (no FK)
     const entryRes = await client.query(
-      `INSERT INTO additional_milestone_progress_entries
-         (additional_milestone_id, project_id, report_date, qty_executed,
-          cumulative_after_entry, progress_pct_after_entry,
-          remarks, reported_by_user_id, reported_by_role)
+      `INSERT INTO additional_milestone_progress_entries (additional_milestone_id, project_id, report_date, qty_executed, cumulative_after_entry, progress_pct_after_entry, remarks, reported_by_user_id, reported_by_role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (additional_milestone_id, report_date) DO UPDATE
-         SET qty_executed             = additional_milestone_progress_entries.qty_executed + EXCLUDED.qty_executed,
-             cumulative_after_entry   = EXCLUDED.cumulative_after_entry,
+         SET qty_executed = additional_milestone_progress_entries.qty_executed + EXCLUDED.qty_executed,
+             cumulative_after_entry = EXCLUDED.cumulative_after_entry,
              progress_pct_after_entry = EXCLUDED.progress_pct_after_entry,
-             remarks                  = COALESCE(EXCLUDED.remarks, additional_milestone_progress_entries.remarks),
-             reported_by_user_id      = EXCLUDED.reported_by_user_id,
-             reported_by_role         = EXCLUDED.reported_by_role
+             remarks = COALESCE(EXCLUDED.remarks, additional_milestone_progress_entries.remarks),
+             reported_by_user_id = EXCLUDED.reported_by_user_id,
+             reported_by_role = EXCLUDED.reported_by_role
        RETURNING id`,
-      [milestoneId, projectId, reportDate, qty,
-       newExecuted, newPct.toFixed(2),
-       remarks || null, req.user.user_id, req.user.role]
+      [milestoneId, projectId, reportDate, qty, newExecuted, newPct.toFixed(2), remarks || null, req.user.user_id, req.user.role]
     );
-
     await client.query(
-      `UPDATE additional_milestones
-       SET executed        = $1,
-           progress_pct    = $2,
-           activity_status = 'in_progress',
-           updated_at      = now()
-       WHERE id = $3`,
+      `UPDATE additional_milestones SET executed=$1, progress_pct=$2, activity_status='in_progress', updated_at=now() WHERE id=$3`,
       [newExecuted, newPct.toFixed(2), milestoneId]
     );
-
     if (req.file) {
       try {
-        const cdResult = await scheduleCloudinaryUpload(
-          req.file.buffer, req.file.originalname,
-          `oneprojectapp/schedules/${projectId}/additional-progress`
-        );
-        // uploaded_by_user_id → INTEGER (no FK)
+        const cdResult = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, `oneprojectapp/schedules/${projectId}/additional-progress`);
         await client.query(
-          `INSERT INTO additional_milestone_attachments
-             (additional_milestone_id, file_name, file_size, mime_type,
-              cloudinary_public_id, cloudinary_url,
-              uploaded_by_user_id, uploaded_by_role)
+          `INSERT INTO additional_milestone_attachments (additional_milestone_id, file_name, file_size, mime_type, cloudinary_public_id, cloudinary_url, uploaded_by_user_id, uploaded_by_role)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [
-            milestoneId,
-            req.file.originalname, req.file.size, req.file.mimetype,
-            cdResult.public_id, cdResult.secure_url,
-            req.user.user_id, req.user.role,
-          ]
+          [milestoneId, req.file.originalname, req.file.size, req.file.mimetype, cdResult.public_id, cdResult.secure_url, req.user.user_id, req.user.role]
         );
-      } catch (cdErr) {
-        console.error('[report-additional-progress] Attachment upload failed:', cdErr);
-      }
+      } catch (cdErr) { console.error('[report-additional-progress] Attachment upload failed:', cdErr); }
     }
-
     await client.query('COMMIT');
-
     const allEntries = await pool.query(
-      `SELECT report_date AS date, qty_executed AS qty, remarks,
-              cumulative_after_entry AS cumulative
-       FROM additional_milestone_progress_entries
-       WHERE additional_milestone_id = $1
-       ORDER BY report_date`,
+      `SELECT report_date AS date, qty_executed AS qty, remarks, cumulative_after_entry AS cumulative
+       FROM additional_milestone_progress_entries WHERE additional_milestone_id = $1 ORDER BY report_date`,
       [milestoneId]
     );
-
-    res.json({
-      success: true,
-      milestone: {
-        id:              milestoneId,
-        executed:        newExecuted,
-        progress_pct:    parseFloat(newPct.toFixed(2)),
-        activity_status: 'in_progress',
-        entries:         allEntries.rows,
-      },
-    });
+    res.json({ success: true, milestone: { id: milestoneId, executed: newExecuted, progress_pct: parseFloat(newPct.toFixed(2)), activity_status: 'in_progress', entries: allEntries.rows } });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[POST /api/report-additional-progress]', err);
@@ -2203,55 +1763,31 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
   }
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  POST /api/complete-milestone
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
   const projectId = parseInt(req.body.projectId, 10);
   const { milestoneId, isExtensionMilestone } = req.body;
-
-  if (!projectId || !milestoneId) {
-    return res.status(400).json({ error: 'Valid projectId and milestoneId are required' });
-  }
-
+  if (!projectId || !milestoneId) return res.status(400).json({ error: 'Valid projectId and milestoneId are required' });
   const isExt  = isExtensionMilestone === true || isExtensionMilestone === 'true';
   const table  = isExt ? 'additional_milestones' : 'milestones';
   const client = await pool.connect();
-
   try {
     await client.query('BEGIN');
-
-    // milestoneId → UUID, projectId → INTEGER
-    const msRes = await client.query(
-      `SELECT * FROM ${table} WHERE id = $1 AND project_id = $2 FOR UPDATE`,
-      [milestoneId, projectId]
-    );
+    const msRes = await client.query(`SELECT * FROM ${table} WHERE id = $1 AND project_id = $2 FOR UPDATE`, [milestoneId, projectId]);
     if (!msRes.rows.length) return res.status(404).json({ error: 'Milestone not found' });
     const ms = msRes.rows[0];
-
-    if (ms.activity_status === 'completed') {
-      return res.status(409).json({ error: 'Milestone is already completed' });
-    }
-
+    if (ms.activity_status === 'completed') return res.status(409).json({ error: 'Milestone is already completed' });
     const planned = parseFloat(ms.quantity) || 0;
     const exec    = parseFloat(ms.executed)  || 0;
     if (planned > 0 && exec < planned) {
-      return res.status(422).json({
-        error: `Cannot complete: only ${exec} of ${planned} ${ms.unit || ''} executed`,
-      });
+      return res.status(422).json({ error: `Cannot complete: only ${exec} of ${planned} ${ms.unit || ''} executed` });
     }
-
     await client.query(
-      `UPDATE ${table}
-       SET activity_status = 'completed',
-           progress_pct    = 100,
-           completed_at    = now(),
-           updated_at      = now()
-       WHERE id = $1`,
+      `UPDATE ${table} SET activity_status='completed', progress_pct=100, completed_at=now(), updated_at=now() WHERE id=$1`,
       [milestoneId]
     );
-
     await client.query('COMMIT');
     res.json({ success: true, completedAt: new Date().toISOString() });
   } catch (err) {
@@ -2263,146 +1799,70 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
   }
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  POST /api/save-extension
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res) => {
   const projectId = parseInt(req.body.projectId, 10);
   if (!projectId) return res.status(400).json({ error: 'Valid integer projectId is required' });
-
   const extensionDays    = parseInt(req.body.extensionDays, 10);
   const newPlannedFinish = req.body.newPlannedFinish;
   const reason           = (req.body.reason || '').trim();
   const extensionType    = req.body.extensionType;
   const scopeType        = req.body.scopeType;
-
   let newMilestones = [];
   try { newMilestones = JSON.parse(req.body.newMilestones || '[]'); }
   catch { return res.status(400).json({ error: 'Invalid JSON in newMilestones' }); }
-
-  if (!extensionDays || extensionDays < 1)
-    return res.status(400).json({ error: 'extensionDays must be a positive integer' });
-  if (!newPlannedFinish)
-    return res.status(400).json({ error: 'newPlannedFinish is required' });
-  if (!reason)
-    return res.status(400).json({ error: 'reason is required' });
-  if (!['delay', 'scope_addition', 'force_majeure'].includes(extensionType))
-    return res.status(400).json({ error: 'Invalid extensionType' });
-
+  if (!extensionDays || extensionDays < 1) return res.status(400).json({ error: 'extensionDays must be a positive integer' });
+  if (!newPlannedFinish) return res.status(400).json({ error: 'newPlannedFinish is required' });
+  if (!reason) return res.status(400).json({ error: 'reason is required' });
+  if (!['delay', 'scope_addition', 'force_majeure'].includes(extensionType)) return res.status(400).json({ error: 'Invalid extensionType' });
   const fileMap = {};
-  (req.files || []).forEach(f => {
-    const m = f.fieldname.match(/^extFile_(\d+)$/);
-    if (m) fileMap[parseInt(m[1], 10)] = f;
-  });
-
+  (req.files || []).forEach(f => { const m = f.fieldname.match(/^extFile_(\d+)$/); if (m) fileMap[parseInt(m[1], 10)] = f; });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    // projectId → INTEGER
-    const schedRes = await client.query(
-      'SELECT id, planned_finish FROM project_schedules WHERE project_id = $1 LIMIT 1',
-      [projectId]
-    );
-    if (!schedRes.rows.length)
-      return res.status(404).json({ error: 'No schedule found for this project' });
+    const schedRes = await client.query('SELECT id, planned_finish FROM project_schedules WHERE project_id = $1 LIMIT 1', [projectId]);
+    if (!schedRes.rows.length) return res.status(404).json({ error: 'No schedule found for this project' });
     const scheduleId = schedRes.rows[0].id;
-
     // requested_by_user_id → INTEGER (no FK)
     const extRes = await client.query(
-      `INSERT INTO schedule_extensions
-         (schedule_id, project_id, extension_days, new_planned_finish,
-          reason, extension_type, requested_by_user_id, requested_by_role)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id`,
-      [scheduleId, projectId, extensionDays, newPlannedFinish,
-       reason, extensionType, req.user.user_id, req.user.role]
+      `INSERT INTO schedule_extensions (schedule_id, project_id, extension_days, new_planned_finish, reason, extension_type, requested_by_user_id, requested_by_role)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [scheduleId, projectId, extensionDays, newPlannedFinish, reason, extensionType, req.user.user_id, req.user.role]
     );
     const extensionId = extRes.rows[0].id;
-
-    await client.query(
-      'UPDATE project_schedules SET planned_finish = $1, updated_at = now() WHERE id = $2',
-      [newPlannedFinish, scheduleId]
-    );
-
+    await client.query('UPDATE project_schedules SET planned_finish=$1, updated_at=now() WHERE id=$2', [newPlannedFinish, scheduleId]);
     const insertedAdditional = [];
     if (scopeType === 'new' && newMilestones.length > 0) {
       for (let i = 0; i < newMilestones.length; i++) {
         const ms     = newMilestones[i];
         const dur    = Math.max(1, daysBetween(ms.planned_start, ms.planned_end));
-        const floatD = Math.max(
-          0,
-          Math.round((new Date(newPlannedFinish) - new Date(ms.planned_end)) / 86400000)
-        );
-        const depBaselineId = ms.depends_on_baseline && ms.depends_on_baseline !== 'None'
-          ? ms.depends_on_baseline
-          : null;
-
+        const floatD = Math.max(0, Math.round((new Date(newPlannedFinish) - new Date(ms.planned_end)) / 86400000));
+        const depBaselineId = ms.depends_on_baseline && ms.depends_on_baseline !== 'None' ? ms.depends_on_baseline : null;
         // project_id → INTEGER, added_by_user_id → INTEGER (no FK)
         const amRes = await client.query(
-          `INSERT INTO additional_milestones
-             (schedule_id, project_id, schedule_extension_id,
-              title, description, sort_order,
-              planned_start, planned_end, duration_days, float_days,
-              is_critical, weight_pct, quantity, unit,
-              depends_on_baseline, added_by_user_id, added_by_role)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-           RETURNING id`,
-          [
-            scheduleId, projectId, extensionId,
-            ms.title, ms.description || null,
-            i, ms.planned_start, ms.planned_end, dur, floatD,
-            floatD === 0, 0,
-            parseFloat(ms.quantity) || 0, ms.unit || null,
-            depBaselineId, req.user.user_id, req.user.role,
-          ]
+          `INSERT INTO additional_milestones (schedule_id, project_id, schedule_extension_id, title, description, sort_order, planned_start, planned_end, duration_days, float_days, is_critical, weight_pct, quantity, unit, depends_on_baseline, added_by_user_id, added_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
+          [scheduleId, projectId, extensionId, ms.title, ms.description || null, i, ms.planned_start, ms.planned_end, dur, floatD, floatD === 0, 0, parseFloat(ms.quantity) || 0, ms.unit || null, depBaselineId, req.user.user_id, req.user.role]
         );
         const additionalId = amRes.rows[0].id;
         insertedAdditional.push({ id: additionalId, index: i });
-
         const file = fileMap[i];
         if (file) {
           try {
-            const cdResult = await scheduleCloudinaryUpload(
-              file.buffer, file.originalname,
-              `oneprojectapp/schedules/${projectId}/additional`
-            );
-            // uploaded_by_user_id → INTEGER (no FK)
+            const cdResult = await scheduleCloudinaryUpload(file.buffer, file.originalname, `oneprojectapp/schedules/${projectId}/additional`);
             await client.query(
-              `INSERT INTO additional_milestone_attachments
-                 (additional_milestone_id, file_name, file_size, mime_type,
-                  cloudinary_public_id, cloudinary_url,
-                  uploaded_by_user_id, uploaded_by_role)
+              `INSERT INTO additional_milestone_attachments (additional_milestone_id, file_name, file_size, mime_type, cloudinary_public_id, cloudinary_url, uploaded_by_user_id, uploaded_by_role)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-              [
-                additionalId,
-                file.originalname, file.size, file.mimetype,
-                cdResult.public_id, cdResult.secure_url,
-                req.user.user_id, req.user.role,
-              ]
+              [additionalId, file.originalname, file.size, file.mimetype, cdResult.public_id, cdResult.secure_url, req.user.user_id, req.user.role]
             );
-          } catch (cdErr) {
-            console.error('[save-extension] Cloudinary upload failed for additional milestone', additionalId, cdErr);
-          }
+          } catch (cdErr) { console.error('[save-extension] Cloudinary upload failed for additional milestone', additionalId, cdErr); }
         }
       }
     }
-
     await client.query('COMMIT');
-
-    res.json({
-      success: true,
-      extension: {
-        id:                 extensionId,
-        extensionDays,
-        newPlannedFinish,
-        reason,
-        extensionType,
-        status:             'pending',
-        newMilestonesAdded: insertedAdditional.length,
-      },
-    });
+    res.json({ success: true, extension: { id: extensionId, extensionDays, newPlannedFinish, reason, extensionType, status: 'pending', newMilestonesAdded: insertedAdditional.length } });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('[POST /api/save-extension]', err);
@@ -2412,33 +1872,17 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
   }
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  MILESTONE PHOTOS
-//  GET    /api/milestone-photos?milestoneId=<uuid>
-//  GET    /api/milestone-photos?additionalMilestoneId=<uuid>
-//  POST   /api/milestone-photos   (multipart field "photos", up to 10)
-//  DELETE /api/milestone-photos/:id
-//
-//  milestone_photos:
-//    project_id          → INTEGER  (REFERENCES projects.id SERIAL)
-//    uploaded_by_user_id → INTEGER  (no FK — multi-role system)
-//    milestone_id / additional_milestone_id → UUID
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
   const { milestoneId, additionalMilestoneId } = req.query;
-  if (!milestoneId && !additionalMilestoneId) {
-    return res.status(400).json({ error: 'milestoneId or additionalMilestoneId is required' });
-  }
+  if (!milestoneId && !additionalMilestoneId) return res.status(400).json({ error: 'milestoneId or additionalMilestoneId is required' });
   try {
     const col = milestoneId ? 'milestone_id' : 'additional_milestone_id';
     const val = milestoneId ?? additionalMilestoneId;
     const { rows } = await pool.query(
-      `SELECT id, file_name, file_size, mime_type,
-              cloudinary_url, uploaded_at
-       FROM milestone_photos
-       WHERE ${col} = $1
-       ORDER BY uploaded_at ASC`,
+      `SELECT id, file_name, file_size, mime_type, cloudinary_url, uploaded_at FROM milestone_photos WHERE ${col} = $1 ORDER BY uploaded_at ASC`,
       [val]
     );
     res.json({ photos: rows });
@@ -2451,49 +1895,30 @@ app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
 app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos', 10), async (req, res) => {
   const { milestoneId, additionalMilestoneId } = req.body;
   const projectId = parseInt(req.body.projectId, 10);   // INTEGER
-
-  if (!projectId)
-    return res.status(400).json({ error: 'projectId is required' });
-  if (!milestoneId && !additionalMilestoneId)
-    return res.status(400).json({ error: 'milestoneId or additionalMilestoneId is required' });
-  if (!req.files || req.files.length === 0)
-    return res.status(400).json({ error: 'No files uploaded' });
-
+  if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+  if (!milestoneId && !additionalMilestoneId) return res.status(400).json({ error: 'milestoneId or additionalMilestoneId is required' });
+  if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
   const col    = milestoneId ? 'milestone_id' : 'additional_milestone_id';
   const val    = milestoneId ?? additionalMilestoneId;
   const folder = milestoneId
     ? `oneprojectapp/schedules/${projectId}/milestone-photos`
     : `oneprojectapp/schedules/${projectId}/additional-photos`;
-
   const inserted = [];
   try {
     for (const file of req.files) {
       const cdResult = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
-          {
-            folder,
-            resource_type: 'image',
-            public_id: `${Date.now()}_${file.originalname.replace(/\s+/g, '-')}`,
-          },
+          { folder, resource_type: 'image', public_id: `${Date.now()}_${file.originalname.replace(/\s+/g, '-')}` },
           (err, result) => (err ? reject(err) : resolve(result))
         );
         Readable.from(file.buffer).pipe(stream);
       });
-
       // project_id → INTEGER, uploaded_by_user_id → INTEGER (no FK)
       const { rows } = await pool.query(
-        `INSERT INTO milestone_photos
-           (${col}, project_id, file_name, file_size, mime_type,
-            cloudinary_public_id, cloudinary_url,
-            uploaded_by_user_id, uploaded_by_role)
+        `INSERT INTO milestone_photos (${col}, project_id, file_name, file_size, mime_type, cloudinary_public_id, cloudinary_url, uploaded_by_user_id, uploaded_by_role)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          RETURNING id, file_name, cloudinary_url, uploaded_at`,
-        [
-          val, projectId,
-          file.originalname, file.size, file.mimetype,
-          cdResult.public_id, cdResult.secure_url,
-          req.user.user_id, req.user.role,
-        ]
+        [val, projectId, file.originalname, file.size, file.mimetype, cdResult.public_id, cdResult.secure_url, req.user.user_id, req.user.role]
       );
       inserted.push(rows[0]);
     }
@@ -2512,18 +1937,13 @@ app.delete('/api/milestone-photos/:id', authenticateToken, async (req, res) => {
       [id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Photo not found' });
-
-    // Both are INTEGER — direct compare, no String() coercion needed
+    // Both INTEGER — direct compare, no String() coercion
     if (rows[0].uploaded_by_user_id !== req.user.user_id) {
       return res.status(403).json({ error: 'Only the uploader can delete this photo' });
     }
-
     try {
       await cloudinary.uploader.destroy(rows[0].cloudinary_public_id, { resource_type: 'image' });
-    } catch (cdErr) {
-      console.error('[DELETE /api/milestone-photos] Cloudinary destroy error (non-fatal):', cdErr);
-    }
-
+    } catch (cdErr) { console.error('[DELETE /api/milestone-photos] Cloudinary destroy error (non-fatal):', cdErr); }
     await pool.query('DELETE FROM milestone_photos WHERE id = $1', [id]);
     res.json({ success: true });
   } catch (err) {
