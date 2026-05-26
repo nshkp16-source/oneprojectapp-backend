@@ -41,7 +41,6 @@ const upload = multer({
   },
 });
 
-// Images-only multer for milestone photos — defined here so all routes can use it
 const photoUpload = multer({
   limits:     { fileSize: 10 * 1024 * 1024 },
   storage:    multer.memoryStorage(),
@@ -80,7 +79,7 @@ function authenticateToken(req, res, next) {
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) return res.status(403).json({ error: 'Invalid or expired token' });
     req.user = {
-      user_id: parseInt(decoded.sub, 10),   // INTEGER — matches SERIAL ids in all role tables
+      user_id: parseInt(decoded.sub, 10),
       role:    decoded.role,
       email:   decoded.companyEmail || decoded.email,
     };
@@ -928,11 +927,9 @@ async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
-
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
     if (!projectId || !title) return res.status(400).json({ success: false, message: 'projectId and title are required.' });
-
     const memberCheck = await pool.query(
       `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
        UNION ALL
@@ -943,7 +940,6 @@ async function handleAddRecord(req, res) {
     if (!memberCheck.rows.length) {
       return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
     }
-
     let filePath = null, attachmentId = null;
     if (req.file) {
       try {
@@ -960,10 +956,8 @@ async function handleAddRecord(req, res) {
         return res.status(500).json({ success: false, message: 'File upload failed.' });
       }
     }
-
     const resolvedKind = recordKind || (noticeTiedId ? 'notice' : 'new');
     const noticeTied   = noticeTiedId ? Number(noticeTiedId) : null;
-
     if (noticeTied) {
       const parentCheck = await pool.query(
         `SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`,
@@ -973,7 +967,6 @@ async function handleAddRecord(req, res) {
         return res.status(400).json({ success: false, message: 'The parent record this notice is tied to no longer exists.' });
       }
     }
-
     const dbClient = await pool.connect();
     try {
       await dbClient.query('BEGIN');
@@ -1054,9 +1047,8 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ...r,
         is_decision_maker: isDecisionMaker(r.reviewer_role),
       }));
-      const uploaderSide = getSide(rec.uploader_role);
-      const isUploader   = String(rec.uploaded_by) === String(userId)
-                        && getSide(rec.uploader_role) === getSide(userRole);
+      const isUploader = String(rec.uploaded_by) === String(userId)
+                      && getSide(rec.uploader_role) === getSide(userRole);
       let isViewed = isUploader;
       if (!isUploader) {
         const { rows: viewed } = await pool.query(
@@ -1071,9 +1063,10 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       const myReview    = myReviewRow
         ? { action: myReviewRow.action, comment: myReviewRow.comment || '' }
         : {};
-      const step2SideMap = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
-      const step2Side = step2SideMap[uploaderSide];
-      const isLocked  =
+      const uploaderSide  = getSide(rec.uploader_role);
+      const step2SideMap  = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
+      const step2Side     = step2SideMap[uploaderSide];
+      const isLocked      =
         rec.status === 'approved_record' ||
         annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
       const stepMap = {
@@ -1527,7 +1520,6 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // created_by_user_id → INTEGER (no FK)
     const schedRes = await client.query(
       `INSERT INTO project_schedules (project_id, planned_start, planned_finish, total_duration, created_by_user_id, created_by_role)
        VALUES ($1, $2, $3, $4, $5, $6)
@@ -1555,7 +1547,6 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       const w     = totalDur > 0 ? (dur / totalDur) * 100 : 0;
       const depId = ms.dep && ms.dep !== 'None' && tempToReal[ms.dep] ? tempToReal[ms.dep] : null;
       if (newIds.has(ms.id)) {
-        // project_id → INTEGER, created_by_user_id → INTEGER (no FK)
         const ins = await client.query(
           `INSERT INTO milestones (schedule_id, project_id, title, description, sort_order, planned_start, planned_end, duration_days, float_days, is_critical, weight_pct, quantity, unit, depends_on, created_by_user_id, created_by_role)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
@@ -1575,7 +1566,6 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
         await client.query('UPDATE milestones SET sort_order = $1 WHERE id = $2 AND schedule_id = $3', [i, ms.id, schedId]);
       }
     }
-    // uploaded_by_user_id → INTEGER (no FK)
     for (const { realId, tempId } of needsAttachment) {
       const file = fileMap[tempId];
       if (!file) continue;
@@ -1644,14 +1634,13 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
     if (!msRes.rows.length) return res.status(404).json({ error: 'Milestone not found' });
     const ms = msRes.rows[0];
     if (ms.activity_status === 'completed') return res.status(409).json({ error: 'Milestone is already completed' });
-    const planned = parseFloat(ms.quantity) || 0;
-    const prevExec = parseFloat(ms.executed) || 0;
+    const planned    = parseFloat(ms.quantity) || 0;
+    const prevExec   = parseFloat(ms.executed) || 0;
     const newExecuted = prevExec + qty;
     if (planned > 0 && newExecuted > planned) {
       return res.status(422).json({ error: `Cannot exceed planned quantity of ${planned} ${ms.unit || ''}. Remaining: ${(planned - prevExec).toFixed(3)}` });
     }
     const newPct = planned > 0 ? Math.min(100, (newExecuted / planned) * 100) : 0;
-    // reported_by_user_id → INTEGER (no FK)
     const entryRes = await client.query(
       `INSERT INTO milestone_progress_entries (milestone_id, project_id, report_date, qty_executed, cumulative_after_entry, progress_pct_after_entry, remarks, reported_by_user_id, reported_by_role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -1712,14 +1701,13 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
     if (!msRes.rows.length) return res.status(404).json({ error: 'Additional milestone not found' });
     const ms = msRes.rows[0];
     if (ms.activity_status === 'completed') return res.status(409).json({ error: 'Milestone is already completed' });
-    const planned = parseFloat(ms.quantity) || 0;
-    const prevExec = parseFloat(ms.executed) || 0;
+    const planned    = parseFloat(ms.quantity) || 0;
+    const prevExec   = parseFloat(ms.executed) || 0;
     const newExecuted = prevExec + qty;
     if (planned > 0 && newExecuted > planned) {
       return res.status(422).json({ error: `Cannot exceed planned quantity. Remaining: ${(planned - prevExec).toFixed(3)} ${ms.unit || ''}` });
     }
     const newPct = planned > 0 ? Math.min(100, (newExecuted / planned) * 100) : 0;
-    // reported_by_user_id → INTEGER (no FK)
     const entryRes = await client.query(
       `INSERT INTO additional_milestone_progress_entries (additional_milestone_id, project_id, report_date, qty_executed, cumulative_after_entry, progress_pct_after_entry, remarks, reported_by_user_id, reported_by_role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -1825,7 +1813,6 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
     const schedRes = await client.query('SELECT id, planned_finish FROM project_schedules WHERE project_id = $1 LIMIT 1', [projectId]);
     if (!schedRes.rows.length) return res.status(404).json({ error: 'No schedule found for this project' });
     const scheduleId = schedRes.rows[0].id;
-    // requested_by_user_id → INTEGER (no FK)
     const extRes = await client.query(
       `INSERT INTO schedule_extensions (schedule_id, project_id, extension_days, new_planned_finish, reason, extension_type, requested_by_user_id, requested_by_role)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
@@ -1840,7 +1827,6 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
         const dur    = Math.max(1, daysBetween(ms.planned_start, ms.planned_end));
         const floatD = Math.max(0, Math.round((new Date(newPlannedFinish) - new Date(ms.planned_end)) / 86400000));
         const depBaselineId = ms.depends_on_baseline && ms.depends_on_baseline !== 'None' ? ms.depends_on_baseline : null;
-        // project_id → INTEGER, added_by_user_id → INTEGER (no FK)
         const amRes = await client.query(
           `INSERT INTO additional_milestones (schedule_id, project_id, schedule_extension_id, title, description, sort_order, planned_start, planned_end, duration_days, float_days, is_critical, weight_pct, quantity, unit, depends_on_baseline, added_by_user_id, added_by_role)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING id`,
@@ -1894,7 +1880,7 @@ app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
 
 app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos', 10), async (req, res) => {
   const { milestoneId, additionalMilestoneId } = req.body;
-  const projectId = parseInt(req.body.projectId, 10);   // INTEGER
+  const projectId = parseInt(req.body.projectId, 10);
   if (!projectId) return res.status(400).json({ error: 'projectId is required' });
   if (!milestoneId && !additionalMilestoneId) return res.status(400).json({ error: 'milestoneId or additionalMilestoneId is required' });
   if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
@@ -1913,7 +1899,6 @@ app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',
         );
         Readable.from(file.buffer).pipe(stream);
       });
-      // project_id → INTEGER, uploaded_by_user_id → INTEGER (no FK)
       const { rows } = await pool.query(
         `INSERT INTO milestone_photos (${col}, project_id, file_name, file_size, mime_type, cloudinary_public_id, cloudinary_url, uploaded_by_user_id, uploaded_by_role)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -1937,7 +1922,6 @@ app.delete('/api/milestone-photos/:id', authenticateToken, async (req, res) => {
       [id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Photo not found' });
-    // Both INTEGER — direct compare, no String() coercion
     if (rows[0].uploaded_by_user_id !== req.user.user_id) {
       return res.status(403).json({ error: 'Only the uploader can delete this photo' });
     }
@@ -1949,6 +1933,170 @@ app.delete('/api/milestone-photos/:id', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('[DELETE /api/milestone-photos/:id]', err);
     res.status(500).json({ error: 'Failed to delete photo' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GET /api/project-summary
+//  Single-call endpoint for the summary panel
+//  Returns: timeline, progress stats, per-milestone chart data, all photos
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/project-summary', authenticateToken, async (req, res) => {
+  const projectId = parseInt(req.query.projectId, 10);
+  if (!projectId) return res.status(400).json({ error: 'Valid integer projectId is required' });
+
+  try {
+    // ── 1. Schedule ──
+    const schedRow = await pool.query(
+      'SELECT id, planned_start, planned_finish, total_duration FROM project_schedules WHERE project_id = $1 LIMIT 1',
+      [projectId]
+    );
+    if (!schedRow.rows.length) {
+      return res.json({ hasSchedule: false, milestones: [], photos: [], timeline: null });
+    }
+    const sched = schedRow.rows[0];
+
+    // ── 2. Baseline milestones ──
+    const msRows = await pool.query(
+      `SELECT
+         m.id, m.title, m.planned_start AS start, m.planned_end AS end,
+         m.quantity, m.unit, m.weight_pct, m.float_days, m.is_critical,
+         m.executed, m.progress_pct, m.activity_status, m.completed_at,
+         m.depends_on AS dep
+       FROM milestones m
+       WHERE m.schedule_id = $1
+       ORDER BY m.sort_order`,
+      [sched.id]
+    );
+
+    // ── 3. Extension milestones ──
+    const amRows = await pool.query(
+      `SELECT
+         am.id, am.title, am.planned_start AS start, am.planned_end AS end,
+         am.quantity, am.unit, am.weight_pct, am.float_days, am.is_critical,
+         am.executed, am.progress_pct, am.activity_status, am.completed_at,
+         am.depends_on_baseline AS dep,
+         true AS is_extension
+       FROM additional_milestones am
+       WHERE am.schedule_id = $1
+       ORDER BY am.sort_order`,
+      [sched.id]
+    );
+
+    const allMilestones = [
+      ...msRows.rows.map(m => ({ ...m, is_extension: false })),
+      ...amRows.rows.map(m => ({ ...m, is_extension: true  })),
+    ];
+
+    // ── 4. Overall progress (weight-aware) ──
+    const totalWeight = allMilestones.reduce((s, m) => s + Number(m.weight_pct || 0), 0);
+    const overallPct  = allMilestones.length === 0 ? 0
+      : totalWeight > 0
+        ? allMilestones.reduce((s, m) => s + Number(m.weight_pct || 0) * Number(m.progress_pct || 0), 0) / totalWeight
+        : allMilestones.reduce((s, m) => s + Number(m.progress_pct || 0), 0) / allMilestones.length;
+
+    // ── 5. Planned % today ──
+    const today      = new Date(); today.setHours(0, 0, 0, 0);
+    const projStart  = new Date(sched.planned_start);
+    const projFinish = new Date(sched.planned_finish);
+    const elapsed    = Math.max(0, (today - projStart) / 86400000);
+    const totalDays  = Math.max(1, (projFinish - projStart) / 86400000);
+    const plannedPct = Math.min(100, (elapsed / totalDays) * 100);
+    const variance   = parseFloat((overallPct - plannedPct).toFixed(2));
+
+    // ── 6. Last completed milestone ──
+    const completed     = allMilestones.filter(m => m.activity_status === 'completed');
+    const lastCompleted = completed.length ? completed[completed.length - 1].title : null;
+
+    // ── 7. Per-milestone chart data (max 7) ──
+    const chartMilestones = allMilestones.slice(0, 7).map(ms => {
+      const msStart = new Date(ms.start);
+      const msEnd   = new Date(ms.end);
+      let msPlanPct = 0;
+      if (today >= msEnd)        msPlanPct = 100;
+      else if (today > msStart)  msPlanPct = Math.min(100, ((today - msStart) / Math.max(1, msEnd - msStart)) * 100);
+      return {
+        id:              ms.id,
+        title:           ms.title,
+        start:           ms.start,
+        end:             ms.end,
+        planned_pct:     parseFloat(msPlanPct.toFixed(2)),
+        actual_pct:      parseFloat(Number(ms.progress_pct || 0).toFixed(2)),
+        activity_status: ms.activity_status,
+        weight_pct:      ms.weight_pct,
+        is_extension:    ms.is_extension,
+      };
+    });
+
+    // ── 8. All photos — bulk queries ──
+    const msIds = msRows.rows.map(m => m.id);
+    const amIds = amRows.rows.map(m => m.id);
+    let photos  = [];
+
+    if (msIds.length > 0) {
+      const placeholders = msIds.map((_, i) => `$${i + 1}`).join(', ');
+      const photoRes = await pool.query(
+        `SELECT
+           mp.id, mp.file_name, mp.cloudinary_url, mp.uploaded_at,
+           m.title AS ms_title
+         FROM milestone_photos mp
+         JOIN milestones m ON m.id = mp.milestone_id
+         WHERE mp.milestone_id IN (${placeholders})
+         ORDER BY mp.uploaded_at ASC`,
+        msIds
+      );
+      photos = photos.concat(photoRes.rows.map(p => ({ ...p, is_extension: false })));
+    }
+
+    if (amIds.length > 0) {
+      const placeholders = amIds.map((_, i) => `$${i + 1}`).join(', ');
+      const amPhotoRes = await pool.query(
+        `SELECT
+           mp.id, mp.file_name, mp.cloudinary_url, mp.uploaded_at,
+           am.title AS ms_title
+         FROM milestone_photos mp
+         JOIN additional_milestones am ON am.id = mp.additional_milestone_id
+         WHERE mp.additional_milestone_id IN (${placeholders})
+         ORDER BY mp.uploaded_at ASC`,
+        amIds
+      );
+      photos = photos.concat(amPhotoRes.rows.map(p => ({ ...p, is_extension: true })));
+    }
+
+    // ── 9. Latest approved extension ──
+    const extRow = await pool.query(
+      `SELECT extension_days, new_planned_finish, status
+       FROM schedule_extensions
+       WHERE schedule_id = $1 AND status = 'approved'
+       ORDER BY created_at DESC LIMIT 1`,
+      [sched.id]
+    );
+    const latestExtension = extRow.rows[0] || null;
+
+    res.json({
+      hasSchedule: true,
+      timeline: {
+        start:          sched.planned_start,
+        finish:         sched.planned_finish,
+        duration:       sched.total_duration,
+        current_finish: latestExtension ? latestExtension.new_planned_finish : sched.planned_finish,
+      },
+      progress: {
+        overall_pct:       parseFloat(overallPct.toFixed(2)),
+        planned_pct:       parseFloat(plannedPct.toFixed(2)),
+        variance_pct:      variance,
+        last_completed:    lastCompleted,
+        total_milestones:  allMilestones.length,
+        completed_count:   completed.length,
+        in_progress_count: allMilestones.filter(m => m.activity_status === 'in_progress').length,
+      },
+      chart_milestones: chartMilestones,
+      photos,
+    });
+
+  } catch (err) {
+    console.error('[GET /api/project-summary]', err);
+    res.status(500).json({ error: 'Failed to load project summary' });
   }
 });
 
