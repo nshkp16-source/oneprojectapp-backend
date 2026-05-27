@@ -542,390 +542,109 @@ setInterval(async () => {
 }, 3*60*1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FETCH TAB RECORDS
+//  PROFILE ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
-  const { projectId, recordType } = req.body;
-  const table = resolveTable(recordType);
-  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-  const userId   = req.user.user_id;
-  const userRole = req.user.role;
-  const userSide = getSide(userRole);
-  const userIsDM = isDecisionMaker(userRole);
-  try {
-    const { rows: records } = await pool.query(
-      `SELECT r.id, r.title, r.description, r.file_path,
-              r.issued_date, r.role AS uploader_role,
-              r.uploaded_by, r.status, r.record_kind, r.notice_tied_id
-       FROM ${table} r
-       WHERE r.project_id = $1
-       ORDER BY r.issued_date DESC`,
-      [projectId]
-    );
-    const enriched = await Promise.all(records.map(async rec => {
-      const { rows: reviews } = await pool.query(
-        `SELECT dr.reviewer_id, dr.reviewer_role, dr.action, dr.action_date,
-                dr.comment, dr.reviewer_email, dr.reviewer_position
-         FROM document_reviews dr
-         WHERE dr.record_type = $1 AND dr.record_id = $2
-         ORDER BY dr.action_date ASC`,
-        [table, rec.id]
-      );
-      const annotatedReviews = reviews.map(r => ({
-        ...r,
-        is_decision_maker: isDecisionMaker(r.reviewer_role),
-      }));
-      const isUploader = String(rec.uploaded_by) === String(userId)
-                      && getSide(rec.uploader_role) === getSide(userRole);
-      let isViewed = isUploader;
-      if (!isUploader) {
-        // FIX 1: also check reviewer_role so a user with multiple roles
-        // doesn't get falsely marked as viewed from a different role's row
-        const { rows: viewed } = await pool.query(
-          `SELECT 1 FROM document_reviews
-           WHERE record_type = $1 AND record_id = $2
-             AND reviewer_id = $3 AND reviewer_role = $4 LIMIT 1`,
-          [table, rec.id, userId, userRole]
-        );
-        isViewed = viewed.length > 0;
-      }
-      const myReviewRow = reviews.find(r => String(r.reviewer_id) === String(userId)
-                                         && getSide(r.reviewer_role) === getSide(userRole));
-      const myReview    = myReviewRow
-        ? { action: myReviewRow.action, comment: myReviewRow.comment || '' }
-        : {};
-      const uploaderSide  = getSide(rec.uploader_role);
-      const step2SideMap  = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
-      const step2Side     = step2SideMap[uploaderSide];
-      const isLocked      =
-        rec.status === 'approved_record' ||
-        annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
-      const stepMap = {
-        contractor: [
-          { side: 'consultant', step: 1, label: 'Consultant Approval', action: 'approved' },
-          { side: 'client',     step: 2, label: 'Client Acceptance',   action: 'accepted' },
-        ],
-        consultant: [
-          { side: 'client',     step: 1, label: 'Client Approval',      action: 'approved' },
-          { side: 'contractor', step: 2, label: 'Contractor Acceptance', action: 'accepted' },
-        ],
-        client: [
-          { side: 'consultant', step: 1, label: 'Consultant Approval',   action: 'approved' },
-          { side: 'contractor', step: 2, label: 'Contractor Acceptance', action: 'accepted' },
-        ],
-      };
-      const steps = uploaderSide ? stepMap[uploaderSide] : null;
-      const workflowSteps = steps
-        ? steps.map(s => {
-            const doneReview     = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
-            const rejectedReview = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && r.action === 'rejected');
-            let status;
-            if (isLocked)            status = 'locked';
-            else if (doneReview)     status = 'done';
-            else if (rejectedReview) status = 'rejected';
-            else                     status = 'pending';
-            return { label: s.label, status };
-          })
-        : [];
-      let btnState = 'none', pendingRole = null, approveLabel = null;
-      if (isUploader) {
-        btnState = 'uploader';
-      } else if (isLocked) {
-        btnState = 'locked';
-      } else if (!userIsDM) {
-        btnState = 'team_member';
-      } else if (userSide === uploaderSide) {
-        btnState = 'none';
+function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,assignmentTable,assignmentFk,isClientRole,extraProfileFields}) {
+  app.get(`${routePrefix}/profile`, authenticateToken, async (req, res) => {
+    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    try {
+      const fields=['email','profile_picture',...(extraProfileFields||[])].join(',');
+      const result=await pool.query(`SELECT ${fields} FROM ${dbTable} WHERE id=$1 AND ${emailCol}=$2`,[req.user.user_id,req.user.email]);
+      if (!result.rows.length) return res.status(404).json({error:`${jwtRole} not found`});
+      res.json({...result.rows[0],role:jwtRole});
+    } catch(err){console.error(`Fetch ${jwtRole} profile error:`,err);res.status(500).json({error:'Failed to fetch profile'});}
+  });
+
+  app.post(`${routePrefix}/upload-picture`, authenticateToken, upload.single('profile_picture'), async (req, res) => {
+    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    try {
+      if (!req.file) return res.status(400).json({error:'No file uploaded or file too large.'});
+      if (!req.file.mimetype.startsWith('image/')) return res.status(400).json({error:'Only image files allowed.'});
+      const cdResult=await uploadToCloudinary(req.file.buffer,cloudFolder,'image');
+      await pool.query(`UPDATE ${dbTable} SET profile_picture=$1,profile_picture_id=$2 WHERE id=$3 AND ${emailCol}=$4`,[cdResult.secure_url,cdResult.public_id,req.user.user_id,req.user.email]);
+      res.json({success:true,url:cdResult.secure_url});
+    } catch(err){console.error(`Upload ${jwtRole} picture error:`,err);res.status(500).json({error:'Failed to upload picture'});}
+  });
+
+  app.post(`${routePrefix}/delete-picture`, authenticateToken, async (req, res) => {
+    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    try {
+      const result=await pool.query(`SELECT profile_picture_id FROM ${dbTable} WHERE id=$1 AND ${emailCol}=$2`,[req.user.user_id,req.user.email]);
+      if (result.rows.length>0&&result.rows[0].profile_picture_id) await cloudinary.uploader.destroy(result.rows[0].profile_picture_id);
+      await pool.query(`UPDATE ${dbTable} SET profile_picture=NULL,profile_picture_id=NULL WHERE id=$1 AND ${emailCol}=$2`,[req.user.user_id,req.user.email]);
+      res.json({success:true});
+    } catch(err){console.error(`Delete ${jwtRole} picture error:`,err);res.status(500).json({error:'Failed to delete picture'});}
+  });
+
+  app.post(`${routePrefix}/projects`, authenticateToken, async (req, res) => {
+    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    try {
+      let rows;
+      if (isClientRole) {
+        const r=await pool.query('SELECT id,name,location,contract_reference,created_at FROM projects WHERE client_id=$1',[req.user.user_id]);
+        rows=r.rows;
       } else {
-        const workflowActions = ['approved', 'accepted', 'rejected'];
-        const alreadyActed    = myReviewRow && workflowActions.includes(myReviewRow.action);
-        if (alreadyActed) {
-          btnState = 'acted';
-        } else if (steps) {
-          const myStep = steps.find(s => s.side === userSide);
-          if (!myStep) {
-            btnState = 'none';
-          } else if (myStep.step === 2) {
-            const step1     = steps.find(s => s.step === 1);
-            const step1Done = annotatedReviews.some(r => getSide(r.reviewer_role) === step1.side && (r.action === 'approved' || r.action === 'accepted'));
-            if (!step1Done) {
-              btnState = 'awaiting'; pendingRole = step1.side;
-            } else {
-              btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
-            }
-          } else {
-            btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
-          }
-        }
+        const r=await pool.query(`SELECT p.id,p.name,p.location,p.contract_reference,p.created_at FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1`,[req.user.user_id]);
+        rows=r.rows;
       }
-      const { rows: myNotices } = await pool.query(
-        `SELECT id, title FROM ${table}
-         WHERE notice_tied_id = $1 AND project_id = $2 AND uploaded_by = $3 AND role = $4`,
-        [rec.id, projectId, userId, userRole]
-      );
-      const myIssuedNotice = myNotices.length > 0 ? myNotices[0] : null;
-      let tiedRecordTitle = null;
-      if (rec.notice_tied_id) {
-        const { rows: tied } = await pool.query(`SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]);
-        tiedRecordTitle = tied[0]?.title || null;
-      }
-      return {
-        ...rec,
-        reviews:           annotatedReviews,
-        is_uploader:       isUploader,
-        is_viewed:         isViewed,
-        is_locked:         isLocked,
-        is_decision_maker: userIsDM,
-        btn_state:         btnState,
-        pending_role:      pendingRole,
-        approve_label:     approveLabel,
-        my_review:         myReview,
-        workflow_steps:    workflowSteps,
-        my_issued_notice:  myIssuedNotice,
-        tied_record_title: tiedRecordTitle,
-      };
-    }));
-    res.json({ records: enriched });
-  } catch (err) {
-    console.error('Fetch tab records error:', err);
-    res.status(500).json({ error: 'Failed to fetch records.' });
-  }
-});
+      res.json({projects:rows});
+    } catch(err){console.error(`Fetch ${jwtRole} projects error:`,err);res.status(500).json({error:'Failed to fetch projects'});}
+  });
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MARK RECORD VIEWED
-// ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
-  const { recordId, projectId, recordType } = req.body;
-  const reviewerId   = req.user.user_id;
-  const reviewerRole = req.user.role;
-  const table = resolveTable(recordType);
-  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-  try {
-    const { rows: rec } = await pool.query(
-      `SELECT uploaded_by, role FROM ${table} WHERE id = $1 AND project_id = $2`,
-      [recordId, projectId]
-    );
-    if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
-    if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) {
-      return res.json({ success: true, skipped: true });
-    }
-    const assignRow = await pool.query(
-      `SELECT av.role_email AS email, av.position FROM assignments_view av
-       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3 LIMIT 1`,
-      [projectId, reviewerId, reviewerRole]
-    );
-    const reviewerEmail    = assignRow.rows[0]?.email    || null;
-    const reviewerPosition = assignRow.rows[0]?.position || null;
-    await pool.query(
-      `INSERT INTO document_reviews
-         (record_type, record_id, record_kind, reviewer_id, reviewer_role,
-          reviewer_email, reviewer_position, action)
-       VALUES ($1, $2, 'new', $3, $4, $5, $6, 'no_action')
-       ON CONFLICT (record_type, record_id, reviewer_id) DO NOTHING`,
-      [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Mark viewed error:', err);
-    res.status(500).json({ error: 'Failed to mark as viewed.' });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  REVIEW RECORD
-// ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/review-record', authenticateToken, async (req, res) => {
-  const { projectId, recordId, recordType, action, comment, actorType } = req.body;
-  const reviewerId   = req.user.user_id;
-  const reviewerRole = req.user.role;
-  const table = resolveTable(recordType);
-  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-  const workflowActions      = ['approved', 'accepted', 'rejected'];
-  const isWorkflow           = workflowActions.includes(action);
-  // FIX 3: removed actorType bypass — role alone determines DM status,
-  // a team member can never perform workflow actions regardless of actorType
-  const isDecisionMakerActor = isDecisionMaker(reviewerRole);
-  if (!isWorkflow && action !== 'no_action') return res.status(400).json({ error: 'Invalid action.' });
-  if (isWorkflow && !isDecisionMakerActor) {
-    return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
-  }
-  try {
-    // FIX 2: added title to SELECT so notification message uses record title
-    const { rows: recRows } = await pool.query(
-      `SELECT id, role, uploaded_by, title FROM ${table} WHERE id = $1 AND project_id = $2`,
-      [recordId, projectId]
-    );
-    if (!recRows.length) return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
-    const rec = recRows[0];
-    if (String(rec.uploaded_by) === String(reviewerId) && getSide(rec.role) === getSide(reviewerRole)) {
-      return res.status(403).json({ error: 'You cannot review your own record.' });
-    }
-    const assignRow = await pool.query(
-      `SELECT av.role_email AS email, av.position FROM assignments_view av
-       WHERE av.project_id = $1 AND av.role_id = $2 AND av.role = $3 LIMIT 1`,
-      [projectId, reviewerId, reviewerRole]
-    );
-    const reviewerEmail    = assignRow.rows[0]?.email    || null;
-    const reviewerPosition = assignRow.rows[0]?.position || null;
-    const { rows: existing } = await pool.query(
-      `SELECT id, action FROM document_reviews
-       WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3 LIMIT 1`,
-      [table, recordId, reviewerId]
-    );
-    if (action === 'no_action' && comment?.trim()) {
-      if (existing.length > 0) {
-        await pool.query(
-          `UPDATE document_reviews SET comment = $1, action_date = NOW() WHERE id = $2`,
-          [comment.trim(), existing[0].id]
-        );
+  app.post(`${routePrefix}/project-details`, authenticateToken, async (req, res) => {
+    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    try {
+      const {projectId}=req.body;
+      let project;
+      if (isClientRole) {
+        const r=await pool.query('SELECT id,name,location,contract_reference,created_at FROM projects WHERE id=$1 AND client_id=$2',[projectId,req.user.user_id]);
+        if (!r.rows.length) return res.status(404).json({error:'Project not found or not owned by client'});
+        project=r.rows[0];
       } else {
-        await pool.query(
-          `INSERT INTO document_reviews
-             (record_type, record_id, record_kind, reviewer_id, reviewer_role,
-              reviewer_email, reviewer_position, action, comment)
-           VALUES ($1, $2, 'new', $3, $4, $5, $6, 'no_action', $7)`,
-          [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, comment.trim()]
-        );
+        const r=await pool.query(`SELECT p.id,p.name,p.location,p.contract_reference,p.created_at FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1 AND p.id=$2`,[req.user.user_id,projectId]);
+        if (!r.rows.length) return res.status(404).json({error:'Project not found or not assigned'});
+        project=r.rows[0];
       }
-      return res.json({ success: true, message: 'Comment saved.' });
-    }
-    if (existing.length > 0) {
-      if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
-        return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
-      }
-      await pool.query(
-        `UPDATE document_reviews
-         SET action = $1, action_date = NOW(), comment = COALESCE($2, comment)
-         WHERE id = $3`,
-        [action, comment?.trim() || null, existing[0].id]
-      );
-    } else {
-      await pool.query(
-        `INSERT INTO document_reviews
-           (record_type, record_id, record_kind, reviewer_id, reviewer_role,
-            reviewer_email, reviewer_position, action, comment)
-         VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8)`,
-        [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, action, comment?.trim() || null]
-      );
-    }
-    if (isDecisionMakerActor && isWorkflow) {
-      const uploaderSide = getSide(rec.role);
-      let newStatus;
-      if (action === 'rejected') {
-        newStatus = 'rejected';
-      } else if (action === 'accepted') {
-        newStatus = 'approved_record';
-      } else {
-        const step2StatusMap = {
-          contractor: 'pending_client_acceptance',
-          consultant: 'pending_contractor_acceptance',
-          client:     'pending_contractor_acceptance',
-        };
-        newStatus = step2StatusMap[uploaderSide] || 'pending_review';
-      }
-      await pool.query(
-        `UPDATE ${table} SET status = $1 WHERE id = $2 AND project_id = $3`,
-        [newStatus, recordId, projectId]
-      );
-      // FIX 2: use rec.title instead of rec.role in notification message
-      const notifMsg = `${reviewerRole} ${action} record "${rec.title}" #${recordId}`;
-      const dbClient = await pool.connect();
-      try {
-        await dbClient.query('BEGIN');
-        const notifRes = await dbClient.query(
-          `INSERT INTO notifications
-             (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-          [projectId, recordId, table, notifMsg, reviewerId, reviewerRole]
-        );
-        const notificationId = notifRes.rows[0].id;
-        const recipientIds   = await getProjectMemberUserIds(projectId, reviewerId);
-        if (recipientIds.length > 0) {
-          const vals = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
-          await dbClient.query(
-            `INSERT INTO notification_recipients (notification_id, user_id)
-             VALUES ${vals}
-             ON CONFLICT (notification_id, user_id) DO NOTHING`,
-            [notificationId, ...recipientIds]
-          );
-        }
-        await dbClient.query('COMMIT');
-      } catch (notifErr) {
-        await dbClient.query('ROLLBACK');
-        console.error('Notification insert error (non-fatal):', notifErr);
-      } finally {
-        dbClient.release();
-      }
-    }
-    res.json({ success: true, message: `Action '${action}' recorded successfully.` });
-  } catch (err) {
-    console.error('Review record error:', err);
-    res.status(500).json({ error: 'Failed to process review.' });
-  }
+      res.json({project});
+    } catch(err){console.error(`Fetch ${jwtRole} project-details error:`,err);res.status(500).json({error:'Failed to fetch project details'});}
+  });
+}
+
+buildProfileRoutes({routePrefix:'/client',jwtRole:'Client',dbTable:'clients',emailCol:'company_email',cloudFolder:'oneprojectapp/clients',isClientRole:true,extraProfileFields:['representative','title','telephone','company_name']});
+buildProfileRoutes({routePrefix:'/contractor',jwtRole:'Contractor',dbTable:'contractors',emailCol:'email',cloudFolder:'oneprojectapp/contractors',assignmentTable:'contractor_assignments',assignmentFk:'contractor_id'});
+buildProfileRoutes({routePrefix:'/consultant',jwtRole:'Consultant',dbTable:'consultants',emailCol:'email',cloudFolder:'oneprojectapp/consultants',assignmentTable:'consultant_assignments',assignmentFk:'consultant_id'});
+buildProfileRoutes({routePrefix:'/client-project-manager',jwtRole:'Client Project Manager',dbTable:'client_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/client_project_managers',assignmentTable:'client_pm_assignments',assignmentFk:'client_pm_id'});
+buildProfileRoutes({routePrefix:'/contractor-project-manager',jwtRole:'Contractor Project Manager',dbTable:'contractor_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/contractor_project_managers',assignmentTable:'contractor_pm_assignments',assignmentFk:'contractor_pm_id'});
+buildProfileRoutes({routePrefix:'/consultant-project-manager',jwtRole:'Consultant Project Manager',dbTable:'consultant_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/consultant_project_managers',assignmentTable:'consultant_pm_assignments',assignmentFk:'consultant_pm_id'});
+buildProfileRoutes({routePrefix:'/team-member',jwtRole:'Team Member',dbTable:'team_members',emailCol:'email',cloudFolder:'oneprojectapp/team_members',assignmentTable:'team_member_assignments',assignmentFk:'team_member_id'});
+
+// ─── Client legacy routes ──────────────────────────────────────────────────
+app.post('/client/check-email', async (req, res) => {
+  const {email}=req.body;
+  try {
+    const result=await pool.query('SELECT company_email FROM clients WHERE company_email=$1',[email]);
+    res.json({exists:result.rows.length>0});
+  } catch(err){console.error('Check email error:',err);res.status(500).json({error:'Server error'});}
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  DOWNLOAD FILE
-// ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/download-file', authenticateToken, async (req, res) => {
-  const { recordId, recordType } = req.query;
-  const table = resolveTable(recordType);
-  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+app.post('/client/login', async (req, res) => {
+  const {email,password}=req.body;
   try {
-    const { rows } = await pool.query(`SELECT file_path FROM ${table} WHERE id = $1`, [recordId]);
-    if (!rows.length || !rows[0].file_path) return res.status(404).json({ error: 'File not found.' });
-    const filePath = rows[0].file_path;
-    const fileName = filePath.split('/').pop() || 'download';
-    if (filePath.startsWith('http')) return res.json({ url: filePath, fileName });
-    res.status(404).json({ error: 'File not accessible.' });
-  } catch (err) {
-    console.error('Download file error:', err);
-    res.status(500).json({ error: 'Failed to download file.' });
-  }
+    const result=await pool.query('SELECT company_email,password_hash FROM clients WHERE company_email=$1',[email]);
+    if (!result.rows.length) return res.status(401).json({success:false,error:'Client not found.'});
+    const client=result.rows[0];
+    if (!await bcrypt.compare(password,client.password_hash)) return res.status(401).json({success:false,error:'Invalid password.'});
+    res.json({success:true,clientEmail:client.company_email});
+  } catch(err){console.error('Login error:',err);res.status(500).json({success:false,error:'Server error'});}
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  DELETE RECORD
-// ─────────────────────────────────────────────────────────────────────────────
-app.delete('/api/delete-record', authenticateToken, async (req, res) => {
-  const { projectId, recordId, recordType } = req.body;
-  const userId = req.user.user_id;
-  const table  = resolveTable(recordType);
-  if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+app.post('/client/profile-picture', async (req, res) => {
+  const {email}=req.body;
   try {
-    const { rows } = await pool.query(
-      `SELECT uploaded_by, role FROM ${table} WHERE id = $1 AND project_id = $2`,
-      [recordId, projectId]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Record not found.' });
-    if (String(rows[0].uploaded_by) !== String(userId) || getSide(rows[0].role) !== getSide(req.user.role)) {
-      return res.status(403).json({ error: 'Only the uploader can delete this record.' });
-    }
-    await pool.query(
-      `DELETE FROM notification_recipients
-       WHERE notification_id IN (
-         SELECT id FROM notifications WHERE entity_id = $1 AND entity_type = $2
-       )`,
-      [recordId, table]
-    );
-    await pool.query(
-      `DELETE FROM notifications WHERE entity_id = $1 AND entity_type = $2`,
-      [recordId, table]
-    );
-    await pool.query(
-      `DELETE FROM document_reviews WHERE record_type = $1 AND record_id = $2`,
-      [table, recordId]
-    );
-    await pool.query(
-      `DELETE FROM ${table} WHERE id = $1 AND project_id = $2`,
-      [recordId, projectId]
-    );
-    res.json({ success: true, message: 'Record deleted successfully.' });
-  } catch (err) {
-    console.error('Delete record error:', err);
-    res.status(500).json({ error: 'Failed to delete record.' });
-  }
+    const result=await pool.query('SELECT profile_picture FROM clients WHERE TRIM(LOWER(company_email))=TRIM(LOWER($1))',[email]);
+    if (!result.rows.length) return res.json({success:false,error:'Client not found.'});
+    res.json({success:true,profile_picture:result.rows[0].profile_picture||null});
+  } catch(err){console.error('Profile picture fetch error:',err);res.status(500).json({success:false,error:'Server error.'});}
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
