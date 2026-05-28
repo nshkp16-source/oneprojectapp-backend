@@ -1051,10 +1051,12 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
                       && getSide(rec.uploader_role) === getSide(userRole);
       let isViewed = isUploader;
       if (!isUploader) {
+        // ── FIX: scope viewed check by reviewer_role too ──
         const { rows: viewed } = await pool.query(
           `SELECT 1 FROM document_reviews
-           WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3 LIMIT 1`,
-          [table, rec.id, userId]
+           WHERE record_type = $1 AND record_id = $2
+           AND reviewer_id = $3 AND reviewer_role = $4 LIMIT 1`,
+          [table, rec.id, userId, userRole]
         );
         isViewed = viewed.length > 0;
       }
@@ -1186,12 +1188,13 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     );
     const reviewerEmail    = assignRow.rows[0]?.email    || null;
     const reviewerPosition = assignRow.rows[0]?.position || null;
+    // ── FIX: conflict target now includes reviewer_role ──
     await pool.query(
       `INSERT INTO document_reviews
          (record_type, record_id, record_kind, reviewer_id, reviewer_role,
           reviewer_email, reviewer_position, action)
        VALUES ($1, $2, 'new', $3, $4, $5, $6, 'no_action')
-       ON CONFLICT (record_type, record_id, reviewer_id) DO NOTHING`,
+       ON CONFLICT (record_type, record_id, reviewer_id, reviewer_role) DO NOTHING`,
       [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition]
     );
     res.json({ success: true });
@@ -1234,38 +1237,55 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     );
     const reviewerEmail    = assignRow.rows[0]?.email    || null;
     const reviewerPosition = assignRow.rows[0]?.position || null;
+
+    // ── FIX: scope existing-row lookup by reviewer_role so a user acting
+    //         in two different roles (e.g. Consultant then Contractor)
+    //         gets a separate row per role and is never falsely blocked ──
     const { rows: existing } = await pool.query(
       `SELECT id, action FROM document_reviews
-       WHERE record_type = $1 AND record_id = $2 AND reviewer_id = $3 LIMIT 1`,
-      [table, recordId, reviewerId]
+       WHERE record_type = $1 AND record_id = $2
+       AND reviewer_id = $3 AND reviewer_role = $4 LIMIT 1`,
+      [table, recordId, reviewerId, reviewerRole]
     );
+
     if (action === 'no_action' && comment?.trim()) {
       if (existing.length > 0) {
-        await pool.query(`UPDATE document_reviews SET comment = $1, action_date = NOW() WHERE id = $2`, [comment.trim(), existing[0].id]);
+        await pool.query(
+          `UPDATE document_reviews SET comment = $1, action_date = NOW() WHERE id = $2`,
+          [comment.trim(), existing[0].id]
+        );
       } else {
         await pool.query(
-          `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action, comment)
+          `INSERT INTO document_reviews
+             (record_type, record_id, record_kind, reviewer_id, reviewer_role,
+              reviewer_email, reviewer_position, action, comment)
            VALUES ($1, $2, 'new', $3, $4, $5, $6, 'no_action', $7)`,
           [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, comment.trim()]
         );
       }
       return res.json({ success: true, message: 'Comment saved.' });
     }
+
     if (existing.length > 0) {
       if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
         return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
       }
       await pool.query(
-        `UPDATE document_reviews SET action = $1, action_date = NOW(), comment = COALESCE($2, comment) WHERE id = $3`,
+        `UPDATE document_reviews
+         SET action = $1, action_date = NOW(), comment = COALESCE($2, comment)
+         WHERE id = $3`,
         [action, comment?.trim() || null, existing[0].id]
       );
     } else {
       await pool.query(
-        `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action, comment)
+        `INSERT INTO document_reviews
+           (record_type, record_id, record_kind, reviewer_id, reviewer_role,
+            reviewer_email, reviewer_position, action, comment)
          VALUES ($1, $2, 'new', $3, $4, $5, $6, $7, $8)`,
         [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, action, comment?.trim() || null]
       );
     }
+
     if (isDecisionMakerActor && isWorkflow) {
       const uploaderSide = getSide(rec.role);
       let newStatus;
@@ -1274,16 +1294,24 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       } else if (action === 'accepted') {
         newStatus = 'approved_record';
       } else {
-        const step2StatusMap = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' };
+        const step2StatusMap = {
+          contractor: 'pending_client_acceptance',
+          consultant: 'pending_contractor_acceptance',
+          client:     'pending_contractor_acceptance',
+        };
         newStatus = step2StatusMap[uploaderSide] || 'pending_review';
       }
-      await pool.query(`UPDATE ${table} SET status = $1 WHERE id = $2 AND project_id = $3`, [newStatus, recordId, projectId]);
+      await pool.query(
+        `UPDATE ${table} SET status = $1 WHERE id = $2 AND project_id = $3`,
+        [newStatus, recordId, projectId]
+      );
       const notifMsg = `${reviewerRole} ${action} record "${rec.role}" #${recordId}`;
       const dbClient = await pool.connect();
       try {
         await dbClient.query('BEGIN');
         const notifRes = await dbClient.query(
-          `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+          `INSERT INTO notifications
+             (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
            VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
           [projectId, recordId, table, notifMsg, reviewerId, reviewerRole]
         );
@@ -1292,7 +1320,9 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
         if (recipientIds.length > 0) {
           const vals = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
           await dbClient.query(
-            `INSERT INTO notification_recipients (notification_id, user_id) VALUES ${vals} ON CONFLICT (notification_id, user_id) DO NOTHING`,
+            `INSERT INTO notification_recipients (notification_id, user_id)
+             VALUES ${vals}
+             ON CONFLICT (notification_id, user_id) DO NOTHING`,
             [notificationId, ...recipientIds]
           );
         }
