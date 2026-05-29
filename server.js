@@ -362,7 +362,7 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
         (project_id, sender_role, sender_id, sender_email,
          recipient_role, recipient_id, recipient_email,
          is_group, content, attachment_url, attachment_name, delivered)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false)
        RETURNING *`,
       [projectId, normalizedSenderRole, req.user.user_id, req.user.email || '',
        isGroupChat ? null : normalizedRecipientRole,
