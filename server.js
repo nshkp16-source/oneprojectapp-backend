@@ -165,6 +165,188 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
   return [...ids];
 }
 
+async function getProjectMembers(projectId) {
+  const { rows } = await pool.query(`
+    SELECT 'Client' AS role, p.client_id AS role_id,
+           COALESCE(c.representative, c.company_name, c.company_email) AS display_name,
+           c.company_email AS email,
+           c.company_name, c.title, NULL::text AS position, c.profile_picture
+    FROM projects p
+    JOIN clients c ON p.client_id = c.id
+    WHERE p.id = $1
+    UNION ALL
+    SELECT 'Contractor' AS role, a.contractor_id AS role_id,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           c.email AS email,
+           a.company_name, a.title, a.position, c.profile_picture
+    FROM contractor_assignments a
+    JOIN contractors c ON a.contractor_id = c.id
+    WHERE a.project_id = $1
+    UNION ALL
+    SELECT 'Consultant' AS role, a.consultant_id AS role_id,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           c.email AS email,
+           a.company_name, a.title, a.position, c.profile_picture
+    FROM consultant_assignments a
+    JOIN consultants c ON a.consultant_id = c.id
+    WHERE a.project_id = $1
+    UNION ALL
+    SELECT 'Client Project Manager' AS role, a.client_pm_id AS role_id,
+           COALESCE(a.representative, c.email) AS display_name,
+           c.email AS email,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
+    FROM client_pm_assignments a
+    JOIN client_project_managers c ON a.client_pm_id = c.id
+    WHERE a.project_id = $1
+    UNION ALL
+    SELECT 'Contractor Project Manager' AS role, a.contractor_pm_id AS role_id,
+           COALESCE(a.representative, c.email) AS display_name,
+           c.email AS email,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
+    FROM contractor_pm_assignments a
+    JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
+    WHERE a.project_id = $1
+    UNION ALL
+    SELECT 'Consultant Project Manager' AS role, a.consultant_pm_id AS role_id,
+           COALESCE(a.representative, c.email) AS display_name,
+           c.email AS email,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
+    FROM consultant_pm_assignments a
+    JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
+    WHERE a.project_id = $1
+    UNION ALL
+    SELECT 'Team Member' AS role, a.team_member_id AS role_id,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           c.email AS email,
+           a.company_name, a.title, a.position, c.profile_picture
+    FROM team_member_assignments a
+    JOIN team_members c ON a.team_member_id = c.id
+    WHERE a.project_id = $1
+  `, [projectId]);
+  return rows.map(r => ({
+    ...r,
+    role_id: Number(r.role_id),
+    display_name: r.display_name || r.email || 'Unknown',
+  }));
+}
+
+async function userHasProjectAccess(userId, role, projectId) {
+  const projectCheck = {
+    Client:                        { table: 'projects',             idCol: 'client_id' },
+    Contractor:                    { table: 'contractor_assignments', idCol: 'contractor_id' },
+    Consultant:                    { table: 'consultant_assignments', idCol: 'consultant_id' },
+    'Client Project Manager':      { table: 'client_pm_assignments',      idCol: 'client_pm_id' },
+    'Contractor Project Manager':  { table: 'contractor_pm_assignments', idCol: 'contractor_pm_id' },
+    'Consultant Project Manager':  { table: 'consultant_pm_assignments', idCol: 'consultant_pm_id' },
+    'Team Member':                 { table: 'team_member_assignments', idCol: 'team_member_id' },
+  }[role];
+
+  if (!projectCheck) return false;
+  const query = projectCheck.table === 'projects'
+    ? `SELECT 1 FROM ${projectCheck.table} WHERE id=$1 AND ${projectCheck.idCol}=$2`
+    : `SELECT 1 FROM ${projectCheck.table} WHERE project_id=$1 AND ${projectCheck.idCol}=$2`;
+  const { rows } = await pool.query(query, [projectId, userId]);
+  return rows.length > 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CHAT ROUTES
+app.get('/chat/members', authenticateToken, async (req, res) => {
+  const { projectId } = req.query;
+  if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
+
+  const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+  if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
+
+  try {
+    const members = await getProjectMembers(projectId);
+    res.json({ success: true, members });
+  } catch (err) {
+    console.error('Chat members error:', err);
+    res.status(500).json({ success: false, error: 'Failed to load chat members' });
+  }
+});
+
+app.get('/chat/messages', authenticateToken, async (req, res) => {
+  const { projectId, recipientRole, recipientId, isGroup } = req.query;
+  if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
+
+  const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+  if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
+
+  try {
+    if (isGroup === 'true' || isGroup === '1') {
+      const { rows } = await pool.query(
+        `SELECT * FROM project_chat_messages WHERE project_id = $1 AND is_group = true ORDER BY created_at ASC`,
+        [projectId]
+      );
+      return res.json({ success: true, messages: rows });
+    }
+
+    if (!recipientRole || !recipientId) {
+      return res.status(400).json({ success: false, error: 'recipientRole and recipientId are required for direct chat' });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT * FROM project_chat_messages WHERE project_id = $1 AND is_group = false
+         AND ((sender_role = $2 AND sender_id = $3 AND recipient_role = $4 AND recipient_id = $5)
+              OR (sender_role = $4 AND sender_id = $5 AND recipient_role = $2 AND recipient_id = $3))
+       ORDER BY created_at ASC`,
+      [projectId, req.user.role, req.user.user_id, recipientRole, recipientId]
+    );
+    res.json({ success: true, messages: rows });
+  } catch (err) {
+    console.error('Chat messages error:', err);
+    res.status(500).json({ success: false, error: 'Failed to load chat messages' });
+  }
+});
+
+app.post('/chat/messages', authenticateToken, async (req, res) => {
+  const { projectId, recipientRole, recipientId, content, isGroup } = req.body;
+
+  if (!projectId || !content || typeof content !== 'string' || !content.trim()) {
+    return res.status(400).json({ success: false, error: 'projectId and non-empty content are required' });
+  }
+
+  const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+  if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
+
+  try {
+    const isGroupChat = isGroup === true || isGroup === 'true' || isGroup === 1 || isGroup === '1';
+    let recipientEmail = null;
+    if (!isGroupChat) {
+      if (!recipientRole || !recipientId) {
+        return res.status(400).json({ success: false, error: 'recipientRole and recipientId are required for direct chat' });
+      }
+      const members = await getProjectMembers(projectId);
+      const recipient = members.find(m => String(m.role) === String(recipientRole) && String(m.role_id) === String(recipientId));
+      if (!recipient) {
+        return res.status(400).json({ success: false, error: 'Recipient not found in project members' });
+      }
+      recipientEmail = recipient.email;
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO project_chat_messages
+         (project_id, sender_role, sender_id, sender_email,
+          recipient_role, recipient_id, recipient_email,
+          is_group, content)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING *`,
+      [projectId, req.user.role, req.user.user_id, req.user.email || '',
+       isGroupChat ? null : recipientRole,
+       isGroupChat ? null : recipientId,
+       isGroupChat ? null : recipientEmail,
+       isGroupChat, content.trim()]
+    );
+
+    res.status(201).json({ success: true, message: 'Message saved', chatMessage: rows[0] });
+  } catch (err) {
+    console.error('Send chat message error:', err);
+    res.status(500).json({ success: false, error: 'Failed to send chat message' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ROOT
 // ─────────────────────────────────────────────────────────────────────────────
