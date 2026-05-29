@@ -80,7 +80,7 @@ function authenticateToken(req, res, next) {
     if (err) return res.status(403).json({ error: 'Invalid or expired token' });
     req.user = {
       user_id: parseInt(decoded.sub, 10),
-      role:    decoded.role,
+      role:    normalizeRole(decoded.role),
       email:   decoded.companyEmail || decoded.email,
     };
     next();
@@ -126,20 +126,38 @@ function getSide(role) {
 
 function isDecisionMaker(role) { return getSide(role) !== null; }
 
+function normalizeRole(role) {
+  if (!role) return role;
+  return {
+    Client: 'Client',
+    Contractor: 'Contractor',
+    Consultant: 'Consultant',
+    ClientPM: 'ClientPM',
+    'Client Project Manager': 'ClientPM',
+    ContractorPM: 'ContractorPM',
+    'Contractor Project Manager': 'ContractorPM',
+    ConsultantPM: 'ConsultantPM',
+    'Consultant Project Manager': 'ConsultantPM',
+    TeamMember: 'TeamMember',
+    'Team Member': 'TeamMember',
+  }[role] || role;
+}
+
 function daysBetween(startStr, endStr) {
   if (!startStr || !endStr) return 0;
   return Math.max(0, Math.round((new Date(endStr) - new Date(startStr)) / 86400000) + 1);
 }
 
 function roleTableMap(role) {
-  switch (role) {
+  const normalized = normalizeRole(role);
+  switch (normalized) {
     case 'Client':                      return { table: 'clients',                    emailCol: 'company_email' };
-    case 'Client Project Manager':      return { table: 'client_project_managers',    emailCol: 'email' };
+    case 'ClientPM':                    return { table: 'client_project_managers',    emailCol: 'email' };
     case 'Consultant':                  return { table: 'consultants',                emailCol: 'email' };
-    case 'Consultant Project Manager':  return { table: 'consultant_project_managers',emailCol: 'email' };
+    case 'ConsultantPM':                return { table: 'consultant_project_managers',emailCol: 'email' };
     case 'Contractor':                  return { table: 'contractors',                emailCol: 'email' };
-    case 'Contractor Project Manager':  return { table: 'contractor_project_managers',emailCol: 'email' };
-    case 'Team Member':                 return { table: 'team_members',               emailCol: 'email' };
+    case 'ContractorPM':                return { table: 'contractor_project_managers',emailCol: 'email' };
+    case 'TeamMember':                  return { table: 'team_members',               emailCol: 'email' };
     default:                            return null;
   }
 }
@@ -191,7 +209,7 @@ async function getProjectMembers(projectId) {
     JOIN consultants c ON a.consultant_id = c.id
     WHERE a.project_id = $1
     UNION ALL
-    SELECT 'Client Project Manager' AS role, a.client_pm_id AS role_id,
+    SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
            COALESCE(a.representative, c.email) AS display_name,
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
@@ -199,7 +217,7 @@ async function getProjectMembers(projectId) {
     JOIN client_project_managers c ON a.client_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
-    SELECT 'Contractor Project Manager' AS role, a.contractor_pm_id AS role_id,
+    SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
            COALESCE(a.representative, c.email) AS display_name,
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
@@ -207,7 +225,7 @@ async function getProjectMembers(projectId) {
     JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
-    SELECT 'Consultant Project Manager' AS role, a.consultant_pm_id AS role_id,
+    SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
            COALESCE(a.representative, c.email) AS display_name,
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
@@ -215,7 +233,7 @@ async function getProjectMembers(projectId) {
     JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
-    SELECT 'Team Member' AS role, a.team_member_id AS role_id,
+    SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
            a.company_name, a.title, a.position, c.profile_picture
@@ -235,11 +253,11 @@ async function userHasProjectAccess(userId, role, projectId) {
     Client:                        { table: 'projects',             idCol: 'client_id' },
     Contractor:                    { table: 'contractor_assignments', idCol: 'contractor_id' },
     Consultant:                    { table: 'consultant_assignments', idCol: 'consultant_id' },
-    'Client Project Manager':      { table: 'client_pm_assignments',      idCol: 'client_pm_id' },
-    'Contractor Project Manager':  { table: 'contractor_pm_assignments', idCol: 'contractor_pm_id' },
-    'Consultant Project Manager':  { table: 'consultant_pm_assignments', idCol: 'consultant_pm_id' },
-    'Team Member':                 { table: 'team_member_assignments', idCol: 'team_member_id' },
-  }[role];
+    ClientPM:                      { table: 'client_pm_assignments',      idCol: 'client_pm_id' },
+    ContractorPM:                  { table: 'contractor_pm_assignments', idCol: 'contractor_pm_id' },
+    ConsultantPM:                  { table: 'consultant_pm_assignments', idCol: 'consultant_pm_id' },
+    TeamMember:                    { table: 'team_member_assignments', idCol: 'team_member_id' },
+  }[normalizeRole(role)];
 
   if (!projectCheck) return false;
   const query = projectCheck.table === 'projects'
@@ -287,12 +305,14 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, error: 'recipientRole and recipientId are required for direct chat' });
     }
 
+    const normalizedRecipientRole = normalizeRole(recipientRole);
+    const normalizedUserRole = normalizeRole(req.user.role);
     const { rows } = await pool.query(
       `SELECT * FROM project_chat_messages WHERE project_id = $1 AND is_group = false
          AND ((sender_role = $2 AND sender_id = $3 AND recipient_role = $4 AND recipient_id = $5)
               OR (sender_role = $4 AND sender_id = $5 AND recipient_role = $2 AND recipient_id = $3))
        ORDER BY created_at ASC`,
-      [projectId, req.user.role, req.user.user_id, recipientRole, recipientId]
+      [projectId, normalizedUserRole, req.user.user_id, normalizedRecipientRole, recipientId]
     );
     res.json({ success: true, messages: rows });
   } catch (err) {
@@ -314,12 +334,14 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
   try {
     const isGroupChat = isGroup === true || isGroup === 'true' || isGroup === 1 || isGroup === '1';
     let recipientEmail = null;
+    const normalizedSenderRole = normalizeRole(req.user.role);
+    const normalizedRecipientRole = normalizeRole(recipientRole);
     if (!isGroupChat) {
       if (!recipientRole || !recipientId) {
         return res.status(400).json({ success: false, error: 'recipientRole and recipientId are required for direct chat' });
       }
       const members = await getProjectMembers(projectId);
-      const recipient = members.find(m => String(m.role) === String(recipientRole) && String(m.role_id) === String(recipientId));
+      const recipient = members.find(m => String(normalizeRole(m.role)) === String(normalizedRecipientRole) && String(m.role_id) === String(recipientId));
       if (!recipient) {
         return res.status(400).json({ success: false, error: 'Recipient not found in project members' });
       }
@@ -333,8 +355,8 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
           is_group, content)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        RETURNING *`,
-      [projectId, req.user.role, req.user.user_id, req.user.email || '',
-       isGroupChat ? null : recipientRole,
+      [projectId, normalizedSenderRole, req.user.user_id, req.user.email || '',
+       isGroupChat ? null : normalizedRecipientRole,
        isGroupChat ? null : recipientId,
        isGroupChat ? null : recipientEmail,
        isGroupChat, content.trim()]
@@ -653,7 +675,8 @@ app.post('/refresh', async (req, res) => {
   try {
     const tokenRes = await pool.query('SELECT user_id,role,expires_at FROM refresh_tokens WHERE token=$1',[refreshToken]);
     if (!tokenRes.rows.length) return res.status(401).json({success:false,error:'Refresh token not recognized.'});
-    const {user_id,role,expires_at}=tokenRes.rows[0];
+    const {user_id, role: storedRole, expires_at}=tokenRes.rows[0];
+    const role = normalizeRole(storedRole);
     if (new Date(expires_at)<new Date()) return res.status(403).json({success:false,error:'Refresh token expired.'});
     const map=roleTableMap(role);
     if (!map) return res.status(400).json({success:false,error:'Invalid role.'});
@@ -661,13 +684,13 @@ app.post('/refresh', async (req, res) => {
     if (!userRes.rows.length) return res.status(404).json({success:false,error:'User not found.'});
     const user=userRes.rows[0];
     const assignmentInfo={
-      'Client':{table:'projects',fk:'client_id'},
-      'Client Project Manager':{table:'client_pm_assignments',fk:'client_pm_id'},
-      'Consultant':{table:'consultant_assignments',fk:'consultant_id'},
-      'Consultant Project Manager':{table:'consultant_pm_assignments',fk:'consultant_pm_id'},
-      'Contractor':{table:'contractor_assignments',fk:'contractor_id'},
-      'Contractor Project Manager':{table:'contractor_pm_assignments',fk:'contractor_pm_id'},
-      'Team Member':{table:'team_member_assignments',fk:'team_member_id'},
+      Client: {table:'projects',fk:'client_id'},
+      ClientPM: {table:'client_pm_assignments',fk:'client_pm_id'},
+      Consultant: {table:'consultant_assignments',fk:'consultant_id'},
+      ConsultantPM: {table:'consultant_pm_assignments',fk:'consultant_pm_id'},
+      Contractor: {table:'contractor_assignments',fk:'contractor_id'},
+      ContractorPM: {table:'contractor_pm_assignments',fk:'contractor_pm_id'},
+      TeamMember: {table:'team_member_assignments',fk:'team_member_id'},
     };
     let projectAssignments=[];
     if (role==='Client'){const r=await pool.query('SELECT id FROM projects WHERE client_id=$1',[user_id]);projectAssignments=r.rows.map(r=>r.id);}
