@@ -542,81 +542,143 @@ setInterval(async () => {
 }, 3*60*1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  PROFILE ROUTES
+//  PROFILE ROUTES (Cloudinary-ready, works for all roles)
 // ─────────────────────────────────────────────────────────────────────────────
-function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,assignmentTable,assignmentFk,isClientRole,extraProfileFields}) {
+function buildProfileRoutes({
+  routePrefix,
+  jwtRole,
+  dbTable,
+  emailCol,
+  cloudFolder,
+  assignmentTable,
+  assignmentFk,
+  isClientRole,
+  extraProfileFields
+}) {
+  // Fetch profile
   app.get(`${routePrefix}/profile`, authenticateToken, async (req, res) => {
-    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    if (req.user.role !== jwtRole) return res.status(403).json({ error: `Access denied: ${jwtRole} only` });
     try {
-      const fields=['email','profile_picture',...(extraProfileFields||[])].join(',');
-      const result=await pool.query(`SELECT ${fields} FROM ${dbTable} WHERE id=$1 AND ${emailCol}=$2`,[req.user.user_id,req.user.email]);
-      if (!result.rows.length) return res.status(404).json({error:`${jwtRole} not found`});
-      res.json({...result.rows[0],role:jwtRole});
-    } catch(err){console.error(`Fetch ${jwtRole} profile error:`,err);res.status(500).json({error:'Failed to fetch profile'});}
+      const fields = [emailCol, 'profile_picture', ...(extraProfileFields || [])].join(',');
+      const result = await pool.query(
+        `SELECT ${fields} FROM ${dbTable} WHERE id=$1 AND ${emailCol}=$2`,
+        [req.user.user_id, req.user.companyEmail || req.user.email]
+      );
+      if (!result.rows.length) return res.status(404).json({ error: `${jwtRole} not found` });
+
+      const row = result.rows[0];
+      res.json({
+        email: row[emailCol], // normalize to "email" for frontend
+        profile_picture: row.profile_picture,
+        ...extraProfileFields?.reduce((acc, f) => { acc[f] = row[f]; return acc; }, {}),
+        role: jwtRole
+      });
+    } catch (err) {
+      console.error(`Fetch ${jwtRole} profile error:`, err);
+      res.status(500).json({ error: 'Failed to fetch profile' });
+    }
   });
 
+  // Upload profile picture
   app.post(`${routePrefix}/upload-picture`, authenticateToken, upload.single('profile_picture'), async (req, res) => {
-    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    if (req.user.role !== jwtRole) return res.status(403).json({ error: `Access denied: ${jwtRole} only` });
     try {
-      if (!req.file) return res.status(400).json({error:'No file uploaded or file too large.'});
-      if (!req.file.mimetype.startsWith('image/')) return res.status(400).json({error:'Only image files allowed.'});
-      const cdResult=await uploadToCloudinary(req.file.buffer,cloudFolder,'image');
-      await pool.query(`UPDATE ${dbTable} SET profile_picture=$1,profile_picture_id=$2 WHERE id=$3 AND ${emailCol}=$4`,[cdResult.secure_url,cdResult.public_id,req.user.user_id,req.user.email]);
-      res.json({success:true,url:cdResult.secure_url});
-    } catch(err){console.error(`Upload ${jwtRole} picture error:`,err);res.status(500).json({error:'Failed to upload picture'});}
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded or file too large.' });
+      if (!req.file.mimetype.startsWith('image/')) return res.status(400).json({ error: 'Only image files allowed.' });
+
+      const cdResult = await uploadToCloudinary(req.file.buffer, cloudFolder, 'image');
+      await pool.query(
+        `UPDATE ${dbTable} SET profile_picture=$1, profile_picture_id=$2 WHERE id=$3 AND ${emailCol}=$4`,
+        [cdResult.secure_url, cdResult.public_id, req.user.user_id, req.user.companyEmail || req.user.email]
+      );
+      res.json({ success: true, url: cdResult.secure_url });
+    } catch (err) {
+      console.error(`Upload ${jwtRole} picture error:`, err);
+      res.status(500).json({ error: 'Failed to upload picture' });
+    }
   });
 
+  // Delete profile picture
   app.post(`${routePrefix}/delete-picture`, authenticateToken, async (req, res) => {
-    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    if (req.user.role !== jwtRole) return res.status(403).json({ error: `Access denied: ${jwtRole} only` });
     try {
-      const result=await pool.query(`SELECT profile_picture_id FROM ${dbTable} WHERE id=$1 AND ${emailCol}=$2`,[req.user.user_id,req.user.email]);
-      if (result.rows.length>0&&result.rows[0].profile_picture_id) await cloudinary.uploader.destroy(result.rows[0].profile_picture_id);
-      await pool.query(`UPDATE ${dbTable} SET profile_picture=NULL,profile_picture_id=NULL WHERE id=$1 AND ${emailCol}=$2`,[req.user.user_id,req.user.email]);
-      res.json({success:true});
-    } catch(err){console.error(`Delete ${jwtRole} picture error:`,err);res.status(500).json({error:'Failed to delete picture'});}
+      const result = await pool.query(
+        `SELECT profile_picture_id FROM ${dbTable} WHERE id=$1 AND ${emailCol}=$2`,
+        [req.user.user_id, req.user.companyEmail || req.user.email]
+      );
+      if (result.rows.length > 0 && result.rows[0].profile_picture_id) {
+        await cloudinary.uploader.destroy(result.rows[0].profile_picture_id);
+      }
+      await pool.query(
+        `UPDATE ${dbTable} SET profile_picture=NULL, profile_picture_id=NULL WHERE id=$1 AND ${emailCol}=$2`,
+        [req.user.user_id, req.user.companyEmail || req.user.email]
+      );
+      res.json({ success: true });
+    } catch (err) {
+      console.error(`Delete ${jwtRole} picture error:`, err);
+      res.status(500).json({ error: 'Failed to delete picture' });
+    }
   });
 
+  // Fetch projects
   app.post(`${routePrefix}/projects`, authenticateToken, async (req, res) => {
-    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    if (req.user.role !== jwtRole) return res.status(403).json({ error: `Access denied: ${jwtRole} only` });
     try {
       let rows;
       if (isClientRole) {
-        const r=await pool.query('SELECT id,name,location,contract_reference,created_at FROM projects WHERE client_id=$1',[req.user.user_id]);
-        rows=r.rows;
+        const r = await pool.query(
+          'SELECT id,name,location,contract_reference,created_at FROM projects WHERE client_id=$1',
+          [req.user.user_id]
+        );
+        rows = r.rows;
       } else {
-        const r=await pool.query(`SELECT p.id,p.name,p.location,p.contract_reference,p.created_at FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1`,[req.user.user_id]);
-        rows=r.rows;
+        const r = await pool.query(
+          `SELECT p.id,p.name,p.location,p.contract_reference,p.created_at 
+           FROM ${assignmentTable} a 
+           JOIN projects p ON a.project_id=p.id 
+           WHERE a.${assignmentFk}=$1`,
+          [req.user.user_id]
+        );
+        rows = r.rows;
       }
-      res.json({projects:rows});
-    } catch(err){console.error(`Fetch ${jwtRole} projects error:`,err);res.status(500).json({error:'Failed to fetch projects'});}
+      res.json({ projects: rows });
+    } catch (err) {
+      console.error(`Fetch ${jwtRole} projects error:`, err);
+      res.status(500).json({ error: 'Failed to fetch projects' });
+    }
   });
 
+  // Fetch project details
   app.post(`${routePrefix}/project-details`, authenticateToken, async (req, res) => {
-    if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
+    if (req.user.role !== jwtRole) return res.status(403).json({ error: `Access denied: ${jwtRole} only` });
     try {
-      const {projectId}=req.body;
+      const { projectId } = req.body;
       let project;
       if (isClientRole) {
-        const r=await pool.query('SELECT id,name,location,contract_reference,created_at FROM projects WHERE id=$1 AND client_id=$2',[projectId,req.user.user_id]);
-        if (!r.rows.length) return res.status(404).json({error:'Project not found or not owned by client'});
-        project=r.rows[0];
+        const r = await pool.query(
+          'SELECT id,name,location,contract_reference,created_at FROM projects WHERE id=$1 AND client_id=$2',
+          [projectId, req.user.user_id]
+        );
+        if (!r.rows.length) return res.status(404).json({ error: 'Project not found or not owned by client' });
+        project = r.rows[0];
       } else {
-        const r=await pool.query(`SELECT p.id,p.name,p.location,p.contract_reference,p.created_at FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1 AND p.id=$2`,[req.user.user_id,projectId]);
-        if (!r.rows.length) return res.status(404).json({error:'Project not found or not assigned'});
-        project=r.rows[0];
+        const r = await pool.query(
+          `SELECT p.id,p.name,p.location,p.contract_reference,p.created_at 
+           FROM ${assignmentTable} a 
+           JOIN projects p ON a.project_id=p.id 
+           WHERE a.${assignmentFk}=$1 AND p.id=$2`,
+          [req.user.user_id, projectId]
+        );
+        if (!r.rows.length) return res.status(404).json({ error: 'Project not found or not assigned' });
+        project = r.rows[0];
       }
-      res.json({project});
-    } catch(err){console.error(`Fetch ${jwtRole} project-details error:`,err);res.status(500).json({error:'Failed to fetch project details'});}
+      res.json({ project });
+    } catch (err) {
+      console.error(`Fetch ${jwtRole} project-details error:`, err);
+      res.status(500).json({ error: 'Failed to fetch project details' });
+    }
   });
 }
-
-buildProfileRoutes({routePrefix:'/client',jwtRole:'Client',dbTable:'clients',emailCol:'company_email',cloudFolder:'oneprojectapp/clients',isClientRole:true,extraProfileFields:['representative','title','telephone','company_name']});
-buildProfileRoutes({routePrefix:'/contractor',jwtRole:'Contractor',dbTable:'contractors',emailCol:'email',cloudFolder:'oneprojectapp/contractors',assignmentTable:'contractor_assignments',assignmentFk:'contractor_id'});
-buildProfileRoutes({routePrefix:'/consultant',jwtRole:'Consultant',dbTable:'consultants',emailCol:'email',cloudFolder:'oneprojectapp/consultants',assignmentTable:'consultant_assignments',assignmentFk:'consultant_id'});
-buildProfileRoutes({routePrefix:'/client-project-manager',jwtRole:'Client Project Manager',dbTable:'client_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/client_project_managers',assignmentTable:'client_pm_assignments',assignmentFk:'client_pm_id'});
-buildProfileRoutes({routePrefix:'/contractor-project-manager',jwtRole:'Contractor Project Manager',dbTable:'contractor_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/contractor_project_managers',assignmentTable:'contractor_pm_assignments',assignmentFk:'contractor_pm_id'});
-buildProfileRoutes({routePrefix:'/consultant-project-manager',jwtRole:'Consultant Project Manager',dbTable:'consultant_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/consultant_project_managers',assignmentTable:'consultant_pm_assignments',assignmentFk:'consultant_pm_id'});
-buildProfileRoutes({routePrefix:'/team-member',jwtRole:'Team Member',dbTable:'team_members',emailCol:'email',cloudFolder:'oneprojectapp/team_members',assignmentTable:'team_member_assignments',assignmentFk:'team_member_id'});
 
 // ─── Client legacy routes ──────────────────────────────────────────────────
 app.post('/client/check-email', async (req, res) => {
