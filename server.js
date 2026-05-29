@@ -2130,6 +2130,703 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
   }
 });
 
+// =============================================================================
+//  WORK CENTER ROUTES
+//  Paste these directly into your server.js (after your existing helpers).
+//  Uses: authenticateToken, pool, upload, uploadToCloudinary,
+//        scheduleCloudinaryUpload, cloudinary  — already defined above.
+// =============================================================================
+
+// ─── local helper (work-center only) ─────────────────────────────────────────
+function wcSide(role) {
+  // Works with the role strings stored in JWT:
+  // Contractor | ContractorPM | Consultant | ConsultantPM | Client | ClientPM
+  if (['Contractor',  'ContractorPM'].includes(role)) return 'Contractor';
+  if (['Consultant',  'ConsultantPM'].includes(role)) return 'Consultant';
+  if (['Client',      'ClientPM'].includes(role))     return 'Client';
+  return null;
+}
+
+function isWCLeader(role) {
+  return wcSide(role) !== null;
+}
+
+// ─── SQL: run once ────────────────────────────────────────────────────────────
+// CREATE TABLE IF NOT EXISTS work_center_views (
+//   id         SERIAL PRIMARY KEY,
+//   task_id    INTEGER NOT NULL REFERENCES workspace_work_center(id) ON DELETE CASCADE,
+//   viewer_id  INTEGER NOT NULL,
+//   viewed_at  TIMESTAMP DEFAULT NOW(),
+//   UNIQUE(task_id, viewer_id)
+// );
+
+// =============================================================================
+//  1.  GET /api/work-center/team-members
+//      Returns team members on the same side as the requesting PM/leader.
+//      JWT → role determines side.  Query → ?projectId=...
+// =============================================================================
+app.get('/api/work-center/team-members', authenticateToken, async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+    const { projectId }     = req.query;
+
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+
+    const side = wcSide(role);
+    if (!side) return res.status(403).json({ error: 'Your role cannot manage tasks.' });
+
+    const result = await pool.query(
+      `SELECT
+         t.id,
+         t.email,
+         tma.position,
+         tma.title,
+         tma.telephone
+       FROM team_member_assignments tma
+       JOIN team_members t ON t.id = tma.team_member_id
+       WHERE tma.project_id   = $1
+         AND tma.assigned_part = $2
+       ORDER BY tma.position, t.email`,
+      [projectId, side]
+    );
+
+    return res.json({ members: result.rows });
+  } catch (err) {
+    console.error('GET /api/work-center/team-members:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  2.  POST /api/work-center
+//      Create a task.  PM / Leader only.
+//      Body (multipart/form-data):
+//        projectId, title, description, work_package,
+//        assigned_members (JSON string), priority,
+//        start_date, end_date, linked_file (optional)
+// =============================================================================
+app.post('/api/work-center', authenticateToken, upload.single('linked_file'), async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+
+    if (!isWCLeader(role)) {
+      return res.status(403).json({ error: 'Only leaders and PMs can create tasks.' });
+    }
+
+    const side = wcSide(role);
+    const {
+      projectId,
+      title,
+      description    = '',
+      work_package   = '',
+      assigned_members,
+      priority       = 'normal',
+      start_date,
+      end_date,
+    } = req.body;
+
+    if (!projectId)  return res.status(400).json({ error: 'projectId is required.' });
+    if (!title)      return res.status(400).json({ error: 'title is required.' });
+    if (!start_date) return res.status(400).json({ error: 'start_date is required.' });
+    if (!end_date)   return res.status(400).json({ error: 'end_date is required.' });
+    if (!['low','normal','high'].includes(priority)) {
+      return res.status(400).json({ error: 'priority must be low, normal, or high.' });
+    }
+
+    // Parse assigned members
+    let members = [];
+    try   { members = JSON.parse(assigned_members || '[]'); }
+    catch { return res.status(400).json({ error: 'assigned_members must be valid JSON.' }); }
+    if (!Array.isArray(members) || !members.length) {
+      return res.status(400).json({ error: 'At least one team member must be assigned.' });
+    }
+
+    // Verify all members belong to this project and the same side
+    const memberIds = members.map(m => parseInt(m.id, 10)).filter(Boolean);
+    const check = await pool.query(
+      `SELECT COUNT(*) AS cnt
+       FROM team_member_assignments
+       WHERE project_id    = $1
+         AND team_member_id = ANY($2::int[])
+         AND assigned_part  = $3`,
+      [projectId, memberIds, side]
+    );
+    if (parseInt(check.rows[0].cnt, 10) !== memberIds.length) {
+      return res.status(403).json({
+        error: 'One or more assigned members do not belong to your side on this project.'
+      });
+    }
+
+    // Upload linked file to Cloudinary if provided
+    let linkedFileName = null;
+    let linkedFileId   = null;
+    let linkedFileUrl  = null;
+
+    if (req.file) {
+      const result = await scheduleCloudinaryUpload(
+        req.file.buffer, req.file.originalname, 'work_center/tasks'
+      );
+      linkedFileName = req.file.originalname;
+      linkedFileId   = result.public_id;
+      linkedFileUrl  = result.secure_url;
+    }
+
+    const insertResult = await pool.query(
+      `INSERT INTO workspace_work_center
+         (project_id, title, description, work_package,
+          assigned_members, priority, start_date, end_date,
+          linked_file_name, linked_file_id, linked_file_url,
+          creator_id, creator_role, side)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING *`,
+      [
+        projectId, title, description, work_package,
+        JSON.stringify(members), priority, start_date, end_date,
+        linkedFileName, linkedFileId, linkedFileUrl,
+        user_id, role, side,
+      ]
+    );
+
+    return res.status(201).json({ success: true, task: insertResult.rows[0] });
+  } catch (err) {
+    console.error('POST /api/work-center:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  3.  PUT /api/work-center/:taskId
+//      Update a task.  PM / Leader (same side) only.
+//      Body (multipart/form-data): any subset of task fields + optional linked_file
+// =============================================================================
+app.put('/api/work-center/:taskId', authenticateToken, upload.single('linked_file'), async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+    const { taskId }        = req.params;
+    const { projectId }     = req.body;
+
+    if (!isWCLeader(role)) {
+      return res.status(403).json({ error: 'Only leaders and PMs can update tasks.' });
+    }
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+
+    const side = wcSide(role);
+
+    // Confirm task belongs to this project and same side
+    const taskCheck = await pool.query(
+      `SELECT id, side, linked_file_id
+       FROM workspace_work_center
+       WHERE id = $1 AND project_id = $2`,
+      [taskId, projectId]
+    );
+    if (!taskCheck.rows.length) return res.status(404).json({ error: 'Task not found.' });
+    if (taskCheck.rows[0].side !== side) {
+      return res.status(403).json({ error: 'You cannot edit tasks from another side.' });
+    }
+
+    const {
+      title, description, work_package,
+      assigned_members, priority, start_date, end_date,
+    } = req.body;
+
+    // Parse members if provided
+    let members = null;
+    if (assigned_members !== undefined) {
+      try   { members = JSON.parse(assigned_members); }
+      catch { return res.status(400).json({ error: 'assigned_members must be valid JSON.' }); }
+
+      // Validate members belong to same side
+      if (members && members.length > 0) {
+        const memberIds = members.map(m => parseInt(m.id, 10)).filter(Boolean);
+        const check = await pool.query(
+          `SELECT COUNT(*) AS cnt
+           FROM team_member_assignments
+           WHERE project_id    = $1
+             AND team_member_id = ANY($2::int[])
+             AND assigned_part  = $3`,
+          [projectId, memberIds, side]
+        );
+        if (parseInt(check.rows[0].cnt, 10) !== memberIds.length) {
+          return res.status(403).json({ error: 'One or more members do not belong to your side.' });
+        }
+      }
+    }
+
+    // Build dynamic SET clause
+    const setClauses = [];
+    const values     = [];
+    let   idx        = 1;
+
+    const push = (col, val) => { setClauses.push(`${col} = $${idx++}`); values.push(val); };
+
+    if (title           !== undefined) push('title',            title);
+    if (description     !== undefined) push('description',      description);
+    if (work_package    !== undefined) push('work_package',     work_package);
+    if (members         !== null)      push('assigned_members', JSON.stringify(members));
+    if (priority        !== undefined) push('priority',         priority);
+    if (start_date      !== undefined) push('start_date',       start_date);
+    if (end_date        !== undefined) push('end_date',         end_date);
+
+    // Replace linked file if new one uploaded
+    if (req.file) {
+      // Delete old Cloudinary file (non-fatal)
+      if (taskCheck.rows[0].linked_file_id) {
+        await cloudinary.uploader.destroy(taskCheck.rows[0].linked_file_id, { resource_type: 'raw' })
+          .catch(() => {});
+      }
+      const uploaded = await scheduleCloudinaryUpload(
+        req.file.buffer, req.file.originalname, 'work_center/tasks'
+      );
+      push('linked_file_name', req.file.originalname);
+      push('linked_file_id',   uploaded.public_id);
+      push('linked_file_url',  uploaded.secure_url);
+    }
+
+    if (!setClauses.length) return res.status(400).json({ error: 'No fields to update.' });
+
+    values.push(taskId, projectId);
+    const updated = await pool.query(
+      `UPDATE workspace_work_center
+       SET ${setClauses.join(', ')}
+       WHERE id = $${idx} AND project_id = $${idx + 1}
+       RETURNING *`,
+      values
+    );
+
+    return res.json({ success: true, task: updated.rows[0] });
+  } catch (err) {
+    console.error('PUT /api/work-center/:taskId:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  4.  DELETE /api/work-center/:taskId
+//      Delete a task and all its progress entries (CASCADE handles DB rows).
+//      Cleans up Cloudinary files too.
+//      Body: { projectId }
+// =============================================================================
+app.delete('/api/work-center/:taskId', authenticateToken, async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+    const { taskId }        = req.params;
+    const { projectId }     = req.body;
+
+    if (!isWCLeader(role)) {
+      return res.status(403).json({ error: 'Only leaders and PMs can delete tasks.' });
+    }
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+
+    const side = wcSide(role);
+
+    const taskCheck = await pool.query(
+      `SELECT id, side, linked_file_id
+       FROM workspace_work_center
+       WHERE id = $1 AND project_id = $2`,
+      [taskId, projectId]
+    );
+    if (!taskCheck.rows.length) return res.status(404).json({ error: 'Task not found.' });
+    if (taskCheck.rows[0].side !== side) {
+      return res.status(403).json({ error: 'You cannot delete tasks from another side.' });
+    }
+
+    // Clean up Cloudinary files (all non-fatal)
+    const task = taskCheck.rows[0];
+    if (task.linked_file_id) {
+      await cloudinary.uploader.destroy(task.linked_file_id, { resource_type: 'raw' })
+        .catch(() => {});
+    }
+
+    // Clean up progress attachment files
+    const progressFiles = await pool.query(
+      `SELECT attachment_id FROM workspace_work_center_progress
+       WHERE task_id = $1 AND attachment_id IS NOT NULL`,
+      [taskId]
+    );
+    await Promise.allSettled(
+      progressFiles.rows.map(r =>
+        cloudinary.uploader.destroy(r.attachment_id, { resource_type: 'raw' })
+      )
+    );
+
+    // Delete task (progress rows cascade)
+    await pool.query(
+      `DELETE FROM workspace_work_center WHERE id = $1 AND project_id = $2`,
+      [taskId, projectId]
+    );
+
+    return res.json({ success: true, message: 'Task deleted.' });
+  } catch (err) {
+    console.error('DELETE /api/work-center/:taskId:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  5.  GET /api/work-center-progress/:taskId
+//      PM / Leader  → all entries with member info
+//      Team Member  → only their own entries
+//      Query: ?projectId=...
+// =============================================================================
+app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+    const { taskId }        = req.params;
+    const { projectId }     = req.query;
+
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+
+    // Fetch task to check access
+    const taskCheck = await pool.query(
+      `SELECT id, side, assigned_members
+       FROM workspace_work_center
+       WHERE id = $1 AND project_id = $2`,
+      [taskId, projectId]
+    );
+    if (!taskCheck.rows.length) return res.status(404).json({ error: 'Task not found.' });
+
+    const task = taskCheck.rows[0];
+    const side = wcSide(role);
+
+    if (isWCLeader(role)) {
+      // Must be on the same side
+      if (task.side !== side) return res.status(403).json({ error: 'Access denied.' });
+
+      // Return all entries with member details
+      const result = await pool.query(
+        `SELECT
+           p.*,
+           t.email          AS member_email,
+           tma.position     AS member_position,
+           tma.title        AS member_title
+         FROM workspace_work_center_progress p
+         JOIN team_members t ON t.id = p.member_id
+         LEFT JOIN team_member_assignments tma
+           ON tma.team_member_id = p.member_id
+          AND tma.project_id    = $2
+         WHERE p.task_id = $1
+         ORDER BY p.submitted_at DESC`,
+        [taskId, projectId]
+      );
+      return res.json({ entries: result.rows });
+
+    } else if (role === 'TeamMember') {
+      // Must be assigned to this task
+      const assignedMembers = Array.isArray(task.assigned_members)
+        ? task.assigned_members : [];
+      const isAssigned = assignedMembers.some(m => String(m.id) === String(user_id));
+      if (!isAssigned) return res.status(403).json({ error: 'You are not assigned to this task.' });
+
+      // Return only their own entries
+      const result = await pool.query(
+        `SELECT * FROM workspace_work_center_progress
+         WHERE task_id = $1 AND member_id = $2
+         ORDER BY submitted_at DESC`,
+        [taskId, user_id]
+      );
+      return res.json({ entries: result.rows });
+
+    } else {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+  } catch (err) {
+    console.error('GET /api/work-center-progress/:taskId:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  6.  POST /api/work-center-progress
+//      Submit a progress entry.  Assigned team members only.
+//      Body (multipart/form-data):
+//        projectId, taskId, reportDate, workDone,
+//        manpower, equipment, materials, progressPct,
+//        issues, notes, attachment (optional file)
+// =============================================================================
+app.post('/api/work-center-progress', authenticateToken, upload.single('attachment'), async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+
+    if (role !== 'TeamMember') {
+      return res.status(403).json({
+        error: 'Only assigned team members can submit progress reports.'
+      });
+    }
+
+    const {
+      projectId,
+      taskId,
+      reportDate,
+      workDone,
+      manpower    = '',
+      equipment   = '',
+      materials   = '',
+      progressPct = '0',
+      issues      = '',
+      notes       = '',
+    } = req.body;
+
+    if (!projectId)  return res.status(400).json({ error: 'projectId is required.' });
+    if (!taskId)     return res.status(400).json({ error: 'taskId is required.' });
+    if (!reportDate) return res.status(400).json({ error: 'reportDate is required.' });
+    if (!workDone)   return res.status(400).json({ error: 'workDone is required.' });
+
+    const pct = parseInt(progressPct, 10);
+    if (isNaN(pct) || pct < 0 || pct > 100) {
+      return res.status(400).json({ error: 'progressPct must be between 0 and 100.' });
+    }
+
+    // Confirm task exists and member is assigned
+    const taskCheck = await pool.query(
+      `SELECT id, assigned_members
+       FROM workspace_work_center
+       WHERE id = $1 AND project_id = $2`,
+      [taskId, projectId]
+    );
+    if (!taskCheck.rows.length) return res.status(404).json({ error: 'Task not found.' });
+
+    const assignedMembers = Array.isArray(taskCheck.rows[0].assigned_members)
+      ? taskCheck.rows[0].assigned_members : [];
+    const isAssigned = assignedMembers.some(m => String(m.id) === String(user_id));
+    if (!isAssigned) {
+      return res.status(403).json({
+        error: 'You are not assigned to this task and cannot submit progress.'
+      });
+    }
+
+    // Upload attachment to Cloudinary if provided
+    let attachmentName = null;
+    let attachmentId   = null;
+    let attachmentUrl  = null;
+
+    if (req.file) {
+      const uploaded = await scheduleCloudinaryUpload(
+        req.file.buffer, req.file.originalname, 'work_center/progress'
+      );
+      attachmentName = req.file.originalname;
+      attachmentId   = uploaded.public_id;
+      attachmentUrl  = uploaded.secure_url;
+    }
+
+    const result = await pool.query(
+      `INSERT INTO workspace_work_center_progress
+         (task_id, report_date, member_id, member_role,
+          work_done, manpower, equipment, materials,
+          progress_pct, issues, notes,
+          attachment_name, attachment_id, attachment_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       RETURNING *`,
+      [
+        taskId, reportDate, user_id, role,
+        workDone, manpower, equipment, materials,
+        pct, issues, notes,
+        attachmentName, attachmentId, attachmentUrl,
+      ]
+    );
+
+    return res.status(201).json({ success: true, entry: result.rows[0] });
+  } catch (err) {
+    console.error('POST /api/work-center-progress:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  7.  PUT /api/work-center-progress/:progressId/validate
+//      Approve or reject a progress entry.  PM / Leader (same side) only.
+//      Body: { projectId, validation_status, validation_notes }
+// =============================================================================
+app.put('/api/work-center-progress/:progressId/validate', authenticateToken, async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+    const { progressId }    = req.params;
+    const { projectId, validation_status, validation_notes = '' } = req.body;
+
+    if (!isWCLeader(role)) {
+      return res.status(403).json({ error: 'Only leaders and PMs can validate progress entries.' });
+    }
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!['approved','rejected'].includes(validation_status)) {
+      return res.status(400).json({ error: 'validation_status must be "approved" or "rejected".' });
+    }
+
+    const side = wcSide(role);
+
+    // Confirm entry exists and task belongs to same project + side
+    const check = await pool.query(
+      `SELECT p.id, w.side, w.project_id
+       FROM workspace_work_center_progress p
+       JOIN workspace_work_center w ON w.id = p.task_id
+       WHERE p.id = $1`,
+      [progressId]
+    );
+    if (!check.rows.length) return res.status(404).json({ error: 'Progress entry not found.' });
+
+    const row = check.rows[0];
+    if (String(row.project_id) !== String(projectId)) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    if (row.side !== side) {
+      return res.status(403).json({ error: 'You cannot validate entries from another side.' });
+    }
+
+    const result = await pool.query(
+      `UPDATE workspace_work_center_progress
+       SET
+         validation_status = $1,
+         validation_notes  = $2,
+         validated_by      = $3,
+         validated_at      = NOW()
+       WHERE id = $4
+       RETURNING *`,
+      [validation_status, validation_notes, user_id, progressId]
+    );
+
+    return res.json({ success: true, entry: result.rows[0] });
+  } catch (err) {
+    console.error('PUT /api/work-center-progress/:progressId/validate:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  8.  GET /api/work-center-progress/download/:progressId
+//      Returns a signed Cloudinary URL for the progress attachment.
+//      Accessible by: the submitting member OR the PM of the same side.
+//      Query: ?projectId=...
+// =============================================================================
+app.get('/api/work-center-progress/download/:progressId', authenticateToken, async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+    const { progressId }    = req.params;
+    const { projectId }     = req.query;
+
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+
+    const result = await pool.query(
+      `SELECT
+         p.member_id, p.attachment_id, p.attachment_name, p.attachment_url,
+         w.side, w.project_id
+       FROM workspace_work_center_progress p
+       JOIN workspace_work_center w ON w.id = p.task_id
+       WHERE p.id = $1`,
+      [progressId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Entry not found.' });
+
+    const entry = result.rows[0];
+    if (String(entry.project_id) !== String(projectId)) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    const side     = wcSide(role);
+    const isOwner  = role === 'TeamMember' && String(entry.member_id) === String(user_id);
+    const isPMSide = isWCLeader(role) && entry.side === side;
+
+    if (!isOwner && !isPMSide) return res.status(403).json({ error: 'Access denied.' });
+    if (!entry.attachment_id)  return res.status(404).json({ error: 'No attachment for this entry.' });
+
+    // Generate a signed URL valid for 1 hour
+    const url = cloudinary.url(entry.attachment_id, {
+      resource_type: 'raw',
+      type:          'upload',
+      sign_url:      true,
+      expires_at:    Math.floor(Date.now() / 1000) + 3600,
+    });
+
+    return res.json({ url, filename: entry.attachment_name });
+  } catch (err) {
+    console.error('GET /api/work-center-progress/download/:progressId:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
+
+// =============================================================================
+//  9.  EXTEND your existing  POST /api/fetch-tab-records
+//      Inside your switch/if on recordType, add this block:
+// =============================================================================
+//
+//  if (recordType === 'workspace_work_center') {
+//    const { user_id, role } = req.user;
+//    const side = wcSide(role);          // 'Contractor' | 'Consultant' | 'Client' | null
+//
+//    let records = [];
+//
+//    if (isWCLeader(role)) {
+//      // PM / Leader: all tasks on their side for this project
+//      const r = await pool.query(
+//        `SELECT
+//           w.*,
+//           true AS is_creator,
+//           EXISTS (
+//             SELECT 1 FROM work_center_views v
+//             WHERE v.task_id = w.id AND v.viewer_id = $2
+//           ) AS is_viewed
+//         FROM workspace_work_center w
+//         WHERE w.project_id = $1
+//           AND w.side       = $3
+//         ORDER BY w.created_at DESC`,
+//        [projectId, user_id, side]
+//      );
+//      records = r.rows;
+//
+//    } else if (role === 'TeamMember') {
+//      // Team Member: only tasks where their id is in assigned_members JSONB
+//      const r = await pool.query(
+//        `SELECT
+//           w.*,
+//           false AS is_creator,
+//           EXISTS (
+//             SELECT 1 FROM work_center_views v
+//             WHERE v.task_id = w.id AND v.viewer_id = $2
+//           ) AS is_viewed
+//         FROM workspace_work_center w
+//         WHERE w.project_id      = $1
+//           AND w.assigned_members @> $3::jsonb
+//         ORDER BY w.created_at DESC`,
+//        [projectId, user_id, JSON.stringify([{ id: String(user_id) }])]
+//      );
+//      records = r.rows;
+//    }
+//
+//    return res.json({ records });
+//  }
+
+// =============================================================================
+//  10. EXTEND your existing  POST /api/mark-record-viewed
+//      Add this block when recordType === 'workspace_work_center':
+// =============================================================================
+//
+//  if (recordType === 'workspace_work_center') {
+//    await pool.query(
+//      `INSERT INTO work_center_views (task_id, viewer_id)
+//       VALUES ($1, $2)
+//       ON CONFLICT (task_id, viewer_id) DO NOTHING`,
+//      [recordId, req.user.user_id]
+//    );
+//    return res.json({ success: true });
+//  }
+
+// =============================================================================
+//  SQL — run once in your database
+// =============================================================================
+//
+//  -- Add attachment_url column if not already present:
+//  ALTER TABLE workspace_work_center
+//    ADD COLUMN IF NOT EXISTS linked_file_url TEXT;
+//
+//  ALTER TABLE workspace_work_center_progress
+//    ADD COLUMN IF NOT EXISTS attachment_url TEXT;
+//
+//  -- Views tracking table:
+//  CREATE TABLE IF NOT EXISTS work_center_views (
+//    id         SERIAL PRIMARY KEY,
+//    task_id    INTEGER NOT NULL REFERENCES workspace_work_center(id) ON DELETE CASCADE,
+//    viewer_id  INTEGER NOT NULL,
+//    viewed_at  TIMESTAMP DEFAULT NOW(),
+//    UNIQUE(task_id, viewer_id)
+//  );
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  GLOBAL ERROR HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
