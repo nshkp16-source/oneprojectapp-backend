@@ -1392,68 +1392,181 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MEETING ROUTES
-// ─────────────────────────────────────────────────────────────────────────────
-app.post('/records/schedule-meeting', authenticateToken, async (req, res) => {
-  const {projectId,title,dateTime,participants,agenda}=req.body;
-  if (!projectId||!title||!dateTime||!participants||!agenda)
-    return res.status(400).json({success:false,message:'All fields are required.'});
-  try {
-    const result=await pool.query(
-      `INSERT INTO meetings (project_id,title,meeting_date,participants,agenda,type,created_by,created_at)
-       VALUES ($1,$2,$3,$4,$5,'scheduled',$6,NOW()) RETURNING id`,
-      [projectId,title,new Date(dateTime),participants,agenda,req.user.user_id]
-    );
-    res.json({success:true,meetingId:result.rows[0].id,message:'Meeting scheduled successfully.'});
-  } catch(err){console.error('Schedule meeting error:',err);res.status(500).json({success:false,message:'Failed to schedule meeting.'});}
-});
+// ─── MEETINGS ─────────────────────────────────────────────────────────────────
+// Paste these routes into server.js — all dependencies (pool, upload,
+// uploadToCloudinary, authenticateToken) already exist there.
 
-app.post('/records/meetings', authenticateToken, async (req, res) => {
-  const {projectId,type}=req.body;
-  if (!projectId) return res.status(400).json({success:false,message:'projectId is required.'});
-  try {
-    const meetingType = type==='scheduled' ? 'scheduled' : 'minutes';
-    const result=await pool.query(
-      `SELECT id,title,meeting_date AS date,description,type FROM meetings
-       WHERE project_id=$1 AND type=$2 ORDER BY meeting_date DESC`,
-      [projectId,meetingType]
-    );
-    res.json({success:true,meetings:result.rows});
-  } catch(err){console.error('Meetings list error:',err);res.status(500).json({success:false,message:'Failed to fetch meetings.'});}
-});
+// GET /api/meetings?view=scheduled|minutes&scope=global|side&scope_value=&project_id=
+app.get('/api/meetings', authenticateToken, async (req, res) => {
+  const { view, scope, scope_value, project_id } = req.query;
+  if (!project_id || !view || !scope)
+    return res.status(400).json({ error: 'project_id, view and scope are required' });
 
-app.post('/records/meeting-detail', authenticateToken, async (req, res) => {
-  const {meetingId,projectId}=req.body;
-  if (!meetingId) return res.status(400).json({success:false,message:'meetingId is required.'});
   try {
-    const result=await pool.query(
-      `SELECT id,title,meeting_date AS date,participants,description AS minutes,agenda,type FROM meetings WHERE id=$1 AND project_id=$2`,
-      [meetingId,projectId]
-    );
-    if (!result.rows.length) return res.status(404).json({success:false,message:'Meeting not found.'});
-    res.json({success:true,...result.rows[0]});
-  } catch(err){console.error('Meeting detail error:',err);res.status(500).json({success:false,message:'Failed to fetch meeting detail.'});}
-});
-
-app.post('/records/add-meeting-minute', authenticateToken, upload.array('documents', 5), async (req, res) => {
-  const {title,details,projectId,date}=req.body;
-  if (!title||!details||!projectId) return res.status(400).json({success:false,message:'title, details and projectId are required.'});
-  try {
-    const attachmentUrls=[];
-    for (const file of (req.files||[])) {
-      try {
-        const r=await uploadToCloudinary(file.buffer,'oneprojectapp/meetings');
-        attachmentUrls.push(r.secure_url);
-      } catch(cdErr){console.error('Meeting attachment upload error:',cdErr);}
+    const params = [project_id, scope, new Date()];
+    let scopeFilter = '';
+    if (scope === 'side' && scope_value) {
+      scopeFilter = ` AND m.scope_value = $4`;
+      params.push(scope_value);
     }
-    const result=await pool.query(
-      `INSERT INTO meetings (project_id,title,description,meeting_date,type,attachments,created_by,created_at)
-       VALUES ($1,$2,$3,$4,'minutes',$5,$6,NOW()) RETURNING id`,
-      [projectId,title,details,date?new Date(date):new Date(),JSON.stringify(attachmentUrls),req.user.user_id]
+
+    const { rows } = await pool.query(`
+      SELECT
+        m.*,
+        EXISTS (
+          SELECT 1 FROM meeting_minutes mm WHERE mm.meeting_id = m.id
+        ) AS has_minute,
+        (
+          SELECT json_build_object(
+            'id',               mm.id,
+            'attendees',        mm.attendees,
+            'agenda_discussed', mm.agenda_discussed,
+            'decisions',        mm.decisions,
+            'action_items',     mm.action_items,
+            'next_meeting_date',mm.next_meeting_date,
+            'attachments', (
+              SELECT COALESCE(json_agg(json_build_object('name', a.name, 'url', a.url)), '[]')
+              FROM meeting_attachments a WHERE a.minute_id = mm.id
+            )
+          )
+          FROM meeting_minutes mm WHERE mm.meeting_id = m.id LIMIT 1
+        ) AS minute,
+        (
+          SELECT COALESCE(json_agg(json_build_object('name', a.name, 'url', a.url)), '[]')
+          FROM meeting_attachments a WHERE a.meeting_id = m.id AND a.minute_id IS NULL
+        ) AS attachments
+      FROM meetings m
+      WHERE m.project_id = $1
+        AND m.scope = $2
+        AND m.date_time ${view === 'scheduled' ? '>=' : '<'} $3
+      ${scopeFilter}
+      ORDER BY m.date_time ${view === 'scheduled' ? 'ASC' : 'DESC'}
+    `, params);
+
+    res.json(rows);
+  } catch (err) {
+    console.error('GET /api/meetings:', err);
+    res.status(500).json({ error: 'Failed to load meetings' });
+  }
+});
+
+// POST /api/meetings
+app.post('/api/meetings', authenticateToken, upload.array('attachments'), async (req, res) => {
+  const { project_id, meeting_type, title, date_time,
+          location, participants, agenda, scope, scope_value } = req.body;
+
+  if (!project_id || !meeting_type || !title || !date_time ||
+      !location || !participants || !agenda || !scope)
+    return res.status(400).json({ error: 'All required fields must be provided' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows } = await client.query(`
+      INSERT INTO meetings
+        (project_id, meeting_type, title, date_time, location,
+         participants, agenda, scope, scope_value, created_by, created_role)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING *`,
+      [project_id, meeting_type, title, date_time, location,
+       participants, agenda, scope, scope_value || null,
+       req.user.user_id, req.user.role]
     );
-    res.json({success:true,meetingId:result.rows[0].id,message:'Meeting minute added successfully.'});
-  } catch(err){console.error('Add meeting minute error:',err);res.status(500).json({success:false,message:'Failed to add meeting minute.'});}
+
+    const meeting = rows[0];
+
+    if (req.files?.length) {
+      for (const file of req.files) {
+        const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
+        await client.query(
+          `INSERT INTO meeting_attachments (meeting_id, name, url, public_id)
+           VALUES ($1,$2,$3,$4)`,
+          [meeting.id, file.originalname, result.secure_url, result.public_id]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json(meeting);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /api/meetings:', err);
+    res.status(500).json({ error: 'Failed to create meeting' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/meetings/:id/minute
+app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachments'), async (req, res) => {
+  const meetingId = req.params.id;
+  const { project_id, attendees, agenda_discussed, decisions,
+          action_items, scope, scope_value, next_meeting_date } = req.body;
+
+  if (!project_id || !attendees || !agenda_discussed || !decisions || !action_items || !scope)
+    return res.status(400).json({ error: 'All required fields must be provided' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: meeting } = await client.query(
+      `SELECT id FROM meetings WHERE id = $1 AND project_id = $2`,
+      [meetingId, project_id]
+    );
+    if (!meeting.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+
+    const { rows: existing } = await client.query(
+      `SELECT id FROM meeting_minutes WHERE meeting_id = $1`, [meetingId]
+    );
+    if (existing.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Minute already recorded for this meeting' });
+    }
+
+    const { rows } = await client.query(`
+      INSERT INTO meeting_minutes
+        (meeting_id, project_id, attendees, agenda_discussed, decisions,
+         action_items, next_meeting_date, scope, scope_value, created_by, created_role)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING *`,
+      [meetingId, project_id, attendees, agenda_discussed, decisions,
+       action_items, next_meeting_date || null,
+       scope, scope_value || null,
+       req.user.user_id, req.user.role]
+    );
+
+    const minute = rows[0];
+
+    if (req.files?.length) {
+      for (const file of req.files) {
+        const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
+        await client.query(
+          `INSERT INTO meeting_attachments (minute_id, name, url, public_id)
+           VALUES ($1,$2,$3,$4)`,
+          [minute.id, file.originalname, result.secure_url, result.public_id]
+        );
+      }
+    }
+
+    const { rows: attachments } = await client.query(
+      `SELECT name, url FROM meeting_attachments WHERE minute_id = $1`, [minute.id]
+    );
+    minute.attachments = attachments;
+
+    await client.query('COMMIT');
+    res.status(201).json({ minute });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /api/meetings/:id/minute:', err);
+    res.status(500).json({ error: 'Failed to save minute' });
+  } finally {
+    client.release();
+  }
 });
 
 // =============================================================================
