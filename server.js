@@ -26,18 +26,12 @@ cloudinary.config({
 
 // ─── Multer ───────────────────────────────────────────────────────────────────
 const upload = multer({
-  limits: { fileSize: 10 * 1024 * 1024 },
+  // allow larger uploads and accept any file type (the cloudinary uploader handles resource type)
+  limits: { fileSize: 50 * 1024 * 1024 },
   storage: multer.memoryStorage(),
-  fileFilter: (_req, file, cb) => {
-    const allowed = [
-      'image/png','image/jpeg','image/jpg','application/pdf',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'application/vnd.ms-excel',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    ];
-    cb(allowed.includes(file.mimetype) ? null : new Error('Unsupported file type'),
-       allowed.includes(file.mimetype));
+  fileFilter: (_req, _file, cb) => {
+    // accept all mimetypes
+    cb(null, true);
   },
 });
 
@@ -293,9 +287,16 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
   if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
 
   try {
+    // return messages and read-receipts (who read each message)
     if (isGroup === 'true' || isGroup === '1') {
       const { rows } = await pool.query(
-        `SELECT * FROM project_chat_messages WHERE project_id = $1 AND is_group = true ORDER BY created_at ASC`,
+        `SELECT m.*,
+                COALESCE(json_agg(r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by
+           FROM project_chat_messages m
+           LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+           WHERE m.project_id = $1 AND m.is_group = true
+           GROUP BY m.id
+           ORDER BY m.created_at ASC`,
         [projectId]
       );
       return res.json({ success: true, messages: rows });
@@ -308,10 +309,15 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
     const normalizedRecipientRole = normalizeRole(recipientRole);
     const normalizedUserRole = normalizeRole(req.user.role);
     const { rows } = await pool.query(
-      `SELECT * FROM project_chat_messages WHERE project_id = $1 AND is_group = false
-         AND ((sender_role = $2 AND sender_id = $3 AND recipient_role = $4 AND recipient_id = $5)
-              OR (sender_role = $4 AND sender_id = $5 AND recipient_role = $2 AND recipient_id = $3))
-       ORDER BY created_at ASC`,
+      `SELECT m.*,
+              COALESCE(json_agg(r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by
+         FROM project_chat_messages m
+         LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+         WHERE m.project_id = $1 AND m.is_group = false
+           AND ((m.sender_role = $2 AND m.sender_id = $3 AND m.recipient_role = $4 AND m.recipient_id = $5)
+                OR (m.sender_role = $4 AND m.sender_id = $5 AND m.recipient_role = $2 AND m.recipient_id = $3))
+         GROUP BY m.id
+         ORDER BY m.created_at ASC`,
       [projectId, normalizedUserRole, req.user.user_id, normalizedRecipientRole, recipientId]
     );
     res.json({ success: true, messages: rows });
@@ -348,24 +354,59 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
       recipientEmail = recipient.email;
     }
 
-    const { rows } = await pool.query(
+     // allow optional attachment fields and track delivery/read state
+     const attachmentUrl = req.body.attachmentUrl || null;
+     const attachmentName = req.body.attachmentName || null;
+     const { rows } = await pool.query(
       `INSERT INTO project_chat_messages
-         (project_id, sender_role, sender_id, sender_email,
-          recipient_role, recipient_id, recipient_email,
-          is_group, content)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        (project_id, sender_role, sender_id, sender_email,
+         recipient_role, recipient_id, recipient_email,
+         is_group, content, attachment_url, attachment_name, delivered)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)
        RETURNING *`,
       [projectId, normalizedSenderRole, req.user.user_id, req.user.email || '',
        isGroupChat ? null : normalizedRecipientRole,
        isGroupChat ? null : recipientId,
        isGroupChat ? null : recipientEmail,
-       isGroupChat, content.trim()]
-    );
+       isGroupChat, content.trim(), attachmentUrl, attachmentName]
+     );
 
-    res.status(201).json({ success: true, message: 'Message saved', chatMessage: rows[0] });
+     res.status(201).json({ success: true, message: 'Message saved', chatMessage: rows[0] });
   } catch (err) {
     console.error('Send chat message error:', err);
     res.status(500).json({ success: false, error: 'Failed to send chat message' });
+  }
+});
+
+app.post('/chat/mark-read', authenticateToken, async (req, res) => {
+  const { messageIds, projectId } = req.body;
+  if (!Array.isArray(messageIds) || !messageIds.length) return res.status(400).json({ success: false, error: 'messageIds required' });
+  if (!projectId) return res.status(400).json({ success: false, error: 'projectId required' });
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
+
+    // Insert read receipts (avoid duplicates)
+    const now = new Date();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const mid of messageIds) {
+        await client.query(
+          `INSERT INTO project_chat_read_receipts (message_id, user_id, read_at)
+             VALUES ($1,$2,NOW()) ON CONFLICT (message_id,user_id) DO NOTHING`,
+          [mid, req.user.user_id]
+        );
+      }
+      // mark messages as delivered
+      await client.query(`UPDATE project_chat_messages SET delivered=true, delivered_at=NOW() WHERE id = ANY($1::int[])`, [messageIds]);
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+
+    res.json({ success: true, message: 'Marked read' });
+  } catch (err) {
+    console.error('Mark-read error:', err);
+    res.status(500).json({ success: false, error: 'Failed to mark messages read' });
   }
 });
 
