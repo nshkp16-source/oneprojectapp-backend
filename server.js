@@ -3102,58 +3102,89 @@ app.get('/api/work-center-progress/download/:progressId', authenticateToken, asy
 });
 
 
-// ─── POST /api/fetch-tab-records  (workspace_work_center case) ───────────────
-// Add this block inside your existing fetch-tab-records handler.
-// Find the if/else or switch that checks recordType and paste this in.
-//
-// if (recordType === 'workspace_work_center') {
-//   const { user_id, role } = req.user;
-//   const side = wcSide(role);
-//   let records = [];
-//
-//   if (isWCLeader(role)) {
-//     const r = await pool.query(
-//       `SELECT w.*,
-//          (w.creator_id = $2) AS is_creator,
-//          EXISTS (SELECT 1 FROM work_center_views v
-//                  WHERE v.task_id = w.id AND v.viewer_id = $2) AS is_viewed
-//        FROM workspace_work_center w
-//        WHERE w.project_id = $1 AND w.side = $3
-//        ORDER BY w.created_at DESC`,
-//       [projectId, user_id, side]
-//     );
-//     records = r.rows;
-//
-//   } else if (role === 'TeamMember') {
-//     const r = await pool.query(
-//       `SELECT w.*,
-//          false AS is_creator,
-//          EXISTS (SELECT 1 FROM work_center_views v
-//                  WHERE v.task_id = w.id AND v.viewer_id = $2) AS is_viewed
-//        FROM workspace_work_center w
-//        WHERE w.project_id = $1
-//          AND w.assigned_members @> $3::jsonb
-//        ORDER BY w.created_at DESC`,
-//       [projectId, user_id, JSON.stringify([{ id: String(user_id) }])]
-//     );
-//     records = r.rows;
-//   }
-//
-//   return res.json({ records });
-// }
+// ─── POST /api/fetch-work-center-records ─────────────────────────────────────
+// Dedicated fetch route for work center tasks (separate from fetch-tab-records
+// which handles contractual/administrative/safety/operational/financial only).
+// Body: { projectId }
+// Leaders → all tasks on their side | TeamMember → only assigned tasks
+
+app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) => {
+  try {
+    const { user_id, role } = req.user;
+    const { projectId }     = req.body;
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+
+    const side = wcSide(role);
+    let records = [];
+
+    if (isWCLeader(role)) {
+      const r = await pool.query(
+        `SELECT w.*,
+           (w.creator_id = $2) AS is_creator,
+           EXISTS (SELECT 1 FROM work_center_views v
+                   WHERE v.task_id = w.id AND v.viewer_id = $2) AS is_viewed
+         FROM workspace_work_center w
+         WHERE w.project_id = $1 AND w.side = $3
+         ORDER BY w.created_at DESC`,
+        [projectId, user_id, side]
+      );
+      records = r.rows;
+
+    } else if (role === 'TeamMember') {
+      const r = await pool.query(
+        `SELECT w.*,
+           false AS is_creator,
+           EXISTS (SELECT 1 FROM work_center_views v
+                   WHERE v.task_id = w.id AND v.viewer_id = $2) AS is_viewed
+         FROM workspace_work_center w
+         WHERE w.project_id = $1
+           AND w.assigned_members @> $3::jsonb
+         ORDER BY w.created_at DESC`,
+        [projectId, user_id, JSON.stringify([{ id: String(user_id) }])]
+      );
+      records = r.rows;
+
+    } else {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    return res.json({ records });
+  } catch (err) {
+    console.error('POST /api/fetch-work-center-records:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
 
 
-// ─── POST /api/mark-record-viewed  (workspace_work_center case) ──────────────
-// Add this block inside your existing mark-record-viewed handler.
-//
-// if (recordType === 'workspace_work_center') {
-//   await pool.query(
-//     `INSERT INTO work_center_views (task_id, viewer_id)
-//      VALUES ($1, $2) ON CONFLICT (task_id, viewer_id) DO NOTHING`,
-//     [recordId, req.user.user_id]
-//   );
-//   return res.json({ success: true });
-// }
+// ─── POST /api/mark-work-center-viewed ───────────────────────────────────────
+// Dedicated viewed route for work center tasks (separate from mark-record-viewed
+// which handles the standard document record tables).
+// Body: { projectId, recordId }
+
+app.post('/api/mark-work-center-viewed', authenticateToken, async (req, res) => {
+  try {
+    const { user_id }        = req.user;
+    const { projectId, recordId } = req.body;
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!recordId)  return res.status(400).json({ error: 'recordId is required.' });
+
+    const check = await pool.query(
+      `SELECT id FROM workspace_work_center WHERE id = $1 AND project_id = $2`,
+      [recordId, projectId]
+    );
+    if (!check.rows.length) return res.status(404).json({ error: 'Task not found.' });
+
+    await pool.query(
+      `INSERT INTO work_center_views (task_id, viewer_id)
+       VALUES ($1, $2) ON CONFLICT (task_id, viewer_id) DO NOTHING`,
+      [recordId, user_id]
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/mark-work-center-viewed:', err);
+    return res.status(500).json({ error: 'Server error.' });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GLOBAL ERROR HANDLER
