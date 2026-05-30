@@ -204,25 +204,25 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
-           COALESCE(a.representative, c.email) AS display_name,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
+           a.company_name, a.title, a.position, c.profile_picture
     FROM client_pm_assignments a
     JOIN client_project_managers c ON a.client_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
-           COALESCE(a.representative, c.email) AS display_name,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
+           a.company_name, a.title, a.position, c.profile_picture
     FROM contractor_pm_assignments a
     JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
-           COALESCE(a.representative, c.email) AS display_name,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, NULL::text AS profile_picture
+           a.company_name, a.title, a.position, c.profile_picture
     FROM consultant_pm_assignments a
     JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
     WHERE a.project_id = $1
@@ -300,9 +300,9 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                   WHEN 'Client' THEN COALESCE(c.representative, c.company_name, c.company_email)
                   WHEN 'Contractor' THEN COALESCE(ca_rep.representative, ct.email, ca_rep.company_name)
                   WHEN 'Consultant' THEN COALESCE(csa_rep.representative, cns.email, csa_rep.company_name)
-                  WHEN 'ClientPM' THEN COALESCE(cpma_rep.representative, cpm.email)
-                  WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm.email)
-                  WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email)
+                  WHEN 'ClientPM' THEN COALESCE(cpma_rep.representative, cpm.email, cpma_rep.company_name)
+                  WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm.email, ctrpma_rep.company_name)
+                  WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email, cnspma_rep.company_name)
                   WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
                   ELSE m.sender_email
                 END AS sender_display_name,
@@ -310,9 +310,9 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                   WHEN 'Client' THEN COALESCE(c.title, '')
                   WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ca_rep.company_name, '')
                   WHEN 'Consultant' THEN COALESCE(csa_rep.position, csa_rep.title, csa_rep.company_name, '')
-                  WHEN 'ClientPM' THEN COALESCE(cpm.title, '')
-                  WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, '')
-                  WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, '')
+                  WHEN 'ClientPM' THEN COALESCE(cpm.title, cpma_rep.position, cpma_rep.title, '')
+                  WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, ctrpma_rep.position, ctrpma_rep.title, '')
+                  WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, cnspma_rep.position, cnspma_rep.title, '')
                   WHEN 'TeamMember' THEN COALESCE(tma_rep.position, tm.position, tma_rep.title, tma_rep.company_name, '')
                   ELSE ''
                 END AS sender_position
@@ -352,9 +352,9 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                 WHEN 'Client' THEN COALESCE(c.representative, c.company_name, c.company_email)
                 WHEN 'Contractor' THEN COALESCE(ca_rep.representative, ct.email, ca_rep.company_name)
                 WHEN 'Consultant' THEN COALESCE(csa_rep.representative, cns.email, csa_rep.company_name)
-                WHEN 'ClientPM' THEN COALESCE(cpma_rep.representative, cpm.email)
-                WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm.email)
-                WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email)
+                WHEN 'ClientPM' THEN COALESCE(cpma_rep.representative, cpm.email, cpma_rep.company_name)
+                WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm.email, ctrpma_rep.company_name)
+                WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email, cnspma_rep.company_name)
                 WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
                 ELSE m.sender_email
               END AS sender_display_name,
@@ -362,9 +362,9 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                 WHEN 'Client' THEN COALESCE(c.title, '')
                 WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ca_rep.company_name, '')
                 WHEN 'Consultant' THEN COALESCE(csa_rep.position, csa_rep.title, csa_rep.company_name, '')
-                WHEN 'ClientPM' THEN COALESCE(cpm.title, '')
-                WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, '')
-                WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, '')
+                WHEN 'ClientPM' THEN COALESCE(cpm.title, cpma_rep.position, cpma_rep.title, '')
+                WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, ctrpma_rep.position, ctrpma_rep.title, '')
+                WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, cnspma_rep.position, cnspma_rep.title, '')
                 WHEN 'TeamMember' THEN COALESCE(tma_rep.position, tm.position, tma_rep.title, tma_rep.company_name, '')
                 ELSE ''
               END AS sender_position
