@@ -279,6 +279,97 @@ app.get('/chat/members', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/chat/conversations', authenticateToken, async (req, res) => {
+  const { projectId } = req.query;
+  if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
+
+  const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+  if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
+
+  try {
+    const normalizedUserRole = normalizeRole(req.user.role);
+    const userId = req.user.user_id;
+    const [members, messageRows] = await Promise.all([
+      getProjectMembers(projectId),
+      pool.query(
+        `SELECT m.*, COALESCE(json_agg(r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by
+           FROM project_chat_messages m
+           LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+           WHERE m.project_id = $1
+             AND (m.is_group = true OR (m.sender_role = $2 AND m.sender_id = $3) OR (m.recipient_role = $2 AND m.recipient_id = $3))
+           GROUP BY m.id
+           ORDER BY m.created_at DESC`,
+        [projectId, normalizedUserRole, userId]
+      )
+    ]);
+
+    const messages = messageRows.rows;
+    const groupMessages = messages.filter(m => m.is_group === true);
+    const lastGroupMessage = groupMessages[0];
+    const groupUnread = groupMessages.reduce((count, message) => {
+      const readBy = Array.isArray(message.read_by) ? message.read_by : [];
+      return count + ((message.sender_role !== normalizedUserRole || message.sender_id !== userId) && !readBy.includes(userId) ? 1 : 0);
+    }, 0);
+
+    const conversationMap = new Map();
+    for (const message of messages) {
+      if (message.is_group) continue;
+      const isIncoming = message.recipient_role === normalizedUserRole && Number(message.recipient_id) === Number(userId);
+      const otherRole = isIncoming ? message.sender_role : message.recipient_role;
+      const otherId = isIncoming ? message.sender_id : message.recipient_id;
+      if (!otherRole || !otherId) continue;
+      const key = `${otherRole}-${otherId}`;
+      const existing = conversationMap.get(key) || {
+        otherRole,
+        otherId,
+        lastMessage: '',
+        time: '',
+        lastAt: null,
+        unreadCount: 0,
+      };
+
+      if (!existing.lastAt || new Date(message.created_at) > new Date(existing.lastAt)) {
+        existing.lastAt = message.created_at;
+        existing.lastMessage = message.content || (message.attachment_name ? `Attachment: ${message.attachment_name}` : 'Attachment');
+        existing.time = new Date(message.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      }
+
+      const readBy = Array.isArray(message.read_by) ? message.read_by : [];
+      if (isIncoming && !readBy.includes(userId)) {
+        existing.unreadCount += 1;
+      }
+
+      conversationMap.set(key, existing);
+    }
+
+    const enrichedMembers = members.map(member => {
+      const key = `${member.role}-${member.role_id}`;
+      const conversation = conversationMap.get(key);
+      return {
+        ...member,
+        lastMessage: conversation?.lastMessage || 'Tap to chat',
+        time: conversation?.time || '',
+        sortAt: conversation?.lastAt || null,
+        unreadCount: conversation?.unreadCount || 0,
+      };
+    });
+
+    res.json({
+      success: true,
+      group: {
+        lastMessage: lastGroupMessage?.content || 'Group chat for the project',
+        time: lastGroupMessage ? new Date(lastGroupMessage.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+        unreadCount: groupUnread,
+        membersCount: members.length,
+      },
+      members: enrichedMembers,
+    });
+  } catch (err) {
+    console.error('Chat conversations error:', err);
+    res.status(500).json({ success: false, error: 'Failed to load chat conversations' });
+  }
+});
+
 app.get('/chat/messages', authenticateToken, async (req, res) => {
   const { projectId, recipientRole, recipientId, isGroup } = req.query;
   // Reply feature is not implemented yet. To support replies in future,
