@@ -302,7 +302,17 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                   WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email)
                   WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
                   ELSE m.sender_email
-                END AS sender_display_name
+                END AS sender_display_name,
+                CASE m.sender_role
+                  WHEN 'Client' THEN COALESCE(c.title, '')
+                  WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ct.company_name, '')
+                  WHEN 'Consultant' THEN COALESCE(csa_rep.position, csa_rep.title, cns.company_name, '')
+                  WHEN 'ClientPM' THEN COALESCE(cpm.title, '')
+                  WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, '')
+                  WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, '')
+                  WHEN 'TeamMember' THEN COALESCE(tma_rep.position, tm.position, tma_rep.title, tm.company_name, '')
+                  ELSE ''
+                END AS sender_position
            FROM project_chat_messages m
            LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
            LEFT JOIN clients c ON m.sender_role = 'Client' AND m.sender_id = c.id
@@ -344,7 +354,17 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                 WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email)
                 WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
                 ELSE m.sender_email
-              END AS sender_display_name
+              END AS sender_display_name,
+              CASE m.sender_role
+                WHEN 'Client' THEN COALESCE(c.title, '')
+                WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ct.company_name, '')
+                WHEN 'Consultant' THEN COALESCE(csa_rep.position, csa_rep.title, cns.company_name, '')
+                WHEN 'ClientPM' THEN COALESCE(cpm.title, '')
+                WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, '')
+                WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, '')
+                WHEN 'TeamMember' THEN COALESCE(tma_rep.position, tm.position, tma_rep.title, tm.company_name, '')
+                ELSE ''
+              END AS sender_position
          FROM project_chat_messages m
          LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
          LEFT JOIN clients c ON m.sender_role = 'Client' AND m.sender_id = c.id
@@ -404,18 +424,19 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
      // allow optional attachment fields and track delivery/read state
      const attachmentUrl = req.body.attachmentUrl || null;
      const attachmentName = req.body.attachmentName || null;
+     const attachmentMime = req.body.attachmentMime || null;
      const { rows } = await pool.query(
       `INSERT INTO project_chat_messages
         (project_id, sender_role, sender_id, sender_email,
          recipient_role, recipient_id, recipient_email,
-         is_group, content, attachment_url, attachment_name, delivered)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false)
+         is_group, content, attachment_url, attachment_name, attachment_mime, delivered)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)
        RETURNING *`,
       [projectId, normalizedSenderRole, req.user.user_id, req.user.email || '',
        isGroupChat ? null : normalizedRecipientRole,
        isGroupChat ? null : recipientId,
        isGroupChat ? null : recipientEmail,
-       isGroupChat, content.trim(), attachmentUrl, attachmentName]
+       isGroupChat, content.trim(), attachmentUrl, attachmentName, attachmentMime]
      );
 
      res.status(201).json({ success: true, message: 'Message saved', chatMessage: rows[0] });
