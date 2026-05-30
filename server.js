@@ -420,10 +420,35 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
            LEFT JOIN team_member_assignments tma_rep ON m.sender_role = 'TeamMember' AND m.sender_id = tma_rep.team_member_id AND tma_rep.project_id = m.project_id
            LEFT JOIN team_members tm ON tma_rep.team_member_id = tm.id
            WHERE m.project_id = $1 AND m.is_group = true
-           GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, cpm.id, ctrpma_rep.id, ctrpm.id, cnspma_rep.id, cnspm.id, tma_rep.id, tm.id
+           GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, ctrpma_rep.id, cnspma_rep.id, tma_rep.id, tm.id
            ORDER BY m.created_at ASC`,
         [projectId]
       );
+      
+      // Auto-mark incoming group messages as read
+      const unreadGroupMessageIds = rows
+        .filter(m => {
+          const readBy = Array.isArray(m.read_by) ? m.read_by : [];
+          return m.sender_role !== normalizedUserRole || Number(m.sender_id) !== Number(req.user.user_id)
+            ? !readBy.includes(req.user.user_id)
+            : false;
+        })
+        .map(m => m.id);
+      
+      if (unreadGroupMessageIds.length > 0) {
+        try {
+          for (const messageId of unreadGroupMessageIds) {
+            await pool.query(
+              `INSERT INTO project_chat_read_receipts (message_id, user_id, user_role, read_at)
+               VALUES ($1,$2,$3,NOW()) ON CONFLICT (message_id,user_id) DO NOTHING`,
+              [messageId, req.user.user_id, normalizedUserRole]
+            );
+          }
+        } catch (e) {
+          console.error('Failed to mark group messages as read:', e);
+        }
+      }
+      
       return res.json({ success: true, messages: rows });
     }
 
@@ -471,10 +496,35 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
          WHERE m.project_id = $1 AND m.is_group = false
            AND ((m.sender_role = $2 AND m.sender_id = $3 AND m.recipient_role = $4 AND m.recipient_id = $5)
                 OR (m.sender_role = $4 AND m.sender_id = $5 AND m.recipient_role = $2 AND m.recipient_id = $3))
-         GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, cpm.id, ctrpma_rep.id, ctrpm.id, cnspma_rep.id, cnspm.id, tma_rep.id, tm.id
+         GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, ctrpma_rep.id, cnspma_rep.id, tma_rep.id, tm.id
          ORDER BY m.created_at ASC`,
       [projectId, normalizedUserRole, req.user.user_id, normalizedRecipientRole, recipientId]
     );
+    
+    // Auto-mark incoming messages as read
+    const unreadMessageIds = rows
+      .filter(m => {
+        const readBy = Array.isArray(m.read_by) ? m.read_by : [];
+        return m.sender_role !== normalizedUserRole || Number(m.sender_id) !== Number(req.user.user_id)
+          ? !readBy.includes(req.user.user_id)
+          : false;
+      })
+      .map(m => m.id);
+    
+    if (unreadMessageIds.length > 0) {
+      try {
+        for (const messageId of unreadMessageIds) {
+          await pool.query(
+            `INSERT INTO project_chat_read_receipts (message_id, user_id, user_role, read_at)
+             VALUES ($1,$2,$3,NOW()) ON CONFLICT (message_id,user_id) DO NOTHING`,
+            [messageId, req.user.user_id, normalizedUserRole]
+          );
+        }
+      } catch (e) {
+        console.error('Failed to mark messages as read:', e);
+      }
+    }
+    
     res.json({ success: true, messages: rows });
   } catch (err) {
     console.error('Chat messages error:', err);
@@ -528,6 +578,18 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
        isGroupChat ? null : recipientEmail,
        isGroupChat, contentText, attachmentUrl, attachmentName, attachmentMime]
      );
+
+     // Auto-mark sender's message as read
+     const messageId = rows[0].id;
+     try {
+       await pool.query(
+         `INSERT INTO project_chat_read_receipts (message_id, user_id, user_role, read_at)
+          VALUES ($1,$2,$3,NOW()) ON CONFLICT (message_id,user_id) DO NOTHING`,
+         [messageId, req.user.user_id, normalizedSenderRole]
+       );
+     } catch (e) {
+       console.error('Failed to mark sent message as read:', e);
+     }
 
      res.status(201).json({ success: true, message: 'Message saved', chatMessage: rows[0] });
   } catch (err) {
