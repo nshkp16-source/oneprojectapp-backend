@@ -310,9 +310,9 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                   WHEN 'Client' THEN COALESCE(c.title, '')
                   WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ca_rep.company_name, '')
                   WHEN 'Consultant' THEN COALESCE(csa_rep.position, csa_rep.title, csa_rep.company_name, '')
-                  WHEN 'ClientPM' THEN COALESCE(cpm.title, cpma_rep.position, cpma_rep.title, '')
-                  WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, ctrpma_rep.position, ctrpma_rep.title, '')
-                  WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, cnspma_rep.position, cnspma_rep.title, '')
+                  WHEN 'ClientPM' THEN COALESCE(cpma_rep.position, cpma_rep.title, cpma_rep.company_name, '')
+                  WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.position, ctrpma_rep.title, ctrpma_rep.company_name, '')
+                  WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.position, cnspma_rep.title, cnspma_rep.company_name, '')
                   WHEN 'TeamMember' THEN COALESCE(tma_rep.position, tm.position, tma_rep.title, tma_rep.company_name, '')
                   ELSE ''
                 END AS sender_position
@@ -362,9 +362,9 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                 WHEN 'Client' THEN COALESCE(c.title, '')
                 WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ca_rep.company_name, '')
                 WHEN 'Consultant' THEN COALESCE(csa_rep.position, csa_rep.title, csa_rep.company_name, '')
-                WHEN 'ClientPM' THEN COALESCE(cpm.title, cpma_rep.position, cpma_rep.title, '')
-                WHEN 'ContractorPM' THEN COALESCE(ctrpm.title, ctrpma_rep.position, ctrpma_rep.title, '')
-                WHEN 'ConsultantPM' THEN COALESCE(cnspm.title, cnspma_rep.position, cnspma_rep.title, '')
+                WHEN 'ClientPM' THEN COALESCE(cpma_rep.position, cpma_rep.title, cpma_rep.company_name, '')
+                WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.position, ctrpma_rep.title, ctrpma_rep.company_name, '')
+                WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.position, cnspma_rep.title, cnspma_rep.company_name, '')
                 WHEN 'TeamMember' THEN COALESCE(tma_rep.position, tm.position, tma_rep.title, tma_rep.company_name, '')
                 ELSE ''
               END AS sender_position
