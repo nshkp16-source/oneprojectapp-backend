@@ -288,14 +288,38 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
 
   try {
     // return messages and read-receipts (who read each message)
+    // Also include sender display names by joining with role tables
     if (isGroup === 'true' || isGroup === '1') {
       const { rows } = await pool.query(
         `SELECT m.*,
-                COALESCE(json_agg(r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by
+                COALESCE(json_agg(r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
+                CASE m.sender_role
+                  WHEN 'Client' THEN COALESCE(c.representative, c.company_name, c.company_email)
+                  WHEN 'Contractor' THEN COALESCE(ca_rep.representative, ct.email, ca_rep.company_name)
+                  WHEN 'Consultant' THEN COALESCE(csa_rep.representative, cns.email, csa_rep.company_name)
+                  WHEN 'ClientPM' THEN COALESCE(cpma_rep.representative, cpm.email)
+                  WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm.email)
+                  WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email)
+                  WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
+                  ELSE m.sender_email
+                END AS sender_display_name
            FROM project_chat_messages m
            LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+           LEFT JOIN clients c ON m.sender_role = 'Client' AND m.sender_id = c.id
+           LEFT JOIN contractor_assignments ca_rep ON m.sender_role = 'Contractor' AND m.sender_id = ca_rep.contractor_id AND ca_rep.project_id = m.project_id
+           LEFT JOIN contractors ct ON ca_rep.contractor_id = ct.id
+           LEFT JOIN consultant_assignments csa_rep ON m.sender_role = 'Consultant' AND m.sender_id = csa_rep.consultant_id AND csa_rep.project_id = m.project_id
+           LEFT JOIN consultants cns ON csa_rep.consultant_id = cns.id
+           LEFT JOIN client_pm_assignments cpma_rep ON m.sender_role = 'ClientPM' AND m.sender_id = cpma_rep.client_pm_id AND cpma_rep.project_id = m.project_id
+           LEFT JOIN client_project_managers cpm ON cpma_rep.client_pm_id = cpm.id
+           LEFT JOIN contractor_pm_assignments ctrpma_rep ON m.sender_role = 'ContractorPM' AND m.sender_id = ctrpma_rep.contractor_pm_id AND ctrpma_rep.project_id = m.project_id
+           LEFT JOIN contractor_project_managers ctrpm ON ctrpma_rep.contractor_pm_id = ctrpm.id
+           LEFT JOIN consultant_pm_assignments cnspma_rep ON m.sender_role = 'ConsultantPM' AND m.sender_id = cnspma_rep.consultant_pm_id AND cnspma_rep.project_id = m.project_id
+           LEFT JOIN consultant_project_managers cnspm ON cnspma_rep.consultant_pm_id = cnspm.id
+           LEFT JOIN team_member_assignments tma_rep ON m.sender_role = 'TeamMember' AND m.sender_id = tma_rep.team_member_id AND tma_rep.project_id = m.project_id
+           LEFT JOIN team_members tm ON tma_rep.team_member_id = tm.id
            WHERE m.project_id = $1 AND m.is_group = true
-           GROUP BY m.id
+           GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, cpm.id, ctrpma_rep.id, ctrpm.id, cnspma_rep.id, cnspm.id, tma_rep.id, tm.id
            ORDER BY m.created_at ASC`,
         [projectId]
       );
@@ -310,13 +334,36 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
     const normalizedUserRole = normalizeRole(req.user.role);
     const { rows } = await pool.query(
       `SELECT m.*,
-              COALESCE(json_agg(r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by
+              COALESCE(json_agg(r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
+              CASE m.sender_role
+                WHEN 'Client' THEN COALESCE(c.representative, c.company_name, c.company_email)
+                WHEN 'Contractor' THEN COALESCE(ca_rep.representative, ct.email, ca_rep.company_name)
+                WHEN 'Consultant' THEN COALESCE(csa_rep.representative, cns.email, csa_rep.company_name)
+                WHEN 'ClientPM' THEN COALESCE(cpma_rep.representative, cpm.email)
+                WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm.email)
+                WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm.email)
+                WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
+                ELSE m.sender_email
+              END AS sender_display_name
          FROM project_chat_messages m
          LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+         LEFT JOIN clients c ON m.sender_role = 'Client' AND m.sender_id = c.id
+         LEFT JOIN contractor_assignments ca_rep ON m.sender_role = 'Contractor' AND m.sender_id = ca_rep.contractor_id AND ca_rep.project_id = m.project_id
+         LEFT JOIN contractors ct ON ca_rep.contractor_id = ct.id
+         LEFT JOIN consultant_assignments csa_rep ON m.sender_role = 'Consultant' AND m.sender_id = csa_rep.consultant_id AND csa_rep.project_id = m.project_id
+         LEFT JOIN consultants cns ON csa_rep.consultant_id = cns.id
+         LEFT JOIN client_pm_assignments cpma_rep ON m.sender_role = 'ClientPM' AND m.sender_id = cpma_rep.client_pm_id AND cpma_rep.project_id = m.project_id
+         LEFT JOIN client_project_managers cpm ON cpma_rep.client_pm_id = cpm.id
+         LEFT JOIN contractor_pm_assignments ctrpma_rep ON m.sender_role = 'ContractorPM' AND m.sender_id = ctrpma_rep.contractor_pm_id AND ctrpma_rep.project_id = m.project_id
+         LEFT JOIN contractor_project_managers ctrpm ON ctrpma_rep.contractor_pm_id = ctrpm.id
+         LEFT JOIN consultant_pm_assignments cnspma_rep ON m.sender_role = 'ConsultantPM' AND m.sender_id = cnspma_rep.consultant_pm_id AND cnspma_rep.project_id = m.project_id
+         LEFT JOIN consultant_project_managers cnspm ON cnspma_rep.consultant_pm_id = cnspm.id
+         LEFT JOIN team_member_assignments tma_rep ON m.sender_role = 'TeamMember' AND m.sender_id = tma_rep.team_member_id AND tma_rep.project_id = m.project_id
+         LEFT JOIN team_members tm ON tma_rep.team_member_id = tm.id
          WHERE m.project_id = $1 AND m.is_group = false
            AND ((m.sender_role = $2 AND m.sender_id = $3 AND m.recipient_role = $4 AND m.recipient_id = $5)
                 OR (m.sender_role = $4 AND m.sender_id = $5 AND m.recipient_role = $2 AND m.recipient_id = $3))
-         GROUP BY m.id
+         GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, cpm.id, ctrpma_rep.id, ctrpm.id, cnspma_rep.id, cnspm.id, tma_rep.id, tm.id
          ORDER BY m.created_at ASC`,
       [projectId, normalizedUserRole, req.user.user_id, normalizedRecipientRole, recipientId]
     );
