@@ -397,6 +397,10 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                   WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
                   ELSE m.sender_email
                 END AS sender_display_name,
+                rm.id AS reply_to_message_id,
+                rm.content AS reply_to_content,
+                rm.sender_role AS reply_to_sender_role,
+                rm.sender_email AS reply_to_sender_email,
                 CASE m.sender_role
                   WHEN 'Client' THEN COALESCE(c.title, '')
                   WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ca_rep.company_name, '')
@@ -409,6 +413,7 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                 END AS sender_position
            FROM project_chat_messages m
            LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+           LEFT JOIN project_chat_messages rm ON m.reply_to_message_id = rm.id
            LEFT JOIN clients c ON m.sender_role = 'Client' AND m.sender_id = c.id
            LEFT JOIN contractor_assignments ca_rep ON m.sender_role = 'Contractor' AND m.sender_id = ca_rep.contractor_id AND ca_rep.project_id = m.project_id
            LEFT JOIN contractors ct ON ca_rep.contractor_id = ct.id
@@ -420,7 +425,7 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
            LEFT JOIN team_member_assignments tma_rep ON m.sender_role = 'TeamMember' AND m.sender_id = tma_rep.team_member_id AND tma_rep.project_id = m.project_id
            LEFT JOIN team_members tm ON tma_rep.team_member_id = tm.id
            WHERE m.project_id = $1 AND m.is_group = true
-           GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, ctrpma_rep.id, cnspma_rep.id, tma_rep.id, tm.id
+           GROUP BY m.id, rm.id, rm.content, rm.sender_role, rm.sender_email, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, ctrpma_rep.id, cnspma_rep.id, tma_rep.id, tm.id
            ORDER BY m.created_at ASC`,
         [projectId]
       );
@@ -471,6 +476,10 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
                 WHEN 'TeamMember' THEN COALESCE(tma_rep.representative, tm.email, tma_rep.company_name)
                 ELSE m.sender_email
               END AS sender_display_name,
+              rm.id AS reply_to_message_id,
+              rm.content AS reply_to_content,
+              rm.sender_role AS reply_to_sender_role,
+              rm.sender_email AS reply_to_sender_email,
               CASE m.sender_role
                 WHEN 'Client' THEN COALESCE(c.title, '')
                 WHEN 'Contractor' THEN COALESCE(ca_rep.position, ca_rep.title, ca_rep.company_name, '')
@@ -483,6 +492,7 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
               END AS sender_position
          FROM project_chat_messages m
          LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+         LEFT JOIN project_chat_messages rm ON m.reply_to_message_id = rm.id
          LEFT JOIN clients c ON m.sender_role = 'Client' AND m.sender_id = c.id
          LEFT JOIN contractor_assignments ca_rep ON m.sender_role = 'Contractor' AND m.sender_id = ca_rep.contractor_id AND ca_rep.project_id = m.project_id
          LEFT JOIN contractors ct ON ca_rep.contractor_id = ct.id
@@ -496,7 +506,7 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
          WHERE m.project_id = $1 AND m.is_group = false
            AND ((m.sender_role = $2 AND m.sender_id = $3 AND m.recipient_role = $4 AND m.recipient_id = $5)
                 OR (m.sender_role = $4 AND m.sender_id = $5 AND m.recipient_role = $2 AND m.recipient_id = $3))
-         GROUP BY m.id, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, ctrpma_rep.id, cnspma_rep.id, tma_rep.id, tm.id
+         GROUP BY m.id, rm.id, rm.content, rm.sender_role, rm.sender_email, c.id, ca_rep.id, ct.id, csa_rep.id, cns.id, cpma_rep.id, ctrpma_rep.id, cnspma_rep.id, tma_rep.id, tm.id
          ORDER BY m.created_at ASC`,
       [projectId, normalizedUserRole, req.user.user_id, normalizedRecipientRole, recipientId]
     );
@@ -561,21 +571,22 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
       recipientEmail = recipient.email;
     }
 
-     // allow optional attachment fields and track delivery/read state
-     const attachmentUrl = req.body.attachmentUrl || null;
-     const attachmentName = req.body.attachmentName || null;
-     const attachmentMime = req.body.attachmentMime || null;
-     const { rows } = await pool.query(
+    // allow optional attachment fields and track delivery/read state
+    const attachmentName = req.body.attachmentName || null;
+    const attachmentMime = req.body.attachmentMime || null;
+    const { rows } = await pool.query(
       `INSERT INTO project_chat_messages
         (project_id, sender_role, sender_id, sender_email,
          recipient_role, recipient_id, recipient_email,
+         reply_to_message_id,
          is_group, content, attachment_url, attachment_name, attachment_mime, delivered)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,false)
        RETURNING *`,
       [projectId, normalizedSenderRole, req.user.user_id, req.user.email || '',
        isGroupChat ? null : normalizedRecipientRole,
        isGroupChat ? null : recipientId,
        isGroupChat ? null : recipientEmail,
+       req.body.replyToMessageId ? Number(req.body.replyToMessageId) : null,
        isGroupChat, contentText, attachmentUrl, attachmentName, attachmentMime]
      );
 
@@ -613,9 +624,9 @@ app.post('/chat/mark-read', authenticateToken, async (req, res) => {
       await client.query('BEGIN');
       for (const mid of messageIds) {
         await client.query(
-          `INSERT INTO project_chat_read_receipts (message_id, user_id, read_at)
-             VALUES ($1,$2,NOW()) ON CONFLICT (message_id,user_id) DO NOTHING`,
-          [mid, req.user.user_id]
+          `INSERT INTO project_chat_read_receipts (message_id, user_id, user_role, read_at)
+             VALUES ($1,$2,$3,NOW()) ON CONFLICT (message_id,user_id) DO NOTHING`,
+          [mid, req.user.user_id, normalizeRole(req.user.role)]
         );
       }
       // mark messages as delivered
