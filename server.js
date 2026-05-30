@@ -372,11 +372,10 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
 
 app.get('/chat/messages', authenticateToken, async (req, res) => {
   const { projectId, recipientRole, recipientId, isGroup } = req.query;
-  // Reply feature is not implemented yet. To support replies in future,
-  // add a reply_to_message_id reference in project_chat_messages and
-  // return reply metadata from this endpoint.
+  // Reply feature is supported. Ensure the database schema includes reply_to_message_id.
   if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
 
+  const normalizedUserRole = normalizeRole(req.user.role);
   const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
   if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
 
