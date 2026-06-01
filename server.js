@@ -983,7 +983,7 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
   app.get(`${routePrefix}/profile`, authenticateToken, async (req, res) => {
     if (req.user.role!==jwtRole) return res.status(403).json({error:`Access denied: ${jwtRole} only`});
     try {
-      const fields=['email','profile_picture',...(extraProfileFields||[])].join(',');
+      const fields=[emailCol,'profile_picture',...(extraProfileFields||[])].join(',');
       const result=await pool.query(`SELECT ${fields} FROM ${dbTable} WHERE id=$1 AND ${emailCol}=$2`,[req.user.user_id,req.user.email]);
       if (!result.rows.length) return res.status(404).json({error:`${jwtRole} not found`});
       res.json({...result.rows[0],role:jwtRole});
@@ -1045,13 +1045,13 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
   });
 }
 
-buildProfileRoutes({routePrefix:'/client',jwtRole:'Client',dbTable:'clients',emailCol:'company_email',cloudFolder:'oneprojectapp/clients',isClientRole:true,extraProfileFields:['representative','title','telephone','company_name']});
-buildProfileRoutes({routePrefix:'/contractor',jwtRole:'Contractor',dbTable:'contractors',emailCol:'email',cloudFolder:'oneprojectapp/contractors',assignmentTable:'contractor_assignments',assignmentFk:'contractor_id'});
-buildProfileRoutes({routePrefix:'/consultant',jwtRole:'Consultant',dbTable:'consultants',emailCol:'email',cloudFolder:'oneprojectapp/consultants',assignmentTable:'consultant_assignments',assignmentFk:'consultant_id'});
-buildProfileRoutes({routePrefix:'/client-project-manager',jwtRole:'Client Project Manager',dbTable:'client_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/client_project_managers',assignmentTable:'client_pm_assignments',assignmentFk:'client_pm_id'});
-buildProfileRoutes({routePrefix:'/contractor-project-manager',jwtRole:'Contractor Project Manager',dbTable:'contractor_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/contractor_project_managers',assignmentTable:'contractor_pm_assignments',assignmentFk:'contractor_pm_id'});
-buildProfileRoutes({routePrefix:'/consultant-project-manager',jwtRole:'Consultant Project Manager',dbTable:'consultant_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/consultant_project_managers',assignmentTable:'consultant_pm_assignments',assignmentFk:'consultant_pm_id'});
-buildProfileRoutes({routePrefix:'/team-member',jwtRole:'Team Member',dbTable:'team_members',emailCol:'email',cloudFolder:'oneprojectapp/team_members',assignmentTable:'team_member_assignments',assignmentFk:'team_member_id'});
+buildProfileRoutes({routePrefix:'/client',jwtRole:'Client',dbTable:'clients',emailCol:'company_email',cloudFolder:'oneprojectapp/clients',isClientRole:true,extraProfileFields:['representative','title','telephone','company_name','profile_picture_id']});
+buildProfileRoutes({routePrefix:'/contractor',jwtRole:'Contractor',dbTable:'contractors',emailCol:'email',cloudFolder:'oneprojectapp/contractors',assignmentTable:'contractor_assignments',assignmentFk:'contractor_id',extraProfileFields:['profile_picture_id']});
+buildProfileRoutes({routePrefix:'/consultant',jwtRole:'Consultant',dbTable:'consultants',emailCol:'email',cloudFolder:'oneprojectapp/consultants',assignmentTable:'consultant_assignments',assignmentFk:'consultant_id',extraProfileFields:['profile_picture_id']});
+buildProfileRoutes({routePrefix:'/client-project-manager',jwtRole:'ClientPM',dbTable:'client_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/client_project_managers',assignmentTable:'client_pm_assignments',assignmentFk:'client_pm_id',extraProfileFields:['profile_picture_id']});
+buildProfileRoutes({routePrefix:'/contractor-project-manager',jwtRole:'ContractorPM',dbTable:'contractor_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/contractor_project_managers',assignmentTable:'contractor_pm_assignments',assignmentFk:'contractor_pm_id',extraProfileFields:['profile_picture_id']});
+buildProfileRoutes({routePrefix:'/consultant-project-manager',jwtRole:'ConsultantPM',dbTable:'consultant_project_managers',emailCol:'email',cloudFolder:'oneprojectapp/consultant_project_managers',assignmentTable:'consultant_pm_assignments',assignmentFk:'consultant_pm_id',extraProfileFields:['profile_picture_id']});
+buildProfileRoutes({routePrefix:'/team-member',jwtRole:'TeamMember',dbTable:'team_members',emailCol:'email',cloudFolder:'oneprojectapp/team_members',assignmentTable:'team_member_assignments',assignmentFk:'team_member_id',extraProfileFields:['profile_picture_id']});
 
 // ─── Client legacy routes ──────────────────────────────────────────────────
 app.post('/client/check-email', async (req, res) => {
