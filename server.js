@@ -1259,6 +1259,45 @@ app.get('/api/me', authenticateToken, (req, res) => {
   res.json({ id: req.user.user_id, role: req.user.role, email: req.user.email });
 });
 
+app.get('/api/user-assignment', authenticateToken, async (req, res) => {
+  try {
+    const { projectId } = req.query;
+    const { user_id, role } = req.user;
+
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    const isLeader = isWCLeader(role);
+    let side = null;
+
+    if (isLeader) {
+      // For leaders, derive side from role
+      side = wcSide(role);
+    } else if (role === 'TeamMember') {
+      // For team members, fetch assigned_part from DB
+      const result = await pool.query(
+        `SELECT assigned_part FROM team_member_assignments
+         WHERE project_id = $1 AND team_member_id = $2`,
+        [projectId, user_id]
+      );
+      if (result.rows.length > 0) {
+        side = result.rows[0].assigned_part;
+      }
+    }
+
+    return res.json({
+      userId: user_id,
+      role,
+      side,
+      isLeader
+    });
+  } catch (err) {
+    console.error('GET /api/user-assignment:', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS
 // ─────────────────────────────────────────────────────────────────────────────
