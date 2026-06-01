@@ -270,13 +270,19 @@ async function userHasProjectAccess(userId, role, projectId) {
 // =============================================================================
 
 function wcSide(role) {
-  if (['Contractor',  'ContractorPM'].includes(role)) return 'Contractor';
-  if (['Consultant',  'ConsultantPM'].includes(role)) return 'Consultant';
-  if (['Client',      'ClientPM'].includes(role))     return 'Client';
+  if (!role) return null;
+  const normalized = normalizeRole(role);
+  if (['Contractor',  'ContractorPM'].includes(normalized)) return 'Contractor';
+  if (['Consultant',  'ConsultantPM'].includes(normalized)) return 'Consultant';
+  if (['Client',      'ClientPM'].includes(normalized))     return 'Client';
   return null;
 }
 
-function isWCLeader(role) { return wcSide(role) !== null; }
+function isWCLeader(role) {
+  const result = wcSide(role) !== null;
+  console.log(`[AUTH] isWCLeader(${role || 'null'}) -> ${result} [normalized: ${normalizeRole(role) || 'null'}]`);
+  return result;
+}
 
 function sideRoles(side) {
   if (side === 'Contractor') return ['Contractor', 'ContractorPM'];
@@ -2526,7 +2532,11 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
 app.post('/api/planning-execution/create', authenticateToken, upload.single('linked_file'), async (req, res) => {
   try {
     const { user_id, role }=req.user;
-    if (!isWCLeader(role)) return res.status(403).json({error:'Only leaders and PMs can create activities.'});
+    console.log(`[PE CREATE] user=${user_id} role='${role}' body keys=[${Object.keys(req.body).join(',')}]`);
+    if (!isWCLeader(role)) {
+      console.log(`[PE CREATE DENIED] isWCLeader failed for role='${role}'`);
+      return res.status(403).json({error:'Only leaders and PMs can create activities.'});
+    }
     const { projectId,milestone_ref,title,description='',start_date,end_date,planned_quantity,unit,planned_work='',planned_manpower='',planned_equipment='',planned_materials='',status='ongoing' }=req.body;
     if (!projectId) return res.status(400).json({error:'projectId is required.'});
     if (!milestone_ref?.trim()) return res.status(400).json({error:'milestone_ref is required.'});
