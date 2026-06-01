@@ -1387,6 +1387,93 @@ app.post('/notifications/mark-all-read', authenticateToken, async (req, res) => 
   }
 });
 
+// Duplicate notification routes with '/api' prefix for frontend consistency
+app.get('/api/notifications/unread-count', authenticateToken, async (req, res) => {
+  const { projectId } = req.query;
+  const userId = req.user.user_id;
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*) AS count
+       FROM notifications n
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id AND nr.user_id = $2
+       WHERE n.project_id = $1 AND n.added_by_id != $2
+         AND (nr.is_read = false OR nr.id IS NULL)`,
+      [projectId, userId]
+    );
+    res.json({ count: parseInt(result.rows[0].count, 10) });
+  } catch (err) {
+    console.error('Unread count error (api):', err);
+    res.status(500).json({ count: 0 });
+  }
+});
+
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  const { projectId } = req.query;
+  const userId = req.user.user_id;
+  try {
+    const { rows: notifs } = await pool.query(
+      `SELECT n.id, n.entity_type, n.entity_id, n.message,
+              n.added_by_role, n.created_at,
+              COALESCE(nr.is_read, false) AS is_read
+       FROM notifications n
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id AND nr.user_id = $2
+       WHERE n.project_id = $1 AND n.added_by_id != $2
+       ORDER BY n.created_at DESC`,
+      [projectId, userId]
+    );
+    for (const n of notifs) {
+      await pool.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+         VALUES ($1, $2, false) ON CONFLICT (notification_id, user_id) DO NOTHING`,
+        [n.id, userId]
+      );
+    }
+    res.json({ notifications: notifs });
+  } catch (err) {
+    console.error('Fetch notifications error (api):', err);
+    res.status(500).json({ notifications: [] });
+  }
+});
+
+app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.user_id;
+  try {
+    await pool.query(
+      `INSERT INTO notification_recipients (notification_id, user_id, is_read, read_at)
+       VALUES ($1, $2, true, NOW())
+       ON CONFLICT (notification_id, user_id) DO UPDATE SET is_read = true, read_at = NOW()`,
+      [id, userId]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Mark read error (api):', err);
+    res.status(500).json({ success: false });
+  }
+});
+
+app.post('/api/notifications/mark-all-read', authenticateToken, async (req, res) => {
+  const { notificationIds } = req.body;
+  const userId = req.user.user_id;
+  if (!Array.isArray(notificationIds) || !notificationIds.length) {
+    return res.json({ success: true, updated: 0 });
+  }
+  try {
+    for (const notifId of notificationIds) {
+      await pool.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, is_read, read_at)
+         VALUES ($1, $2, true, NOW())
+         ON CONFLICT (notification_id, user_id) DO UPDATE SET is_read = true, read_at = NOW()`,
+        [notifId, userId]
+      );
+    }
+    res.json({ success: true, updated: notificationIds.length });
+  } catch (err) {
+    console.error('Mark all read error (api):', err);
+    res.status(500).json({ success: false });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ADD RECORD
 // ─────────────────────────────────────────────────────────────────────────────
