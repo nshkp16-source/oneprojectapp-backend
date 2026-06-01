@@ -2537,9 +2537,9 @@ app.post('/api/planning-execution/create', authenticateToken, upload.single('lin
       console.log(`[PE CREATE DENIED] isWCLeader failed for role='${role}'`);
       return res.status(403).json({error:'Only leaders and PMs can create activities.'});
     }
-    const { projectId,milestone_ref,title,description='',start_date,end_date,planned_quantity,unit,planned_work='',planned_manpower='',planned_equipment='',planned_materials='',status='ongoing' }=req.body;
+    const { projectId,title,description='',start_date,end_date,planned_quantity,unit,planned_work='',planned_manpower='',planned_equipment='',planned_materials='',status='ongoing' }=req.body;
+    const milestone_ref = req.body.milestone_ref?.trim() || null;
     if (!projectId) return res.status(400).json({error:'projectId is required.'});
-    if (!milestone_ref?.trim()) return res.status(400).json({error:'milestone_ref is required.'});
     if (!title?.trim()) return res.status(400).json({error:'title is required.'});
     if (!start_date) return res.status(400).json({error:'start_date is required.'});
     if (!end_date) return res.status(400).json({error:'end_date is required.'});
@@ -2550,7 +2550,7 @@ app.post('/api/planning-execution/create', authenticateToken, upload.single('lin
     if (!projCheck.rows.length) return res.status(403).json({error:'You are not a member of this project.'});
     let linkedFileName=null,linkedFileId=null,linkedFileUrl=null;
     if (req.file){const uploaded=await scheduleCloudinaryUpload(req.file.buffer,req.file.originalname,'planning_execution/plans');linkedFileName=req.file.originalname;linkedFileId=uploaded.public_id;linkedFileUrl=uploaded.secure_url;}
-    const result=await pool.query(`INSERT INTO planning_execution (project_id,milestone_ref,title,description,start_date,end_date,planned_quantity,unit,planned_work,planned_manpower,planned_equipment,planned_materials,linked_file_name,linked_file_id,linked_file_url,status,creator_id,creator_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,[projectId,milestone_ref.trim(),title.trim(),description,start_date,end_date,planned_quantity,unit.trim(),planned_work,planned_manpower,planned_equipment,planned_materials,linkedFileName,linkedFileId,linkedFileUrl,status,user_id,role]);
+    const result=await pool.query(`INSERT INTO planning_execution (project_id,milestone_ref,title,description,start_date,end_date,planned_quantity,unit,planned_work,planned_manpower,planned_equipment,planned_materials,linked_file_name,linked_file_id,linked_file_url,status,creator_id,creator_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,[projectId,milestone_ref,title.trim(),description,start_date,end_date,planned_quantity,unit.trim(),planned_work,planned_manpower,planned_equipment,planned_materials,linkedFileName,linkedFileId,linkedFileUrl,status,user_id,role]);
     return res.status(201).json({ success:true,record:result.rows[0] });
   } catch(err){console.error('POST /api/planning-execution/create:',err);return res.status(500).json({error:'Server error.'});}
 });
