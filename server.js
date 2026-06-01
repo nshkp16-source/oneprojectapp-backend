@@ -17,6 +17,14 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Simple request logger for API routes (helps diagnose frontend/backend calls)
+app.use((req, res, next) => {
+  if (req.originalUrl && req.originalUrl.startsWith('/api')) {
+    console.log(`[API] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+  }
+  next();
+});
+
 // ─── Cloudinary ───────────────────────────────────────────────────────────────
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -3102,6 +3110,7 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
   try {
     const { user_id, role } = req.user;
     const { projectId }     = req.body;
+    console.log(`[WC] fetch-work-center-records projectId=${projectId} user=${user_id} role=${role}`);
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
     const side = wcSide(role);
     let records = [];
@@ -3176,6 +3185,7 @@ app.post('/api/planning-execution', authenticateToken, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     const { projectId }     = req.body;
+    console.log(`[PE] planning-execution POST projectId=${projectId} user=${user_id} role=${role}`);
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
     const side = wcSide(role);
     if (!side) return res.status(403).json({ error: 'Access denied.' });
@@ -3203,6 +3213,7 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     const { projectId }     = req.query;
+    console.log(`[PE] planning-execution GET projectId=${projectId} user=${user_id} role=${role}`);
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
     const side = wcSide(role);
     if (!side) return res.status(403).json({ error: 'Access denied.' });
