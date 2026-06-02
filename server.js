@@ -1904,7 +1904,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       else if (action === 'accepted') { newStatus = 'approved_record'; }
       else { const m = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' }; newStatus = m[uploaderSide] || 'pending_review'; }
       await pool.query(`UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, recordId, projectId]);
-      const notifMsg = `${reviewerRole} ${action} record "${rec.role}" #${recordId}`;
+      const notifMsg = `${reviewerRole} ${action} record #${recordId} (uploaded by ${rec.role})`;
       const dbClient = await pool.connect();
       try {
         await dbClient.query('BEGIN');
