@@ -2372,10 +2372,13 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
     const result = await pool.query(`
       SELECT id, title, milestone_name, status, start_date, end_date,
              planned_quantity, unit,
+             -- recommended (latest entry only):
              COALESCE((
-               SELECT ROUND(AVG(t.progress_pct)::numeric, 1)
+               SELECT t.progress_pct
                FROM   planning_execution_tracking t
                WHERE  t.activity_id = pe.id
+               ORDER  BY t.report_date DESC, t.created_at DESC
+               LIMIT  1
              ), 0) AS avg_progress
       FROM   planning_execution pe
       WHERE  project_id = $1
