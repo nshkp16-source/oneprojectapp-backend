@@ -3521,7 +3521,7 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
   }
 });
 
-// Create a new document (draft)
+// Create a new document (draft for team members, auto-approved for side leaders)
 app.post('/api/document-approval/create', authenticateToken, upload.single('file'), async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
@@ -3538,11 +3538,25 @@ app.post('/api/document-approval/create', authenticateToken, upload.single('file
     // Resolve side: for leaders/PMs use role mapping, for TeamMember use assignment for this project
     const resolvedSide = await resolveSide(req.user.role, req.user.user_id, projectId);
     const side = sideLabel(resolvedSide);
-    const insert = await pool.query(
-      `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-      [projectId, title, description || null, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, side]
-    );
+    
+    // Side leaders auto-approve their own documents; team members need approval
+    const isLeader = getSide(req.user.role) !== null;
+    const approvalStatus = isLeader ? 'approved' : 'draft';
+    const approvedById = isLeader ? req.user.user_id : null;
+    const approvedByRole = isLeader ? req.user.role : null;
+    
+    let q = `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side, approval_status`;
+    let params = [projectId, title, description || null, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, side, approvalStatus];
+    let paramIdx = 12;
+    
+    if (isLeader) {
+      q += `, approved_by_id, approved_by_role, approval_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$${paramIdx},$${paramIdx+1},NOW())`;
+      params.push(approvedById, approvedByRole);
+    } else {
+      q += `) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`;
+    }
+    
+    const insert = await pool.query(q + ` RETURNING id`, params);
     return res.json({ success: true, id: insert.rows[0].id });
   } catch (err) {
     console.error('POST /api/document-approval/create:', err);
