@@ -3479,6 +3479,248 @@ app.post('/api/mark-work-center-viewed', authenticateToken, async (req, res) => 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GLOBAL ERROR HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
+//  DOCUMENT & APPROVAL  + CONTROL & REPORT API
+// -----------------------------------------------------------------------------
+
+function sideLabel(side) {
+  if (!side) return null;
+  if (side === 'contractor') return 'Contractor';
+  if (side === 'consultant') return 'Consultant';
+  if (side === 'client') return 'Client';
+  return side;
+}
+
+// List document-approval items for a project
+app.post('/api/document-approval', authenticateToken, async (req, res) => {
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, project_id, title, description, category AS doc_type, document_date, file_name, file_url, creator_id, creator_role, side, approval_status AS status, approved_by_id, approved_by_role, approval_date AS reviewed_at, rejection_reason, is_shared, shared_at, created_at
+       FROM documents WHERE project_id = $1 ORDER BY created_at DESC`,
+      [projectId]
+    );
+    return res.json({ documents: rows });
+  } catch (err) {
+    console.error('POST /api/document-approval:', err);
+    return res.status(500).json({ error: 'Failed to load documents' });
+  }
+});
+
+// Create a new document (draft)
+app.post('/api/document-approval/create', authenticateToken, upload.single('file'), async (req, res) => {
+  const projectId = req.body.projectId;
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  const { doc_type, title, description } = req.body;
+  if (!doc_type || !title) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    let fileUrl = null; let fileName = null; let fileId = null;
+    if (req.file) {
+      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'documents');
+      fileUrl = uploaded.secure_url || uploaded.url || null;
+      fileName = req.file.originalname;
+      fileId = uploaded.public_id || null;
+    }
+    const side = sideLabel(getSide(req.user.role));
+    const insert = await pool.query(
+      `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+      [projectId, title, description || null, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, side]
+    );
+    return res.json({ success: true, id: insert.rows[0].id });
+  } catch (err) {
+    console.error('POST /api/document-approval/create:', err);
+    return res.status(500).json({ error: 'Failed to create document' });
+  }
+});
+
+// Resubmit (update) existing document
+app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single('file'), async (req, res) => {
+  const docId = req.params.id;
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT creator_id FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    if (String(rows[0].creator_id) !== String(req.user.user_id)) return res.status(403).json({ error: 'Not allowed' });
+    let fileUrl = null; let fileName = null; let fileId = null;
+    if (req.file) {
+      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'documents');
+      fileUrl = uploaded.secure_url || uploaded.url || null;
+      fileName = req.file.originalname;
+      fileId = uploaded.public_id || null;
+    }
+    const doc_type = req.body.doc_type || null;
+    const title = req.body.title || null;
+    const description = req.body.description || null;
+    const updates = [];
+    const params = [];
+    let idx = 1;
+    if (title) { updates.push(`title=$${idx++}`); params.push(title); }
+    if (description) { updates.push(`description=$${idx++}`); params.push(description); }
+    if (doc_type) { updates.push(`category=$${idx++}`); params.push(doc_type); }
+    if (fileName) { updates.push(`file_name=$${idx++}`, `file_id=$${idx++}`, `file_url=$${idx++}`); params.push(fileName, fileId, fileUrl); }
+    updates.push(`approval_status='pending'`, `is_shared=false`, `rejection_reason=NULL`, `updated_at=NOW()`);
+    const q = `UPDATE documents SET ${updates.join(', ')} WHERE id=$${idx} AND project_id=$${idx+1}`;
+    params.push(docId, projectId);
+    await pool.query(q, params);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('PUT /api/document-approval/:id/resubmit:', err);
+    return res.status(500).json({ error: 'Failed to resubmit' });
+  }
+});
+
+// Review (approve/reject)
+app.post('/api/document-approval/:id/review', authenticateToken, async (req, res) => {
+  const docId = req.params.id;
+  const { projectId, action, comment } = req.body || {};
+  if (!projectId || !action) return res.status(400).json({ error: 'Missing fields' });
+  if (!['approved','rejected'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
+  try {
+    const { rows } = await pool.query('SELECT id, approval_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    const now = new Date();
+    if (action === 'approved') {
+      await pool.query(`UPDATE documents SET approval_status='approved', approved_by_id=$1, approved_by_role=$2, approval_date=NOW(), updated_at=NOW() WHERE id=$3`, [req.user.user_id, req.user.role, docId]);
+    } else {
+      await pool.query(`UPDATE documents SET approval_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2`, [comment || null, docId]);
+    }
+    // Insert approval note
+    await pool.query(`INSERT INTO document_approval_notes(document_id, note_text, created_by_id, created_by_role, is_visible_to_creator) VALUES($1,$2,$3,$4,$5)`, [docId, comment || (action === 'approved' ? 'Approved' : 'Rejected'), req.user.user_id, req.user.role, true]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/document-approval/:id/review:', err);
+    return res.status(500).json({ error: 'Failed to submit review' });
+  }
+});
+
+// Share to Control & Report
+app.post('/api/document-approval/:id/share', authenticateToken, async (req, res) => {
+  const docId = req.params.id;
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT approval_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Only approved documents can be shared' });
+    await pool.query('UPDATE documents SET is_shared=true, shared_at=NOW(), updated_at=NOW() WHERE id=$1', [docId]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/document-approval/:id/share:', err);
+    return res.status(500).json({ error: 'Failed to share document' });
+  }
+});
+
+// Submit draft for approval
+app.post('/api/document-approval/:id/submit', authenticateToken, async (req, res) => {
+  const docId = req.params.id;
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT creator_id FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    if (String(rows[0].creator_id) !== String(req.user.user_id)) return res.status(403).json({ error: 'Not allowed' });
+    await pool.query("UPDATE documents SET approval_status='pending', updated_at=NOW() WHERE id=$1", [docId]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/document-approval/:id/submit:', err);
+    return res.status(500).json({ error: 'Failed to submit' });
+  }
+});
+
+// Delete document
+app.delete('/api/document-approval/:id', authenticateToken, async (req, res) => {
+  const docId = req.params.id;
+  const projectId = req.body.projectId || req.query.projectId;
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT creator_id FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    if (String(rows[0].creator_id) !== String(req.user.user_id)) return res.status(403).json({ error: 'Not allowed' });
+    await pool.query('DELETE FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/document-approval/:id:', err);
+    return res.status(500).json({ error: 'Failed to delete' });
+  }
+});
+
+// Download document file (returns URL)
+app.get('/api/document-approval/:id/download', authenticateToken, async (req, res) => {
+  const docId = req.params.id;
+  const projectId = req.query.projectId;
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT file_url FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    return res.json({ url: rows[0].file_url || null });
+  } catch (err) {
+    console.error('GET /api/document-approval/:id/download:', err);
+    return res.status(500).json({ error: 'Failed to download' });
+  }
+});
+
+// CONTROL & REPORT — list shared documents
+app.post('/api/control-reports', authenticateToken, async (req, res) => {
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, project_id, title, description, category AS doc_type, file_name, file_url, creator_id, creator_role, side, is_shared, shared_at, approval_date AS reviewed_at, created_at
+       FROM documents WHERE project_id=$1 AND is_shared = true ORDER BY shared_at DESC NULLS LAST`,
+      [projectId]
+    );
+    return res.json({ documents: rows });
+  } catch (err) {
+    console.error('POST /api/control-reports:', err);
+    return res.status(500).json({ error: 'Failed to load control reports' });
+  }
+});
+
+// CONTROL & REPORT — create (leader direct add)
+app.post('/api/control-reports/create', authenticateToken, upload.single('file'), async (req, res) => {
+  const projectId = req.body.projectId;
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  const { doc_type, title, description } = req.body;
+  if (!doc_type || !title || !description) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    let fileUrl = null; let fileName = null; let fileId = null;
+    if (req.file) {
+      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'control_reports');
+      fileUrl = uploaded.secure_url || uploaded.url || null;
+      fileName = req.file.originalname;
+      fileId = uploaded.public_id || null;
+    }
+    const side = sideLabel(getSide(req.user.role));
+    const insert = await pool.query(
+      `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side, approval_status, approved_by_id, approved_by_role, approval_date, is_shared, shared_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'approved',$11,$12,NOW(),true,NOW()) RETURNING id`,
+      [projectId, title, description, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, side, req.user.user_id, req.user.role]
+    );
+    return res.json({ success: true, id: insert.rows[0].id });
+  } catch (err) {
+    console.error('POST /api/control-reports/create:', err);
+    return res.status(500).json({ error: 'Failed to create control report' });
+  }
+});
+
+// CONTROL & REPORT — download
+app.get('/api/control-reports/:id/download', authenticateToken, async (req, res) => {
+  const id = req.params.id;
+  const projectId = req.query.projectId;
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT file_url FROM documents WHERE id=$1 AND project_id=$2', [id, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    return res.json({ url: rows[0].file_url || null });
+  } catch (err) {
+    console.error('GET /api/control-reports/:id/download:', err);
+    return res.status(500).json({ error: 'Failed to download' });
+  }
+});
+
 app.use((err, _req, res, _next) => {
   console.error('Unexpected error:', err);
   res.status(500).json({ error: 'Internal server error' });
