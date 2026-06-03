@@ -3496,11 +3496,24 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query(
-      `SELECT id, project_id, title, description, category AS doc_type, document_date, file_name, file_url, creator_id, creator_role, side, approval_status AS status, approved_by_id, approved_by_role, approval_date AS reviewed_at, rejection_reason, is_shared, shared_at, created_at
-       FROM documents WHERE project_id = $1 ORDER BY created_at DESC`,
-      [projectId]
-    );
+    const userId = req.user.user_id;
+    const userSide = getSide(req.user.role); // 'contractor'|'consultant'|'client' or null
+    const isLeader = userSide !== null;
+
+    // Visibility rules:
+    // - Creator always sees their documents
+    // - Side leader (Contractor/ContractorPM, Consultant/ConsultantPM, Client/ClientPM) sees documents for their side
+    // - Shared documents are visible to everyone in Control & Report, but here include them as visible in DA listing too
+    const params = [projectId, userId];
+    let q = `SELECT id, project_id, title, description, category AS doc_type, document_date, file_name, file_url, creator_id, creator_role, side, approval_status AS status, approved_by_id, approved_by_role, approval_date AS reviewed_at, rejection_reason, is_shared, shared_at, created_at
+       FROM documents WHERE project_id = $1 AND (is_shared = true OR creator_id = $2`;
+    if (isLeader) {
+      params.push(userSide);
+      q += ` OR lower(side) = $3`;
+    }
+    q += `) ORDER BY created_at DESC`;
+
+    const { rows } = await pool.query(q, params);
     return res.json({ documents: rows });
   } catch (err) {
     console.error('POST /api/document-approval:', err);
@@ -3522,7 +3535,9 @@ app.post('/api/document-approval/create', authenticateToken, upload.single('file
       fileName = req.file.originalname;
       fileId = uploaded.public_id || null;
     }
-    const side = sideLabel(getSide(req.user.role));
+    // Resolve side: for leaders/PMs use role mapping, for TeamMember use assignment for this project
+    const resolvedSide = await resolveSide(req.user.role, req.user.user_id, projectId);
+    const side = sideLabel(resolvedSide);
     const insert = await pool.query(
       `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
@@ -3579,9 +3594,14 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
   if (!projectId || !action) return res.status(400).json({ error: 'Missing fields' });
   if (!['approved','rejected'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
   try {
-    const { rows } = await pool.query('SELECT id, approval_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT id, approval_status, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    const now = new Date();
+
+    const docSide = (rows[0].side || '').toLowerCase();
+    const userSide = getSide(req.user.role);
+    if (!userSide) return res.status(403).json({ error: 'Only side leaders can review documents' });
+    if (userSide !== docSide) return res.status(403).json({ error: 'You can only review documents for your side' });
+
     if (action === 'approved') {
       await pool.query(`UPDATE documents SET approval_status='approved', approved_by_id=$1, approved_by_role=$2, approval_date=NOW(), updated_at=NOW() WHERE id=$3`, [req.user.user_id, req.user.role, docId]);
     } else {
@@ -3602,9 +3622,15 @@ app.post('/api/document-approval/:id/share', authenticateToken, async (req, res)
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT approval_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT approval_status, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Only approved documents can be shared' });
+
+    const docSide = (rows[0].side || '').toLowerCase();
+    const userSide = getSide(req.user.role);
+    if (!userSide) return res.status(403).json({ error: 'Only side leaders can share documents' });
+    if (userSide !== docSide) return res.status(403).json({ error: 'You can only share documents for your side' });
+
     await pool.query('UPDATE documents SET is_shared=true, shared_at=NOW(), updated_at=NOW() WHERE id=$1', [docId]);
     return res.json({ success: true });
   } catch (err) {
@@ -3636,9 +3662,16 @@ app.delete('/api/document-approval/:id', authenticateToken, async (req, res) => 
   const projectId = req.body.projectId || req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT creator_id FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT creator_id, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    if (String(rows[0].creator_id) !== String(req.user.user_id)) return res.status(403).json({ error: 'Not allowed' });
+    const creatorId = String(rows[0].creator_id);
+    const docSide = (rows[0].side || '').toLowerCase();
+    const userSide = getSide(req.user.role);
+
+    // Allow deletion if creator, or if user is side leader for the same side
+    if (String(req.user.user_id) !== creatorId) {
+      if (!userSide || userSide !== docSide) return res.status(403).json({ error: 'Not allowed' });
+    }
     await pool.query('DELETE FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     return res.json({ success: true });
   } catch (err) {
@@ -3653,9 +3686,25 @@ app.get('/api/document-approval/:id/download', authenticateToken, async (req, re
   const projectId = req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT file_url FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT file_url, creator_id, side, is_shared FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    return res.json({ url: rows[0].file_url || null });
+    const row = rows[0];
+    const docSide = (row.side || '').toLowerCase();
+    const userSide = getSide(req.user.role);
+
+    // Allow if creator
+    if (String(row.creator_id) === String(req.user.user_id)) return res.json({ url: row.file_url || null });
+
+    // Allow side leaders for same side
+    if (userSide && userSide === docSide) return res.json({ url: row.file_url || null });
+
+    // Allow if shared and user belongs to same side (resolve for TeamMember)
+    if (row.is_shared) {
+      const sideResolved = await resolveSide(req.user.role, req.user.user_id, projectId);
+      if (sideResolved && sideResolved.toLowerCase() === docSide) return res.json({ url: row.file_url || null });
+    }
+
+    return res.status(403).json({ error: 'Access denied' });
   } catch (err) {
     console.error('GET /api/document-approval/:id/download:', err);
     return res.status(500).json({ error: 'Failed to download' });
@@ -3667,10 +3716,12 @@ app.post('/api/control-reports', authenticateToken, async (req, res) => {
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
+    const side = await resolveSide(req.user.role, req.user.user_id, projectId);
+    if (!side) return res.status(403).json({ error: 'Access denied' });
     const { rows } = await pool.query(
       `SELECT id, project_id, title, description, category AS doc_type, file_name, file_url, creator_id, creator_role, side, is_shared, shared_at, approval_date AS reviewed_at, created_at
-       FROM documents WHERE project_id=$1 AND is_shared = true ORDER BY shared_at DESC NULLS LAST`,
-      [projectId]
+       FROM documents WHERE project_id=$1 AND is_shared = true AND lower(side) = $2 ORDER BY shared_at DESC NULLS LAST`,
+      [projectId, side.toLowerCase()]
     );
     return res.json({ documents: rows });
   } catch (err) {
@@ -3686,6 +3737,9 @@ app.post('/api/control-reports/create', authenticateToken, upload.single('file')
   const { doc_type, title, description } = req.body;
   if (!doc_type || !title || !description) return res.status(400).json({ error: 'Missing fields' });
   try {
+    // Only side leaders (Client/ClientPM, Contractor/ContractorPM, Consultant/ConsultantPM) can add direct C&R records
+    const userSide = getSide(req.user.role);
+    if (!userSide) return res.status(403).json({ error: 'Only side leaders can add control & report records' });
     let fileUrl = null; let fileName = null; let fileId = null;
     if (req.file) {
       const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'control_reports');
@@ -3712,8 +3766,11 @@ app.get('/api/control-reports/:id/download', authenticateToken, async (req, res)
   const projectId = req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT file_url FROM documents WHERE id=$1 AND project_id=$2', [id, projectId]);
+    const { rows } = await pool.query('SELECT file_url, side FROM documents WHERE id=$1 AND project_id=$2', [id, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    const docSide = (rows[0].side || '').toLowerCase();
+    const side = await resolveSide(req.user.role, req.user.user_id, projectId);
+    if (!side || side.toLowerCase() !== docSide) return res.status(403).json({ error: 'Access denied' });
     return res.json({ url: rows[0].file_url || null });
   } catch (err) {
     console.error('GET /api/control-reports/:id/download:', err);
