@@ -1675,6 +1675,12 @@ async function handleAddRecord(req, res) {
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
     if (!projectId || !title) return res.status(400).json({ success: false, message: 'projectId and title are required.' });
+
+    // ── GUARD: team members cannot add records ──
+    if (role === 'Team Member') {
+      return res.status(403).json({ success: false, message: 'Team members cannot add records.' });
+    }
+
     const memberCheck = await pool.query(
       `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
        UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
@@ -1980,6 +1986,10 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/meetings', authenticateToken, upload.array('attachments'), async (req, res) => {
+  // ── GUARD: team members cannot schedule meetings ──
+  if (req.user.role === 'Team Member') {
+    return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
+  }
   const { project_id, meeting_type, title, date_time, location, participants, agenda, scope, scope_value } = req.body;
   if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
   const client = await pool.connect();
@@ -1999,6 +2009,10 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), async 
 });
 
 app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachments'), async (req, res) => {
+  // ── GUARD: team members cannot add meeting minutes ──
+  if (req.user.role === 'Team Member') {
+    return res.status(403).json({ error: 'Team members cannot add meeting minutes.' });
+  }
   const meetingId = req.params.id;
   const { project_id, attendees, agenda_discussed, decisions, action_items, scope, scope_value, next_meeting_date } = req.body;
   if (!project_id||!attendees||!agenda_discussed||!decisions||!action_items||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
