@@ -3507,14 +3507,16 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
     const params = [projectId, userId];
     let q = `SELECT id, project_id, title, description, category AS doc_type, document_date, file_name, file_url, creator_id, creator_role, side, approval_status AS status, approved_by_id, approved_by_role, approval_date AS reviewed_at, rejection_reason, is_shared, shared_at, created_at
        FROM documents WHERE project_id = $1 AND (creator_id = $2`;
+
+    // Always enforce side equality for non-creator visibility. If we can
+    // resolve the caller's side, include documents that belong to that
+    // side only. This prevents any cross-side visibility even for shared
+    // documents.
     if (userSide) {
       params.push(userSide.toLowerCase());
-      if (isLeader) {
-        q += ` OR lower(side) = $3`;
-      } else {
-        q += ` OR (is_shared = true AND lower(side) = $3)`;
-      }
+      q += ` OR lower(side) = $3`;
     }
+
     q += `) ORDER BY created_at DESC`;
 
     const { rows } = await pool.query(q, params);
