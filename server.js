@@ -1321,7 +1321,9 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         const r=await pool.query('SELECT id,name,location,contract_reference,created_at FROM projects WHERE client_id=$1',[req.user.user_id]);
         rows=r.rows;
       } else {
-        const r=await pool.query(`SELECT p.id,p.name,p.location,p.contract_reference,p.created_at FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1`,[req.user.user_id]);
+        const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
+        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
+        const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1`,[req.user.user_id]);
         rows=r.rows;
       }
       res.json({projects:rows});
@@ -1338,7 +1340,9 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         if (!r.rows.length) return res.status(404).json({error:'Project not found or not owned by client'});
         project=r.rows[0];
       } else {
-        const r=await pool.query(`SELECT p.id,p.name,p.location,p.contract_reference,p.created_at FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1 AND p.id=$2`,[req.user.user_id,projectId]);
+        const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
+        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
+        const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1 AND p.id=$2`,[req.user.user_id,projectId]);
         if (!r.rows.length) return res.status(404).json({error:'Project not found or not assigned'});
         project=r.rows[0];
       }
