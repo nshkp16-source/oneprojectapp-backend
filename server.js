@@ -3497,24 +3497,24 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
     const userId = req.user.user_id;
-    const userSide = await resolveSide(req.user.role, userId, projectId); // 'Contractor'|'Consultant'|'Client' or null
-    const isLeader = getSide(req.user.role) !== null;
+    const userRole = req.user.role;
+    const userSide = await resolveSide(userRole, userId, projectId); // 'Contractor'|'Consultant'|'Client' or null
+    const isLeader = getSide(userRole) !== null;
 
     // Visibility rules:
     // - Creator always sees their documents
     // - Side leader sees documents for their own side
     // - Shared documents appear in DA only for the same side
-    const params = [projectId, userId];
-    let q = `SELECT id, project_id, title, description, category AS doc_type, document_date, file_name, file_url, creator_id, creator_role, side, approval_status AS status, approved_by_id, approved_by_role, approval_date AS reviewed_at, rejection_reason, is_shared, shared_at, created_at
-       FROM documents WHERE project_id = $1 AND (creator_id = $2`;
+    // Build query requiring both creator id+role match, OR documents belonging
+    // to the caller's resolved side. This prevents collisions where numeric
+    // ids overlap across role tables.
+    const params = [projectId, userId, userRole];
+     let q = `SELECT id, project_id, title, description, category AS doc_type, document_date, file_name, file_url, creator_id, creator_role, side, approval_status AS status, approved_by_id, approved_by_role, approval_date AS reviewed_at, rejection_reason, is_shared, shared_at, created_at
+       FROM documents WHERE project_id = $1 AND ((creator_id = $2 AND lower(creator_role) = lower($3))`;
 
-    // Always enforce side equality for non-creator visibility. If we can
-    // resolve the caller's side, include documents that belong to that
-    // side only. This prevents any cross-side visibility even for shared
-    // documents.
     if (userSide) {
       params.push(userSide.toLowerCase());
-      q += ` OR lower(side) = $3`;
+      q += ` OR lower(side) = $4`;
     }
 
     q += `) ORDER BY created_at DESC`;
@@ -3576,9 +3576,17 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT creator_id FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT creator_id, creator_role FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    if (String(rows[0].creator_id) !== String(req.user.user_id)) return res.status(403).json({ error: 'Not allowed' });
+    const docCreatorId = String(rows[0].creator_id);
+    const docCreatorRole = rows[0].creator_role;
+    const isCreator = docCreatorId === String(req.user.user_id) && normalizeRole(docCreatorRole) === normalizeRole(req.user.role);
+    let isAssignedBy = false;
+    if (!isCreator && normalizeRole(docCreatorRole) === 'teammember') {
+      const assignCheck = await pool.query('SELECT 1 FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 AND assigned_by=$4 LIMIT 1', [projectId, docCreatorId, 'TeamMember', req.user.user_id]);
+      if (assignCheck.rows.length) isAssignedBy = true;
+    }
+    if (!isCreator && !isAssignedBy) return res.status(403).json({ error: 'Not allowed' });
     let fileUrl = null; let fileName = null; let fileId = null;
     if (req.file) {
       const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'documents');
@@ -3665,9 +3673,17 @@ app.post('/api/document-approval/:id/submit', authenticateToken, async (req, res
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT creator_id FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT creator_id, creator_role FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    if (String(rows[0].creator_id) !== String(req.user.user_id)) return res.status(403).json({ error: 'Not allowed' });
+    const docCreatorId = String(rows[0].creator_id);
+    const docCreatorRole = rows[0].creator_role;
+    const isCreator = docCreatorId === String(req.user.user_id) && normalizeRole(docCreatorRole) === normalizeRole(req.user.role);
+    let isAssignedBy = false;
+    if (!isCreator && normalizeRole(docCreatorRole) === 'teammember') {
+      const assignCheck = await pool.query('SELECT 1 FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 AND assigned_by=$4 LIMIT 1', [projectId, docCreatorId, 'TeamMember', req.user.user_id]);
+      if (assignCheck.rows.length) isAssignedBy = true;
+    }
+    if (!isCreator && !isAssignedBy) return res.status(403).json({ error: 'Not allowed' });
     await pool.query("UPDATE documents SET approval_status='pending', updated_at=NOW() WHERE id=$1", [docId]);
     return res.json({ success: true });
   } catch (err) {
@@ -3682,14 +3698,22 @@ app.delete('/api/document-approval/:id', authenticateToken, async (req, res) => 
   const projectId = req.body.projectId || req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT creator_id, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT creator_id, creator_role, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     const creatorId = String(rows[0].creator_id);
+    const creatorRole = rows[0].creator_role;
     const docSide = (rows[0].side || '').toLowerCase();
     const userSide = getSide(req.user.role);
 
-    // Allow deletion if creator, or if user is side leader for the same side
-    if (String(req.user.user_id) !== creatorId) {
+    // Allow deletion if creator, or if user is the team member's assigner,
+    // or if user is a side leader for the same side
+    const isCreator = String(req.user.user_id) === creatorId && normalizeRole(creatorRole) === normalizeRole(req.user.role);
+    let isAssignedBy = false;
+    if (!isCreator && normalizeRole(creatorRole) === 'teammember') {
+      const assignCheck = await pool.query('SELECT 1 FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 AND assigned_by=$4 LIMIT 1', [projectId, creatorId, 'TeamMember', req.user.user_id]);
+      if (assignCheck.rows.length) isAssignedBy = true;
+    }
+    if (!isCreator && !isAssignedBy) {
       if (!userSide || userSide !== docSide) return res.status(403).json({ error: 'Not allowed' });
     }
     await pool.query('DELETE FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
@@ -3706,14 +3730,20 @@ app.get('/api/document-approval/:id/download', authenticateToken, async (req, re
   const projectId = req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT file_url, creator_id, side, is_shared FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT file_url, creator_id, creator_role, side, is_shared FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     const row = rows[0];
     const docSide = (row.side || '').toLowerCase();
     const userSide = getSide(req.user.role);
 
-    // Allow if creator
-    if (String(row.creator_id) === String(req.user.user_id)) return res.json({ url: row.file_url || null });
+    // Allow if creator or the team-member's assigner
+    const isCreator = String(row.creator_id) === String(req.user.user_id) && normalizeRole(row.creator_role) === normalizeRole(req.user.role);
+    let isAssignedBy = false;
+    if (!isCreator && normalizeRole(row.creator_role) === 'teammember') {
+      const assignCheck = await pool.query('SELECT 1 FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 AND assigned_by=$4 LIMIT 1', [projectId, String(row.creator_id), 'TeamMember', req.user.user_id]);
+      if (assignCheck.rows.length) isAssignedBy = true;
+    }
+    if (isCreator || isAssignedBy) return res.json({ url: row.file_url || null });
 
     // Allow side leaders for same side
     if (userSide && userSide === docSide) return res.json({ url: row.file_url || null });
