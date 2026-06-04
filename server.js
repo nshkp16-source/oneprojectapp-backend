@@ -1982,6 +1982,7 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
 app.post('/api/meetings', authenticateToken, upload.array('attachments'), async (req, res) => {
   const { project_id, meeting_type, title, date_time, location, participants, agenda, scope, scope_value } = req.body;
   if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
+  if (normalizeRole(req.user.role) === 'teammember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -2002,6 +2003,7 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
   const meetingId = req.params.id;
   const { project_id, attendees, agenda_discussed, decisions, action_items, scope, scope_value, next_meeting_date } = req.body;
   if (!project_id||!attendees||!agenda_discussed||!decisions||!action_items||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
+  if (normalizeRole(req.user.role) === 'teammember') return res.status(403).json({ error: 'Team members cannot add meeting minutes.' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
