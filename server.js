@@ -3265,8 +3265,14 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                tma.title     AS member_title
         FROM   workspace_work_center_progress p
         JOIN   team_members t ON t.id = p.member_id
-        LEFT JOIN team_member_assignments tma
-               ON tma.team_member_id = p.member_id AND tma.project_id = $2
+        LEFT JOIN LATERAL (
+               SELECT position, title
+               FROM   team_member_assignments
+               WHERE  team_member_id = p.member_id
+                 AND  project_id = $2
+               ORDER  BY id DESC
+               LIMIT 1
+        ) tma ON true
         WHERE  p.task_id = $1
         ORDER  BY p.submitted_at DESC
       `, [taskId, projectId]);
@@ -3526,7 +3532,15 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
     q += `) ORDER BY created_at DESC`;
 
     const { rows } = await pool.query(q, params);
-    return res.json({ documents: rows });
+    const normalizedRows = rows.map(row => {
+      if (row.is_shared) {
+        row.status = 'shared';
+      } else if (row.status === 'pending') {
+        row.status = 'pending_approval';
+      }
+      return row;
+    });
+    return res.json({ documents: normalizedRows });
   } catch (err) {
     console.error('POST /api/document-approval:', err);
     return res.status(500).json({ error: 'Failed to load documents' });
@@ -3551,8 +3565,9 @@ app.post('/api/document-approval/create', authenticateToken, upload.single('file
     const resolvedSide = await resolveSide(req.user.role, req.user.user_id, projectId);
     const side = sideLabel(resolvedSide);
     
-    // Side leaders auto-approve their own documents; team members need approval
+    // Side leaders auto-approve their own documents; team members save drafts first
     const isLeader = getSide(req.user.role) !== null;
+    // DB check constraint only allows 'draft','pending_approval','approved','rejected'
     const approvalStatus = isLeader ? 'approved' : 'draft';
     const approvedById = isLeader ? req.user.user_id : null;
     const approvedByRole = isLeader ? req.user.role : null;
@@ -3568,11 +3583,33 @@ app.post('/api/document-approval/create', authenticateToken, upload.single('file
       q += `) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`;
     }
     
+    console.log('CREATE DOCUMENT SQL:', q, params);
+    console.log('CREATE DOCUMENT CONTEXT: user=', { id: req.user.user_id, role: req.user.role, isLeader }, 'file=', req.file ? req.file.originalname : null);
     const insert = await pool.query(q + ` RETURNING id`, params);
     return res.json({ success: true, id: insert.rows[0].id });
   } catch (err) {
     console.error('POST /api/document-approval/create:', err);
     return res.status(500).json({ error: 'Failed to create document' });
+  }
+});
+
+// DEBUG: allow testing the create flow without auth in non-production environments
+app.post('/api/_debug/document-approval/create', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') return res.status(403).json({ error: 'Disabled in production' });
+  const { projectId, doc_type, title, description, creator_id, creator_role, side } = req.body || {};
+  if (!projectId || !doc_type || !title) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const fileName = null; const fileId = null; const fileUrl = req.body.file_url || null;
+    const isLeader = false;
+    const approvalStatus = 'draft';
+    const params = [projectId, title, description || null, doc_type || null, fileName, fileId, fileUrl, creator_id || 99999, creator_role || 'TeamMember', side || null, approvalStatus];
+    const q = `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side, approval_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`;
+    console.log('DEBUG CREATE:', q, params);
+    const insert = await pool.query(q, params);
+    return res.json({ success: true, id: insert.rows[0].id });
+  } catch (err) {
+    console.error('DEBUG POST create error:', err);
+    return res.status(500).json({ error: 'Debug create failed' });
   }
 });
 
@@ -3610,7 +3647,7 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
     if (description) { updates.push(`description=$${idx++}`); params.push(description); }
     if (doc_type) { updates.push(`category=$${idx++}`); params.push(doc_type); }
     if (fileName) { updates.push(`file_name=$${idx++}`, `file_id=$${idx++}`, `file_url=$${idx++}`); params.push(fileName, fileId, fileUrl); }
-    updates.push(`approval_status='pending'`, `is_shared=false`, `rejection_reason=NULL`, `updated_at=NOW()`);
+    updates.push(`approval_status='pending_approval'`, `is_shared=false`, `rejection_reason=NULL`, `updated_at=NOW()`);
     const q = `UPDATE documents SET ${updates.join(', ')} WHERE id=$${idx} AND project_id=$${idx+1}`;
     params.push(docId, projectId);
     await pool.query(q, params);
@@ -3690,7 +3727,7 @@ app.post('/api/document-approval/:id/submit', authenticateToken, async (req, res
       if (assignCheck.rows.length) isAssignedBy = true;
     }
     if (!isCreator && !isAssignedBy) return res.status(403).json({ error: 'Not allowed' });
-    await pool.query("UPDATE documents SET approval_status='pending', updated_at=NOW() WHERE id=$1", [docId]);
+    await pool.query("UPDATE documents SET approval_status='pending_approval', updated_at=NOW() WHERE id=$1", [docId]);
     return res.json({ success: true });
   } catch (err) {
     console.error('POST /api/document-approval/:id/submit:', err);
