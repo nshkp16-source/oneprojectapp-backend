@@ -141,6 +141,19 @@ function normalizeRole(role) {
   }[role] || role;
 }
 
+function normalizeProjectId(value) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  return /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : raw;
+}
+
+function parseJsonSafe(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
 function daysBetween(startStr, endStr) {
   if (!startStr || !endStr) return 0;
   return Math.max(0, Math.round((new Date(endStr) - new Date(startStr)) / 86400000) + 1);
@@ -2035,8 +2048,8 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
 // =============================================================================
 
 app.get('/api/get-schedule', authenticateToken, async (req, res) => {
-  const projectId = parseInt(req.query.projectId, 10);
-  if (!projectId) return res.status(400).json({ error: 'Valid integer projectId is required' });
+  const projectId = normalizeProjectId(req.query.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
   try {
     const schedRow = await pool.query('SELECT * FROM project_schedules WHERE project_id=$1 LIMIT 1', [projectId]);
     if (!schedRow.rows.length) return res.json({ schedule: null });
@@ -2045,14 +2058,15 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
     const extRows = await pool.query(`SELECT id,extension_days,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
     const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt });
-    res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows } });
+    res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},location:sched.location||null,milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows } });
   } catch (err) { console.error('[GET /api/get-schedule]', err); res.status(500).json({ error: 'Failed to load schedule' }); }
 });
 
 app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res) => {
-  const projectId = parseInt(req.body.projectId, 10);
-  if (!projectId) return res.status(400).json({ error: 'Valid integer projectId is required' });
+  const projectId = normalizeProjectId(req.body.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
   let tl, rawMilestones, newIds, editedIds, unchangedIds, deletedIds;
+  const location = parseJsonSafe(req.body.location);
   try { tl=JSON.parse(req.body.timeline); rawMilestones=JSON.parse(req.body.milestones); newIds=new Set(JSON.parse(req.body.newIds||'[]')); editedIds=new Set(JSON.parse(req.body.editedIds||'[]')); unchangedIds=new Set(JSON.parse(req.body.unchangedIds||'[]')); deletedIds=JSON.parse(req.body.deletedIds||'[]'); }
   catch { return res.status(400).json({ error: 'Invalid JSON in timeline, milestones, or id lists' }); }
   const fileMap = {};
@@ -2060,7 +2074,7 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const schedRes = await client.query(`INSERT INTO project_schedules (project_id,planned_start,planned_finish,total_duration,created_by_user_id,created_by_role) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (project_id) DO UPDATE SET planned_start=EXCLUDED.planned_start,planned_finish=EXCLUDED.planned_finish,total_duration=EXCLUDED.total_duration,updated_at=now() RETURNING *`, [projectId,tl.start,tl.finish,tl.duration,req.user.user_id,req.user.role]);
+    const schedRes = await client.query(`INSERT INTO project_schedules (project_id,planned_start,planned_finish,total_duration,location,created_by_user_id,created_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (project_id) DO UPDATE SET planned_start=EXCLUDED.planned_start,planned_finish=EXCLUDED.planned_finish,total_duration=EXCLUDED.total_duration,location=COALESCE(EXCLUDED.location, project_schedules.location),updated_at=now() RETURNING *`, [projectId,tl.start,tl.finish,tl.duration,location,req.user.user_id,req.user.role]);
     const schedId = schedRes.rows[0].id;
     for (const dbId of deletedIds) {
       const check = await client.query('SELECT executed FROM milestones WHERE id=$1 AND schedule_id=$2', [dbId, schedId]);
@@ -2098,12 +2112,13 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
     }
     await client.query('COMMIT');
     const freshMs = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [schedId]);
-    res.json({ success:true,schedule:{ id:schedId,timeline:{start:tl.start,finish:tl.finish,duration:tl.duration},milestones:freshMs.rows.map(ms=>({id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null})),extension_milestones:[] } });
+    const savedLocation = schedRes.rows[0]?.location || location || null;
+    res.json({ success:true,schedule:{ id:schedId,timeline:{start:tl.start,finish:tl.finish,duration:tl.duration},location:savedLocation,milestones:freshMs.rows.map(ms=>({id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null})),extension_milestones:[] } });
   } catch (err) { await client.query('ROLLBACK'); console.error('[POST /api/save-schedule]', err); res.status(500).json({ error: 'Failed to save schedule' }); } finally { client.release(); }
 });
 
 app.post('/api/report-progress', authenticateToken, upload.single('attachment'), async (req, res) => {
-  const projectId = parseInt(req.body.projectId, 10);
+  const projectId = normalizeProjectId(req.body.projectId);
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
   if (!projectId||!milestoneId||!reportDate||!qty||qty<=0) return res.status(400).json({ error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required' });
@@ -2129,7 +2144,7 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
 });
 
 app.post('/api/report-additional-progress', authenticateToken, upload.single('attachment'), async (req, res) => {
-  const projectId = parseInt(req.body.projectId, 10);
+  const projectId = normalizeProjectId(req.body.projectId);
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
   if (!projectId||!milestoneId||!reportDate||!qty||qty<=0) return res.status(400).json({ error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required' });
@@ -2153,7 +2168,7 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
 });
 
 app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
-  const projectId=parseInt(req.body.projectId,10);
+  const projectId = normalizeProjectId(req.body.projectId);
   const { milestoneId, isExtensionMilestone } = req.body;
   if (!projectId||!milestoneId) return res.status(400).json({ error: 'Valid projectId and milestoneId are required' });
   const isExt=isExtensionMilestone===true||isExtensionMilestone==='true';
@@ -2174,8 +2189,8 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res) => {
-  const projectId=parseInt(req.body.projectId,10);
-  if (!projectId) return res.status(400).json({ error: 'Valid integer projectId is required' });
+  const projectId = normalizeProjectId(req.body.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
   const extensionDays=parseInt(req.body.extensionDays,10),newPlannedFinish=req.body.newPlannedFinish,reason=(req.body.reason||'').trim(),extensionType=req.body.extensionType,scopeType=req.body.scopeType;
   let newMilestones=[];
   try{newMilestones=JSON.parse(req.body.newMilestones||'[]');}catch{return res.status(400).json({error:'Invalid JSON in newMilestones'});}
@@ -2221,7 +2236,7 @@ app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
 
 app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',10), async (req, res) => {
   const { milestoneId, additionalMilestoneId } = req.body;
-  const projectId=parseInt(req.body.projectId,10);
+  const projectId = normalizeProjectId(req.body.projectId);
   if (!projectId) return res.status(400).json({error:'projectId is required'});
   if (!milestoneId&&!additionalMilestoneId) return res.status(400).json({error:'milestoneId or additionalMilestoneId is required'});
   if (!req.files||req.files.length===0) return res.status(400).json({error:'No files uploaded'});
@@ -2250,8 +2265,8 @@ app.delete('/api/milestone-photos/:id', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/project-summary', authenticateToken, async (req, res) => {
-  const projectId=parseInt(req.query.projectId,10);
-  if (!projectId) return res.status(400).json({error:'Valid integer projectId is required'});
+  const projectId = normalizeProjectId(req.query.projectId);
+  if (!projectId) return res.status(400).json({error:'Valid projectId is required'});
   try {
     const schedRow=await pool.query('SELECT id,planned_start,planned_finish,total_duration FROM project_schedules WHERE project_id=$1 LIMIT 1',[projectId]);
     if (!schedRow.rows.length) return res.json({hasSchedule:false,milestones:[],photos:[],timeline:null});
