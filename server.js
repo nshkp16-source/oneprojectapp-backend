@@ -276,7 +276,7 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
       return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
     })
     .map(m => ({
-      recipient_role: m.role,
+      recipient_role: normalizeRole(m.role),
       recipient_role_id: Number(m.role_id),
       recipient_email: m.email || null,
       user_id: Number(m.role_id),
@@ -1649,7 +1649,10 @@ async function insertNotificationRecipients(notificationId, recipients) {
     `($1, $${i * 3 + 2}, $${i * 3 + 3}, $${i * 3 + 4})`
   ).join(', ');
   const params = [notificationId];
-  recipients.forEach(r => params.push(r.role, r.role_id, r.email || null));
+  recipients.forEach(r => {
+    const recipientRole = normalizeRole(r.role || r.recipient_role);
+    params.push(recipientRole, Number(r.role_id || r.recipient_role_id), r.email || null);
+  });
   await pool.query(
     `INSERT INTO notification_recipients
        (notification_id, recipient_role, recipient_role_id, recipient_email)
@@ -1693,7 +1696,7 @@ async function getNotifications(projectId, userRole, userId) {
             n.created_at,
             COALESCE(nr.is_read, false) AS is_read
      FROM notifications n
-     LEFT JOIN notification_recipients nr
+     JOIN notification_recipients nr
        ON nr.notification_id = n.id
       AND nr.recipient_role    = $2
       AND nr.recipient_role_id = $3
