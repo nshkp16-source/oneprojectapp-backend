@@ -2384,15 +2384,24 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), async 
     const notifMsg = scope === 'side'
       ? `New ${meeting_type} meeting scheduled by ${req.user.role} for ${scope_value || 'your'} side: "${title}" on ${date_time}`
       : `New ${meeting_type} meeting scheduled by ${req.user.role}: "${title}" on ${date_time}`;
-    const notifRes = await client.query(
-      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [project_id, meeting.id, 'meetings', notifMsg, req.user.user_id, req.user.role]
-    );
-    const notificationId = notifRes.rows[0].id;
-    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-    await insertNotificationRecipients(notificationId, recipients);
+    // Commit the meeting save first so notifications can't block meeting creation
     await client.query('COMMIT');
     res.status(201).json(meeting);
+
+    // Perform notification creation asynchronously and outside the transaction.
+    (async () => {
+      try {
+        const notifRes = await pool.query(
+          `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [project_id, meeting.id, 'meetings', notifMsg, req.user.user_id, req.user.role]
+        );
+        const notificationId = notifRes.rows[0].id;
+        const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
+        await insertNotificationRecipients(notificationId, recipients);
+      } catch (notifyErr) {
+        console.error('POST /api/meetings: notification creation failed', notifyErr);
+      }
+    })();
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings:', err); res.status(500).json({ error: 'Failed to create meeting' }); } finally { client.release(); }
 });
 
