@@ -2292,11 +2292,29 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
     const elapsed=Math.max(0,(today-projStart)/86400000),totalDays=Math.max(1,(projFinish-projStart)/86400000);
     const plannedPct=Math.min(100,(elapsed/totalDays)*100),variance=parseFloat((overallPct-plannedPct).toFixed(2));
     const completed=allMilestones.filter(m=>m.activity_status==='completed'),lastCompleted=completed.length?completed[completed.length-1].title:null;
-    const chartMilestones=allMilestones.slice(0,7).map(ms=>{
-      const msStart=new Date(ms.start),msEnd=new Date(ms.end);
-      let msPlanPct=0;
-      if(today>=msEnd)msPlanPct=100;else if(today>msStart)msPlanPct=Math.min(100,((today-msStart)/Math.max(1,msEnd-msStart))*100);
-      return {id:ms.id,title:ms.title,start:ms.start,end:ms.end,planned_pct:parseFloat(msPlanPct.toFixed(2)),actual_pct:parseFloat(Number(ms.progress_pct||0).toFixed(2)),activity_status:ms.activity_status,weight_pct:ms.weight_pct,is_extension:ms.is_extension};
+    const currentMsIndex = allMilestones.findIndex(m => m.activity_status !== 'completed');
+    const currentMsForChart = currentMsIndex >= 0 ? allMilestones[currentMsIndex] : (allMilestones.length ? allMilestones[allMilestones.length - 1] : null);
+    const chartMilestones = currentMsForChart ? [{
+      id: currentMsForChart.id,
+      title: currentMsForChart.title,
+      start: currentMsForChart.start,
+      end: currentMsForChart.end,
+      planned_pct: (() => {
+        const msStart = new Date(currentMsForChart.start), msEnd = new Date(currentMsForChart.end);
+        if(today >= msEnd) return 100;
+        if(today > msStart) return Math.min(100, ((today - msStart) / Math.max(1, msEnd - msStart)) * 100);
+        return 0;
+      })(),
+      actual_pct: parseFloat(Number(currentMsForChart.progress_pct || 0).toFixed(2)),
+      activity_status: currentMsForChart.activity_status,
+      weight_pct: currentMsForChart.weight_pct,
+      is_extension: currentMsForChart.is_extension,
+    }] : [];
+    const allChartMilestones = allMilestones.map((ms, idx) => {
+      const msStart = new Date(ms.start), msEnd = new Date(ms.end);
+      let msPlanPct = 0;
+      if(today >= msEnd) msPlanPct = 100; else if(today > msStart) msPlanPct = Math.min(100, ((today - msStart) / Math.max(1, msEnd - msStart)) * 100);
+      return {id: ms.id, title: ms.title, start: ms.start, end: ms.end, planned_pct: parseFloat(msPlanPct.toFixed(2)), actual_pct: parseFloat(Number(ms.progress_pct || 0).toFixed(2)), activity_status: ms.activity_status, weight_pct: ms.weight_pct, is_extension: ms.is_extension, milestone_index: idx};
     });
     const msIds=msRows.rows.map(m=>m.id),amIds=amRows.rows.map(m=>m.id);
     let photos=[];
@@ -2322,7 +2340,8 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
       progress:{overall_pct:parseFloat(overallPct.toFixed(2)),planned_pct:parseFloat(plannedPct.toFixed(2)),variance_pct:variance,last_completed:lastCompleted,total_milestones:allMilestones.length,completed_count:completed.length,in_progress_count:allMilestones.filter(m=>m.activity_status==='in_progress').length},
       project_remaining_days: projectRemainingDays,
       current_milestone: currentMilestone,
-      chart_milestones:chartMilestones,
+      chart_milestones: chartMilestones,
+      all_milestones_for_modal: allChartMilestones,
       photos,
     });
   } catch(err){console.error('[GET /api/project-summary]',err);res.status(500).json({error:'Failed to load project summary'});}
