@@ -2278,9 +2278,10 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
   if (!projectId) return res.status(400).json({error:'Valid projectId is required'});
   try {
-    const schedRow=await pool.query('SELECT id,planned_start,planned_finish,total_duration FROM project_schedules WHERE project_id=$1 LIMIT 1',[projectId]);
+    const schedRow=await pool.query('SELECT id,planned_start,planned_finish,total_duration,location FROM project_schedules WHERE project_id=$1 LIMIT 1',[projectId]);
     if (!schedRow.rows.length) return res.json({hasSchedule:false,milestones:[],photos:[],timeline:null});
     const sched=schedRow.rows[0];
+    const location=sched.location || null;
     const msRows=await pool.query(`SELECT m.id,m.title,m.planned_start AS start,m.planned_end AS end,m.quantity,m.unit,m.weight_pct,m.float_days,m.is_critical,m.executed,m.progress_pct,m.activity_status,m.completed_at,m.depends_on AS dep FROM milestones m WHERE m.schedule_id=$1 ORDER BY m.sort_order`,[sched.id]);
     const amRows=await pool.query(`SELECT am.id,am.title,am.planned_start AS start,am.planned_end AS end,am.quantity,am.unit,am.weight_pct,am.float_days,am.is_critical,am.executed,am.progress_pct,am.activity_status,am.completed_at,am.depends_on_baseline AS dep,true AS is_extension FROM additional_milestones am WHERE am.schedule_id=$1 ORDER BY am.sort_order`,[sched.id]);
     const allMilestones=[...msRows.rows.map(m=>({...m,is_extension:false})),...amRows.rows.map(m=>({...m,is_extension:true}))];
@@ -2303,7 +2304,27 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
     if (amIds.length>0){const ph=amIds.map((_,i)=>`$${i+1}`).join(',');const amPhotoRes=await pool.query(`SELECT mp.id,mp.file_name,mp.cloudinary_url,mp.uploaded_at,am.title AS ms_title FROM milestone_photos mp JOIN additional_milestones am ON am.id=mp.additional_milestone_id WHERE mp.additional_milestone_id IN (${ph}) ORDER BY mp.uploaded_at ASC`,amIds);photos=photos.concat(amPhotoRes.rows.map(p=>({...p,is_extension:true})));}
     const extRow=await pool.query(`SELECT extension_days,new_planned_finish,status FROM schedule_extensions WHERE schedule_id=$1 AND status='approved' ORDER BY created_at DESC LIMIT 1`,[sched.id]);
     const latestExtension=extRow.rows[0]||null;
-    res.json({hasSchedule:true,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration,current_finish:latestExtension?latestExtension.new_planned_finish:sched.planned_finish},progress:{overall_pct:parseFloat(overallPct.toFixed(2)),planned_pct:parseFloat(plannedPct.toFixed(2)),variance_pct:variance,last_completed:lastCompleted,total_milestones:allMilestones.length,completed_count:completed.length,in_progress_count:allMilestones.filter(m=>m.activity_status==='in_progress').length},chart_milestones:chartMilestones,photos});
+    const currentFinish = latestExtension ? new Date(latestExtension.new_planned_finish) : new Date(sched.planned_finish);
+    const projectRemainingDays = Math.max(0, Math.ceil((currentFinish - today) / 86400000));
+    const currentMs = allMilestones.find(m => m.activity_status !== 'completed') || (allMilestones.length ? allMilestones[allMilestones.length - 1] : null);
+    const currentMilestone = currentMs ? {
+      title: currentMs.title,
+      start: currentMs.start,
+      end: currentMs.end,
+      status: currentMs.activity_status || 'pending',
+      remaining_days: Math.max(0, Math.ceil((new Date(currentMs.end) - today) / 86400000)),
+      is_extension: currentMs.is_extension,
+    } : null;
+    res.json({
+      hasSchedule:true,
+      location,
+      timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration,current_finish:latestExtension?latestExtension.new_planned_finish:sched.planned_finish},
+      progress:{overall_pct:parseFloat(overallPct.toFixed(2)),planned_pct:parseFloat(plannedPct.toFixed(2)),variance_pct:variance,last_completed:lastCompleted,total_milestones:allMilestones.length,completed_count:completed.length,in_progress_count:allMilestones.filter(m=>m.activity_status==='in_progress').length},
+      project_remaining_days: projectRemainingDays,
+      current_milestone: currentMilestone,
+      chart_milestones:chartMilestones,
+      photos,
+    });
   } catch(err){console.error('[GET /api/project-summary]',err);res.status(500).json({error:'Failed to load project summary'});}
 });
 
