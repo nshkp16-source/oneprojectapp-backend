@@ -1664,200 +1664,234 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
   }
 });
 
+// =============================================================================
+//  ONEPROJECT — FULL NOTIFICATION + RECORD ROUTES
+//  Replace the matching sections in your server.js with this entire block.
+//  Requires: pool, authenticateToken, upload, cloudinary, Readable already set up.
+// =============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  HELPERS — shared by all routes below
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Map recordType string → table name */
+function resolveTable(recordType) {
+  const map = {
+    contractual_records:    'contractual_records',
+    administrative_records: 'administrative_records',
+    safety_records:         'safety_records',
+    operational_records:    'operational_records',
+    financial_records:      'financial_records',
+    contractual:            'contractual_records',
+    administrative:         'administrative_records',
+    safety:                 'safety_records',
+    operational:            'operational_records',
+    financial:              'financial_records',
+  };
+  return map[recordType] || null;
+}
+
+/** Normalise role string to lowercase, no spaces */
+function normalizeRole(role) {
+  return (role || '').toLowerCase().replace(/\s+/g, '');
+}
+
+/** Which "side" does a role belong to? */
+function getSide(role) {
+  const r = normalizeRole(role);
+  if (['contractor', 'contractorpm', 'teammember'].includes(r)) return 'contractor';
+  if (['consultant', 'consultantpm'].includes(r))               return 'consultant';
+  if (['client', 'clientpm'].includes(r))                       return 'client';
+  return null;
+}
+
+/** Is this role a decision-maker (not a plain team member)? */
+function isDecisionMaker(role) {
+  return normalizeRole(role) !== 'teammember';
+}
+
+/**
+ * Get all project members as { role, role_id, email } objects.
+ * Excludes the actor themselves (excludeId / excludeRole).
+ * If scope === 'side', only return members on scopeValue side.
+ */
+async function getProjectRecipientKeys(projectId, excludeId, excludeRole, scope = 'global', scopeValue = null) {
+  // All assigned members via assignments_view
+  const { rows: members } = await pool.query(
+    `SELECT role, role_id, role_email AS email, assigned_part
+     FROM assignments_view
+     WHERE project_id = $1`,
+    [projectId]
+  );
+
+  // Also add the client who owns the project
+  const { rows: clientRows } = await pool.query(
+    `SELECT c.id AS role_id, c.company_email AS email
+     FROM projects p JOIN clients c ON c.id = p.client_id
+     WHERE p.id = $1`,
+    [projectId]
+  );
+  const allMembers = [
+    ...members,
+    ...clientRows.map(c => ({ role: 'Client', role_id: c.role_id, email: c.email, assigned_part: null })),
+  ];
+
+  return allMembers.filter(m => {
+    // Never notify the person who triggered the event
+    if (String(m.role_id) === String(excludeId) && normalizeRole(m.role) === normalizeRole(excludeRole)) return false;
+
+    if (scope === 'side' && scopeValue) {
+      const memberSide = getSide(m.role);
+      // For TeamMembers respect assigned_part
+      if (normalizeRole(m.role) === 'teammember') {
+        return (m.assigned_part || '').toLowerCase() === (scopeValue || '').toLowerCase();
+      }
+      return memberSide === getSide(scopeValue);
+    }
+    return true; // global — everyone
+  });
+}
+
+/**
+ * Insert notification_recipients rows using the NEW schema.
+ * recipients = array of { role, role_id, email }
+ * Uses pool directly (not a transaction client) so record save is not affected.
+ */
+async function insertNotificationRecipients(notificationId, recipients) {
+  if (!recipients || !recipients.length) return;
+  const values = recipients.map((_, i) =>
+    `($1, $${i * 3 + 2}, $${i * 3 + 3}, $${i * 3 + 4})`
+  ).join(', ');
+  const params = [notificationId];
+  recipients.forEach(r => params.push(r.role, r.role_id, r.email || null));
+  await pool.query(
+    `INSERT INTO notification_recipients
+       (notification_id, recipient_role, recipient_role_id, recipient_email)
+     VALUES ${values}
+     ON CONFLICT ON CONSTRAINT uniq_notif_recipient_per_role DO NOTHING`,
+    params
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS  (both /notifications/* and /api/notifications/*)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Unread count for the current user */
 async function getUnreadCount(projectId, userRole, userId) {
-  try {
-    const result = await pool.query(
-      `SELECT COUNT(DISTINCT n.id) AS count
-       FROM notifications n
-       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-       WHERE n.project_id = $1 AND n.added_by_id != $3
-         AND (nr.is_read = false OR nr.id IS NULL)`,
-      [projectId, userRole, userId]
-    );
-    return parseInt(result.rows[0].count, 10);
-  } catch (err) {
-    if (err.message.includes('column') && err.message.includes('does not exist')) {
-      console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
-      const result = await pool.query(
-        `SELECT COUNT(DISTINCT n.id) AS count
-         FROM notifications n
-         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND n.added_by_id != $2
-           AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
-        [projectId, userId]
-      );
-      return parseInt(result.rows[0].count, 10);
-    }
-    throw err;
-  }
+  const { rows } = await pool.query(
+    `SELECT COUNT(DISTINCT n.id) AS count
+     FROM notifications n
+     JOIN notification_recipients nr
+       ON nr.notification_id = n.id
+      AND nr.recipient_role    = $2
+      AND nr.recipient_role_id = $3
+      AND nr.is_read           = false
+     WHERE n.project_id  = $1
+       AND n.is_deleted  = false
+       AND NOT (n.added_by_id = $3 AND n.added_by_role = $2)`,
+    [projectId, userRole, userId]
+  );
+  return parseInt(rows[0].count, 10);
 }
 
+/** All notifications for the current user, newest first */
 async function getNotifications(projectId, userRole, userId) {
-  let notifs = [];
-  try {
-    const { rows } = await pool.query(
-      `SELECT n.id, n.entity_type, n.entity_id, n.message,
-              n.added_by_role, n.created_at,
-              COALESCE(nr.is_read, false) AS is_read
-       FROM notifications n
-       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-       WHERE n.project_id = $1 AND n.added_by_id != $3
-       ORDER BY n.created_at DESC`,
-      [projectId, userRole, userId]
-    );
-    notifs = rows;
-  } catch (err) {
-    if (err.message.includes('column') && err.message.includes('does not exist')) {
-      console.warn('[getNotifications] Schema upgrade pending. Using legacy query.');
-      const { rows } = await pool.query(
-        `SELECT n.id, n.entity_type, n.entity_id, n.message,
-                n.added_by_role, n.created_at,
-                COALESCE(nr.is_read, false) AS is_read
-         FROM notifications n
-         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND n.added_by_id != $2
-         ORDER BY n.created_at DESC`,
-        [projectId, userId]
-      );
-      notifs = rows;
-    } else {
-      throw err;
-    }
-  }
-  
-  for (const n of notifs) {
-    try {
-      await pool.query(
-        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
-         SELECT $1, $2, $3, $4, false
-         WHERE NOT EXISTS (
-           SELECT 1 FROM notification_recipients nr
-           WHERE nr.notification_id = $1
-             AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
-                  OR (nr.recipient_role IS NULL AND nr.user_id = $2))
-         )`,
-        [n.id, userId, userRole, userId]
-      ).catch(() => {});
-    } catch (err) {
-      if (err.message.includes('column') && err.message.includes('does not exist')) {
-        await pool.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-           SELECT $1, $2, false
-           WHERE NOT EXISTS (
-             SELECT 1 FROM notification_recipients nr
-             WHERE nr.notification_id = $1 AND nr.user_id = $2
-           )`,
-          [n.id, userId]
-        ).catch(() => {});
-      }
-    }
-  }
-  return notifs;
+  const { rows } = await pool.query(
+    `SELECT n.id,
+            n.entity_type,
+            n.entity_id,
+            n.notification_type,
+            n.message,
+            n.added_by_role,
+            n.created_at,
+            COALESCE(nr.is_read, false) AS is_read
+     FROM notifications n
+     LEFT JOIN notification_recipients nr
+       ON nr.notification_id = n.id
+      AND nr.recipient_role    = $2
+      AND nr.recipient_role_id = $3
+     WHERE n.project_id = $1
+       AND n.is_deleted  = false
+       AND NOT (n.added_by_id = $3 AND n.added_by_role = $2)
+     ORDER BY n.created_at DESC
+     LIMIT 100`,
+    [projectId, userRole, userId]
+  );
+  return rows;
 }
 
 for (const prefix of ['/notifications', '/api/notifications']) {
+
+  /** GET unread count */
   app.get(`${prefix}/unread-count`, authenticateToken, async (req, res) => {
     try {
-      const count = await getUnreadCount(req.query.projectId, req.user.role, req.user.user_id);
+      const count = await getUnreadCount(
+        req.query.projectId,
+        req.user.role,
+        req.user.user_id
+      );
       res.json({ count });
-    } catch (err) { console.error('Unread count error:', err); res.status(500).json({ count: 0 }); }
+    } catch (err) {
+      console.error('Unread count error:', err);
+      res.status(500).json({ count: 0 });
+    }
   });
 
+  /** GET all notifications for current user */
   app.get(`${prefix}`, authenticateToken, async (req, res) => {
     try {
-      const notifications = await getNotifications(req.query.projectId, req.user.role, req.user.user_id);
+      const notifications = await getNotifications(
+        req.query.projectId,
+        req.user.role,
+        req.user.user_id
+      );
       res.json({ notifications });
-    } catch (err) { console.error('Fetch notifications error:', err); res.status(500).json({ notifications: [] }); }
+    } catch (err) {
+      console.error('Fetch notifications error:', err);
+      res.status(500).json({ notifications: [] });
+    }
   });
 
+  /** PUT mark one notification read */
   app.put(`${prefix}/:id/read`, authenticateToken, async (req, res) => {
     try {
-      let result;
-      try {
-        result = await pool.query(
-          `UPDATE notification_recipients
-           SET is_read = true, read_at = NOW()
-           WHERE notification_id = $1
-             AND recipient_role = $2
-             AND recipient_role_id = $3`,
-          [req.params.id, req.user.role, req.user.user_id]
-        );
-      } catch (err) {
-        if (err.message.includes('column') && err.message.includes('does not exist')) {
-          console.warn('[mark read] Schema upgrade pending. Using legacy update.');
-          result = await pool.query(
-            `UPDATE notification_recipients
-             SET is_read = true, read_at = NOW()
-             WHERE notification_id = $1 AND user_id = $2`,
-            [req.params.id, req.user.user_id]
-          );
-        } else {
-          throw err;
-        }
-      }
-      if (result.rowCount === 0) {
-        await pool.query(
-          `UPDATE notification_recipients
-           SET is_read = true, read_at = NOW()
-           WHERE notification_id = $1
-             AND recipient_role IS NULL
-             AND user_id = $2`,
-          [req.params.id, req.user.user_id]
-        );
-      }
+      await pool.query(
+        `UPDATE notification_recipients
+         SET is_read = true, read_at = NOW()
+         WHERE notification_id   = $1
+           AND recipient_role    = $2
+           AND recipient_role_id = $3`,
+        [req.params.id, req.user.role, req.user.user_id]
+      );
       res.json({ success: true });
-    } catch (err) { console.error('Mark read error:', err); res.status(500).json({ success: false }); }
+    } catch (err) {
+      console.error('Mark read error:', err);
+      res.status(500).json({ success: false });
+    }
   });
 
+  /** POST mark many notifications read at once */
   app.post(`${prefix}/mark-all-read`, authenticateToken, async (req, res) => {
     const { notificationIds } = req.body;
-    if (!Array.isArray(notificationIds) || !notificationIds.length) return res.json({ success: true, updated: 0 });
+    if (!Array.isArray(notificationIds) || !notificationIds.length) {
+      return res.json({ success: true, updated: 0 });
+    }
     try {
-      let updated = 0;
-      for (const notifId of notificationIds) {
-        let result;
-        try {
-          result = await pool.query(
-            `UPDATE notification_recipients
-             SET is_read = true, read_at = NOW()
-             WHERE notification_id = $1
-               AND recipient_role = $2
-               AND recipient_role_id = $3`,
-            [notifId, req.user.role, req.user.user_id]
-          );
-        } catch (err) {
-          if (err.message.includes('column') && err.message.includes('does not exist')) {
-            result = await pool.query(
-              `UPDATE notification_recipients
-               SET is_read = true, read_at = NOW()
-               WHERE notification_id = $1 AND user_id = $2`,
-              [notifId, req.user.user_id]
-            );
-          } else {
-            throw err;
-          }
-        }
-        if (result.rowCount === 0) {
-          await pool.query(
-            `UPDATE notification_recipients
-             SET is_read = true, read_at = NOW()
-             WHERE notification_id = $1
-               AND recipient_role IS NULL
-               AND user_id = $2`,
-            [notifId, req.user.user_id]
-          );
-        }
-        updated += 1;
-      }
-      res.json({ success: true, updated });
-    } catch (err) { console.error('Mark all read error:', err); res.status(500).json({ success: false }); }
+      const result = await pool.query(
+        `UPDATE notification_recipients
+         SET is_read = true, read_at = NOW()
+         WHERE notification_id   = ANY($1::int[])
+           AND recipient_role    = $2
+           AND recipient_role_id = $3
+           AND is_read           = false`,
+        [notificationIds, req.user.role, req.user.user_id]
+      );
+      res.json({ success: true, updated: result.rowCount });
+    } catch (err) {
+      console.error('Mark all read error:', err);
+      res.status(500).json({ success: false });
+    }
   });
 }
 
@@ -1868,65 +1902,111 @@ async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
+
     const table = resolveTable(req.body.recordType);
-    if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
-    if (!projectId || !title) return res.status(400).json({ success: false, message: 'projectId and title are required.' });
+    if (!table)     return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
+    if (!projectId) return res.status(400).json({ success: false, message: 'projectId is required.' });
+    if (!title)     return res.status(400).json({ success: false, message: 'title is required.' });
+
+    // Verify the user is assigned to this project
     const memberCheck = await pool.query(
       `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
-       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
+       UNION ALL
+       SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
        LIMIT 1`,
       [projectId, userId, role]
     );
-    if (!memberCheck.rows.length) return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
+    if (!memberCheck.rows.length) {
+      return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
+    }
+
+    // Upload attachment to Cloudinary if provided
     let filePath = null, attachmentId = null;
     if (req.file) {
       try {
         const r = await new Promise((resolve, reject) => {
           const stream = cloudinary.uploader.upload_stream(
-            { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
-            (err, result) => err ? reject(err) : resolve(result)
+            {
+              folder:        'oneproject/records',
+              resource_type: 'auto',
+              public_id:     `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}`,
+            },
+            (err, result) => (err ? reject(err) : resolve(result))
           );
           Readable.from(req.file.buffer).pipe(stream);
         });
-        filePath = r.secure_url; attachmentId = r.public_id;
+        filePath     = r.secure_url;
+        attachmentId = r.public_id;
       } catch (uploadErr) {
         console.error('Cloudinary upload error:', uploadErr);
         return res.status(500).json({ success: false, message: 'File upload failed.' });
       }
     }
+
     const resolvedKind = recordKind || (noticeTiedId ? 'notice' : 'new');
     const noticeTied   = noticeTiedId ? Number(noticeTiedId) : null;
+
     if (noticeTied) {
-      const parentCheck = await pool.query(`SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`, [noticeTied, projectId]);
-      if (!parentCheck.rows.length) return res.status(400).json({ success: false, message: 'The parent record this notice is tied to no longer exists.' });
+      const parentCheck = await pool.query(
+        `SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`,
+        [noticeTied, projectId]
+      );
+      if (!parentCheck.rows.length) {
+        return res.status(400).json({ success: false, message: 'The parent record this notice is tied to no longer exists.' });
+      }
     }
+
+    // ── STEP 1: Save the record in its own transaction ──────────────────────
+    let recordId;
     const dbClient = await pool.connect();
     try {
       await dbClient.query('BEGIN');
       const recRes = await dbClient.query(
-        `INSERT INTO ${table} (project_id, title, description, file_path, attachment_id, uploaded_by, role, record_kind, notice_tied_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-        [projectId, title, description || null, filePath, attachmentId, userId, role, resolvedKind, noticeTied]
+        `INSERT INTO ${table}
+           (project_id, title, description, file_path, attachment_id,
+            uploaded_by, role, record_kind, notice_tied_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id`,
+        [projectId, title, description || null, filePath, attachmentId,
+         userId, role, resolvedKind, noticeTied]
       );
-      const recordId = recRes.rows[0].id;
-      const notifMsg = noticeTied
-        ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
-        : `New record added by ${role}: "${title}"`;
-      const notifRes = await dbClient.query(
-        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [projectId, recordId, table, notifMsg, userId, role]
-      );
-      const notificationId = notifRes.rows[0].id;
-      const recipients = await getProjectRecipientKeys(projectId, userId, role);
-      await insertNotificationRecipients(dbClient, notificationId, recipients);
+      recordId = recRes.rows[0].id;
       await dbClient.query('COMMIT');
-      res.json({ success: true, message: 'Record saved.', recordId, notificationId, attachmentId, recordKind: resolvedKind });
     } catch (err) {
       await dbClient.query('ROLLBACK');
       console.error('Error saving record:', err);
-      res.status(500).json({ success: false, message: 'Server error saving record.' });
-    } finally { dbClient.release(); }
+      return res.status(500).json({ success: false, message: 'Server error saving record.' });
+    } finally {
+      dbClient.release();
+    }
+
+    // ── Record is committed. Respond immediately so the user isn't blocked. ─
+    res.json({ success: true, message: 'Record saved.', recordId, attachmentId, recordKind: resolvedKind });
+
+    // ── STEP 2: Fire notifications asynchronously ────────────────────────────
+    //    Runs after response is sent — a failure here never affects the save.
+    (async () => {
+      try {
+        const notifMsg = noticeTied
+          ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
+          : `New record added by ${role}: "${title}"`;
+
+        const notifRes = await pool.query(
+          `INSERT INTO notifications
+             (project_id, entity_id, entity_type, notification_type, message, added_by_id, added_by_role)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING id`,
+          [projectId, recordId, table, 'record_created', notifMsg, userId, role]
+        );
+        const notificationId = notifRes.rows[0].id;
+
+        const recipients = await getProjectRecipientKeys(projectId, userId, role);
+        await insertNotificationRecipients(notificationId, recipients);
+      } catch (notifErr) {
+        console.error('[notifications] record_created — non-fatal error:', notifErr);
+      }
+    })();
+
   } catch (err) {
     console.error('Add record route error:', err);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -1941,91 +2021,167 @@ app.post('/records',        authenticateToken, upload.single('attachment'), hand
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, recordType } = req.body;
-  const table = resolveTable(recordType);
+  const table    = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+
   const userId   = req.user.user_id;
   const userRole = req.user.role;
   const userSide = getSide(userRole);
   const userIsDM = isDecisionMaker(userRole);
+
   try {
     const { rows: records } = await pool.query(
       `SELECT r.id, r.title, r.description, r.file_path,
               r.issued_date, r.role AS uploader_role,
               r.uploaded_by, r.status, r.record_kind, r.notice_tied_id
-       FROM ${table} r WHERE r.project_id = $1 ORDER BY r.issued_date DESC`,
+       FROM ${table} r
+       WHERE r.project_id = $1
+       ORDER BY r.issued_date DESC`,
       [projectId]
     );
+
     const enriched = await Promise.all(records.map(async rec => {
       const { rows: reviews } = await pool.query(
         `SELECT dr.reviewer_id, dr.reviewer_role, dr.action, dr.action_date,
                 dr.comment, dr.reviewer_email, dr.reviewer_position
-         FROM document_reviews dr WHERE dr.record_type = $1 AND dr.record_id = $2 ORDER BY dr.action_date ASC`,
+         FROM document_reviews dr
+         WHERE dr.record_type = $1 AND dr.record_id = $2
+         ORDER BY dr.action_date ASC`,
         [table, rec.id]
       );
-      const annotatedReviews = reviews.map(r => ({ ...r, is_decision_maker: isDecisionMaker(r.reviewer_role) }));
-      const isUploader = String(rec.uploaded_by) === String(userId) && getSide(rec.uploader_role) === getSide(userRole);
+
+      const annotatedReviews = reviews.map(r => ({
+        ...r,
+        is_decision_maker: isDecisionMaker(r.reviewer_role),
+      }));
+
+      const isUploader = String(rec.uploaded_by) === String(userId)
+        && getSide(rec.uploader_role) === getSide(userRole);
+
       let isViewed = isUploader;
       if (!isUploader) {
         const { rows: viewed } = await pool.query(
-          `SELECT 1 FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 AND reviewer_role=$4 LIMIT 1`,
+          `SELECT 1 FROM document_reviews
+           WHERE record_type=$1 AND record_id=$2
+             AND reviewer_id=$3 AND reviewer_role=$4
+           LIMIT 1`,
           [table, rec.id, userId, userRole]
         );
         isViewed = viewed.length > 0;
       }
-      const myReviewRow = reviews.find(r => String(r.reviewer_id) === String(userId) && getSide(r.reviewer_role) === getSide(userRole));
-      const myReview    = myReviewRow ? { action: myReviewRow.action, comment: myReviewRow.comment || '' } : {};
-      const uploaderSide  = getSide(rec.uploader_role);
-      const step2SideMap  = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
-      const step2Side     = step2SideMap[uploaderSide];
-      const isLocked      = rec.status === 'approved_record' || annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
+
+      const myReviewRow = reviews.find(
+        r => String(r.reviewer_id) === String(userId)
+          && getSide(r.reviewer_role) === getSide(userRole)
+      );
+      const myReview = myReviewRow
+        ? { action: myReviewRow.action, comment: myReviewRow.comment || '' }
+        : {};
+
+      const uploaderSide = getSide(rec.uploader_role);
+      const step2SideMap = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
+      const step2Side    = step2SideMap[uploaderSide];
+      const isLocked     = rec.status === 'approved_record'
+        || annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
+
       const stepMap = {
-        contractor: [{ side:'consultant',step:1,label:'Consultant Approval',action:'approved'},{side:'client',step:2,label:'Client Acceptance',action:'accepted'}],
-        consultant: [{ side:'client',step:1,label:'Client Approval',action:'approved'},{side:'contractor',step:2,label:'Contractor Acceptance',action:'accepted'}],
-        client:     [{ side:'consultant',step:1,label:'Consultant Approval',action:'approved'},{side:'contractor',step:2,label:'Contractor Acceptance',action:'accepted'}],
+        contractor: [
+          { side: 'consultant', step: 1, label: 'Consultant Approval',  action: 'approved' },
+          { side: 'client',     step: 2, label: 'Client Acceptance',    action: 'accepted' },
+        ],
+        consultant: [
+          { side: 'client',     step: 1, label: 'Client Approval',      action: 'approved' },
+          { side: 'contractor', step: 2, label: 'Contractor Acceptance', action: 'accepted' },
+        ],
+        client: [
+          { side: 'consultant', step: 1, label: 'Consultant Approval',  action: 'approved' },
+          { side: 'contractor', step: 2, label: 'Contractor Acceptance', action: 'accepted' },
+        ],
       };
+
       const steps = uploaderSide ? stepMap[uploaderSide] : null;
       const workflowSteps = steps ? steps.map(s => {
-        const doneReview     = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
-        const rejectedReview = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && r.action === 'rejected');
+        const doneReview     = annotatedReviews.find(r =>
+          getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
+        const rejectedReview = annotatedReviews.find(r =>
+          getSide(r.reviewer_role) === s.side && r.action === 'rejected');
         let status;
-        if (isLocked) status = 'locked';
+        if (isLocked)        status = 'locked';
         else if (doneReview) status = 'done';
         else if (rejectedReview) status = 'rejected';
-        else status = 'pending';
+        else                 status = 'pending';
         return { label: s.label, status };
       }) : [];
+
       let btnState = 'none', pendingRole = null, approveLabel = null;
-      if (isUploader) { btnState = 'uploader'; }
-      else if (isLocked) { btnState = 'locked'; }
-      else if (!userIsDM) { btnState = 'team_member'; }
-      else if (userSide === uploaderSide) { btnState = 'none'; }
-      else {
+      if (isUploader) {
+        btnState = 'uploader';
+      } else if (isLocked) {
+        btnState = 'locked';
+      } else if (!userIsDM) {
+        btnState = 'team_member';
+      } else if (userSide === uploaderSide) {
+        btnState = 'none';
+      } else {
         const workflowActions = ['approved', 'accepted', 'rejected'];
         const alreadyActed = myReviewRow && workflowActions.includes(myReviewRow.action);
-        if (alreadyActed) { btnState = 'acted'; }
-        else if (steps) {
+        if (alreadyActed) {
+          btnState = 'acted';
+        } else if (steps) {
           const myStep = steps.find(s => s.side === userSide);
-          if (!myStep) { btnState = 'none'; }
-          else if (myStep.step === 2) {
-            const step1 = steps.find(s => s.step === 1);
-            const step1Done = annotatedReviews.some(r => getSide(r.reviewer_role) === step1.side && (r.action === 'approved' || r.action === 'accepted'));
-            if (!step1Done) { btnState = 'awaiting'; pendingRole = step1.side; }
-            else { btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve'; }
-          } else { btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve'; }
+          if (!myStep) {
+            btnState = 'none';
+          } else if (myStep.step === 2) {
+            const step1     = steps.find(s => s.step === 1);
+            const step1Done = annotatedReviews.some(
+              r => getSide(r.reviewer_role) === step1.side
+                && (r.action === 'approved' || r.action === 'accepted')
+            );
+            if (!step1Done) {
+              btnState = 'awaiting'; pendingRole = step1.side;
+            } else {
+              btnState = 'can_approve';
+              approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
+            }
+          } else {
+            btnState     = 'can_approve';
+            approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
+          }
         }
       }
+
       const { rows: myNotices } = await pool.query(
-        `SELECT id, title FROM ${table} WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 AND role=$4`,
+        `SELECT id, title FROM ${table}
+         WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 AND role=$4`,
         [rec.id, projectId, userId, userRole]
       );
       const myIssuedNotice = myNotices.length > 0 ? myNotices[0] : null;
+
       let tiedRecordTitle = null;
       if (rec.notice_tied_id) {
-        const { rows: tied } = await pool.query(`SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]);
+        const { rows: tied } = await pool.query(
+          `SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]
+        );
         tiedRecordTitle = tied[0]?.title || null;
       }
-      return { ...rec, reviews: annotatedReviews, is_uploader: isUploader, is_viewed: isViewed, is_locked: isLocked, is_decision_maker: userIsDM, btn_state: btnState, pending_role: pendingRole, approve_label: approveLabel, my_review: myReview, workflow_steps: workflowSteps, my_issued_notice: myIssuedNotice, tied_record_title: tiedRecordTitle };
+
+      return {
+        ...rec,
+        reviews:          annotatedReviews,
+        is_uploader:      isUploader,
+        is_viewed:        isViewed,
+        is_locked:        isLocked,
+        is_decision_maker: userIsDM,
+        btn_state:        btnState,
+        pending_role:     pendingRole,
+        approve_label:    approveLabel,
+        my_review:        myReview,
+        workflow_steps:   workflowSteps,
+        my_issued_notice: myIssuedNotice,
+        tied_record_title: tiedRecordTitle,
+      };
     }));
+
     res.json({ records: enriched });
   } catch (err) {
     console.error('Fetch tab records error:', err);
@@ -2038,21 +2194,45 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, projectId, recordType } = req.body;
-  const reviewerId = req.user.user_id, reviewerRole = req.user.role;
-  const table = resolveTable(recordType);
+  const reviewerId   = req.user.user_id;
+  const reviewerRole = req.user.role;
+  const table        = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+
   try {
-    const { rows: rec } = await pool.query(`SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
-    if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
-    if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) return res.json({ success: true, skipped: true });
-    const assignRow = await pool.query(`SELECT av.role_email AS email, av.position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
-    await pool.query(
-      `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action)
-       VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action') ON CONFLICT (record_type, record_id, reviewer_id, reviewer_role) DO NOTHING`,
-      [table, recordId, reviewerId, reviewerRole, assignRow.rows[0]?.email || null, assignRow.rows[0]?.position || null]
+    const { rows: rec } = await pool.query(
+      `SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`,
+      [recordId, projectId]
     );
+    if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
+    if (String(rec[0].uploaded_by) === String(reviewerId)
+        && getSide(rec[0].role) === getSide(reviewerRole)) {
+      return res.json({ success: true, skipped: true });
+    }
+
+    const assignRow = await pool.query(
+      `SELECT av.role_email AS email, av.position
+       FROM assignments_view av
+       WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3
+       LIMIT 1`,
+      [projectId, reviewerId, reviewerRole]
+    );
+
+    await pool.query(
+      `INSERT INTO document_reviews
+         (record_type, record_id, record_kind, reviewer_id, reviewer_role,
+          reviewer_email, reviewer_position, action)
+       VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action')
+       ON CONFLICT (record_type, record_id, reviewer_id, reviewer_role) DO NOTHING`,
+      [table, recordId, reviewerId, reviewerRole,
+       assignRow.rows[0]?.email || null, assignRow.rows[0]?.position || null]
+    );
+
     res.json({ success: true });
-  } catch (err) { console.error('Mark viewed error:', err); res.status(500).json({ error: 'Failed to mark as viewed.' }); }
+  } catch (err) {
+    console.error('Mark viewed error:', err);
+    res.status(500).json({ error: 'Failed to mark as viewed.' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2060,86 +2240,217 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType, action, comment, actorType } = req.body;
-  const reviewerId = req.user.user_id, reviewerRole = req.user.role;
-  const table = resolveTable(recordType);
+  const reviewerId   = req.user.user_id;
+  const reviewerRole = req.user.role;
+  const table        = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-  const workflowActions = ['approved', 'accepted', 'rejected'];
-  const isWorkflow = workflowActions.includes(action);
+
+  const workflowActions     = ['approved', 'accepted', 'rejected'];
+  const isWorkflow          = workflowActions.includes(action);
   const isDecisionMakerActor = isDecisionMaker(reviewerRole) && actorType !== 'team_member';
-  if (!isWorkflow && action !== 'no_action') return res.status(400).json({ error: 'Invalid action.' });
-  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
+
+  if (!isWorkflow && action !== 'no_action') {
+    return res.status(400).json({ error: 'Invalid action.' });
+  }
+  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') {
+    return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
+  }
+
   try {
-    const { rows: recRows } = await pool.query(`SELECT id, role, uploaded_by FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
+    const { rows: recRows } = await pool.query(
+      `SELECT id, role, uploaded_by FROM ${table} WHERE id=$1 AND project_id=$2`,
+      [recordId, projectId]
+    );
     if (!recRows.length) return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
     const rec = recRows[0];
-    if (String(rec.uploaded_by) === String(reviewerId) && getSide(rec.role) === getSide(reviewerRole)) return res.status(403).json({ error: 'You cannot review your own record.' });
-    const assignRow = await pool.query(`SELECT av.role_email AS email, av.position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
-    const reviewerEmail = assignRow.rows[0]?.email || null, reviewerPosition = assignRow.rows[0]?.position || null;
-    const { rows: existing } = await pool.query(`SELECT id, action FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 AND reviewer_role=$4 LIMIT 1`, [table, recordId, reviewerId, reviewerRole]);
+
+    if (String(rec.uploaded_by) === String(reviewerId)
+        && getSide(rec.role) === getSide(reviewerRole)) {
+      return res.status(403).json({ error: 'You cannot review your own record.' });
+    }
+
+    const assignRow = await pool.query(
+      `SELECT av.role_email AS email, av.position
+       FROM assignments_view av
+       WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3
+       LIMIT 1`,
+      [projectId, reviewerId, reviewerRole]
+    );
+    const reviewerEmail    = assignRow.rows[0]?.email    || null;
+    const reviewerPosition = assignRow.rows[0]?.position || null;
+
+    const { rows: existing } = await pool.query(
+      `SELECT id, action FROM document_reviews
+       WHERE record_type=$1 AND record_id=$2
+         AND reviewer_id=$3 AND reviewer_role=$4
+       LIMIT 1`,
+      [table, recordId, reviewerId, reviewerRole]
+    );
+
+    // Comment-only path
     if (action === 'no_action' && comment?.trim()) {
-      if (existing.length > 0) { await pool.query(`UPDATE document_reviews SET comment=$1, action_date=NOW() WHERE id=$2`, [comment.trim(), existing[0].id]); }
-      else { await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action',$7)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, comment.trim()]); }
+      if (existing.length > 0) {
+        await pool.query(
+          `UPDATE document_reviews SET comment=$1, action_date=NOW() WHERE id=$2`,
+          [comment.trim(), existing[0].id]
+        );
+      } else {
+        await pool.query(
+          `INSERT INTO document_reviews
+             (record_type,record_id,record_kind,reviewer_id,reviewer_role,
+              reviewer_email,reviewer_position,action,comment)
+           VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action',$7)`,
+          [table, recordId, reviewerId, reviewerRole,
+           reviewerEmail, reviewerPosition, comment.trim()]
+        );
+      }
       return res.json({ success: true, message: 'Comment saved.' });
     }
+
+    // Workflow action
     if (existing.length > 0) {
-      if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
-      await pool.query(`UPDATE document_reviews SET action=$1, action_date=NOW(), comment=COALESCE($2,comment) WHERE id=$3`, [action, comment?.trim() || null, existing[0].id]);
+      if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
+        return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
+      }
+      await pool.query(
+        `UPDATE document_reviews
+         SET action=$1, action_date=NOW(), comment=COALESCE($2,comment)
+         WHERE id=$3`,
+        [action, comment?.trim() || null, existing[0].id]
+      );
     } else {
-      await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, action, comment?.trim() || null]);
+      await pool.query(
+        `INSERT INTO document_reviews
+           (record_type,record_id,record_kind,reviewer_id,reviewer_role,
+            reviewer_email,reviewer_position,action,comment)
+         VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8)`,
+        [table, recordId, reviewerId, reviewerRole,
+         reviewerEmail, reviewerPosition, action, comment?.trim() || null]
+      );
     }
+
+    // Update record status
     if (isDecisionMakerActor && isWorkflow) {
       const uploaderSide = getSide(rec.role);
       let newStatus;
-      if (action === 'rejected') { newStatus = 'rejected'; }
-      else if (action === 'accepted') { newStatus = 'approved_record'; }
-      else { const m = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' }; newStatus = m[uploaderSide] || 'pending_review'; }
-      await pool.query(`UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, recordId, projectId]);
-      const notifMsg = `${reviewerRole} ${action} record #${recordId} (uploaded by ${rec.role})`;
-      const dbClient = await pool.connect();
-      try {
-        await dbClient.query('BEGIN');
-        const notifRes = await dbClient.query(`INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`, [projectId, recordId, table, notifMsg, reviewerId, reviewerRole]);
-        const notificationId = notifRes.rows[0].id;
-        const recipients = await getProjectRecipientKeys(projectId, reviewerId, reviewerRole);
-        await insertNotificationRecipients(dbClient, notificationId, recipients);
-        await dbClient.query('COMMIT');
-      } catch (notifErr) { await dbClient.query('ROLLBACK'); console.error('Notification insert error (non-fatal):', notifErr); } finally { dbClient.release(); }
+      if (action === 'rejected') {
+        newStatus = 'rejected';
+      } else if (action === 'accepted') {
+        newStatus = 'approved_record';
+      } else {
+        const m = {
+          contractor: 'pending_client_acceptance',
+          consultant: 'pending_contractor_acceptance',
+          client:     'pending_contractor_acceptance',
+        };
+        newStatus = m[uploaderSide] || 'pending_review';
+      }
+      await pool.query(
+        `UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`,
+        [newStatus, recordId, projectId]
+      );
+
+      // Fire notification asynchronously — never blocks the response
+      res.json({ success: true, message: `Action '${action}' recorded successfully.` });
+
+      (async () => {
+        try {
+          const notifMsg = `${reviewerRole} ${action} record #${recordId} (uploaded by ${rec.role})`;
+          const notifRes = await pool.query(
+            `INSERT INTO notifications
+               (project_id, entity_id, entity_type, notification_type, message, added_by_id, added_by_role)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             RETURNING id`,
+            [projectId, recordId, table, 'record_reviewed', notifMsg, reviewerId, reviewerRole]
+          );
+          const recipients = await getProjectRecipientKeys(projectId, reviewerId, reviewerRole);
+          await insertNotificationRecipients(notifRes.rows[0].id, recipients);
+        } catch (notifErr) {
+          console.error('[notifications] record_reviewed — non-fatal error:', notifErr);
+        }
+      })();
+
+      return; // response already sent above
     }
+
     res.json({ success: true, message: `Action '${action}' recorded successfully.` });
-  } catch (err) { console.error('Review record error:', err); res.status(500).json({ error: 'Failed to process review.' }); }
+  } catch (err) {
+    console.error('Review record error:', err);
+    res.status(500).json({ error: 'Failed to process review.' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DOWNLOAD / DELETE RECORD
+//  DOWNLOAD FILE
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/download-file', authenticateToken, async (req, res) => {
   const { recordId, recordType } = req.query;
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
-    const { rows } = await pool.query(`SELECT file_path FROM ${table} WHERE id=$1`, [recordId]);
-    if (!rows.length || !rows[0].file_path) return res.status(404).json({ error: 'File not found.' });
+    const { rows } = await pool.query(
+      `SELECT file_path FROM ${table} WHERE id=$1`, [recordId]
+    );
+    if (!rows.length || !rows[0].file_path) {
+      return res.status(404).json({ error: 'File not found.' });
+    }
     const filePath = rows[0].file_path;
-    if (filePath.startsWith('http')) return res.json({ url: filePath, fileName: filePath.split('/').pop() || 'download' });
+    if (filePath.startsWith('http')) {
+      return res.json({ url: filePath, fileName: filePath.split('/').pop() || 'download' });
+    }
     res.status(404).json({ error: 'File not accessible.' });
-  } catch (err) { console.error('Download file error:', err); res.status(500).json({ error: 'Failed to download file.' }); }
+  } catch (err) {
+    console.error('Download file error:', err);
+    res.status(500).json({ error: 'Failed to download file.' });
+  }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  DELETE RECORD
+// ─────────────────────────────────────────────────────────────────────────────
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType } = req.body;
   const userId = req.user.user_id;
   const table  = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
+
   try {
-    const { rows } = await pool.query(`SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
+    const { rows } = await pool.query(
+      `SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`,
+      [recordId, projectId]
+    );
     if (!rows.length) return res.status(404).json({ error: 'Record not found.' });
-    if (String(rows[0].uploaded_by) !== String(userId) || getSide(rows[0].role) !== getSide(req.user.role)) return res.status(403).json({ error: 'Only the uploader can delete this record.' });
-    await pool.query(`DELETE FROM notification_recipients WHERE notification_id IN (SELECT id FROM notifications WHERE entity_id=$1 AND entity_type=$2)`, [recordId, table]);
-    await pool.query('DELETE FROM notifications WHERE entity_id=$1 AND entity_type=$2', [recordId, table]);
-    await pool.query('DELETE FROM document_reviews WHERE record_type=$1 AND record_id=$2', [table, recordId]);
-    await pool.query(`DELETE FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
+    if (String(rows[0].uploaded_by) !== String(userId)
+        || getSide(rows[0].role) !== getSide(req.user.role)) {
+      return res.status(403).json({ error: 'Only the uploader can delete this record.' });
+    }
+
+    // Clean up notifications for this record first
+    await pool.query(
+      `DELETE FROM notification_recipients
+       WHERE notification_id IN (
+         SELECT id FROM notifications WHERE entity_id=$1 AND entity_type=$2
+       )`,
+      [recordId, table]
+    );
+    await pool.query(
+      `DELETE FROM notifications WHERE entity_id=$1 AND entity_type=$2`,
+      [recordId, table]
+    );
+    await pool.query(
+      `DELETE FROM document_reviews WHERE record_type=$1 AND record_id=$2`,
+      [table, recordId]
+    );
+    await pool.query(
+      `DELETE FROM ${table} WHERE id=$1 AND project_id=$2`,
+      [recordId, projectId]
+    );
+
     res.json({ success: true, message: 'Record deleted successfully.' });
-  } catch (err) { console.error('Delete record error:', err); res.status(500).json({ error: 'Failed to delete record.' }); }
+  } catch (err) {
+    console.error('Delete record error:', err);
+    res.status(500).json({ error: 'Failed to delete record.' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
