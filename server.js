@@ -2431,15 +2431,23 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
     const notifMsg = scope === 'side'
       ? `Meeting minutes recorded by ${req.user.role} for ${scope_value || 'your'} side: "${meetingTitle}"`
       : `Meeting minutes recorded by ${req.user.role}: "${meetingTitle}"`;
-    const notifRes = await client.query(
-      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [project_id, minute.id, 'meeting_minutes', notifMsg, req.user.user_id, req.user.role]
-    );
-    const notificationId = notifRes.rows[0].id;
-    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-    await insertNotificationRecipients(notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json({ minute });
+
+    // Create notifications asynchronously so failures don't rollback the minute save
+    (async () => {
+      try {
+        const notifRes = await pool.query(
+          `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [project_id, minute.id, 'meeting_minutes', notifMsg, req.user.user_id, req.user.role]
+        );
+        const notificationId = notifRes.rows[0].id;
+        const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
+        await insertNotificationRecipients(notificationId, recipients);
+      } catch (notifyErr) {
+        console.error('POST /api/meetings/:id/minute: notification creation failed', notifyErr);
+      }
+    })();
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings/:id/minute:', err); res.status(500).json({ error: 'Failed to save minute' }); } finally { client.release(); }
 });
 
@@ -2588,16 +2596,23 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     const planned=parseFloat(ms.quantity)||0,exec=parseFloat(ms.executed)||0;
     if (planned>0&&exec<planned) return res.status(422).json({ error:`Cannot complete: only ${exec} of ${planned} ${ms.unit||''} executed` });
     await client.query(`UPDATE ${table} SET activity_status='completed',progress_pct=100,completed_at=now(),updated_at=now() WHERE id=$1`,[milestoneId]);
-    const notifMsg = `${isExt ? 'Additional milestone' : 'Milestone'} completed by ${req.user.role}: "${ms.title || `#${milestoneId}`}"`;
-    const notifRes = await client.query(
-      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [projectId, milestoneId, table, notifMsg, req.user.user_id, req.user.role]
-    );
-    const notificationId = notifRes.rows[0].id;
-    const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
-    await insertNotificationRecipients(notificationId, recipients);
     await client.query('COMMIT');
     res.json({ success:true,completedAt:new Date().toISOString() });
+
+    // Fire milestone-completed notification asynchronously
+    (async () => {
+      try {
+        const notifMsg = `${isExt ? 'Additional milestone' : 'Milestone'} completed by ${req.user.role}: "${ms.title || `#${milestoneId}`}"`;
+        const notifRes = await pool.query(
+          `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [projectId, milestoneId, table, notifMsg, req.user.user_id, req.user.role]
+        );
+        const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
+        await insertNotificationRecipients(notifRes.rows[0].id, recipients);
+      } catch (notifyErr) {
+        console.error('[POST /api/complete-milestone] notification creation failed', notifyErr);
+      }
+    })();
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/complete-milestone]',err);res.status(500).json({error:'Failed to complete milestone'});}finally{client.release();}
 });
 
