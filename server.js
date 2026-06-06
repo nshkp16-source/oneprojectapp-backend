@@ -194,44 +194,6 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
   return [...ids];
 }
 
-async function insertNotificationRecipients(dbClient, notificationId, recipients) {
-  if (!recipients || !recipients.length) return;
-  for (const recipient of recipients) {
-    try {
-      await dbClient.query(
-        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
-         SELECT $1, $2, $3, $4, $5
-         WHERE NOT EXISTS (
-           SELECT 1 FROM notification_recipients nr
-           WHERE nr.notification_id = $1
-             AND (
-               (nr.recipient_role = $3 AND nr.recipient_role_id = $4)
-               OR (nr.recipient_role IS NULL AND nr.user_id = $2)
-             )
-         )`,
-        [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
-      );
-    } catch (err) {
-      if (err.message.includes('column') && err.message.includes('does not exist')) {
-        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
-        await dbClient.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-           SELECT $1, $2, false
-           WHERE NOT EXISTS (
-             SELECT 1 FROM notification_recipients nr
-             WHERE nr.notification_id = $1 AND nr.user_id = $2
-           )`,
-          [notificationId, recipient.user_id]
-        ).catch((legacyErr) => {
-          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
-        });
-      } else {
-        throw err;
-      }
-    }
-  }
-}
-
 async function getProjectMembers(projectId) {
   const { rows } = await pool.query(`
     SELECT 'Client' AS role, p.client_id AS role_id,
@@ -1674,83 +1636,7 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
 //  HELPERS — shared by all routes below
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Map recordType string → table name */
-function resolveTable(recordType) {
-  const map = {
-    contractual_records:    'contractual_records',
-    administrative_records: 'administrative_records',
-    safety_records:         'safety_records',
-    operational_records:    'operational_records',
-    financial_records:      'financial_records',
-    contractual:            'contractual_records',
-    administrative:         'administrative_records',
-    safety:                 'safety_records',
-    operational:            'operational_records',
-    financial:              'financial_records',
-  };
-  return map[recordType] || null;
-}
-
-/** Normalise role string to lowercase, no spaces */
-function normalizeRole(role) {
-  return (role || '').toLowerCase().replace(/\s+/g, '');
-}
-
-/** Which "side" does a role belong to? */
-function getSide(role) {
-  const r = normalizeRole(role);
-  if (['contractor', 'contractorpm', 'teammember'].includes(r)) return 'contractor';
-  if (['consultant', 'consultantpm'].includes(r))               return 'consultant';
-  if (['client', 'clientpm'].includes(r))                       return 'client';
-  return null;
-}
-
-/** Is this role a decision-maker (not a plain team member)? */
-function isDecisionMaker(role) {
-  return normalizeRole(role) !== 'teammember';
-}
-
-/**
- * Get all project members as { role, role_id, email } objects.
- * Excludes the actor themselves (excludeId / excludeRole).
- * If scope === 'side', only return members on scopeValue side.
- */
-async function getProjectRecipientKeys(projectId, excludeId, excludeRole, scope = 'global', scopeValue = null) {
-  // All assigned members via assignments_view
-  const { rows: members } = await pool.query(
-    `SELECT role, role_id, role_email AS email, assigned_part
-     FROM assignments_view
-     WHERE project_id = $1`,
-    [projectId]
-  );
-
-  // Also add the client who owns the project
-  const { rows: clientRows } = await pool.query(
-    `SELECT c.id AS role_id, c.company_email AS email
-     FROM projects p JOIN clients c ON c.id = p.client_id
-     WHERE p.id = $1`,
-    [projectId]
-  );
-  const allMembers = [
-    ...members,
-    ...clientRows.map(c => ({ role: 'Client', role_id: c.role_id, email: c.email, assigned_part: null })),
-  ];
-
-  return allMembers.filter(m => {
-    // Never notify the person who triggered the event
-    if (String(m.role_id) === String(excludeId) && normalizeRole(m.role) === normalizeRole(excludeRole)) return false;
-
-    if (scope === 'side' && scopeValue) {
-      const memberSide = getSide(m.role);
-      // For TeamMembers respect assigned_part
-      if (normalizeRole(m.role) === 'teammember') {
-        return (m.assigned_part || '').toLowerCase() === (scopeValue || '').toLowerCase();
-      }
-      return memberSide === getSide(scopeValue);
-    }
-    return true; // global — everyone
-  });
-}
+// Duplicate shared helper definitions removed; the core helpers above are reused here.
 
 /**
  * Insert notification_recipients rows using the NEW schema.
@@ -2501,7 +2387,7 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), async 
     );
     const notificationId = notifRes.rows[0].id;
     const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-    await insertNotificationRecipients(client, notificationId, recipients);
+    await insertNotificationRecipients(notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json(meeting);
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings:', err); res.status(500).json({ error: 'Failed to create meeting' }); } finally { client.release(); }
@@ -2539,7 +2425,7 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
     );
     const notificationId = notifRes.rows[0].id;
     const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-    await insertNotificationRecipients(client, notificationId, recipients);
+    await insertNotificationRecipients(notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json({ minute });
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings/:id/minute:', err); res.status(500).json({ error: 'Failed to save minute' }); } finally { client.release(); }
@@ -2697,7 +2583,7 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     );
     const notificationId = notifRes.rows[0].id;
     const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
-    await insertNotificationRecipients(client, notificationId, recipients);
+    await insertNotificationRecipients(notificationId, recipients);
     await client.query('COMMIT');
     res.json({ success:true,completedAt:new Date().toISOString() });
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/complete-milestone]',err);res.status(500).json({error:'Failed to complete milestone'});}finally{client.release();}
