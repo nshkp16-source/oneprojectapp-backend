@@ -2057,15 +2057,7 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     const msRows = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [sched.id]);
     const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
     
-    // Try to select new_planned_start if it exists, otherwise compute it
-    let extRows;
-    try {
-      extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
-    } catch (e) {
-      // Fallback: column might not exist yet, compute it manually
-      const rawExtRows = await pool.query(`SELECT id,extension_days,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
-      extRows = { rows: rawExtRows.rows };
-    }
+    const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
     
     const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt });
     res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},location:sched.location||null,milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows } });
@@ -2222,14 +2214,7 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
     const effectiveFinish=lastExtRes.rows[0]?.new_planned_finish||schedRes.rows[0].planned_finish;
     const newPlannedStart=new Date(effectiveFinish);newPlannedStart.setDate(newPlannedStart.getDate()+1);
     
-    // Try to insert with new_planned_start, fall back to without it if column doesn't exist
-    let extRes;
-    try {
-      extRes=await client.query(`INSERT INTO schedule_extensions (schedule_id,project_id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,requested_by_user_id,requested_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,[scheduleId,projectId,extensionDays,newPlannedStart.toISOString().slice(0,10),newPlannedFinish,reason,extensionType,req.user.user_id,req.user.role]);
-    } catch (colErr) {
-      // Column doesn't exist yet, insert without new_planned_start
-      extRes=await client.query(`INSERT INTO schedule_extensions (schedule_id,project_id,extension_days,new_planned_finish,reason,extension_type,requested_by_user_id,requested_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,[scheduleId,projectId,extensionDays,newPlannedFinish,reason,extensionType,req.user.user_id,req.user.role]);
-    }
+    const extRes = await client.query(`INSERT INTO schedule_extensions (schedule_id,project_id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,requested_by_user_id,requested_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,[scheduleId,projectId,extensionDays,newPlannedStart.toISOString().slice(0,10),newPlannedFinish,reason,extensionType,req.user.user_id,req.user.role]);
     
     const extensionId=extRes.rows[0].id;
     await client.query('UPDATE project_schedules SET planned_finish=$1,updated_at=now() WHERE id=$2',[newPlannedFinish,scheduleId]);
