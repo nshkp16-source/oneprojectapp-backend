@@ -2239,7 +2239,7 @@ app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
   if (!milestoneId&&!additionalMilestoneId) return res.status(400).json({ error: 'milestoneId or additionalMilestoneId is required' });
   try {
     const col=milestoneId?'milestone_id':'additional_milestone_id', val=milestoneId??additionalMilestoneId;
-    const { rows }=await pool.query(`SELECT id,file_name,file_size,mime_type,cloudinary_url,uploaded_at FROM milestone_photos WHERE ${col}=$1 ORDER BY uploaded_at ASC`,[val]);
+    const { rows }=await pool.query(`SELECT id,file_name,cloudinary_url,uploaded_at FROM milestone_photos WHERE ${col}=$1 ORDER BY uploaded_at ASC`,[val]);
     res.json({ photos: rows });
   } catch(err){console.error('[GET /api/milestone-photos]',err);res.status(500).json({error:'Failed to fetch photos'});}
 });
@@ -2256,7 +2256,7 @@ app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',
   try {
     for (const file of req.files) {
       const cdResult=await new Promise((resolve,reject)=>{const stream=cloudinary.uploader.upload_stream({folder,resource_type:'image',public_id:`${Date.now()}_${file.originalname.replace(/\s+/g,'-')}`},(err,result)=>(err?reject(err):resolve(result)));Readable.from(file.buffer).pipe(stream);});
-      const { rows }=await pool.query(`INSERT INTO milestone_photos (${col},project_id,file_name,file_size,mime_type,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,file_name,cloudinary_url,uploaded_at`,[val,projectId,file.originalname,file.size,file.mimetype,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]);
+      const { rows }=await pool.query(`INSERT INTO milestone_photos (${col},project_id,file_name,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,file_name,cloudinary_url,uploaded_at`,[val,projectId,file.originalname,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]);
       inserted.push(rows[0]);
     }
     res.json({ success:true,photos:inserted });
