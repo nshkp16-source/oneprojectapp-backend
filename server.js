@@ -1651,15 +1651,26 @@ async function insertNotificationRecipients(notificationId, recipients) {
   const params = [notificationId];
   recipients.forEach(r => {
     const recipientRole = normalizeRole(r.role || r.recipient_role);
-    params.push(recipientRole, Number(r.role_id || r.recipient_role_id), r.email || null);
+    params.push(recipientRole, Number(r.role_id || r.recipient_role_id), r.email || r.recipient_email || null);
   });
-  await pool.query(
-    `INSERT INTO notification_recipients
-       (notification_id, recipient_role, recipient_role_id, recipient_email)
-     VALUES ${values}
-     ON CONFLICT ON CONSTRAINT uniq_notif_recipient_per_role DO NOTHING`,
-    params
-  );
+  try {
+    await pool.query(
+      `INSERT INTO notification_recipients
+         (notification_id, recipient_role, recipient_role_id, recipient_email)
+       VALUES ${values}
+       ON CONFLICT ON CONSTRAINT uniq_notif_recipient_per_role DO NOTHING`,
+      params
+    );
+  } catch (err) {
+    // Detailed logging to aid debugging when inserts fail
+    try {
+      console.error('[notifications] insertNotificationRecipients failed for notificationId=', notificationId, 'error=', err && err.message);
+      const sample = recipients.slice(0,5).map(r => ({ role: r.role || r.recipient_role, role_id: r.role_id || r.recipient_role_id, email: r.email || r.recipient_email }));
+      console.error('[notifications] recipients sample:', JSON.stringify(sample));
+    } catch (logErr) {
+      console.error('[notifications] insertNotificationRecipients logging failed', logErr);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
