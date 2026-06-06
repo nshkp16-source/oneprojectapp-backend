@@ -194,6 +194,25 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
   return [...ids];
 }
 
+async function insertNotificationRecipients(dbClient, notificationId, recipients) {
+  if (!recipients || !recipients.length) return;
+  for (const recipient of recipients) {
+    await dbClient.query(
+      `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
+       SELECT $1, $2, $3, $4, $5
+       WHERE NOT EXISTS (
+         SELECT 1 FROM notification_recipients nr
+         WHERE nr.notification_id = $1
+           AND (
+             (nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+             OR (nr.recipient_role IS NULL AND nr.user_id = $2)
+           )
+       )`,
+      [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
+    );
+  }
+}
+
 async function getProjectMembers(projectId) {
   const { rows } = await pool.query(`
     SELECT 'Client' AS role, p.client_id AS role_id,
@@ -223,7 +242,8 @@ async function getProjectMembers(projectId) {
     SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture
+           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS assigned_part
     FROM client_pm_assignments a
     JOIN client_project_managers c ON a.client_pm_id = c.id
     WHERE a.project_id = $1
@@ -231,7 +251,8 @@ async function getProjectMembers(projectId) {
     SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture
+           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS assigned_part
     FROM contractor_pm_assignments a
     JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
     WHERE a.project_id = $1
@@ -239,7 +260,8 @@ async function getProjectMembers(projectId) {
     SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture
+           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS assigned_part
     FROM consultant_pm_assignments a
     JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
     WHERE a.project_id = $1
@@ -247,7 +269,8 @@ async function getProjectMembers(projectId) {
     SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture
+           a.company_name, a.title, a.position, c.profile_picture,
+           a.assigned_part AS assigned_part
     FROM team_member_assignments a
     JOIN team_members c ON a.team_member_id = c.id
     WHERE a.project_id = $1
@@ -257,6 +280,26 @@ async function getProjectMembers(projectId) {
     role_id:      Number(r.role_id),
     display_name: r.display_name || r.email || 'Unknown',
   }));
+}
+
+async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, scope = 'global', scopeValue = null) {
+  const members = await getProjectMembers(projectId);
+  const normalizedExcludeRole = normalizeRole(excludeRole);
+  const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
+
+  return members
+    .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
+    .filter(m => {
+      if (!targetSide) return true;
+      const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
+      return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
+    })
+    .map(m => ({
+      recipient_role: m.role,
+      recipient_role_id: Number(m.role_id),
+      recipient_email: m.email || null,
+      user_id: Number(m.role_id),
+    }));
 }
 
 async function userHasProjectAccess(userId, role, projectId) {
@@ -1605,34 +1648,44 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS  (both /notifications/* and /api/notifications/*)
 // ─────────────────────────────────────────────────────────────────────────────
-async function getUnreadCount(projectId, userId) {
+async function getUnreadCount(projectId, userRole, userId) {
   const result = await pool.query(
-    `SELECT COUNT(*) AS count
+    `SELECT COUNT(DISTINCT n.id) AS count
      FROM notifications n
-     LEFT JOIN notification_recipients nr ON nr.notification_id = n.id AND nr.user_id = $2
-     WHERE n.project_id = $1 AND n.added_by_id != $2
+     LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+       AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+            OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+     WHERE n.project_id = $1 AND n.added_by_id != $3
        AND (nr.is_read = false OR nr.id IS NULL)`,
-    [projectId, userId]
+    [projectId, userRole, userId]
   );
   return parseInt(result.rows[0].count, 10);
 }
 
-async function getNotifications(projectId, userId) {
+async function getNotifications(projectId, userRole, userId) {
   const { rows: notifs } = await pool.query(
     `SELECT n.id, n.entity_type, n.entity_id, n.message,
             n.added_by_role, n.created_at,
             COALESCE(nr.is_read, false) AS is_read
      FROM notifications n
-     LEFT JOIN notification_recipients nr ON nr.notification_id = n.id AND nr.user_id = $2
-     WHERE n.project_id = $1 AND n.added_by_id != $2
+     LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+       AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+            OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+     WHERE n.project_id = $1 AND n.added_by_id != $3
      ORDER BY n.created_at DESC`,
-    [projectId, userId]
+    [projectId, userRole, userId]
   );
   for (const n of notifs) {
     await pool.query(
-      `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-       VALUES ($1, $2, false) ON CONFLICT (notification_id, user_id) DO NOTHING`,
-      [n.id, userId]
+      `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
+       SELECT $1, $2, $3, $4, false
+       WHERE NOT EXISTS (
+         SELECT 1 FROM notification_recipients nr
+         WHERE nr.notification_id = $1
+           AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+                OR (nr.recipient_role IS NULL AND nr.user_id = $2))
+       )`,
+      [n.id, userId, userRole, userId]
     ).catch(() => {});
   }
   return notifs;
@@ -1641,26 +1694,38 @@ async function getNotifications(projectId, userId) {
 for (const prefix of ['/notifications', '/api/notifications']) {
   app.get(`${prefix}/unread-count`, authenticateToken, async (req, res) => {
     try {
-      const count = await getUnreadCount(req.query.projectId, req.user.user_id);
+      const count = await getUnreadCount(req.query.projectId, req.user.role, req.user.user_id);
       res.json({ count });
     } catch (err) { console.error('Unread count error:', err); res.status(500).json({ count: 0 }); }
   });
 
   app.get(`${prefix}`, authenticateToken, async (req, res) => {
     try {
-      const notifications = await getNotifications(req.query.projectId, req.user.user_id);
+      const notifications = await getNotifications(req.query.projectId, req.user.role, req.user.user_id);
       res.json({ notifications });
     } catch (err) { console.error('Fetch notifications error:', err); res.status(500).json({ notifications: [] }); }
   });
 
   app.put(`${prefix}/:id/read`, authenticateToken, async (req, res) => {
     try {
-      await pool.query(
-        `INSERT INTO notification_recipients (notification_id, user_id, is_read, read_at)
-         VALUES ($1, $2, true, NOW())
-         ON CONFLICT (notification_id, user_id) DO UPDATE SET is_read = true, read_at = NOW()`,
-        [req.params.id, req.user.user_id]
+      const result = await pool.query(
+        `UPDATE notification_recipients
+         SET is_read = true, read_at = NOW()
+         WHERE notification_id = $1
+           AND recipient_role = $2
+           AND recipient_role_id = $3`,
+        [req.params.id, req.user.role, req.user.user_id]
       );
+      if (result.rowCount === 0) {
+        await pool.query(
+          `UPDATE notification_recipients
+           SET is_read = true, read_at = NOW()
+           WHERE notification_id = $1
+             AND recipient_role IS NULL
+             AND user_id = $2`,
+          [req.params.id, req.user.user_id]
+        );
+      }
       res.json({ success: true });
     } catch (err) { console.error('Mark read error:', err); res.status(500).json({ success: false }); }
   });
@@ -1669,15 +1734,29 @@ for (const prefix of ['/notifications', '/api/notifications']) {
     const { notificationIds } = req.body;
     if (!Array.isArray(notificationIds) || !notificationIds.length) return res.json({ success: true, updated: 0 });
     try {
+      let updated = 0;
       for (const notifId of notificationIds) {
-        await pool.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, is_read, read_at)
-           VALUES ($1, $2, true, NOW())
-           ON CONFLICT (notification_id, user_id) DO UPDATE SET is_read = true, read_at = NOW()`,
-          [notifId, req.user.user_id]
+        const result = await pool.query(
+          `UPDATE notification_recipients
+           SET is_read = true, read_at = NOW()
+           WHERE notification_id = $1
+             AND recipient_role = $2
+             AND recipient_role_id = $3`,
+          [notifId, req.user.role, req.user.user_id]
         );
+        if (result.rowCount === 0) {
+          await pool.query(
+            `UPDATE notification_recipients
+             SET is_read = true, read_at = NOW()
+             WHERE notification_id = $1
+               AND recipient_role IS NULL
+               AND user_id = $2`,
+            [notifId, req.user.user_id]
+          );
+        }
+        updated += 1;
       }
-      res.json({ success: true, updated: notificationIds.length });
+      res.json({ success: true, updated });
     } catch (err) { console.error('Mark all read error:', err); res.status(500).json({ success: false }); }
   });
 }
@@ -1739,14 +1818,8 @@ async function handleAddRecord(req, res) {
         [projectId, recordId, table, notifMsg, userId, role]
       );
       const notificationId = notifRes.rows[0].id;
-      const recipientIds = await getProjectMemberUserIds(projectId, userId);
-      if (recipientIds.length > 0) {
-        const recipientValues = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
-        await dbClient.query(
-          `INSERT INTO notification_recipients (notification_id, user_id) VALUES ${recipientValues} ON CONFLICT (notification_id, user_id) DO NOTHING`,
-          [notificationId, ...recipientIds]
-        );
-      }
+      const recipients = await getProjectRecipientKeys(projectId, userId, role);
+      await insertNotificationRecipients(dbClient, notificationId, recipients);
       await dbClient.query('COMMIT');
       res.json({ success: true, message: 'Record saved.', recordId, notificationId, attachmentId, recordKind: resolvedKind });
     } catch (err) {
@@ -1927,11 +2000,8 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
         await dbClient.query('BEGIN');
         const notifRes = await dbClient.query(`INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`, [projectId, recordId, table, notifMsg, reviewerId, reviewerRole]);
         const notificationId = notifRes.rows[0].id;
-        const recipientIds = await getProjectMemberUserIds(projectId, reviewerId);
-        if (recipientIds.length > 0) {
-          const vals = recipientIds.map((uid, i) => `($1, $${i + 2})`).join(', ');
-          await dbClient.query(`INSERT INTO notification_recipients (notification_id, user_id) VALUES ${vals} ON CONFLICT (notification_id, user_id) DO NOTHING`, [notificationId, ...recipientIds]);
-        }
+        const recipients = await getProjectRecipientKeys(projectId, reviewerId, reviewerRole);
+        await insertNotificationRecipients(dbClient, notificationId, recipients);
         await dbClient.query('COMMIT');
       } catch (notifErr) { await dbClient.query('ROLLBACK'); console.error('Notification insert error (non-fatal):', notifErr); } finally { dbClient.release(); }
     }
@@ -1999,7 +2069,7 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
 app.post('/api/meetings', authenticateToken, upload.array('attachments'), async (req, res) => {
   const { project_id, meeting_type, title, date_time, location, participants, agenda, scope, scope_value } = req.body;
   if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
-  if (normalizeRole(req.user.role) === 'teammember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
+  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -2011,6 +2081,16 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), async 
         await client.query(`INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)`, [meeting.id,file.originalname,result.secure_url,result.public_id]);
       }
     }
+    const notifMsg = scope === 'side'
+      ? `New ${meeting_type} meeting scheduled by ${req.user.role} for ${scope_value || 'your'} side: "${title}" on ${date_time}`
+      : `New ${meeting_type} meeting scheduled by ${req.user.role}: "${title}" on ${date_time}`;
+    const notifRes = await client.query(
+      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [project_id, meeting.id, 'meetings', notifMsg, req.user.user_id, req.user.role]
+    );
+    const notificationId = notifRes.rows[0].id;
+    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
+    await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json(meeting);
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings:', err); res.status(500).json({ error: 'Failed to create meeting' }); } finally { client.release(); }
@@ -2020,11 +2100,11 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
   const meetingId = req.params.id;
   const { project_id, attendees, agenda_discussed, decisions, action_items, scope, scope_value, next_meeting_date } = req.body;
   if (!project_id||!attendees||!agenda_discussed||!decisions||!action_items||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
-  if (normalizeRole(req.user.role) === 'teammember') return res.status(403).json({ error: 'Team members cannot add meeting minutes.' });
+  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot add meeting minutes.' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows: meeting } = await client.query(`SELECT id FROM meetings WHERE id=$1 AND project_id=$2`, [meetingId, project_id]);
+    const { rows: meeting } = await client.query(`SELECT id, title FROM meetings WHERE id=$1 AND project_id=$2`, [meetingId, project_id]);
     if (!meeting.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Meeting not found' }); }
     const { rows: existing } = await client.query(`SELECT id FROM meeting_minutes WHERE meeting_id=$1`, [meetingId]);
     if (existing.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Minute already recorded for this meeting' }); }
@@ -2038,6 +2118,17 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
     }
     const { rows: attachments } = await client.query(`SELECT name, url FROM meeting_attachments WHERE minute_id=$1`, [minute.id]);
     minute.attachments = attachments;
+    const meetingTitle = meeting[0]?.title || `#${meetingId}`;
+    const notifMsg = scope === 'side'
+      ? `Meeting minutes recorded by ${req.user.role} for ${scope_value || 'your'} side: "${meetingTitle}"`
+      : `Meeting minutes recorded by ${req.user.role}: "${meetingTitle}"`;
+    const notifRes = await client.query(
+      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [project_id, minute.id, 'meeting_minutes', notifMsg, req.user.user_id, req.user.role]
+    );
+    const notificationId = notifRes.rows[0].id;
+    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
+    await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json({ minute });
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings/:id/minute:', err); res.status(500).json({ error: 'Failed to save minute' }); } finally { client.release(); }
@@ -2188,6 +2279,14 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     const planned=parseFloat(ms.quantity)||0,exec=parseFloat(ms.executed)||0;
     if (planned>0&&exec<planned) return res.status(422).json({ error:`Cannot complete: only ${exec} of ${planned} ${ms.unit||''} executed` });
     await client.query(`UPDATE ${table} SET activity_status='completed',progress_pct=100,completed_at=now(),updated_at=now() WHERE id=$1`,[milestoneId]);
+    const notifMsg = `${isExt ? 'Additional milestone' : 'Milestone'} completed by ${req.user.role}: "${ms.title || `#${milestoneId}`}"`;
+    const notifRes = await client.query(
+      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [projectId, milestoneId, table, notifMsg, req.user.user_id, req.user.role]
+    );
+    const notificationId = notifRes.rows[0].id;
+    const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
+    await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
     res.json({ success:true,completedAt:new Date().toISOString() });
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/complete-milestone]',err);res.status(500).json({error:'Failed to complete milestone'});}finally{client.release();}
