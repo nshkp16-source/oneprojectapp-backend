@@ -197,19 +197,38 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 async function insertNotificationRecipients(dbClient, notificationId, recipients) {
   if (!recipients || !recipients.length) return;
   for (const recipient of recipients) {
-    await dbClient.query(
-      `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
-       SELECT $1, $2, $3, $4, $5
-       WHERE NOT EXISTS (
-         SELECT 1 FROM notification_recipients nr
-         WHERE nr.notification_id = $1
-           AND (
-             (nr.recipient_role = $3 AND nr.recipient_role_id = $4)
-             OR (nr.recipient_role IS NULL AND nr.user_id = $2)
-           )
-       )`,
-      [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
-    );
+    try {
+      await dbClient.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
+         SELECT $1, $2, $3, $4, $5
+         WHERE NOT EXISTS (
+           SELECT 1 FROM notification_recipients nr
+           WHERE nr.notification_id = $1
+             AND (
+               (nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+               OR (nr.recipient_role IS NULL AND nr.user_id = $2)
+             )
+         )`,
+        [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
+      );
+    } catch (err) {
+      if (err.message.includes('column') && err.message.includes('does not exist')) {
+        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
+        await dbClient.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+           SELECT $1, $2, false
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1 AND nr.user_id = $2
+           )`,
+          [notificationId, recipient.user_id]
+        ).catch((legacyErr) => {
+          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
+        });
+      } else {
+        throw err;
+      }
+    }
   }
 }
 
