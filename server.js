@@ -1668,44 +1668,96 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
 //  NOTIFICATIONS  (both /notifications/* and /api/notifications/*)
 // ─────────────────────────────────────────────────────────────────────────────
 async function getUnreadCount(projectId, userRole, userId) {
-  const result = await pool.query(
-    `SELECT COUNT(DISTINCT n.id) AS count
-     FROM notifications n
-     LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-       AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-            OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-     WHERE n.project_id = $1 AND n.added_by_id != $3
-       AND (nr.is_read = false OR nr.id IS NULL)`,
-    [projectId, userRole, userId]
-  );
-  return parseInt(result.rows[0].count, 10);
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(DISTINCT n.id) AS count
+       FROM notifications n
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+       WHERE n.project_id = $1 AND n.added_by_id != $3
+         AND (nr.is_read = false OR nr.id IS NULL)`,
+      [projectId, userRole, userId]
+    );
+    return parseInt(result.rows[0].count, 10);
+  } catch (err) {
+    if (err.message.includes('column') && err.message.includes('does not exist')) {
+      console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
+      const result = await pool.query(
+        `SELECT COUNT(DISTINCT n.id) AS count
+         FROM notifications n
+         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         WHERE n.project_id = $1 AND n.added_by_id != $2
+           AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
+        [projectId, userId]
+      );
+      return parseInt(result.rows[0].count, 10);
+    }
+    throw err;
+  }
 }
 
 async function getNotifications(projectId, userRole, userId) {
-  const { rows: notifs } = await pool.query(
-    `SELECT n.id, n.entity_type, n.entity_id, n.message,
-            n.added_by_role, n.created_at,
-            COALESCE(nr.is_read, false) AS is_read
-     FROM notifications n
-     LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-       AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-            OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-     WHERE n.project_id = $1 AND n.added_by_id != $3
-     ORDER BY n.created_at DESC`,
-    [projectId, userRole, userId]
-  );
+  let notifs = [];
+  try {
+    const { rows } = await pool.query(
+      `SELECT n.id, n.entity_type, n.entity_id, n.message,
+              n.added_by_role, n.created_at,
+              COALESCE(nr.is_read, false) AS is_read
+       FROM notifications n
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+       WHERE n.project_id = $1 AND n.added_by_id != $3
+       ORDER BY n.created_at DESC`,
+      [projectId, userRole, userId]
+    );
+    notifs = rows;
+  } catch (err) {
+    if (err.message.includes('column') && err.message.includes('does not exist')) {
+      console.warn('[getNotifications] Schema upgrade pending. Using legacy query.');
+      const { rows } = await pool.query(
+        `SELECT n.id, n.entity_type, n.entity_id, n.message,
+                n.added_by_role, n.created_at,
+                COALESCE(nr.is_read, false) AS is_read
+         FROM notifications n
+         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         WHERE n.project_id = $1 AND n.added_by_id != $2
+         ORDER BY n.created_at DESC`,
+        [projectId, userId]
+      );
+      notifs = rows;
+    } else {
+      throw err;
+    }
+  }
+  
   for (const n of notifs) {
-    await pool.query(
-      `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
-       SELECT $1, $2, $3, $4, false
-       WHERE NOT EXISTS (
-         SELECT 1 FROM notification_recipients nr
-         WHERE nr.notification_id = $1
-           AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
-                OR (nr.recipient_role IS NULL AND nr.user_id = $2))
-       )`,
-      [n.id, userId, userRole, userId]
-    ).catch(() => {});
+    try {
+      await pool.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
+         SELECT $1, $2, $3, $4, false
+         WHERE NOT EXISTS (
+           SELECT 1 FROM notification_recipients nr
+           WHERE nr.notification_id = $1
+             AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+                  OR (nr.recipient_role IS NULL AND nr.user_id = $2))
+         )`,
+        [n.id, userId, userRole, userId]
+      ).catch(() => {});
+    } catch (err) {
+      if (err.message.includes('column') && err.message.includes('does not exist')) {
+        await pool.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+           SELECT $1, $2, false
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1 AND nr.user_id = $2
+           )`,
+          [n.id, userId]
+        ).catch(() => {});
+      }
+    }
   }
   return notifs;
 }
@@ -1727,14 +1779,29 @@ for (const prefix of ['/notifications', '/api/notifications']) {
 
   app.put(`${prefix}/:id/read`, authenticateToken, async (req, res) => {
     try {
-      const result = await pool.query(
-        `UPDATE notification_recipients
-         SET is_read = true, read_at = NOW()
-         WHERE notification_id = $1
-           AND recipient_role = $2
-           AND recipient_role_id = $3`,
-        [req.params.id, req.user.role, req.user.user_id]
-      );
+      let result;
+      try {
+        result = await pool.query(
+          `UPDATE notification_recipients
+           SET is_read = true, read_at = NOW()
+           WHERE notification_id = $1
+             AND recipient_role = $2
+             AND recipient_role_id = $3`,
+          [req.params.id, req.user.role, req.user.user_id]
+        );
+      } catch (err) {
+        if (err.message.includes('column') && err.message.includes('does not exist')) {
+          console.warn('[mark read] Schema upgrade pending. Using legacy update.');
+          result = await pool.query(
+            `UPDATE notification_recipients
+             SET is_read = true, read_at = NOW()
+             WHERE notification_id = $1 AND user_id = $2`,
+            [req.params.id, req.user.user_id]
+          );
+        } else {
+          throw err;
+        }
+      }
       if (result.rowCount === 0) {
         await pool.query(
           `UPDATE notification_recipients
@@ -1755,14 +1822,28 @@ for (const prefix of ['/notifications', '/api/notifications']) {
     try {
       let updated = 0;
       for (const notifId of notificationIds) {
-        const result = await pool.query(
-          `UPDATE notification_recipients
-           SET is_read = true, read_at = NOW()
-           WHERE notification_id = $1
-             AND recipient_role = $2
-             AND recipient_role_id = $3`,
-          [notifId, req.user.role, req.user.user_id]
-        );
+        let result;
+        try {
+          result = await pool.query(
+            `UPDATE notification_recipients
+             SET is_read = true, read_at = NOW()
+             WHERE notification_id = $1
+               AND recipient_role = $2
+               AND recipient_role_id = $3`,
+            [notifId, req.user.role, req.user.user_id]
+          );
+        } catch (err) {
+          if (err.message.includes('column') && err.message.includes('does not exist')) {
+            result = await pool.query(
+              `UPDATE notification_recipients
+               SET is_read = true, read_at = NOW()
+               WHERE notification_id = $1 AND user_id = $2`,
+              [notifId, req.user.user_id]
+            );
+          } else {
+            throw err;
+          }
+        }
         if (result.rowCount === 0) {
           await pool.query(
             `UPDATE notification_recipients
