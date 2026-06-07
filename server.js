@@ -972,6 +972,78 @@ app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'
   }
 });
 
+app.post('/api/arrets', authenticateToken, upload.single('attachment'), async (req, res) => {
+  try {
+    const { user_id: userId, role, email } = req.user;
+    const projectId = normalizeProjectId(req.body.projectId);
+    const title     = (req.body.title || '').trim();
+    const description = (req.body.description || '').trim();
+
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+    if (!title) return res.status(400).json({ error: 'title is required' });
+    if (!description) return res.status(400).json({ error: 'description is required' });
+
+    const hasAccess = await userHasProjectAccess(userId, role, projectId);
+    if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
+
+    let attachmentUrl = null;
+    let attachmentName = null;
+    let attachmentMime = null;
+    let attachmentPublicId = null;
+
+    if (req.file) {
+      const uploadResult = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/arrets');
+      attachmentUrl = uploadResult.secure_url;
+      attachmentName = req.file.originalname;
+      attachmentMime = req.file.mimetype;
+      attachmentPublicId = uploadResult.public_id;
+    }
+
+    const result = await pool.query(`
+      INSERT INTO arrets
+        (project_id, title, description, attachment_url,
+         attachment_name, attachment_mime, attachment_public_id,
+         created_by, creator_role, creator_email)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      RETURNING *
+    `, [
+      projectId, title, description,
+      attachmentUrl, attachmentName, attachmentMime, attachmentPublicId,
+      userId, role, email,
+    ]);
+
+    res.status(201).json({ success: true, arret: result.rows[0] });
+  } catch (err) {
+    console.error('POST /api/arrets error:', err);
+    res.status(500).json({ error: 'Failed to save arret.' });
+  }
+});
+
+app.get('/api/arrets', authenticateToken, async (req, res) => {
+  try {
+    const projectId = normalizeProjectId(req.query.projectId);
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+    if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
+
+    const { rows } = await pool.query(`
+      SELECT id, project_id, title, description, attachment_url, attachment_name,
+             attachment_mime, attachment_public_id, issued_date,
+             created_by, creator_role, creator_email, status, is_resolved,
+             created_at, updated_at
+      FROM arrets
+      WHERE project_id = $1
+      ORDER BY issued_date DESC
+    `, [projectId]);
+
+    res.json({ success: true, arrets: rows });
+  } catch (err) {
+    console.error('GET /api/arrets error:', err);
+    res.status(500).json({ error: 'Failed to fetch arrets.' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  AUTH ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
