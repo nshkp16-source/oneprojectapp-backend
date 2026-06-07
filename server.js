@@ -972,7 +972,8 @@ app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'
   }
 });
 
-app.post('/api/arrets', authenticateToken, upload.single('attachment'), async (req, res) => {
+app.post('/api/arrets', authenticateToken, upload.array('attachments'), async (req, res) => {
+  const client = await pool.connect();
   try {
     const { user_id: userId, role, email } = req.user;
     const projectId = normalizeProjectId(req.body.projectId);
@@ -986,36 +987,39 @@ app.post('/api/arrets', authenticateToken, upload.single('attachment'), async (r
     const hasAccess = await userHasProjectAccess(userId, role, projectId);
     if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
 
-    let attachmentUrl = null;
-    let attachmentName = null;
-    let attachmentMime = null;
-    let attachmentPublicId = null;
+    await client.query('BEGIN');
+    const arretResult = await client.query(`
+      INSERT INTO arrets
+        (project_id, title, description, created_by, creator_role, creator_email)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      RETURNING *
+    `, [projectId, title, description, userId, role, email]);
 
-    if (req.file) {
-      const uploadResult = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/arrets');
-      attachmentUrl = uploadResult.secure_url;
-      attachmentName = req.file.originalname;
-      attachmentMime = req.file.mimetype;
-      attachmentPublicId = uploadResult.public_id;
+    const arret = arretResult.rows[0];
+    const attachments = [];
+
+    if (Array.isArray(req.files) && req.files.length) {
+      for (const file of req.files) {
+        const uploadResult = await uploadToCloudinary(file.buffer, 'oneprojectapp/arrets');
+        const attachment = await client.query(`
+          INSERT INTO arret_attachments
+            (arret_id, file_name, file_mime, file_url, public_id)
+          VALUES ($1,$2,$3,$4,$5)
+          RETURNING id, file_name, file_mime, file_url, public_id, uploaded_at
+        `, [arret.id, file.originalname, file.mimetype, uploadResult.secure_url, uploadResult.public_id]);
+        attachments.push(attachment.rows[0]);
+      }
     }
 
-    const result = await pool.query(`
-      INSERT INTO arrets
-        (project_id, title, description, attachment_url,
-         attachment_name, attachment_mime, attachment_public_id,
-         created_by, creator_role, creator_email)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-      RETURNING *
-    `, [
-      projectId, title, description,
-      attachmentUrl, attachmentName, attachmentMime, attachmentPublicId,
-      userId, role, email,
-    ]);
-
-    res.status(201).json({ success: true, arret: result.rows[0] });
+    await client.query('COMMIT');
+    arret.attachments = attachments;
+    res.status(201).json({ success: true, arret });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error('POST /api/arrets error:', err);
     res.status(500).json({ error: 'Failed to save arret.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1028,19 +1032,65 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
     if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
 
     const { rows } = await pool.query(`
-      SELECT id, project_id, title, description, attachment_url, attachment_name,
-             attachment_mime, attachment_public_id, issued_date,
-             created_by, creator_role, creator_email, status, is_resolved,
-             created_at, updated_at
-      FROM arrets
-      WHERE project_id = $1
-      ORDER BY issued_date DESC
-    `, [projectId]);
+      SELECT a.id, a.project_id, a.title, a.description, a.issued_date,
+             a.created_by, a.creator_role, a.creator_email, a.status, a.is_resolved,
+             a.created_at, a.updated_at,
+             (av.id IS NOT NULL) AS is_viewed,
+             av.viewed_at
+      FROM arrets a
+      LEFT JOIN arret_views av
+        ON av.arret_id = a.id
+       AND av.viewer_id = $2
+       AND av.viewer_role = $3
+      WHERE a.project_id = $1
+      ORDER BY a.issued_date DESC
+    `, [projectId, req.user.user_id, req.user.role]);
 
-    res.json({ success: true, arrets: rows });
+    const arretIds = rows.map(r => r.id);
+    const attachments = arretIds.length
+      ? await pool.query(`SELECT id, arret_id, file_name, file_mime, file_url, public_id, uploaded_at FROM arret_attachments WHERE arret_id = ANY($1::int[])`, [arretIds])
+      : { rows: [] };
+
+    const attachmentMap = attachments.rows.reduce((map, item) => {
+      map[item.arret_id] = map[item.arret_id] || [];
+      map[item.arret_id].push(item);
+      return map;
+    }, {});
+
+    const enriched = rows.map(r => ({
+      ...r,
+      attachments: attachmentMap[r.id] || [],
+    }));
+
+    res.json({ success: true, arrets: enriched });
   } catch (err) {
     console.error('GET /api/arrets error:', err);
     res.status(500).json({ error: 'Failed to fetch arrets.' });
+  }
+});
+
+app.post('/api/arrets/view', authenticateToken, async (req, res) => {
+  try {
+    const arretId = Number(req.body.arretId);
+    if (!arretId) return res.status(400).json({ error: 'arretId is required' });
+
+    const { rows } = await pool.query('SELECT project_id FROM arrets WHERE id=$1', [arretId]);
+    if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
+
+    const projectId = rows[0].project_id;
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+    if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
+
+    await pool.query(`
+      INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (arret_id, viewer_id, viewer_role) DO NOTHING
+    `, [arretId, req.user.user_id, req.user.role, req.user.email]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/arrets/view error:', err);
+    res.status(500).json({ error: 'Failed to mark arret viewed.' });
   }
 });
 
