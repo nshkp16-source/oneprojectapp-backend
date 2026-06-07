@@ -199,7 +199,8 @@ async function getProjectMembers(projectId) {
     SELECT 'Client' AS role, p.client_id AS role_id,
            COALESCE(c.representative, c.company_name, c.company_email) AS display_name,
            c.company_email AS email,
-           c.company_name, c.title, NULL::text AS position, c.profile_picture
+           c.company_name, c.title, NULL::text AS position, c.profile_picture,
+           NULL::text AS assigned_part
     FROM projects p
     JOIN clients c ON p.client_id = c.id
     WHERE p.id = $1
@@ -207,7 +208,8 @@ async function getProjectMembers(projectId) {
     SELECT 'Contractor' AS role, a.contractor_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture
+           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS assigned_part
     FROM contractor_assignments a
     JOIN contractors c ON a.contractor_id = c.id
     WHERE a.project_id = $1
@@ -215,7 +217,8 @@ async function getProjectMembers(projectId) {
     SELECT 'Consultant' AS role, a.consultant_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture
+           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS assigned_part
     FROM consultant_assignments a
     JOIN consultants c ON a.consultant_id = c.id
     WHERE a.project_id = $1
