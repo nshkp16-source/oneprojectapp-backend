@@ -87,9 +87,40 @@ function authenticateToken(req, res, next) {
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: process.env.DATABASE_URL || process.env.COCKROACH_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+async function ensureArretSchema() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS arret_attachments (
+        id SERIAL PRIMARY KEY,
+        arret_id INTEGER NOT NULL REFERENCES arrets(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL,
+        file_mime TEXT NOT NULL,
+        file_url TEXT NOT NULL,
+        public_id TEXT,
+        uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_arret_attachments_arret_id ON arret_attachments(arret_id);
+      CREATE TABLE IF NOT EXISTS arret_views (
+        id SERIAL PRIMARY KEY,
+        arret_id INTEGER NOT NULL REFERENCES arrets(id) ON DELETE CASCADE,
+        viewer_id INTEGER NOT NULL,
+        viewer_role TEXT NOT NULL,
+        viewer_email TEXT,
+        viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(arret_id, viewer_id, viewer_role)
+      );
+      CREATE INDEX IF NOT EXISTS idx_arret_views_arret_id ON arret_views(arret_id);
+    `);
+    console.log('Ensured arret_attachments and arret_views schema exists');
+  } catch (err) {
+    console.error('Failed to ensure arret schema:', err);
+    throw err;
+  }
+}
 
 // ─── SendGrid ─────────────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport(
@@ -4504,6 +4535,7 @@ app.use((err, _req, res, _next) => {
 //  START
 // ─────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
+await ensureArretSchema();
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 
 setInterval(() => {
