@@ -439,6 +439,12 @@ const CHAT_SENDER_FIELDS = `
     ELSE ''
   END AS sender_position,
 
+  -- Assigned part (for TeamMember assigned part)
+  CASE m.sender_role
+    WHEN 'TeamMember' THEN tma_rep.assigned_part
+    ELSE NULL
+  END AS sender_assigned_part,
+
   -- Company / title for the "title" part of the display name
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.company_name,         c.title,          '')
