@@ -417,7 +417,7 @@ const CHAT_SENDER_FIELDS = `
 
   -- Display name = representative (or email/company) — the "who" label
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.representative,        c.company_name,         c.company_email)
+    WHEN 'Client'       THEN COALESCE(c.representative,        c.company_email,        c.company_name)
     WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,   ct.email,               ca_rep.company_name)
     WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,  cns.email,              csa_rep.company_name)
     WHEN 'ClientPM'     THEN COALESCE(cpma_rep.representative, cpm_u.email,            cpma_rep.company_name)
