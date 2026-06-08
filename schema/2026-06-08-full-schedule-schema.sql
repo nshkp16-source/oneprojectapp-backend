@@ -1,9 +1,8 @@
--- Migration: Schedule + progress schema v2
--- Adds schedule location support and ensures schedule-related tables exist.
+-- Migration: Full updated schedule + progress schema
+-- This snapshot includes the latest schedule extension start date support.
 
 BEGIN;
 
--- Drop existing tables in reverse dependency order
 DROP TABLE IF EXISTS progress_entry_attachments CASCADE;
 DROP TABLE IF EXISTS additional_milestone_attachments CASCADE;
 DROP TABLE IF EXISTS milestone_attachments CASCADE;

@@ -4,18 +4,18 @@
 BEGIN;
 
 ALTER TABLE schedule_extensions
-ADD COLUMN new_planned_start DATE NULL;
+ADD COLUMN IF NOT EXISTS new_planned_start DATE NULL;
 
 -- Backfill: compute start from previous record or baseline finish
 UPDATE schedule_extensions se
 SET new_planned_start = (
-  SELECT COALESCE(
+  SELECT (COALESCE(
     (SELECT new_planned_finish FROM schedule_extensions se2
      WHERE se2.schedule_id = se.schedule_id 
        AND se2.created_at < se.created_at
      ORDER BY created_at DESC LIMIT 1),
     ps.planned_finish
-  ) + INTERVAL '1 day'
+  ) + INTERVAL '1 day')::date
   FROM project_schedules ps
   WHERE ps.id = se.schedule_id
 )
