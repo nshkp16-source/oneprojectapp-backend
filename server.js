@@ -239,7 +239,7 @@ async function getProjectMembers(projectId) {
     SELECT 'Contractor' AS role, a.contractor_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture,
+           a.company_name, a.title_position AS title, NULL::text AS position, c.profile_picture,
            NULL::text AS assigned_part
     FROM contractor_assignments a
     JOIN contractors c ON a.contractor_id = c.id
@@ -248,7 +248,7 @@ async function getProjectMembers(projectId) {
     SELECT 'Consultant' AS role, a.consultant_id AS role_id,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture,
+           a.company_name, a.title_position AS title, NULL::text AS position, c.profile_picture,
            NULL::text AS assigned_part
     FROM consultant_assignments a
     JOIN consultants c ON a.consultant_id = c.id
@@ -285,7 +285,7 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
-           COALESCE(a.representative, c.email) AS display_name,
+           COALESCE(a.name, c.email) AS display_name,
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, a.position, c.profile_picture,
            a.assigned_part
@@ -1203,26 +1203,41 @@ app.post('/commit-account', upload.single('clientPicture'), async (req, res) => 
 
     async function addRoleUser(user, tableName, assignmentTable, fkColumn) {
       if (!user?.email) return;
-      const existing = await pool.query(`SELECT id FROM ${tableName} WHERE email=$1`,[user.email]);
+      const existing = await pool.query(`SELECT id FROM ${tableName} WHERE email=$1`, [user.email]);
       let role_id;
       if (existing.rows.length > 0) {
         role_id = existing.rows[0].id;
       } else {
         let rolePicUrl = null, rolePicId = null;
         if (user.profile_picture && !user.profile_picture_id) {
-          const r = await cloudinary.uploader.upload(user.profile_picture,{folder:`oneprojectapp/${tableName}`,resource_type:'image'});
+          const r = await cloudinary.uploader.upload(user.profile_picture, { folder: `oneprojectapp/${tableName}`, resource_type: 'image' });
           rolePicUrl = r.secure_url; rolePicId = r.public_id;
-        } else { rolePicUrl = user.profile_picture||null; rolePicId = user.profile_picture_id||null; }
+        } else { rolePicUrl = user.profile_picture || null; rolePicId = user.profile_picture_id || null; }
         const roleResult = await pool.query(
           `INSERT INTO ${tableName} (email,password_hash,verified,profile_picture,profile_picture_id,created_at) VALUES ($1,$2,true,$3,$4,NOW()) RETURNING id`,
-          [user.email,user.password_hash||null,rolePicUrl,rolePicId]
+          [user.email, user.password_hash || null, rolePicUrl, rolePicId]
         );
         role_id = roleResult.rows[0].id;
       }
-      await pool.query(
-        `INSERT INTO ${assignmentTable} (project_id,${fkColumn},company_name,title,position,telephone,task,representative,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`,
-        [project_id,role_id,user.company_name||null,user.title||null,user.position||null,user.telephone||null,user.task||null,user.representative||null]
-      );
+
+      let insertQuery;
+      let params;
+
+      if (assignmentTable === 'contractor_assignments' || assignmentTable === 'consultant_assignments') {
+        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},company_name,telephone,task,representative,title_position,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
+        params = [project_id, role_id, user.company_name || null, user.telephone || null, user.task || null, user.representative || null, user.title || user.position || null];
+      } else if (assignmentTable === 'team_member_assignments') {
+        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},name,position,telephone,assigned_part,assigned_by,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
+        params = [project_id, role_id, user.name || user.representative || null, user.position || user.title || null, user.telephone || null, user.assigned_part || 'Client', user.assigned_by || client_id];
+      } else if (assignmentTable === 'contractor_pm_assignments' || assignmentTable === 'consultant_pm_assignments' || assignmentTable === 'client_pm_assignments') {
+        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},name,telephone,task,created_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
+        params = [project_id, role_id, user.name || user.representative || null, user.telephone || null, user.task || null];
+      } else {
+        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},telephone,task,created_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
+        params = [project_id, role_id, user.telephone || null, user.task || null];
+      }
+
+      await pool.query(insertQuery, params);
     }
 
     await addRoleUser(contractor,   'contractors',                'contractor_assignments',   'contractor_id');
@@ -1516,7 +1531,12 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         rows=r.rows;
       } else {
         const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
-        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
+        let extraFields = '';
+        if (assignmentTable === 'team_member_assignments') {
+          extraFields = ',a.position,a.assigned_part';
+        } else if (assignmentTable === 'contractor_assignments' || assignmentTable === 'consultant_assignments') {
+          extraFields = ',a.title_position AS position';
+        }
         const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1`,[req.user.user_id]);
         rows=r.rows;
       }
@@ -1535,7 +1555,12 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         project=r.rows[0];
       } else {
         const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
-        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
+        let extraFields = '';
+        if (assignmentTable === 'team_member_assignments') {
+          extraFields = ',a.position,a.assigned_part';
+        } else if (assignmentTable === 'contractor_assignments' || assignmentTable === 'consultant_assignments') {
+          extraFields = ',a.title_position AS position';
+        }
         const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1 AND p.id=$2`,[req.user.user_id,projectId]);
         if (!r.rows.length) return res.status(404).json({error:'Project not found or not assigned'});
         project=r.rows[0];
@@ -1631,7 +1656,16 @@ app.post('/project-save', async (req, res) => {
       let id;
       if (!r.rows.length){const ins=await pool.query(`INSERT INTO ${partyTable} (email,verified,created_at) VALUES ($1,true,NOW()) RETURNING id`,[party.email]);id=ins.rows[0].id;}
       else id=r.rows[0].id;
-      await pool.query(`INSERT INTO ${assignTable} (project_id,${fk},company_name,representative,title,position,telephone,task,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`,[project_id,id,party.company_name||null,party.representative||null,party.title||null,party.position||null,party.telephone||null,party.task||null]);
+      
+      let insertQuery, params;
+      if (assignTable === 'contractor_assignments' || assignTable === 'consultant_assignments') {
+        insertQuery = `INSERT INTO ${assignTable} (project_id,${fk},company_name,telephone,task,representative,title_position,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`;
+        params = [project_id,id,party.company_name||null,party.telephone||null,party.task||null,party.representative||null,party.title||null];
+      } else {
+        insertQuery = `INSERT INTO ${assignTable} (project_id,${fk},telephone,task,created_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`;
+        params = [project_id,id,party.telephone||null,party.task||null];
+      }
+      await pool.query(insertQuery, params);
     }
     await upsertAndAssign(contractor,'contractors','contractor_assignments','contractor_id');
     await upsertAndAssign(consultant,'consultants','consultant_assignments','consultant_id');
@@ -1700,14 +1734,14 @@ app.post('/assign-team', async (req, res) => {
           const pmTableMap={client:{pmTable:'client_project_managers',aTable:'client_pm_assignments',fk:'client_pm_id'},contractor:{pmTable:'contractor_project_managers',aTable:'contractor_pm_assignments',fk:'contractor_pm_id'},consultant:{pmTable:'consultant_project_managers',aTable:'consultant_pm_assignments',fk:'consultant_pm_id'}};
           const pm=pmTableMap[side];
           await client.query(
-            `INSERT INTO ${pm.aTable} (project_id,${pm.fk},telephone,task) VALUES ($1,(SELECT id FROM ${pm.pmTable} WHERE email=$2),$3,$4) ON CONFLICT DO NOTHING`,
-            [projectId,a.email,a.telephone||null,a.task||null]
+            `INSERT INTO ${pm.aTable} (project_id,${pm.fk},name,telephone,task,created_at) VALUES ($1,(SELECT id FROM ${pm.pmTable} WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,${pm.fk}) DO NOTHING`,
+            [projectId,a.email,a.name||a.representative||null,a.telephone||null,a.task||null]
           );
         } else if (a.role==='Team Member'){
           const assignedPart=a.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
           await client.query(
-            `INSERT INTO team_member_assignments (project_id,team_member_id,position,telephone,assigned_part,assigned_by) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
-            [projectId,a.email,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId]
+            `INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING`,
+            [projectId,a.email,a.name||a.representative||null,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId]
           );
         }
       }
@@ -1732,23 +1766,23 @@ app.post('/assign', async (req, res) => {
     try {
       let insertQuery,params,roleLabel;
       if (assignment.role==='Client Project Manager'){
-        await client.query(`INSERT INTO client_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO client_pm_assignments (project_id,client_pm_id,telephone,task) VALUES ($1,(SELECT id FROM client_project_managers WHERE email=$2),$3,$4) RETURNING client_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.telephone||null,assignment.task||null]; roleLabel='Client';
+        await client.query(`INSERT INTO client_project_managers (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        insertQuery=`INSERT INTO client_pm_assignments (project_id,client_pm_id,name,telephone,task,created_at) VALUES ($1,(SELECT id FROM client_project_managers WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,client_pm_id) DO NOTHING RETURNING client_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.telephone||null,assignment.task||null]; roleLabel='Client';
       } else if (assignment.role==='Contractor Project Manager'){
-        await client.query(`INSERT INTO contractor_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO contractor_pm_assignments (project_id,contractor_pm_id,telephone,task) VALUES ($1,(SELECT id FROM contractor_project_managers WHERE email=$2),$3,$4) RETURNING contractor_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.telephone||null,assignment.task||null]; roleLabel='Contractor';
+        await client.query(`INSERT INTO contractor_project_managers (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        insertQuery=`INSERT INTO contractor_pm_assignments (project_id,contractor_pm_id,name,telephone,task,created_at) VALUES ($1,(SELECT id FROM contractor_project_managers WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,contractor_pm_id) DO NOTHING RETURNING contractor_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.telephone||null,assignment.task||null]; roleLabel='Contractor';
       } else if (assignment.role==='Consultant Project Manager'){
-        await client.query(`INSERT INTO consultant_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO consultant_pm_assignments (project_id,consultant_pm_id,telephone,task) VALUES ($1,(SELECT id FROM consultant_project_managers WHERE email=$2),$3,$4) RETURNING consultant_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.telephone||null,assignment.task||null]; roleLabel='Consultant';
+        await client.query(`INSERT INTO consultant_project_managers (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        insertQuery=`INSERT INTO consultant_pm_assignments (project_id,consultant_pm_id,name,telephone,task,created_at) VALUES ($1,(SELECT id FROM consultant_project_managers WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,consultant_pm_id) DO NOTHING RETURNING consultant_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.telephone||null,assignment.task||null]; roleLabel='Consultant';
       } else if (assignment.role==='Team Member'){
-        await client.query(`INSERT INTO team_members (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        await client.query(`INSERT INTO team_members (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
         const side=getSide(jwtRole);
         const assignedPart=assignment.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
-        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,position,telephone,assigned_part,assigned_by) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6) RETURNING team_member_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.position||null,assignment.telephone||null,assignedPart,assignment.assigned_by||userId]; roleLabel='TeamMember';
+        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING RETURNING team_member_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.position||null,assignment.telephone||null,assignedPart,assignment.assigned_by||userId]; roleLabel='TeamMember';
       } else {
         return res.status(400).json({success:false,error:'Unsupported role'});
       }
@@ -3610,7 +3644,7 @@ app.get('/api/work-center/team-members', authenticateToken, async (req, res) => 
     if (!side) return res.status(403).json({ error: 'Your role cannot manage tasks.' });
 
     const result = await pool.query(`
-      SELECT t.id, t.email, tma.position, tma.title, tma.telephone
+      SELECT t.id, t.email, tma.position, tma.name, tma.telephone
       FROM   team_member_assignments tma
       JOIN   team_members t ON t.id = tma.team_member_id
       WHERE  tma.project_id   = $1
@@ -3924,11 +3958,11 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
         SELECT p.*,
                t.email       AS member_email,
                tma.position  AS member_position,
-               tma.title     AS member_title
+               tma.name      AS member_title
         FROM   workspace_work_center_progress p
         JOIN   team_members t ON t.id = p.member_id
         LEFT JOIN LATERAL (
-               SELECT position, title
+               SELECT position, name
                FROM   team_member_assignments
                WHERE  team_member_id = p.member_id
                  AND  project_id = $2
