@@ -301,6 +301,7 @@ async function getProjectMembers(projectId) {
     ...r,
     role_id:      Number(r.role_id),
     display_name: r.display_name || r.email || 'Unknown',
+    name:         r.display_name || r.representative || r.email || 'Unknown',
   }));
 }
 
