@@ -258,41 +258,54 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
-           a.representative AS representative,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           NULL::text AS representative,
+           COALESCE(c.email, c.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS company_name,
+           NULL::text AS title,
+           NULL::text AS position,
+           c.profile_picture,
            NULL::text AS assigned_part
     FROM client_pm_assignments a
     JOIN client_project_managers c ON a.client_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
-           a.representative AS representative,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           NULL::text AS representative,
+           COALESCE(c.email, c.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS company_name,
+           NULL::text AS title,
+           NULL::text AS position,
+           c.profile_picture,
            NULL::text AS assigned_part
     FROM contractor_pm_assignments a
     JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
-           a.representative AS representative,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           NULL::text AS representative,
+           COALESCE(c.email, c.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture,
+           NULL::text AS company_name,
+           NULL::text AS title,
+           NULL::text AS position,
+           c.profile_picture,
            NULL::text AS assigned_part
     FROM consultant_pm_assignments a
     JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
-           a.representative AS representative,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           NULL::text AS representative,
+           COALESCE(c.email, c.company_name) AS display_name,
            c.email AS email,
-           a.company_name, a.title, a.position, c.profile_picture,
-           a.assigned_part AS assigned_part
+           NULL::text AS company_name,
+           NULL::text AS title,
+           a.position,
+           c.profile_picture,
+           a.assigned_part AS assigned_part,
+           a.assigned_by AS assigned_by
     FROM team_member_assignments a
     JOIN team_members c ON a.team_member_id = c.id
     WHERE a.project_id = $1
@@ -302,6 +315,7 @@ async function getProjectMembers(projectId) {
     role_id:      Number(r.role_id),
     display_name: r.display_name || r.email || 'Unknown',
     name:         r.display_name || r.representative || r.email || 'Unknown',
+    assigned_by:  r.assigned_by || null,
   }));
 }
 
