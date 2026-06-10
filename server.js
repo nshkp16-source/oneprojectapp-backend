@@ -427,11 +427,11 @@ const CHAT_SENDER_FIELDS = `
   -- Position / title for sub-label in group chat bubbles
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.title,                                                            '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.position,   ca_rep.title,   ca_rep.company_name,             '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.position,  csa_rep.title,  csa_rep.company_name,            '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.position, ca_rep.title, ca_rep.title_position, ca_rep.company_name,             '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.position, csa_rep.title, csa_rep.title_position, csa_rep.company_name,            '')
     WHEN 'ClientPM'     THEN COALESCE(cpma_rep.position, cpma_rep.title, cpma_rep.company_name,           '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.position, ctrpma_rep.title, ctrpma_rep.company_name,     '')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.position, cnspma_rep.title, cnspma_rep.company_name,     '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.position, ctrpma_rep.title, ctrpma_rep.name, ctrpma_rep.company_name,     '')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.position, cnspma_rep.title, cnspma_rep.name, cnspma_rep.company_name,     '')
     WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,  tma_rep.title,  tma_rep.company_name,            '')
     ELSE ''
   END AS sender_position,
@@ -445,11 +445,11 @@ const CHAT_SENDER_FIELDS = `
   -- Company / title for the "title" part of the display name
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.company_name,         c.title,          '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,    ca_rep.title,     '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,   csa_rep.title,    '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,    ca_rep.title, ca_rep.title_position, '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,   csa_rep.title, csa_rep.title_position, '')
     WHEN 'ClientPM'     THEN COALESCE(cpma_rep.company_name,  cpma_rep.title,   '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.company_name, ctrpma_rep.title,'')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.company_name, cnspma_rep.title,'')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.company_name, ctrpma_rep.title, ctrpma_rep.name,'')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.company_name, cnspma_rep.title, cnspma_rep.name,'')
     WHEN 'TeamMember'   THEN COALESCE(tma_rep.company_name,   tma_rep.title,    '')
     ELSE ''
   END AS sender_company,
@@ -467,16 +467,22 @@ const CHAT_GROUP_BY = `
     m.id,
     c.id, c.representative, c.company_name, c.company_email, c.title,
     ca_rep.id, ca_rep.representative, ca_rep.company_name, ca_rep.title, ca_rep.position,
+    ca_rep.title_position,
     ct.id, ct.email,
     csa_rep.id, csa_rep.representative, csa_rep.company_name, csa_rep.title, csa_rep.position,
+    csa_rep.title_position,
     cns.id, cns.email,
     cpma_rep.id, cpma_rep.representative, cpma_rep.company_name, cpma_rep.title, cpma_rep.position,
+    cpma_rep.name,
     cpm_u.id, cpm_u.email,
     ctrpma_rep.id, ctrpma_rep.representative, ctrpma_rep.company_name, ctrpma_rep.title, ctrpma_rep.position,
+    ctrpma_rep.name,
     ctrpm_u.id, ctrpm_u.email,
     cnspma_rep.id, cnspma_rep.representative, cnspma_rep.company_name, cnspma_rep.title, cnspma_rep.position,
+    cnspma_rep.name,
     cnspm_u.id, cnspm_u.email,
     tma_rep.id, tma_rep.representative, tma_rep.company_name, tma_rep.title, tma_rep.position,
+    tma_rep.title_position,
     tm.id, tm.email,
     rm.id, rm.content, rm.sender_role, rm.sender_email
 `;
