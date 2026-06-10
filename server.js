@@ -259,7 +259,7 @@ async function getProjectMembers(projectId) {
     UNION ALL
     SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
            NULL::text AS representative,
-           COALESCE(c.email, c.company_name) AS display_name,
+           c.email AS display_name,
            c.email AS email,
            NULL::text AS company_name,
            NULL::text AS title,
@@ -272,7 +272,7 @@ async function getProjectMembers(projectId) {
     UNION ALL
     SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
            NULL::text AS representative,
-           COALESCE(c.email, c.company_name) AS display_name,
+           c.email AS display_name,
            c.email AS email,
            NULL::text AS company_name,
            NULL::text AS title,
@@ -285,7 +285,7 @@ async function getProjectMembers(projectId) {
     UNION ALL
     SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
            NULL::text AS representative,
-           COALESCE(c.email, c.company_name) AS display_name,
+           c.email AS display_name,
            c.email AS email,
            NULL::text AS company_name,
            NULL::text AS title,
@@ -298,7 +298,7 @@ async function getProjectMembers(projectId) {
     UNION ALL
     SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
            NULL::text AS representative,
-           COALESCE(c.email, c.company_name) AS display_name,
+           c.email AS display_name,
            c.email AS email,
            NULL::text AS company_name,
            NULL::text AS title,
