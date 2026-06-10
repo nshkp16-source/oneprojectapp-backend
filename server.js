@@ -1642,6 +1642,36 @@ app.post('/project-verify', async (req, res) => {
   } catch(err){console.error('Project verify error:',err);res.status(500).json({success:false,error:'Failed to verify project code.'});}
 });
 
+// Check whether a project name or contract reference already exists for a given client
+app.post('/project-check-existence', async (req, res) => {
+  const { clientEmail, projectName, contractReference } = req.body || {};
+  try {
+    if (!clientEmail || (!projectName && !contractReference)) return res.status(400).json({ exists: false, error: 'Missing parameters.' });
+    const clientResult = await pool.query(`SELECT id FROM clients WHERE TRIM(LOWER(company_email))=TRIM(LOWER($1))`, [clientEmail]);
+    if (!clientResult.rows.length) {
+      // If client not found, treat as not existing (frontend will still require user flow)
+      return res.json({ exists: false });
+    }
+    const client_id = clientResult.rows[0].id;
+    const q = `SELECT name, contract_reference FROM projects WHERE client_id=$1 AND (TRIM(LOWER(name))=TRIM(LOWER($2)) OR TRIM(LOWER(contract_reference))=TRIM(LOWER($3))) LIMIT 1`;
+    const r = await pool.query(q, [client_id, projectName || '', contractReference || '']);
+    if (r.rows.length) {
+      const row = r.rows[0];
+      const nameMatch = row.name && row.name.trim().toLowerCase() === (projectName||'').trim().toLowerCase();
+      const refMatch = row.contract_reference && row.contract_reference.trim().toLowerCase() === (contractReference||'').trim().toLowerCase();
+      let message = 'A project with this name or contract reference already exists for your account.';
+      if (nameMatch && refMatch) message = 'A project with this name and contract reference already exists for your account.';
+      else if (nameMatch) message = 'A project with this name already exists for your account.';
+      else if (refMatch) message = 'A project with this contract reference already exists for your account.';
+      return res.json({ exists: true, message });
+    }
+    return res.json({ exists: false });
+  } catch (err) {
+    console.error('project-check-existence error:', err);
+    res.status(500).json({ exists: false, error: 'Server error during project check.' });
+  }
+});
+
 app.post('/project-save', async (req, res) => {
   const {project,contractor,consultant,clientEmail}=req.body;
   try {
