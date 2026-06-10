@@ -415,12 +415,12 @@ const CHAT_SENDER_FIELDS = `
   -- Display name = representative (or email/company) — the "who" label
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.representative,        c.company_email,        c.company_name)
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,   ct.email,               ca_rep.company_name)
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,  cns.email,              csa_rep.company_name)
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.representative, cpm_u.email,            cpma_rep.company_name)
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm_u.email,        ctrpma_rep.company_name)
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm_u.email,        cnspma_rep.company_name)
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.representative,  tm.email,               tma_rep.company_name)
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative, ca_rep.name,   ct.email,               ca_rep.company_name)
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative, csa_rep.name,  cns.email,              csa_rep.company_name)
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.representative, cpma_rep.name, cpm_u.email,            cpma_rep.company_name)
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpma_rep.name, ctrpm_u.email,        ctrpma_rep.company_name)
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspma_rep.name, cnspm_u.email,        cnspma_rep.company_name)
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.representative, tma_rep.name,  tm.email,               tma_rep.company_name)
     ELSE m.sender_email
   END AS sender_display_name,
 
@@ -467,9 +467,11 @@ const CHAT_GROUP_BY = `
     m.id,
     c.id, c.representative, c.company_name, c.company_email, c.title,
     ca_rep.id, ca_rep.representative, ca_rep.company_name, ca_rep.title, ca_rep.position,
+    ca_rep.name,
     ca_rep.title_position,
     ct.id, ct.email,
     csa_rep.id, csa_rep.representative, csa_rep.company_name, csa_rep.title, csa_rep.position,
+    csa_rep.name,
     csa_rep.title_position,
     cns.id, cns.email,
     cpma_rep.id, cpma_rep.representative, cpma_rep.company_name, cpma_rep.title, cpma_rep.position,
@@ -482,6 +484,7 @@ const CHAT_GROUP_BY = `
     cnspma_rep.name,
     cnspm_u.id, cnspm_u.email,
     tma_rep.id, tma_rep.representative, tma_rep.company_name, tma_rep.title, tma_rep.position,
+    tma_rep.name,
     tma_rep.title_position,
     tm.id, tm.email,
     rm.id, rm.content, rm.sender_role, rm.sender_email
