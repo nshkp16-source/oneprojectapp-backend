@@ -228,7 +228,6 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 async function getProjectMembers(projectId) {
   const { rows } = await pool.query(`
     SELECT 'Client' AS role, p.client_id AS role_id,
-           c.representative AS representative,
            COALESCE(c.representative, c.company_name, c.company_email) AS display_name,
            c.company_email AS email,
            c.company_name, c.title, NULL::text AS position, c.profile_picture,
@@ -238,7 +237,6 @@ async function getProjectMembers(projectId) {
     WHERE p.id = $1
     UNION ALL
     SELECT 'Contractor' AS role, a.contractor_id AS role_id,
-           a.representative AS representative,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
            a.company_name, a.title, a.position, c.profile_picture,
@@ -248,7 +246,6 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'Consultant' AS role, a.consultant_id AS role_id,
-           a.representative AS representative,
            COALESCE(a.representative, c.email, a.company_name) AS display_name,
            c.email AS email,
            a.company_name, a.title, a.position, c.profile_picture,
@@ -258,12 +255,9 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
-           NULL::text AS representative,
-           c.email AS display_name,
+           COALESCE(c.email) AS display_name,
            c.email AS email,
-           NULL::text AS company_name,
-           NULL::text AS title,
-           NULL::text AS position,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
            c.profile_picture,
            NULL::text AS assigned_part
     FROM client_pm_assignments a
@@ -271,12 +265,9 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
-           NULL::text AS representative,
-           c.email AS display_name,
+           COALESCE(c.email) AS display_name,
            c.email AS email,
-           NULL::text AS company_name,
-           NULL::text AS title,
-           NULL::text AS position,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
            c.profile_picture,
            NULL::text AS assigned_part
     FROM contractor_pm_assignments a
@@ -284,12 +275,9 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
-           NULL::text AS representative,
-           c.email AS display_name,
+           COALESCE(c.email) AS display_name,
            c.email AS email,
-           NULL::text AS company_name,
-           NULL::text AS title,
-           NULL::text AS position,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
            c.profile_picture,
            NULL::text AS assigned_part
     FROM consultant_pm_assignments a
@@ -297,25 +285,19 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
     UNION ALL
     SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
-           NULL::text AS representative,
-           c.email AS display_name,
+           COALESCE(a.representative, c.email) AS display_name,
            c.email AS email,
-           NULL::text AS company_name,
-           NULL::text AS title,
-           a.position,
-           c.profile_picture,
-           a.assigned_part AS assigned_part,
-           a.assigned_by AS assigned_by
+           NULL::text AS company_name, NULL::text AS title, a.position, c.profile_picture,
+           a.assigned_part
     FROM team_member_assignments a
     JOIN team_members c ON a.team_member_id = c.id
     WHERE a.project_id = $1
   `, [projectId]);
+
   return rows.map(r => ({
     ...r,
     role_id:      Number(r.role_id),
     display_name: r.display_name || r.email || 'Unknown',
-    name:         r.display_name || r.representative || r.email || 'Unknown',
-    assigned_by:  r.assigned_by || null,
   }));
 }
 
