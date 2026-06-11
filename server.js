@@ -288,7 +288,20 @@ async function getProjectMembers(projectId) {
            COALESCE(a.name, c.email) AS display_name,
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, a.position, c.profile_picture,
-           a.assigned_part
+           a.assigned_part,
+           COALESCE(
+             CASE a.assigned_by_role
+               WHEN 'Client'      THEN (SELECT COALESCE(company_name, company_email) FROM clients WHERE id = a.assigned_by)
+               WHEN 'Contractor'  THEN (SELECT COALESCE(email, '') FROM contractors WHERE id = a.assigned_by)
+               WHEN 'Consultant'  THEN (SELECT COALESCE(email, '') FROM consultants WHERE id = a.assigned_by)
+               WHEN 'ClientPM'    THEN (SELECT COALESCE(email, '') FROM client_project_managers WHERE id = a.assigned_by)
+               WHEN 'ContractorPM' THEN (SELECT COALESCE(email, '') FROM contractor_project_managers WHERE id = a.assigned_by)
+               WHEN 'ConsultantPM' THEN (SELECT COALESCE(email, '') FROM consultant_project_managers WHERE id = a.assigned_by)
+               WHEN 'TeamMember'  THEN (SELECT COALESCE(email, '') FROM team_members WHERE id = a.assigned_by)
+               ELSE NULL
+             END,
+             ''
+           ) AS assigned_by_name
     FROM team_member_assignments a
     JOIN team_members c ON a.team_member_id = c.id
     WHERE a.project_id = $1
@@ -417,10 +430,10 @@ const CHAT_SENDER_FIELDS = `
     WHEN 'Client'       THEN COALESCE(c.representative,        c.company_email,        c.company_name)
     WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,   ct.email,               ca_rep.company_name)
     WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,  cns.email,              csa_rep.company_name)
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name, cpm_u.email,            cpma_rep.company_name)
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name, ctrpm_u.email,        ctrpma_rep.company_name)
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name, cnspm_u.email,        cnspma_rep.company_name)
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,  tm.email,               tma_rep.company_name)
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name, cpm_u.email,            '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name, ctrpm_u.email,        '')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name, cnspm_u.email,        '')
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,  tm.email,               '')
     ELSE m.sender_email
   END AS sender_display_name,
 
@@ -441,6 +454,22 @@ const CHAT_SENDER_FIELDS = `
     WHEN 'TeamMember' THEN tma_rep.assigned_part
     ELSE NULL
   END AS sender_assigned_part,
+
+  CASE m.sender_role
+    WHEN 'TeamMember' THEN COALESCE(
+      CASE tma_rep.assigned_by_role
+        WHEN 'Client'      THEN (SELECT COALESCE(company_name, company_email) FROM clients WHERE id = tma_rep.assigned_by)
+        WHEN 'Contractor'  THEN (SELECT COALESCE(email, '') FROM contractors WHERE id = tma_rep.assigned_by)
+        WHEN 'Consultant'  THEN (SELECT COALESCE(email, '') FROM consultants WHERE id = tma_rep.assigned_by)
+        WHEN 'ClientPM'    THEN (SELECT COALESCE(email, '') FROM client_project_managers WHERE id = tma_rep.assigned_by)
+        WHEN 'ContractorPM' THEN (SELECT COALESCE(email, '') FROM contractor_project_managers WHERE id = tma_rep.assigned_by)
+        WHEN 'ConsultantPM' THEN (SELECT COALESCE(email, '') FROM consultant_project_managers WHERE id = tma_rep.assigned_by)
+        WHEN 'TeamMember'  THEN (SELECT COALESCE(email, '') FROM team_members WHERE id = tma_rep.assigned_by)
+        ELSE NULL
+      END,
+      '')
+    ELSE NULL
+  END AS sender_assigned_by_name,
 
   -- Company / title for the "title" part of the display name
   CASE m.sender_role
@@ -476,7 +505,7 @@ const CHAT_GROUP_BY = `
     ctrpm_u.id, ctrpm_u.email,
     cnspma_rep.id, cnspma_rep.name, cnspma_rep.task,
     cnspm_u.id, cnspm_u.email,
-    tma_rep.id, tma_rep.name, tma_rep.position,
+    tma_rep.id, tma_rep.name, tma_rep.position, tma_rep.assigned_by, tma_rep.assigned_by_role,
     tm.id, tm.email,
     rm.id, rm.content, rm.sender_role, rm.sender_email
 `;
@@ -1769,9 +1798,10 @@ app.post('/assign-team', async (req, res) => {
           );
         } else if (a.role==='Team Member'){
           const assignedPart=a.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
+          const assignedByRole = normalizeRole(role);
           await client.query(
-            `INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING`,
-            [projectId,a.email,a.name||a.representative||null,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId]
+            `INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING`,
+            [projectId,a.email,a.name||a.representative||null,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId,assignedByRole]
           );
         }
       }
@@ -1811,8 +1841,9 @@ app.post('/assign', async (req, res) => {
         await client.query(`INSERT INTO team_members (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
         const side=getSide(jwtRole);
         const assignedPart=assignment.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
-        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING RETURNING team_member_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.position||null,assignment.telephone||null,assignedPart,assignment.assigned_by||userId]; roleLabel='TeamMember';
+        const assignedByRole = normalizeRole(jwtRole);
+        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING RETURNING team_member_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.position||null,assignment.telephone||null,assignedPart,assignment.assigned_by||userId,assignedByRole]; roleLabel='TeamMember';
       } else {
         return res.status(400).json({success:false,error:'Unsupported role'});
       }
