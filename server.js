@@ -231,66 +231,78 @@ async function getProjectMembers(projectId) {
            COALESCE(c.representative, c.company_name, c.company_email) AS display_name,
            c.company_email AS email,
            c.company_name, c.title, NULL::text AS position, c.profile_picture,
-           NULL::text AS assigned_part
+           NULL::text AS assigned_part,
+           NULL::text AS assigned_by_name
     FROM projects p
     JOIN clients c ON p.client_id = c.id
     WHERE p.id = $1
+
     UNION ALL
+
     SELECT 'Contractor' AS role, a.contractor_id AS role_id,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
-           c.email AS email,
-           a.company_name, a.title_position AS title, NULL::text AS position, c.profile_picture,
-           NULL::text AS assigned_part
+           COALESCE(ct.email, '') AS display_name,
+           ct.email AS email,
+           NULL::text AS company_name, NULL::text AS title, a.title_position AS position, ct.profile_picture,
+           NULL::text AS assigned_part,
+           NULL::text AS assigned_by_name
     FROM contractor_assignments a
-    JOIN contractors c ON a.contractor_id = c.id
+    JOIN contractors ct ON a.contractor_id = ct.id
     WHERE a.project_id = $1
+
     UNION ALL
+
     SELECT 'Consultant' AS role, a.consultant_id AS role_id,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
-           c.email AS email,
-           a.company_name, a.title_position AS title, NULL::text AS position, c.profile_picture,
-           NULL::text AS assigned_part
+           COALESCE(cns.email, '') AS display_name,
+           cns.email AS email,
+           NULL::text AS company_name, NULL::text AS title, a.title_position AS position, cns.profile_picture,
+           NULL::text AS assigned_part,
+           NULL::text AS assigned_by_name
     FROM consultant_assignments a
-    JOIN consultants c ON a.consultant_id = c.id
+    JOIN consultants cns ON a.consultant_id = cns.id
     WHERE a.project_id = $1
+
     UNION ALL
+
     SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
-           COALESCE(c.email) AS display_name,
-           c.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
-           c.profile_picture,
+           COALESCE(a.name, cpm.email, '') AS display_name,
+           cpm.email AS email,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, cpm.profile_picture,
            NULL::text AS assigned_part,
            NULL::text AS assigned_by_name
     FROM client_pm_assignments a
-    JOIN client_project_managers c ON a.client_pm_id = c.id
+    JOIN client_project_managers cpm ON a.client_pm_id = cpm.id
     WHERE a.project_id = $1
+
     UNION ALL
+
     SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
-           COALESCE(c.email) AS display_name,
-           c.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
-           c.profile_picture,
+           COALESCE(a.name, cpm.email, '') AS display_name,
+           cpm.email AS email,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, cpm.profile_picture,
            NULL::text AS assigned_part,
            NULL::text AS assigned_by_name
     FROM contractor_pm_assignments a
-    JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
+    JOIN contractor_project_managers cpm ON a.contractor_pm_id = cpm.id
     WHERE a.project_id = $1
+
     UNION ALL
+
     SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
-           COALESCE(c.email) AS display_name,
-           c.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
-           c.profile_picture,
+           COALESCE(a.name, cpm.email, '') AS display_name,
+           cpm.email AS email,
+           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, cpm.profile_picture,
            NULL::text AS assigned_part,
            NULL::text AS assigned_by_name
     FROM consultant_pm_assignments a
-    JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
+    JOIN consultant_project_managers cpm ON a.consultant_pm_id = cpm.id
     WHERE a.project_id = $1
+
     UNION ALL
+
     SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
-           COALESCE(a.name, c.email) AS display_name,
-           c.email AS email,
-           NULL::text AS company_name, NULL::text AS title, a.position, c.profile_picture,
+           COALESCE(a.name, tm.email, '') AS display_name,
+           tm.email AS email,
+           NULL::text AS company_name, NULL::text AS title, a.position, tm.profile_picture,
            a.assigned_part,
            COALESCE(
              CASE a.assigned_by_role
@@ -306,7 +318,7 @@ async function getProjectMembers(projectId) {
              ''
            ) AS assigned_by_name
     FROM team_member_assignments a
-    JOIN team_members c ON a.team_member_id = c.id
+    JOIN team_members tm ON a.team_member_id = tm.id
     WHERE a.project_id = $1
   `, [projectId]);
 
@@ -431,8 +443,8 @@ const CHAT_SENDER_FIELDS = `
   -- Display name = representative (or email/company) — the "who" label
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.representative,        c.company_email,        c.company_name)
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,   ct.email,               ca_rep.company_name)
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,  cns.email,              csa_rep.company_name)
+    WHEN 'Contractor'   THEN COALESCE(ct.email,                '')
+    WHEN 'Consultant'   THEN COALESCE(cns.email,               '')
     WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name, cpm_u.email,            '')
     WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name, ctrpm_u.email,        '')
     WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name, cnspm_u.email,        '')
@@ -477,8 +489,8 @@ const CHAT_SENDER_FIELDS = `
   -- Company / title for the "title" part of the display name
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.company_name,         c.title,          '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,    ca_rep.title_position, '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,   csa_rep.title_position, '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,    '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position,   '')
     WHEN 'ClientPM'     THEN COALESCE(cpma_rep.task,  '')
     WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.task, '')
     WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.task, '')
@@ -498,9 +510,9 @@ const CHAT_GROUP_BY = `
   GROUP BY
     m.id,
     c.id, c.representative, c.company_name, c.company_email, c.title,
-    ca_rep.id, ca_rep.representative, ca_rep.company_name, ca_rep.title_position,
+    ca_rep.id, ca_rep.title_position,
     ct.id, ct.email,
-    csa_rep.id, csa_rep.representative, csa_rep.company_name, csa_rep.title_position,
+    csa_rep.id, csa_rep.title_position,
     cns.id, cns.email,
     cpma_rep.id, cpma_rep.name, cpma_rep.task,
     cpm_u.id, cpm_u.email,
@@ -508,7 +520,7 @@ const CHAT_GROUP_BY = `
     ctrpm_u.id, ctrpm_u.email,
     cnspma_rep.id, cnspma_rep.name, cnspma_rep.task,
     cnspm_u.id, cnspm_u.email,
-    tma_rep.id, tma_rep.name, tma_rep.position, tma_rep.assigned_by, tma_rep.assigned_by_role,
+    tma_rep.id, tma_rep.name, tma_rep.position, tma_rep.assigned_by, tma_rep.assigned_by_role, tma_rep.assigned_part,
     tm.id, tm.email,
     rm.id, rm.content, rm.sender_role, rm.sender_email
 `;
