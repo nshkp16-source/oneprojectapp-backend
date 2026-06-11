@@ -259,7 +259,8 @@ async function getProjectMembers(projectId) {
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
            c.profile_picture,
-           NULL::text AS assigned_part
+           NULL::text AS assigned_part,
+           NULL::text AS assigned_by_name
     FROM client_pm_assignments a
     JOIN client_project_managers c ON a.client_pm_id = c.id
     WHERE a.project_id = $1
@@ -269,7 +270,8 @@ async function getProjectMembers(projectId) {
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
            c.profile_picture,
-           NULL::text AS assigned_part
+           NULL::text AS assigned_part,
+           NULL::text AS assigned_by_name
     FROM contractor_pm_assignments a
     JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
     WHERE a.project_id = $1
@@ -279,7 +281,8 @@ async function getProjectMembers(projectId) {
            c.email AS email,
            NULL::text AS company_name, NULL::text AS title, NULL::text AS position,
            c.profile_picture,
-           NULL::text AS assigned_part
+           NULL::text AS assigned_part,
+           NULL::text AS assigned_by_name
     FROM consultant_pm_assignments a
     JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
     WHERE a.project_id = $1
