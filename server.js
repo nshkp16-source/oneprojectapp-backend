@@ -227,105 +227,159 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 
 async function getProjectMembers(projectId) {
   const { rows } = await pool.query(`
-    SELECT 'Client' AS role, p.client_id AS role_id,
-           COALESCE(c.representative, c.company_name, c.company_email) AS display_name,
-           c.company_email AS email,
-           c.company_name, c.title, NULL::text AS position, c.profile_picture,
-           NULL::text AS assigned_part,
-           NULL::text AS assigned_by_name
+    SELECT
+      'Client'           AS role,
+      p.client_id        AS role_id,
+      c.company_email    AS email,
+      COALESCE(c.representative, c.company_name, c.company_email) AS name,
+      c.representative   AS representative,
+      c.title            AS position,
+      c.title            AS title,
+      c.company_name     AS company_name,
+      c.profile_picture,
+      NULL::text         AS assigned_part,
+      NULL::text         AS assigned_by_name
     FROM projects p
     JOIN clients c ON p.client_id = c.id
     WHERE p.id = $1
 
     UNION ALL
 
-    SELECT 'Contractor' AS role, a.contractor_id AS role_id,
-           COALESCE(ct.email, '') AS display_name,
-           ct.email AS email,
-           NULL::text AS company_name, NULL::text AS title, a.title_position AS position, ct.profile_picture,
-           NULL::text AS assigned_part,
-           NULL::text AS assigned_by_name
+    SELECT
+      'Contractor'       AS role,
+      a.contractor_id    AS role_id,
+      ct.email,
+      COALESCE(a.representative, ct.email, a.company_name) AS name,
+      COALESCE(a.title_position, a.title, a.position)      AS position,
+      COALESCE(a.title_position, a.title, a.position)      AS title,
+      a.company_name,
+      ct.profile_picture,
+      NULL::text         AS assigned_part,
+      NULL::text         AS assigned_by_name
     FROM contractor_assignments a
     JOIN contractors ct ON a.contractor_id = ct.id
     WHERE a.project_id = $1
 
     UNION ALL
 
-    SELECT 'Consultant' AS role, a.consultant_id AS role_id,
-           COALESCE(cns.email, '') AS display_name,
-           cns.email AS email,
-           NULL::text AS company_name, NULL::text AS title, a.title_position AS position, cns.profile_picture,
-           NULL::text AS assigned_part,
-           NULL::text AS assigned_by_name
+    SELECT
+      'Consultant'       AS role,
+      a.consultant_id    AS role_id,
+      cn.email,
+      COALESCE(a.representative, cn.email, a.company_name) AS name,
+      COALESCE(a.title_position, a.title, a.position)      AS position,
+      COALESCE(a.title_position, a.title, a.position)      AS title,
+      a.company_name,
+      cn.profile_picture,
+      NULL::text         AS assigned_part,
+      NULL::text         AS assigned_by_name
     FROM consultant_assignments a
-    JOIN consultants cns ON a.consultant_id = cns.id
+    JOIN consultants cn ON a.consultant_id = cn.id
     WHERE a.project_id = $1
 
     UNION ALL
 
-    SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
-           COALESCE(a.name, cpm.email, '') AS display_name,
-           cpm.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, cpm.profile_picture,
-           NULL::text AS assigned_part,
-           NULL::text AS assigned_by_name
+    SELECT
+      'ClientPM'         AS role,
+      a.client_pm_id     AS role_id,
+      pm.email,
+      COALESCE(a.name, pm.email)   AS name,
+      NULL::text         AS position,
+      NULL::text         AS title,
+      NULL::text         AS company_name,
+      pm.profile_picture,
+      NULL::text         AS assigned_part,
+      NULL::text         AS assigned_by_name
     FROM client_pm_assignments a
-    JOIN client_project_managers cpm ON a.client_pm_id = cpm.id
+    JOIN client_project_managers pm ON a.client_pm_id = pm.id
     WHERE a.project_id = $1
 
     UNION ALL
 
-    SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
-           COALESCE(a.name, cpm.email, '') AS display_name,
-           cpm.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, cpm.profile_picture,
-           NULL::text AS assigned_part,
-           NULL::text AS assigned_by_name
+    SELECT
+      'ContractorPM'     AS role,
+      a.contractor_pm_id AS role_id,
+      pm.email,
+      COALESCE(a.name, pm.email)   AS name,
+      NULL::text         AS position,
+      NULL::text         AS title,
+      NULL::text         AS company_name,
+      pm.profile_picture,
+      NULL::text         AS assigned_part,
+      NULL::text         AS assigned_by_name
     FROM contractor_pm_assignments a
-    JOIN contractor_project_managers cpm ON a.contractor_pm_id = cpm.id
+    JOIN contractor_project_managers pm ON a.contractor_pm_id = pm.id
     WHERE a.project_id = $1
 
     UNION ALL
 
-    SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
-           COALESCE(a.name, cpm.email, '') AS display_name,
-           cpm.email AS email,
-           NULL::text AS company_name, NULL::text AS title, NULL::text AS position, cpm.profile_picture,
-           NULL::text AS assigned_part,
-           NULL::text AS assigned_by_name
+    SELECT
+      'ConsultantPM'     AS role,
+      a.consultant_pm_id AS role_id,
+      pm.email,
+      COALESCE(a.name, pm.email)   AS name,
+      NULL::text         AS position,
+      NULL::text         AS title,
+      NULL::text         AS company_name,
+      pm.profile_picture,
+      NULL::text         AS assigned_part,
+      NULL::text         AS assigned_by_name
     FROM consultant_pm_assignments a
-    JOIN consultant_project_managers cpm ON a.consultant_pm_id = cpm.id
+    JOIN consultant_project_managers pm ON a.consultant_pm_id = pm.id
     WHERE a.project_id = $1
 
     UNION ALL
 
-    SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
-           COALESCE(a.name, tm.email, '') AS display_name,
-           tm.email AS email,
-           NULL::text AS company_name, NULL::text AS title, a.position, tm.profile_picture,
-           a.assigned_part,
-           COALESCE(
-             CASE a.assigned_by_role
-               WHEN 'Client'      THEN (SELECT COALESCE(company_name, company_email) FROM clients WHERE id = a.assigned_by)
-               WHEN 'Contractor'  THEN (SELECT COALESCE(email, '') FROM contractors WHERE id = a.assigned_by)
-               WHEN 'Consultant'  THEN (SELECT COALESCE(email, '') FROM consultants WHERE id = a.assigned_by)
-               WHEN 'ClientPM'    THEN (SELECT COALESCE(email, '') FROM client_project_managers WHERE id = a.assigned_by)
-               WHEN 'ContractorPM' THEN (SELECT COALESCE(email, '') FROM contractor_project_managers WHERE id = a.assigned_by)
-               WHEN 'ConsultantPM' THEN (SELECT COALESCE(email, '') FROM consultant_project_managers WHERE id = a.assigned_by)
-               WHEN 'TeamMember'  THEN (SELECT COALESCE(email, '') FROM team_members WHERE id = a.assigned_by)
-               ELSE NULL
-             END,
-             ''
-           ) AS assigned_by_name
+    SELECT
+      'TeamMember'           AS role,
+      a.team_member_id       AS role_id,
+      t.email,
+      COALESCE(a.name, t.email) AS name,
+      a.position,
+      a.position             AS title,
+      NULL::text             AS company_name,
+      t.profile_picture,
+      a.assigned_part,
+      CASE a.assigned_by_role
+        WHEN 'Client'
+          THEN (SELECT COALESCE(c2.representative, c2.company_name, c2.company_email)
+                FROM clients c2 WHERE c2.id = a.assigned_by LIMIT 1)
+        WHEN 'Contractor'
+          THEN (SELECT COALESCE(ca2.representative, ct2.email)
+                FROM contractor_assignments ca2
+                JOIN contractors ct2 ON ct2.id = ca2.contractor_id
+                WHERE ct2.id = a.assigned_by AND ca2.project_id = $1 LIMIT 1)
+        WHEN 'Consultant'
+          THEN (SELECT COALESCE(csa2.representative, cn2.email)
+                FROM consultant_assignments csa2
+                JOIN consultants cn2 ON cn2.id = csa2.consultant_id
+                WHERE cn2.id = a.assigned_by AND csa2.project_id = $1 LIMIT 1)
+        WHEN 'ContractorPM'
+          THEN (SELECT COALESCE(cpma2.name, pm2.email)
+                FROM contractor_pm_assignments cpma2
+                JOIN contractor_project_managers pm2 ON pm2.id = cpma2.contractor_pm_id
+                WHERE pm2.id = a.assigned_by AND cpma2.project_id = $1 LIMIT 1)
+        WHEN 'ConsultantPM'
+          THEN (SELECT COALESCE(cpma3.name, pm3.email)
+                FROM consultant_pm_assignments cpma3
+                JOIN consultant_project_managers pm3 ON pm3.id = cpma3.consultant_pm_id
+                WHERE pm3.id = a.assigned_by AND cpma3.project_id = $1 LIMIT 1)
+        WHEN 'ClientPM'
+          THEN (SELECT COALESCE(cpma4.name, pm4.email)
+                FROM client_pm_assignments cpma4
+                JOIN client_project_managers pm4 ON pm4.id = cpma4.client_pm_id
+                WHERE pm4.id = a.assigned_by AND cpma4.project_id = $1 LIMIT 1)
+        ELSE NULL
+      END AS assigned_by_name
     FROM team_member_assignments a
-    JOIN team_members tm ON a.team_member_id = tm.id
+    JOIN team_members t ON a.team_member_id = t.id
     WHERE a.project_id = $1
   `, [projectId]);
 
   return rows.map(r => ({
     ...r,
     role_id:      Number(r.role_id),
-    display_name: r.display_name || r.email || 'Unknown',
+    display_name: r.name || r.email || 'Unknown',
   }));
 }
 
@@ -404,101 +458,174 @@ function sideRoles(side) {
 const CHAT_SENDER_JOINS = `
   LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
   LEFT JOIN project_chat_messages rm ON m.reply_to_message_id = rm.id
+
+  -- Client sender
   LEFT JOIN clients c
     ON m.sender_role = 'Client' AND m.sender_id = c.id
+
+  -- Contractor sender
   LEFT JOIN contractor_assignments ca_rep
-    ON m.sender_role = 'Contractor' AND m.sender_id = ca_rep.contractor_id AND ca_rep.project_id = m.project_id
+    ON m.sender_role = 'Contractor'
+    AND m.sender_id  = ca_rep.contractor_id
+    AND ca_rep.project_id = m.project_id
   LEFT JOIN contractors ct
     ON ca_rep.contractor_id = ct.id
+
+  -- Consultant sender
   LEFT JOIN consultant_assignments csa_rep
-    ON m.sender_role = 'Consultant' AND m.sender_id = csa_rep.consultant_id AND csa_rep.project_id = m.project_id
+    ON m.sender_role = 'Consultant'
+    AND m.sender_id  = csa_rep.consultant_id
+    AND csa_rep.project_id = m.project_id
   LEFT JOIN consultants cns
     ON csa_rep.consultant_id = cns.id
+
+  -- ClientPM sender
   LEFT JOIN client_pm_assignments cpma_rep
-    ON m.sender_role = 'ClientPM' AND m.sender_id = cpma_rep.client_pm_id AND cpma_rep.project_id = m.project_id
+    ON m.sender_role = 'ClientPM'
+    AND m.sender_id  = cpma_rep.client_pm_id
+    AND cpma_rep.project_id = m.project_id
   LEFT JOIN client_project_managers cpm_u
     ON cpma_rep.client_pm_id = cpm_u.id
+
+  -- ContractorPM sender
   LEFT JOIN contractor_pm_assignments ctrpma_rep
-    ON m.sender_role = 'ContractorPM' AND m.sender_id = ctrpma_rep.contractor_pm_id AND ctrpma_rep.project_id = m.project_id
+    ON m.sender_role = 'ContractorPM'
+    AND m.sender_id  = ctrpma_rep.contractor_pm_id
+    AND ctrpma_rep.project_id = m.project_id
   LEFT JOIN contractor_project_managers ctrpm_u
     ON ctrpma_rep.contractor_pm_id = ctrpm_u.id
+
+  -- ConsultantPM sender
   LEFT JOIN consultant_pm_assignments cnspma_rep
-    ON m.sender_role = 'ConsultantPM' AND m.sender_id = cnspma_rep.consultant_pm_id AND cnspma_rep.project_id = m.project_id
+    ON m.sender_role = 'ConsultantPM'
+    AND m.sender_id  = cnspma_rep.consultant_pm_id
+    AND cnspma_rep.project_id = m.project_id
   LEFT JOIN consultant_project_managers cnspm_u
     ON cnspma_rep.consultant_pm_id = cnspm_u.id
+
+  -- TeamMember sender — assignment row for name / position / assigned_part
   LEFT JOIN team_member_assignments tma_rep
-    ON m.sender_role = 'TeamMember' AND m.sender_id = tma_rep.team_member_id AND tma_rep.project_id = m.project_id
+    ON m.sender_role = 'TeamMember'
+    AND m.sender_id  = tma_rep.team_member_id
+    AND tma_rep.project_id = m.project_id
   LEFT JOIN team_members tm
     ON tma_rep.team_member_id = tm.id
-`;
 
+  -- TeamMember assigner name (Client side)
+  LEFT JOIN clients tma_assigner_client
+    ON tma_rep.assigned_by_role = 'Client'
+    AND tma_rep.assigned_by = tma_assigner_client.id
+
+  -- TeamMember assigner name (Contractor side)
+  LEFT JOIN contractor_assignments tma_assigner_ca
+    ON tma_rep.assigned_by_role = 'Contractor'
+    AND tma_assigner_ca.contractor_id = tma_rep.assigned_by
+    AND tma_assigner_ca.project_id    = m.project_id
+  LEFT JOIN contractors tma_assigner_ct
+    ON tma_assigner_ca.contractor_id = tma_assigner_ct.id
+
+  -- TeamMember assigner name (Consultant side)
+  LEFT JOIN consultant_assignments tma_assigner_csa
+    ON tma_rep.assigned_by_role = 'Consultant'
+    AND tma_assigner_csa.consultant_id = tma_rep.assigned_by
+    AND tma_assigner_csa.project_id    = m.project_id
+  LEFT JOIN consultants tma_assigner_cns
+    ON tma_assigner_csa.consultant_id = tma_assigner_cns.id
+
+  -- TeamMember assigner name (ContractorPM side)
+  LEFT JOIN contractor_pm_assignments tma_assigner_ctrpma
+    ON tma_rep.assigned_by_role = 'ContractorPM'
+    AND tma_assigner_ctrpma.contractor_pm_id = tma_rep.assigned_by
+    AND tma_assigner_ctrpma.project_id        = m.project_id
+  LEFT JOIN contractor_project_managers tma_assigner_ctrpm
+    ON tma_assigner_ctrpma.contractor_pm_id = tma_assigner_ctrpm.id
+
+  -- TeamMember assigner name (ConsultantPM side)
+  LEFT JOIN consultant_pm_assignments tma_assigner_cnspma
+    ON tma_rep.assigned_by_role = 'ConsultantPM'
+    AND tma_assigner_cnspma.consultant_pm_id = tma_rep.assigned_by
+    AND tma_assigner_cnspma.project_id        = m.project_id
+  LEFT JOIN consultant_project_managers tma_assigner_cnspm
+    ON tma_assigner_cnspma.consultant_pm_id = tma_assigner_cnspm.id
+
+  -- TeamMember assigner name (ClientPM side)
+  LEFT JOIN client_pm_assignments tma_assigner_cpma
+    ON tma_rep.assigned_by_role = 'ClientPM'
+    AND tma_assigner_cpma.client_pm_id = tma_rep.assigned_by
+    AND tma_assigner_cpma.project_id    = m.project_id
+  LEFT JOIN client_project_managers tma_assigner_cpm
+    ON tma_assigner_cpma.client_pm_id = tma_assigner_cpm.id
+`;
 /**
  * SELECT fields for resolved display name, position, read_by, and reply-to.
  * The display name format is:  company/title · role · position
  * matching the frontend buildContactDisplayName() logic.
  */
 const CHAT_SENDER_FIELDS = `
+  -- Read receipts
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
 
-  -- Display name = representative (or email/company) — the "who" label
+  -- Display name (the "who" label shown in bubble)
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.representative,        c.company_email,        c.company_name)
-    WHEN 'Contractor'   THEN COALESCE(ct.email,                '')
-    WHEN 'Consultant'   THEN COALESCE(cns.email,               '')
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name, cpm_u.email,            '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name, ctrpm_u.email,        '')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name, cnspm_u.email,        '')
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,  tm.email,               '')
+    WHEN 'Client'       THEN COALESCE(c.representative,             c.company_name,           c.company_email)
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,        ct.email,                 ca_rep.company_name)
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,       cns.email,                csa_rep.company_name)
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,                cpm_u.email)
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,              ctrpm_u.email)
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,              cnspm_u.email)
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,                 tm.email)
     ELSE m.sender_email
   END AS sender_display_name,
 
   -- Position / title for sub-label in group chat bubbles
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.title,                                                            '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,                            '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position,                           '')
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.task,                                    '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.task,                                  '')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.task,                                  '')
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,                                 '')
+    WHEN 'Client'       THEN COALESCE(c.title,                                           '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,  ca_rep.title,              '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position, csa_rep.title,             '')
+    WHEN 'ClientPM'     THEN ''
+    WHEN 'ContractorPM' THEN ''
+    WHEN 'ConsultantPM' THEN ''
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,                                  '')
     ELSE ''
   END AS sender_position,
 
-  -- Assigned part (for TeamMember assigned part)
+  -- Company name (used in conversation list sub-label)
   CASE m.sender_role
-    WHEN 'TeamMember' THEN tma_rep.assigned_part
-    ELSE NULL
-  END AS sender_assigned_part,
-
-  CASE m.sender_role
-    WHEN 'TeamMember' THEN COALESCE(
-      CASE tma_rep.assigned_by_role
-        WHEN 'Client'      THEN (SELECT COALESCE(company_name, company_email) FROM clients WHERE id = tma_rep.assigned_by)
-        WHEN 'Contractor'  THEN (SELECT COALESCE(email, '') FROM contractors WHERE id = tma_rep.assigned_by)
-        WHEN 'Consultant'  THEN (SELECT COALESCE(email, '') FROM consultants WHERE id = tma_rep.assigned_by)
-        WHEN 'ClientPM'    THEN (SELECT COALESCE(email, '') FROM client_project_managers WHERE id = tma_rep.assigned_by)
-        WHEN 'ContractorPM' THEN (SELECT COALESCE(email, '') FROM contractor_project_managers WHERE id = tma_rep.assigned_by)
-        WHEN 'ConsultantPM' THEN (SELECT COALESCE(email, '') FROM consultant_project_managers WHERE id = tma_rep.assigned_by)
-        WHEN 'TeamMember'  THEN (SELECT COALESCE(email, '') FROM team_members WHERE id = tma_rep.assigned_by)
-        ELSE NULL
-      END,
-      '')
-    ELSE NULL
-  END AS sender_assigned_by_name,
-
-  -- Company / title for the "title" part of the display name
-  CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.company_name,         c.title,          '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,    '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position,   '')
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.task,  '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.task, '')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.task, '')
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,    '')
+    WHEN 'Client'       THEN COALESCE(c.company_name,                                    '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,                               '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,                              '')
+    WHEN 'ClientPM'     THEN ''
+    WHEN 'ContractorPM' THEN ''
+    WHEN 'ConsultantPM' THEN ''
+    WHEN 'TeamMember'   THEN ''
     ELSE ''
   END AS sender_company,
 
-  -- Reply-to fields (pre-joined so the frontend doesn't need a second request)
+  -- TeamMember: which side they were assigned to (Client / Contractor / Consultant)
+  CASE m.sender_role
+    WHEN 'TeamMember' THEN COALESCE(tma_rep.assigned_part, '')
+    ELSE ''
+  END AS sender_assigned_part,
+
+  -- TeamMember: name of the person who assigned them
+  CASE
+    WHEN m.sender_role != 'TeamMember' THEN NULL
+    WHEN tma_rep.assigned_by_role = 'Client'
+      THEN COALESCE(tma_assigner_client.representative, tma_assigner_client.company_name, tma_assigner_client.company_email)
+    WHEN tma_rep.assigned_by_role = 'Contractor'
+      THEN COALESCE(tma_assigner_ca.representative, tma_assigner_ct.email)
+    WHEN tma_rep.assigned_by_role = 'Consultant'
+      THEN COALESCE(tma_assigner_csa.representative, tma_assigner_cns.email)
+    WHEN tma_rep.assigned_by_role = 'ContractorPM'
+      THEN COALESCE(tma_assigner_ctrpma.name, tma_assigner_ctrpm.email)
+    WHEN tma_rep.assigned_by_role = 'ConsultantPM'
+      THEN COALESCE(tma_assigner_cnspma.name, tma_assigner_cnspm.email)
+    WHEN tma_rep.assigned_by_role = 'ClientPM'
+      THEN COALESCE(tma_assigner_cpma.name, tma_assigner_cpm.email)
+    ELSE NULL
+  END AS sender_assigned_by_name,
+
+  -- Reply-to fields (pre-joined so the frontend needs no second request)
   rm.id           AS reply_to_message_id,
   rm.content      AS reply_to_content,
   rm.sender_role  AS reply_to_sender_role,
@@ -509,19 +636,51 @@ const CHAT_SENDER_FIELDS = `
 const CHAT_GROUP_BY = `
   GROUP BY
     m.id,
+    -- Client
     c.id, c.representative, c.company_name, c.company_email, c.title,
-    ca_rep.id, ca_rep.title_position,
+    -- Contractor
+    ca_rep.id, ca_rep.representative, ca_rep.company_name,
+    ca_rep.title, ca_rep.title_position, ca_rep.position,
     ct.id, ct.email,
-    csa_rep.id, csa_rep.title_position,
+    -- Consultant
+    csa_rep.id, csa_rep.representative, csa_rep.company_name,
+    csa_rep.title, csa_rep.title_position, csa_rep.position,
     cns.id, cns.email,
-    cpma_rep.id, cpma_rep.name, cpma_rep.task,
+    -- ClientPM
+    cpma_rep.id, cpma_rep.name, cpma_rep.company_name,
+    cpma_rep.title, cpma_rep.position,
     cpm_u.id, cpm_u.email,
-    ctrpma_rep.id, ctrpma_rep.name, ctrpma_rep.task,
+    -- ContractorPM
+    ctrpma_rep.id, ctrpma_rep.name, ctrpma_rep.company_name,
+    ctrpma_rep.title, ctrpma_rep.position,
     ctrpm_u.id, ctrpm_u.email,
-    cnspma_rep.id, cnspma_rep.name, cnspma_rep.task,
+    -- ConsultantPM
+    cnspma_rep.id, cnspma_rep.name, cnspma_rep.company_name,
+    cnspma_rep.title, cnspma_rep.position,
     cnspm_u.id, cnspm_u.email,
-    tma_rep.id, tma_rep.name, tma_rep.position, tma_rep.assigned_by, tma_rep.assigned_by_role, tma_rep.assigned_part,
+    -- TeamMember
+    tma_rep.id, tma_rep.name, tma_rep.position,
+    tma_rep.assigned_part, tma_rep.assigned_by, tma_rep.assigned_by_role,
     tm.id, tm.email,
+    -- TeamMember assigner (Client)
+    tma_assigner_client.id, tma_assigner_client.representative,
+    tma_assigner_client.company_name, tma_assigner_client.company_email,
+    -- TeamMember assigner (Contractor)
+    tma_assigner_ca.id, tma_assigner_ca.representative,
+    tma_assigner_ct.id, tma_assigner_ct.email,
+    -- TeamMember assigner (Consultant)
+    tma_assigner_csa.id, tma_assigner_csa.representative,
+    tma_assigner_cns.id, tma_assigner_cns.email,
+    -- TeamMember assigner (ContractorPM)
+    tma_assigner_ctrpma.id, tma_assigner_ctrpma.name,
+    tma_assigner_ctrpm.id, tma_assigner_ctrpm.email,
+    -- TeamMember assigner (ConsultantPM)
+    tma_assigner_cnspma.id, tma_assigner_cnspma.name,
+    tma_assigner_cnspm.id, tma_assigner_cnspm.email,
+    -- TeamMember assigner (ClientPM)
+    tma_assigner_cpma.id, tma_assigner_cpma.name,
+    tma_assigner_cpm.id, tma_assigner_cpm.email,
+    -- Reply-to
     rm.id, rm.content, rm.sender_role, rm.sender_email
 `;
 
@@ -658,19 +817,37 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       conversationMap.set(key, existing);
     }
 
-    // Enrich members with conversation metadata + build display name
-    const enrichedMembers = members.map(member => {
-      const key          = `${member.role}-${member.role_id}`;
-      const conversation = conversationMap.get(key);
+    // Enrich members — keep ALL raw fields so the frontend can format the name
+    // itself via buildDisplayName(). Do NOT overwrite with a pre-joined string.
+    const enrichedMembers = members
+      // exclude the current user from the contact list
+      .filter(m => !(Number(m.role_id) === userId && normalizeRole(m.role) === normalizedUserRole))
+      .map(member => {
+        const key          = `${normalizeRole(member.role)}-${member.role_id}`;
+        const conversation = conversationMap.get(key);
 
-      return {
-        ...member,
-        lastMessage:  conversation?.lastMessage || 'Tap to chat',
-        time:         conversation?.time        || '',
-        sortAt:       conversation?.lastAt      || null,
-        unreadCount:  conversation?.unreadCount || 0,
-      };
-    });
+        return {
+          // --- identity fields (all raw — frontend formats the display name) ---
+          role_id:          member.role_id,
+          role:             member.role,
+          email:            member.email        || '',
+          name:             member.name         || member.email || '',
+          representative:   member.representative || null,
+          position:         member.position     || '',
+          title:            member.title        || '',
+          company_name:     member.company_name || '',
+          assigned_part:    member.assigned_part    || null,
+          assigned_by_name: member.assigned_by_name || null,
+          profile_picture:  member.profile_picture  || null,
+          display_name:     member.display_name || member.name || member.email || '',
+
+          // --- conversation metadata ---
+          lastMessage:  conversation?.lastMessage || 'Tap to chat',
+          time:         conversation?.time        || '',
+          sortAt:       conversation?.lastAt      || null,
+          unreadCount:  conversation?.unreadCount || 0,
+        };
+      });
 
     res.json({
       success: true,
@@ -761,11 +938,13 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       })
       .map(m => m.id);
 
-    // Fire-and-forget: mark as read asynchronously
+    // Mark messages as read before returning so /chat/conversations sees the latest state.
     if (unreadIds.length) {
-      markMessagesRead(unreadIds, userId, normalizedUserRole).catch(e =>
-        console.error('[GET /chat/messages] markMessagesRead error:', e.message)
-      );
+      try {
+        await markMessagesRead(unreadIds, userId, normalizedUserRole);
+      } catch (e) {
+        console.error('[GET /chat/messages] markMessagesRead error:', e.message);
+      }
     }
 
     res.json({ success: true, messages: rows });
