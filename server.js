@@ -87,40 +87,9 @@ function authenticateToken(req, res, next) {
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || process.env.COCKROACH_URL,
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
-
-async function ensureArretSchema() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS arret_attachments (
-        id SERIAL PRIMARY KEY,
-        arret_id INTEGER NOT NULL REFERENCES arrets(id) ON DELETE CASCADE,
-        file_name TEXT NOT NULL,
-        file_mime TEXT NOT NULL,
-        file_url TEXT NOT NULL,
-        public_id TEXT,
-        uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_arret_attachments_arret_id ON arret_attachments(arret_id);
-      CREATE TABLE IF NOT EXISTS arret_views (
-        id SERIAL PRIMARY KEY,
-        arret_id INTEGER NOT NULL REFERENCES arrets(id) ON DELETE CASCADE,
-        viewer_id INTEGER NOT NULL,
-        viewer_role TEXT NOT NULL,
-        viewer_email TEXT,
-        viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(arret_id, viewer_id, viewer_role)
-      );
-      CREATE INDEX IF NOT EXISTS idx_arret_views_arret_id ON arret_views(arret_id);
-    `);
-    console.log('Ensured arret_attachments and arret_views schema exists');
-  } catch (err) {
-    console.error('Failed to ensure arret schema:', err);
-    throw err;
-  }
-}
 
 // ─── SendGrid ─────────────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport(
@@ -225,161 +194,133 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
   return [...ids];
 }
 
+async function insertNotificationRecipients(dbClient, notificationId, recipients) {
+  if (!recipients || !recipients.length) return;
+  for (const recipient of recipients) {
+    try {
+      await dbClient.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
+         SELECT $1, $2, $3, $4, $5
+         WHERE NOT EXISTS (
+           SELECT 1 FROM notification_recipients nr
+           WHERE nr.notification_id = $1
+             AND (
+               (nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+               OR (nr.recipient_role IS NULL AND nr.user_id = $2)
+             )
+         )`,
+        [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
+      );
+    } catch (err) {
+      if (err.message.includes('column') && err.message.includes('does not exist')) {
+        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
+        await dbClient.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+           SELECT $1, $2, false
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1 AND nr.user_id = $2
+           )`,
+          [notificationId, recipient.user_id]
+        ).catch((legacyErr) => {
+          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 async function getProjectMembers(projectId) {
   const { rows } = await pool.query(`
-    SELECT
-      'Client'           AS role,
-      p.client_id        AS role_id,
-      c.company_email    AS email,
-      COALESCE(c.representative, c.company_name, c.company_email) AS name,
-      c.representative   AS representative,
-      c.title            AS position,
-      c.title            AS title,
-      c.company_name     AS company_name,
-      c.profile_picture,
-      NULL::text         AS assigned_part,
-      NULL::text         AS assigned_by_name
+    SELECT 'Client' AS role, p.client_id AS role_id,
+           COALESCE(c.representative, c.company_name, c.company_email) AS display_name,
+           c.company_email AS email,
+           c.company_name, c.title,
+           NULL::text AS position,   -- clients have no position
+           c.profile_picture
     FROM projects p
     JOIN clients c ON p.client_id = c.id
     WHERE p.id = $1
 
     UNION ALL
-
-    SELECT
-      'Contractor'       AS role,
-      a.contractor_id    AS role_id,
-      ct.email,
-      COALESCE(a.representative, ct.email, a.company_name) AS name,
-      COALESCE(a.title_position, a.position)      AS position,
-      COALESCE(a.title_position, a.position)      AS title,
-      a.company_name,
-      ct.profile_picture,
-      NULL::text         AS assigned_part,
-      NULL::text         AS assigned_by_name
+    SELECT 'Contractor' AS role, a.contractor_id AS role_id,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           c.email AS email,
+           a.company_name,
+           a.title_position AS title,
+           a.title_position AS position,  -- ← was a.position
+           c.profile_picture
     FROM contractor_assignments a
-    JOIN contractors ct ON a.contractor_id = ct.id
+    JOIN contractors c ON a.contractor_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-
-    SELECT
-      'Consultant'       AS role,
-      a.consultant_id    AS role_id,
-      cn.email,
-      COALESCE(a.representative, cn.email, a.company_name) AS name,
-      COALESCE(a.title_position, a.position)      AS position,
-      COALESCE(a.title_position, a.position)      AS title,
-      a.company_name,
-      cn.profile_picture,
-      NULL::text         AS assigned_part,
-      NULL::text         AS assigned_by_name
+    SELECT 'Consultant' AS role, a.consultant_id AS role_id,
+           COALESCE(a.representative, c.email, a.company_name) AS display_name,
+           c.email AS email,
+           a.company_name,
+           a.title_position AS title,
+           a.title_position AS position,  -- ← was a.position
+           c.profile_picture
     FROM consultant_assignments a
-    JOIN consultants cn ON a.consultant_id = cn.id
+    JOIN consultants c ON a.consultant_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-
-    SELECT
-      'ClientPM'         AS role,
-      a.client_pm_id     AS role_id,
-      pm.email,
-      COALESCE(a.name, pm.email)   AS name,
-      NULL::text         AS position,
-      NULL::text         AS title,
-      NULL::text         AS company_name,
-      pm.profile_picture,
-      NULL::text         AS assigned_part,
-      NULL::text         AS assigned_by_name
+    SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
+           COALESCE(a.representative, c.email, a.name) AS display_name,
+           c.email AS email,
+           NULL AS company_name,
+           a.name AS title,
+           NULL::text AS position,   -- ← no position col on this table
+           c.profile_picture
     FROM client_pm_assignments a
-    JOIN client_project_managers pm ON a.client_pm_id = pm.id
+    JOIN client_project_managers c ON a.client_pm_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-
-    SELECT
-      'ContractorPM'     AS role,
-      a.contractor_pm_id AS role_id,
-      pm.email,
-      COALESCE(a.name, pm.email)   AS name,
-      NULL::text         AS position,
-      NULL::text         AS title,
-      NULL::text         AS company_name,
-      pm.profile_picture,
-      NULL::text         AS assigned_part,
-      NULL::text         AS assigned_by_name
+    SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
+           COALESCE(a.representative, c.email, a.name) AS display_name,
+           c.email AS email,
+           NULL AS company_name,
+           a.name AS title,
+           NULL::text AS position,   -- ← no position col on this table
+           c.profile_picture
     FROM contractor_pm_assignments a
-    JOIN contractor_project_managers pm ON a.contractor_pm_id = pm.id
+    JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-
-    SELECT
-      'ConsultantPM'     AS role,
-      a.consultant_pm_id AS role_id,
-      pm.email,
-      COALESCE(a.name, pm.email)   AS name,
-      NULL::text         AS position,
-      NULL::text         AS title,
-      NULL::text         AS company_name,
-      pm.profile_picture,
-      NULL::text         AS assigned_part,
-      NULL::text         AS assigned_by_name
+    SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
+           COALESCE(a.representative, c.email, a.name) AS display_name,
+           c.email AS email,
+           NULL AS company_name,
+           a.name AS title,
+           NULL::text AS position,   -- ← no position col on this table
+           c.profile_picture
     FROM consultant_pm_assignments a
-    JOIN consultant_project_managers pm ON a.consultant_pm_id = pm.id
+    JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-
-    SELECT
-      'TeamMember'           AS role,
-      a.team_member_id       AS role_id,
-      t.email,
-      COALESCE(a.name, t.email) AS name,
-      a.position,
-      a.position             AS title,
-      NULL::text             AS company_name,
-      t.profile_picture,
-      a.assigned_part,
-      CASE a.assigned_by_role
-        WHEN 'Client'
-          THEN (SELECT COALESCE(c2.representative, c2.company_name, c2.company_email)
-                FROM clients c2 WHERE c2.id = a.assigned_by LIMIT 1)
-        WHEN 'Contractor'
-          THEN (SELECT COALESCE(ca2.representative, ct2.email)
-                FROM contractor_assignments ca2
-                JOIN contractors ct2 ON ct2.id = ca2.contractor_id
-                WHERE ct2.id = a.assigned_by AND ca2.project_id = $1 LIMIT 1)
-        WHEN 'Consultant'
-          THEN (SELECT COALESCE(csa2.representative, cn2.email)
-                FROM consultant_assignments csa2
-                JOIN consultants cn2 ON cn2.id = csa2.consultant_id
-                WHERE cn2.id = a.assigned_by AND csa2.project_id = $1 LIMIT 1)
-        WHEN 'ContractorPM'
-          THEN (SELECT COALESCE(cpma2.name, pm2.email)
-                FROM contractor_pm_assignments cpma2
-                JOIN contractor_project_managers pm2 ON pm2.id = cpma2.contractor_pm_id
-                WHERE pm2.id = a.assigned_by AND cpma2.project_id = $1 LIMIT 1)
-        WHEN 'ConsultantPM'
-          THEN (SELECT COALESCE(cpma3.name, pm3.email)
-                FROM consultant_pm_assignments cpma3
-                JOIN consultant_project_managers pm3 ON pm3.id = cpma3.consultant_pm_id
-                WHERE pm3.id = a.assigned_by AND cpma3.project_id = $1 LIMIT 1)
-        WHEN 'ClientPM'
-          THEN (SELECT COALESCE(cpma4.name, pm4.email)
-                FROM client_pm_assignments cpma4
-                JOIN client_project_managers pm4 ON pm4.id = cpma4.client_pm_id
-                WHERE pm4.id = a.assigned_by AND cpma4.project_id = $1 LIMIT 1)
-        ELSE NULL
-      END AS assigned_by_name
+    SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
+           COALESCE(a.representative, c.email, a.name) AS display_name,
+           c.email AS email,
+           NULL AS company_name,
+           a.name AS title,
+           a.position AS position,   -- ← team_members DO have position
+           c.profile_picture
     FROM team_member_assignments a
-    JOIN team_members t ON a.team_member_id = t.id
+    JOIN team_members c ON a.team_member_id = c.id
     WHERE a.project_id = $1
   `, [projectId]);
 
   return rows.map(r => ({
     ...r,
     role_id:      Number(r.role_id),
-    display_name: r.name || r.email || 'Unknown',
+    display_name: r.display_name || r.email || 'Unknown',
   }));
 }
 
@@ -396,7 +337,7 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
       return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
     })
     .map(m => ({
-      recipient_role: normalizeRole(m.role),
+      recipient_role: m.role,
       recipient_role_id: Number(m.role_id),
       recipient_email: m.email || null,
       user_id: Number(m.role_id),
@@ -458,174 +399,79 @@ function sideRoles(side) {
 const CHAT_SENDER_JOINS = `
   LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
   LEFT JOIN project_chat_messages rm ON m.reply_to_message_id = rm.id
-
-  -- Client sender
   LEFT JOIN clients c
     ON m.sender_role = 'Client' AND m.sender_id = c.id
-
-  -- Contractor sender
   LEFT JOIN contractor_assignments ca_rep
-    ON m.sender_role = 'Contractor'
-    AND m.sender_id  = ca_rep.contractor_id
-    AND ca_rep.project_id = m.project_id
+    ON m.sender_role = 'Contractor' AND m.sender_id = ca_rep.contractor_id AND ca_rep.project_id = m.project_id
   LEFT JOIN contractors ct
     ON ca_rep.contractor_id = ct.id
-
-  -- Consultant sender
   LEFT JOIN consultant_assignments csa_rep
-    ON m.sender_role = 'Consultant'
-    AND m.sender_id  = csa_rep.consultant_id
-    AND csa_rep.project_id = m.project_id
+    ON m.sender_role = 'Consultant' AND m.sender_id = csa_rep.consultant_id AND csa_rep.project_id = m.project_id
   LEFT JOIN consultants cns
     ON csa_rep.consultant_id = cns.id
-
-  -- ClientPM sender
   LEFT JOIN client_pm_assignments cpma_rep
-    ON m.sender_role = 'ClientPM'
-    AND m.sender_id  = cpma_rep.client_pm_id
-    AND cpma_rep.project_id = m.project_id
+    ON m.sender_role = 'ClientPM' AND m.sender_id = cpma_rep.client_pm_id AND cpma_rep.project_id = m.project_id
   LEFT JOIN client_project_managers cpm_u
     ON cpma_rep.client_pm_id = cpm_u.id
-
-  -- ContractorPM sender
   LEFT JOIN contractor_pm_assignments ctrpma_rep
-    ON m.sender_role = 'ContractorPM'
-    AND m.sender_id  = ctrpma_rep.contractor_pm_id
-    AND ctrpma_rep.project_id = m.project_id
+    ON m.sender_role = 'ContractorPM' AND m.sender_id = ctrpma_rep.contractor_pm_id AND ctrpma_rep.project_id = m.project_id
   LEFT JOIN contractor_project_managers ctrpm_u
     ON ctrpma_rep.contractor_pm_id = ctrpm_u.id
-
-  -- ConsultantPM sender
   LEFT JOIN consultant_pm_assignments cnspma_rep
-    ON m.sender_role = 'ConsultantPM'
-    AND m.sender_id  = cnspma_rep.consultant_pm_id
-    AND cnspma_rep.project_id = m.project_id
+    ON m.sender_role = 'ConsultantPM' AND m.sender_id = cnspma_rep.consultant_pm_id AND cnspma_rep.project_id = m.project_id
   LEFT JOIN consultant_project_managers cnspm_u
     ON cnspma_rep.consultant_pm_id = cnspm_u.id
-
-  -- TeamMember sender — assignment row for name / position / assigned_part
   LEFT JOIN team_member_assignments tma_rep
-    ON m.sender_role = 'TeamMember'
-    AND m.sender_id  = tma_rep.team_member_id
-    AND tma_rep.project_id = m.project_id
+    ON m.sender_role = 'TeamMember' AND m.sender_id = tma_rep.team_member_id AND tma_rep.project_id = m.project_id
   LEFT JOIN team_members tm
     ON tma_rep.team_member_id = tm.id
-
-  -- TeamMember assigner name (Client side)
-  LEFT JOIN clients tma_assigner_client
-    ON tma_rep.assigned_by_role = 'Client'
-    AND tma_rep.assigned_by = tma_assigner_client.id
-
-  -- TeamMember assigner name (Contractor side)
-  LEFT JOIN contractor_assignments tma_assigner_ca
-    ON tma_rep.assigned_by_role = 'Contractor'
-    AND tma_assigner_ca.contractor_id = tma_rep.assigned_by
-    AND tma_assigner_ca.project_id    = m.project_id
-  LEFT JOIN contractors tma_assigner_ct
-    ON tma_assigner_ca.contractor_id = tma_assigner_ct.id
-
-  -- TeamMember assigner name (Consultant side)
-  LEFT JOIN consultant_assignments tma_assigner_csa
-    ON tma_rep.assigned_by_role = 'Consultant'
-    AND tma_assigner_csa.consultant_id = tma_rep.assigned_by
-    AND tma_assigner_csa.project_id    = m.project_id
-  LEFT JOIN consultants tma_assigner_cns
-    ON tma_assigner_csa.consultant_id = tma_assigner_cns.id
-
-  -- TeamMember assigner name (ContractorPM side)
-  LEFT JOIN contractor_pm_assignments tma_assigner_ctrpma
-    ON tma_rep.assigned_by_role = 'ContractorPM'
-    AND tma_assigner_ctrpma.contractor_pm_id = tma_rep.assigned_by
-    AND tma_assigner_ctrpma.project_id        = m.project_id
-  LEFT JOIN contractor_project_managers tma_assigner_ctrpm
-    ON tma_assigner_ctrpma.contractor_pm_id = tma_assigner_ctrpm.id
-
-  -- TeamMember assigner name (ConsultantPM side)
-  LEFT JOIN consultant_pm_assignments tma_assigner_cnspma
-    ON tma_rep.assigned_by_role = 'ConsultantPM'
-    AND tma_assigner_cnspma.consultant_pm_id = tma_rep.assigned_by
-    AND tma_assigner_cnspma.project_id        = m.project_id
-  LEFT JOIN consultant_project_managers tma_assigner_cnspm
-    ON tma_assigner_cnspma.consultant_pm_id = tma_assigner_cnspm.id
-
-  -- TeamMember assigner name (ClientPM side)
-  LEFT JOIN client_pm_assignments tma_assigner_cpma
-    ON tma_rep.assigned_by_role = 'ClientPM'
-    AND tma_assigner_cpma.client_pm_id = tma_rep.assigned_by
-    AND tma_assigner_cpma.project_id    = m.project_id
-  LEFT JOIN client_project_managers tma_assigner_cpm
-    ON tma_assigner_cpma.client_pm_id = tma_assigner_cpm.id
 `;
+
 /**
  * SELECT fields for resolved display name, position, read_by, and reply-to.
  * The display name format is:  company/title · role · position
  * matching the frontend buildContactDisplayName() logic.
  */
 const CHAT_SENDER_FIELDS = `
-  -- Read receipts
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
 
-  -- Display name (the "who" label shown in bubble)
+  -- Display name = representative (or email/company) — the "who" label
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.representative,             c.company_name,           c.company_email)
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,        ct.email,                 ca_rep.company_name)
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,       cns.email,                csa_rep.company_name)
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,                cpm_u.email)
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,              ctrpm_u.email)
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,              cnspm_u.email)
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,                 tm.email)
+    WHEN 'Client'       THEN COALESCE(c.representative,        c.company_name,         c.company_email)
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,   ct.email,               ca_rep.company_name)
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,  cns.email,              csa_rep.company_name)
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.representative, cpm_u.email,            cpma_rep.company_name)
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm_u.email,        ctrpma_rep.company_name)
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm_u.email,        cnspma_rep.company_name)
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.representative,  tm.email,               tma_rep.company_name)
     ELSE m.sender_email
   END AS sender_display_name,
 
   -- Position / title for sub-label in group chat bubbles
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.title,                                           '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,  ca_rep.title,              '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position, csa_rep.title,             '')
-    WHEN 'ClientPM'     THEN ''
-    WHEN 'ContractorPM' THEN ''
-    WHEN 'ConsultantPM' THEN ''
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,                                  '')
+    WHEN 'Client'       THEN COALESCE(c.title,                                                            '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.position,   ca_rep.title,   ca_rep.company_name,             '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.position,  csa_rep.title,  csa_rep.company_name,            '')
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.position, cpma_rep.title, cpma_rep.company_name,           '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.position, ctrpma_rep.title, ctrpma_rep.company_name,     '')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.position, cnspma_rep.title, cnspma_rep.company_name,     '')
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,  tma_rep.title,  tma_rep.company_name,            '')
     ELSE ''
   END AS sender_position,
 
-  -- Company name (used in conversation list sub-label)
+  -- Company / title for the "title" part of the display name
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.company_name,                                    '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,                               '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,                              '')
-    WHEN 'ClientPM'     THEN ''
-    WHEN 'ContractorPM' THEN ''
-    WHEN 'ConsultantPM' THEN ''
-    WHEN 'TeamMember'   THEN ''
+    WHEN 'Client'       THEN COALESCE(c.company_name,         c.title,          '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,    ca_rep.title,     '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,   csa_rep.title,    '')
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.company_name,  cpma_rep.title,   '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.company_name, ctrpma_rep.title,'')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.company_name, cnspma_rep.title,'')
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.company_name,   tma_rep.title,    '')
     ELSE ''
   END AS sender_company,
 
-  -- TeamMember: which side they were assigned to (Client / Contractor / Consultant)
-  CASE m.sender_role
-    WHEN 'TeamMember' THEN COALESCE(tma_rep.assigned_part, '')
-    ELSE ''
-  END AS sender_assigned_part,
-
-  -- TeamMember: name of the person who assigned them
-  CASE
-    WHEN m.sender_role != 'TeamMember' THEN NULL
-    WHEN tma_rep.assigned_by_role = 'Client'
-      THEN COALESCE(tma_assigner_client.representative, tma_assigner_client.company_name, tma_assigner_client.company_email)
-    WHEN tma_rep.assigned_by_role = 'Contractor'
-      THEN COALESCE(tma_assigner_ca.representative, tma_assigner_ct.email)
-    WHEN tma_rep.assigned_by_role = 'Consultant'
-      THEN COALESCE(tma_assigner_csa.representative, tma_assigner_cns.email)
-    WHEN tma_rep.assigned_by_role = 'ContractorPM'
-      THEN COALESCE(tma_assigner_ctrpma.name, tma_assigner_ctrpm.email)
-    WHEN tma_rep.assigned_by_role = 'ConsultantPM'
-      THEN COALESCE(tma_assigner_cnspma.name, tma_assigner_cnspm.email)
-    WHEN tma_rep.assigned_by_role = 'ClientPM'
-      THEN COALESCE(tma_assigner_cpma.name, tma_assigner_cpm.email)
-    ELSE NULL
-  END AS sender_assigned_by_name,
-
-  -- Reply-to fields (pre-joined so the frontend needs no second request)
+  -- Reply-to fields (pre-joined so the frontend doesn't need a second request)
   rm.id           AS reply_to_message_id,
   rm.content      AS reply_to_content,
   rm.sender_role  AS reply_to_sender_role,
@@ -636,51 +482,19 @@ const CHAT_SENDER_FIELDS = `
 const CHAT_GROUP_BY = `
   GROUP BY
     m.id,
-    -- Client
     c.id, c.representative, c.company_name, c.company_email, c.title,
-    -- Contractor
-    ca_rep.id, ca_rep.representative, ca_rep.company_name,
-    ca_rep.title, ca_rep.title_position, ca_rep.position,
+    ca_rep.id, ca_rep.representative, ca_rep.company_name, ca_rep.title, ca_rep.position,
     ct.id, ct.email,
-    -- Consultant
-    csa_rep.id, csa_rep.representative, csa_rep.company_name,
-    csa_rep.title, csa_rep.title_position, csa_rep.position,
+    csa_rep.id, csa_rep.representative, csa_rep.company_name, csa_rep.title, csa_rep.position,
     cns.id, cns.email,
-    -- ClientPM
-    cpma_rep.id, cpma_rep.name, cpma_rep.company_name,
-    cpma_rep.title, cpma_rep.position,
+    cpma_rep.id, cpma_rep.representative, cpma_rep.company_name, cpma_rep.title, cpma_rep.position,
     cpm_u.id, cpm_u.email,
-    -- ContractorPM
-    ctrpma_rep.id, ctrpma_rep.name, ctrpma_rep.company_name,
-    ctrpma_rep.title, ctrpma_rep.position,
+    ctrpma_rep.id, ctrpma_rep.representative, ctrpma_rep.company_name, ctrpma_rep.title, ctrpma_rep.position,
     ctrpm_u.id, ctrpm_u.email,
-    -- ConsultantPM
-    cnspma_rep.id, cnspma_rep.name, cnspma_rep.company_name,
-    cnspma_rep.title, cnspma_rep.position,
+    cnspma_rep.id, cnspma_rep.representative, cnspma_rep.company_name, cnspma_rep.title, cnspma_rep.position,
     cnspm_u.id, cnspm_u.email,
-    -- TeamMember
-    tma_rep.id, tma_rep.name, tma_rep.position,
-    tma_rep.assigned_part, tma_rep.assigned_by, tma_rep.assigned_by_role,
+    tma_rep.id, tma_rep.representative, tma_rep.company_name, tma_rep.title, tma_rep.position,
     tm.id, tm.email,
-    -- TeamMember assigner (Client)
-    tma_assigner_client.id, tma_assigner_client.representative,
-    tma_assigner_client.company_name, tma_assigner_client.company_email,
-    -- TeamMember assigner (Contractor)
-    tma_assigner_ca.id, tma_assigner_ca.representative,
-    tma_assigner_ct.id, tma_assigner_ct.email,
-    -- TeamMember assigner (Consultant)
-    tma_assigner_csa.id, tma_assigner_csa.representative,
-    tma_assigner_cns.id, tma_assigner_cns.email,
-    -- TeamMember assigner (ContractorPM)
-    tma_assigner_ctrpma.id, tma_assigner_ctrpma.name,
-    tma_assigner_ctrpm.id, tma_assigner_ctrpm.email,
-    -- TeamMember assigner (ConsultantPM)
-    tma_assigner_cnspma.id, tma_assigner_cnspma.name,
-    tma_assigner_cnspm.id, tma_assigner_cnspm.email,
-    -- TeamMember assigner (ClientPM)
-    tma_assigner_cpma.id, tma_assigner_cpma.name,
-    tma_assigner_cpm.id, tma_assigner_cpm.email,
-    -- Reply-to
     rm.id, rm.content, rm.sender_role, rm.sender_email
 `;
 
@@ -817,37 +631,28 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       conversationMap.set(key, existing);
     }
 
-    // Enrich members — keep ALL raw fields so the frontend can format the name
-    // itself via buildDisplayName(). Do NOT overwrite with a pre-joined string.
-    const enrichedMembers = members
-      // exclude the current user from the contact list
-      .filter(m => !(Number(m.role_id) === userId && normalizeRole(m.role) === normalizedUserRole))
-      .map(member => {
-        const key          = `${normalizeRole(member.role)}-${member.role_id}`;
-        const conversation = conversationMap.get(key);
+    // Enrich members with conversation metadata + build display name
+    const enrichedMembers = members.map(member => {
+      const key          = `${member.role}-${member.role_id}`;
+      const conversation = conversationMap.get(key);
 
-        return {
-          // --- identity fields (all raw — frontend formats the display name) ---
-          role_id:          member.role_id,
-          role:             member.role,
-          email:            member.email        || '',
-          name:             member.name         || member.email || '',
-          representative:   member.representative || null,
-          position:         member.position     || '',
-          title:            member.title        || '',
-          company_name:     member.company_name || '',
-          assigned_part:    member.assigned_part    || null,
-          assigned_by_name: member.assigned_by_name || null,
-          profile_picture:  member.profile_picture  || null,
-          display_name:     member.display_name || member.name || member.email || '',
+      // Display name = company/title · role · position  (mirrors frontend logic)
+      const nameParts = [
+        member.company_name || member.title || '',
+        member.role,
+        member.position || '',
+      ].filter(Boolean);
+      const displayName = nameParts.join(' · ') || member.display_name || member.email || member.role;
 
-          // --- conversation metadata ---
-          lastMessage:  conversation?.lastMessage || 'Tap to chat',
-          time:         conversation?.time        || '',
-          sortAt:       conversation?.lastAt      || null,
-          unreadCount:  conversation?.unreadCount || 0,
-        };
-      });
+      return {
+        ...member,
+        display_name: displayName,   // overwrite with formatted name
+        lastMessage:  conversation?.lastMessage || 'Tap to chat',
+        time:         conversation?.time        || '',
+        sortAt:       conversation?.lastAt      || null,
+        unreadCount:  conversation?.unreadCount || 0,
+      };
+    });
 
     res.json({
       success: true,
@@ -938,13 +743,11 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       })
       .map(m => m.id);
 
-    // Mark messages as read before returning so /chat/conversations sees the latest state.
+    // Fire-and-forget: mark as read asynchronously
     if (unreadIds.length) {
-      try {
-        await markMessagesRead(unreadIds, userId, normalizedUserRole);
-      } catch (e) {
-        console.error('[GET /chat/messages] markMessagesRead error:', e.message);
-      }
+      markMessagesRead(unreadIds, userId, normalizedUserRole).catch(e =>
+        console.error('[GET /chat/messages] markMessagesRead error:', e.message)
+      );
     }
 
     res.json({ success: true, messages: rows });
@@ -1227,128 +1030,6 @@ app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'
   }
 });
 
-app.post('/api/arrets', authenticateToken, upload.array('attachments'), async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { user_id: userId, role, email } = req.user;
-    const projectId = normalizeProjectId(req.body.projectId);
-    const title     = (req.body.title || '').trim();
-    const description = (req.body.description || '').trim();
-
-    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
-    if (!title) return res.status(400).json({ error: 'title is required' });
-    if (!description) return res.status(400).json({ error: 'description is required' });
-
-    const hasAccess = await userHasProjectAccess(userId, role, projectId);
-    if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
-
-    await client.query('BEGIN');
-    const arretResult = await client.query(`
-      INSERT INTO arrets
-        (project_id, title, description, created_by, creator_role, creator_email)
-      VALUES ($1,$2,$3,$4,$5,$6)
-      RETURNING *
-    `, [projectId, title, description, userId, role, email]);
-
-    const arret = arretResult.rows[0];
-    const attachments = [];
-
-    if (Array.isArray(req.files) && req.files.length) {
-      for (const file of req.files) {
-        const uploadResult = await uploadToCloudinary(file.buffer, 'oneprojectapp/arrets');
-        const attachment = await client.query(`
-          INSERT INTO arret_attachments
-            (arret_id, file_name, file_mime, file_url, public_id)
-          VALUES ($1,$2,$3,$4,$5)
-          RETURNING id, file_name, file_mime, file_url, public_id, uploaded_at
-        `, [arret.id, file.originalname, file.mimetype, uploadResult.secure_url, uploadResult.public_id]);
-        attachments.push(attachment.rows[0]);
-      }
-    }
-
-    await client.query('COMMIT');
-    arret.attachments = attachments;
-    res.status(201).json({ success: true, arret });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('POST /api/arrets error:', err);
-    res.status(500).json({ error: 'Failed to save arret.' });
-  } finally {
-    client.release();
-  }
-});
-
-app.get('/api/arrets', authenticateToken, async (req, res) => {
-  try {
-    const projectId = normalizeProjectId(req.query.projectId);
-    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
-
-    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
-    if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
-
-    const { rows } = await pool.query(`
-      SELECT a.id, a.project_id, a.title, a.description, a.issued_date,
-             a.created_by, a.creator_role, a.creator_email, a.status, a.is_resolved,
-             a.created_at, a.updated_at,
-             (av.id IS NOT NULL) AS is_viewed,
-             av.viewed_at
-      FROM arrets a
-      LEFT JOIN arret_views av
-        ON av.arret_id = a.id
-       AND av.viewer_id = $2
-       AND av.viewer_role = $3
-      WHERE a.project_id = $1
-      ORDER BY a.issued_date DESC
-    `, [projectId, req.user.user_id, req.user.role]);
-
-    const arretIds = rows.map(r => r.id);
-    const attachments = arretIds.length
-      ? await pool.query(`SELECT id, arret_id, file_name, file_mime, file_url, public_id, uploaded_at FROM arret_attachments WHERE arret_id = ANY($1::int[])`, [arretIds])
-      : { rows: [] };
-
-    const attachmentMap = attachments.rows.reduce((map, item) => {
-      map[item.arret_id] = map[item.arret_id] || [];
-      map[item.arret_id].push(item);
-      return map;
-    }, {});
-
-    const enriched = rows.map(r => ({
-      ...r,
-      attachments: attachmentMap[r.id] || [],
-    }));
-
-    res.json({ success: true, arrets: enriched });
-  } catch (err) {
-    console.error('GET /api/arrets error:', err);
-    res.status(500).json({ error: 'Failed to fetch arrets.' });
-  }
-});
-
-app.post('/api/arrets/view', authenticateToken, async (req, res) => {
-  try {
-    const arretId = Number(req.body.arretId);
-    if (!arretId) return res.status(400).json({ error: 'arretId is required' });
-
-    const { rows } = await pool.query('SELECT project_id FROM arrets WHERE id=$1', [arretId]);
-    if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
-
-    const projectId = rows[0].project_id;
-    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
-    if (!hasAccess) return res.status(403).json({ error: 'You are not assigned to this project.' });
-
-    await pool.query(`
-      INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
-      VALUES ($1,$2,$3,$4)
-      ON CONFLICT (arret_id, viewer_id, viewer_role) DO NOTHING
-    `, [arretId, req.user.user_id, req.user.role, req.user.email]);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('POST /api/arrets/view error:', err);
-    res.status(500).json({ error: 'Failed to mark arret viewed.' });
-  }
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  AUTH ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1426,41 +1107,26 @@ app.post('/commit-account', upload.single('clientPicture'), async (req, res) => 
 
     async function addRoleUser(user, tableName, assignmentTable, fkColumn) {
       if (!user?.email) return;
-      const existing = await pool.query(`SELECT id FROM ${tableName} WHERE email=$1`, [user.email]);
+      const existing = await pool.query(`SELECT id FROM ${tableName} WHERE email=$1`,[user.email]);
       let role_id;
       if (existing.rows.length > 0) {
         role_id = existing.rows[0].id;
       } else {
         let rolePicUrl = null, rolePicId = null;
         if (user.profile_picture && !user.profile_picture_id) {
-          const r = await cloudinary.uploader.upload(user.profile_picture, { folder: `oneprojectapp/${tableName}`, resource_type: 'image' });
+          const r = await cloudinary.uploader.upload(user.profile_picture,{folder:`oneprojectapp/${tableName}`,resource_type:'image'});
           rolePicUrl = r.secure_url; rolePicId = r.public_id;
-        } else { rolePicUrl = user.profile_picture || null; rolePicId = user.profile_picture_id || null; }
+        } else { rolePicUrl = user.profile_picture||null; rolePicId = user.profile_picture_id||null; }
         const roleResult = await pool.query(
           `INSERT INTO ${tableName} (email,password_hash,verified,profile_picture,profile_picture_id,created_at) VALUES ($1,$2,true,$3,$4,NOW()) RETURNING id`,
-          [user.email, user.password_hash || null, rolePicUrl, rolePicId]
+          [user.email,user.password_hash||null,rolePicUrl,rolePicId]
         );
         role_id = roleResult.rows[0].id;
       }
-
-      let insertQuery;
-      let params;
-
-      if (assignmentTable === 'contractor_assignments' || assignmentTable === 'consultant_assignments') {
-        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},company_name,telephone,task,representative,title_position,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
-        params = [project_id, role_id, user.company_name || null, user.telephone || null, user.task || null, user.representative || null, user.title || user.position || null];
-      } else if (assignmentTable === 'team_member_assignments') {
-        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},name,position,telephone,assigned_part,assigned_by,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
-        params = [project_id, role_id, user.name || user.representative || null, user.position || user.title || null, user.telephone || null, user.assigned_part || 'Client', user.assigned_by || client_id];
-      } else if (assignmentTable === 'contractor_pm_assignments' || assignmentTable === 'consultant_pm_assignments' || assignmentTable === 'client_pm_assignments') {
-        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},name,telephone,task,created_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
-        params = [project_id, role_id, user.name || user.representative || null, user.telephone || null, user.task || null];
-      } else {
-        insertQuery = `INSERT INTO ${assignmentTable} (project_id,${fkColumn},telephone,task,created_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`;
-        params = [project_id, role_id, user.telephone || null, user.task || null];
-      }
-
-      await pool.query(insertQuery, params);
+      await pool.query(
+        `INSERT INTO ${assignmentTable} (project_id,${fkColumn},company_name,title,position,telephone,task,representative,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`,
+        [project_id,role_id,user.company_name||null,user.title||null,user.position||null,user.telephone||null,user.task||null,user.representative||null]
+      );
     }
 
     await addRoleUser(contractor,   'contractors',                'contractor_assignments',   'contractor_id');
@@ -1754,12 +1420,7 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         rows=r.rows;
       } else {
         const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
-        let extraFields = '';
-        if (assignmentTable === 'team_member_assignments') {
-          extraFields = ',a.position,a.assigned_part';
-        } else if (assignmentTable === 'contractor_assignments' || assignmentTable === 'consultant_assignments') {
-          extraFields = ',a.title_position AS position';
-        }
+        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
         const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1`,[req.user.user_id]);
         rows=r.rows;
       }
@@ -1778,12 +1439,7 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         project=r.rows[0];
       } else {
         const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
-        let extraFields = '';
-        if (assignmentTable === 'team_member_assignments') {
-          extraFields = ',a.position,a.assigned_part';
-        } else if (assignmentTable === 'contractor_assignments' || assignmentTable === 'consultant_assignments') {
-          extraFields = ',a.title_position AS position';
-        }
+        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
         const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1 AND p.id=$2`,[req.user.user_id,projectId]);
         if (!r.rows.length) return res.status(404).json({error:'Project not found or not assigned'});
         project=r.rows[0];
@@ -1865,36 +1521,6 @@ app.post('/project-verify', async (req, res) => {
   } catch(err){console.error('Project verify error:',err);res.status(500).json({success:false,error:'Failed to verify project code.'});}
 });
 
-// Check whether a project name or contract reference already exists for a given client
-app.post('/project-check-existence', async (req, res) => {
-  const { clientEmail, projectName, contractReference } = req.body || {};
-  try {
-    if (!clientEmail || (!projectName && !contractReference)) return res.status(400).json({ exists: false, error: 'Missing parameters.' });
-    const clientResult = await pool.query(`SELECT id FROM clients WHERE TRIM(LOWER(company_email))=TRIM(LOWER($1))`, [clientEmail]);
-    if (!clientResult.rows.length) {
-      // If client not found, treat as not existing (frontend will still require user flow)
-      return res.json({ exists: false });
-    }
-    const client_id = clientResult.rows[0].id;
-    const q = `SELECT name, contract_reference FROM projects WHERE client_id=$1 AND (TRIM(LOWER(name))=TRIM(LOWER($2)) OR TRIM(LOWER(contract_reference))=TRIM(LOWER($3))) LIMIT 1`;
-    const r = await pool.query(q, [client_id, projectName || '', contractReference || '']);
-    if (r.rows.length) {
-      const row = r.rows[0];
-      const nameMatch = row.name && row.name.trim().toLowerCase() === (projectName||'').trim().toLowerCase();
-      const refMatch = row.contract_reference && row.contract_reference.trim().toLowerCase() === (contractReference||'').trim().toLowerCase();
-      let message = 'A project with this name or contract reference already exists for your account.';
-      if (nameMatch && refMatch) message = 'A project with this name and contract reference already exists for your account.';
-      else if (nameMatch) message = 'A project with this name already exists for your account.';
-      else if (refMatch) message = 'A project with this contract reference already exists for your account.';
-      return res.json({ exists: true, message });
-    }
-    return res.json({ exists: false });
-  } catch (err) {
-    console.error('project-check-existence error:', err);
-    res.status(500).json({ exists: false, error: 'Server error during project check.' });
-  }
-});
-
 app.post('/project-save', async (req, res) => {
   const {project,contractor,consultant,clientEmail}=req.body;
   try {
@@ -1909,16 +1535,7 @@ app.post('/project-save', async (req, res) => {
       let id;
       if (!r.rows.length){const ins=await pool.query(`INSERT INTO ${partyTable} (email,verified,created_at) VALUES ($1,true,NOW()) RETURNING id`,[party.email]);id=ins.rows[0].id;}
       else id=r.rows[0].id;
-      
-      let insertQuery, params;
-      if (assignTable === 'contractor_assignments' || assignTable === 'consultant_assignments') {
-        insertQuery = `INSERT INTO ${assignTable} (project_id,${fk},company_name,telephone,task,representative,title_position,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`;
-        params = [project_id,id,party.company_name||null,party.telephone||null,party.task||null,party.representative||null,party.title||null];
-      } else {
-        insertQuery = `INSERT INTO ${assignTable} (project_id,${fk},telephone,task,created_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`;
-        params = [project_id,id,party.telephone||null,party.task||null];
-      }
-      await pool.query(insertQuery, params);
+      await pool.query(`INSERT INTO ${assignTable} (project_id,${fk},company_name,representative,title,position,telephone,task,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`,[project_id,id,party.company_name||null,party.representative||null,party.title||null,party.position||null,party.telephone||null,party.task||null]);
     }
     await upsertAndAssign(contractor,'contractors','contractor_assignments','contractor_id');
     await upsertAndAssign(consultant,'consultants','consultant_assignments','consultant_id');
@@ -1986,17 +1603,10 @@ app.post('/assign-team', async (req, res) => {
         if (a.role==='Project Manager'){
           const pmTableMap={client:{pmTable:'client_project_managers',aTable:'client_pm_assignments',fk:'client_pm_id'},contractor:{pmTable:'contractor_project_managers',aTable:'contractor_pm_assignments',fk:'contractor_pm_id'},consultant:{pmTable:'consultant_project_managers',aTable:'consultant_pm_assignments',fk:'consultant_pm_id'}};
           const pm=pmTableMap[side];
-          await client.query(
-            `INSERT INTO ${pm.aTable} (project_id,${pm.fk},name,telephone,task,created_at) VALUES ($1,(SELECT id FROM ${pm.pmTable} WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,${pm.fk}) DO NOTHING`,
-            [projectId,a.email,a.name||a.representative||null,a.telephone||null,a.task||null]
-          );
+          await client.query(`INSERT INTO ${pm.aTable} (project_id,${pm.fk},company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM ${pm.pmTable} WHERE email=$2),$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,[projectId,a.email,a.company_name,a.title,a.position,a.telephone,a.task,a.representative]);
         } else if (a.role==='Team Member'){
           const assignedPart=a.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
-          const assignedByRole = normalizeRole(role);
-          await client.query(
-            `INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING`,
-            [projectId,a.email,a.name||a.representative||null,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId,assignedByRole]
-          );
+          await client.query(`INSERT INTO team_member_assignments (project_id,team_member_id,company_name,title,position,telephone,task,representative,assigned_part,assigned_by) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`,[projectId,a.email,a.company_name,a.title,a.position,a.telephone,a.task,a.representative,assignedPart,a.assigned_by||userId]);
         }
       }
       const pmCheckMap={client:'SELECT 1 FROM client_pm_assignments WHERE project_id=$1 LIMIT 1',contractor:'SELECT 1 FROM contractor_pm_assignments WHERE project_id=$1 LIMIT 1',consultant:'SELECT 1 FROM consultant_pm_assignments WHERE project_id=$1 LIMIT 1'};
@@ -2020,24 +1630,23 @@ app.post('/assign', async (req, res) => {
     try {
       let insertQuery,params,roleLabel;
       if (assignment.role==='Client Project Manager'){
-        await client.query(`INSERT INTO client_project_managers (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO client_pm_assignments (project_id,client_pm_id,name,telephone,task,created_at) VALUES ($1,(SELECT id FROM client_project_managers WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,client_pm_id) DO NOTHING RETURNING client_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.telephone||null,assignment.task||null]; roleLabel='Client';
+        await client.query(`INSERT INTO client_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        insertQuery=`INSERT INTO client_pm_assignments (project_id,client_pm_id,company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM client_project_managers WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING client_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative]; roleLabel='Client';
       } else if (assignment.role==='Contractor Project Manager'){
-        await client.query(`INSERT INTO contractor_project_managers (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO contractor_pm_assignments (project_id,contractor_pm_id,name,telephone,task,created_at) VALUES ($1,(SELECT id FROM contractor_project_managers WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,contractor_pm_id) DO NOTHING RETURNING contractor_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.telephone||null,assignment.task||null]; roleLabel='Contractor';
+        await client.query(`INSERT INTO contractor_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        insertQuery=`INSERT INTO contractor_pm_assignments (project_id,contractor_pm_id,company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM contractor_project_managers WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING contractor_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative]; roleLabel='Contractor';
       } else if (assignment.role==='Consultant Project Manager'){
-        await client.query(`INSERT INTO consultant_project_managers (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO consultant_pm_assignments (project_id,consultant_pm_id,name,telephone,task,created_at) VALUES ($1,(SELECT id FROM consultant_project_managers WHERE email=$2),$3,$4,$5,NOW()) ON CONFLICT (project_id,consultant_pm_id) DO NOTHING RETURNING consultant_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.telephone||null,assignment.task||null]; roleLabel='Consultant';
+        await client.query(`INSERT INTO consultant_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        insertQuery=`INSERT INTO consultant_pm_assignments (project_id,consultant_pm_id,company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM consultant_project_managers WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING consultant_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative]; roleLabel='Consultant';
       } else if (assignment.role==='Team Member'){
-        await client.query(`INSERT INTO team_members (email,verified,created_at) VALUES ($1,true,NOW()) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
+        await client.query(`INSERT INTO team_members (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
         const side=getSide(jwtRole);
         const assignedPart=assignment.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
-        const assignedByRole = normalizeRole(jwtRole);
-        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role,created_at) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,team_member_id) DO NOTHING RETURNING team_member_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.name||assignment.representative||null,assignment.position||null,assignment.telephone||null,assignedPart,assignment.assigned_by||userId,assignedByRole]; roleLabel='TeamMember';
+        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,company_name,title,position,telephone,task,representative,assigned_part,assigned_by) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,$9,$10) RETURNING team_member_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative,assignedPart,assignment.assigned_by||userId]; roleLabel='TeamMember';
       } else {
         return res.status(400).json({success:false,error:'Unsupported role'});
       }
@@ -2078,172 +1687,200 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
   }
 });
 
-// =============================================================================
-//  ONEPROJECT — FULL NOTIFICATION + RECORD ROUTES
-//  Replace the matching sections in your server.js with this entire block.
-//  Requires: pool, authenticateToken, upload, cloudinary, Readable already set up.
-// =============================================================================
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  HELPERS — shared by all routes below
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Duplicate shared helper definitions removed; the core helpers above are reused here.
-
-/**
- * Insert notification_recipients rows using the NEW schema.
- * recipients = array of { role, role_id, email }
- * Uses pool directly (not a transaction client) so record save is not affected.
- */
-async function insertNotificationRecipients(notificationId, recipients) {
-  if (!recipients || !recipients.length) return;
-  const values = recipients.map((_, i) =>
-    `($1, $${i * 3 + 2}, $${i * 3 + 3}, $${i * 3 + 4})`
-  ).join(', ');
-  const params = [notificationId];
-  recipients.forEach(r => {
-    const recipientRole = normalizeRole(r.role || r.recipient_role);
-    params.push(recipientRole, Number(r.role_id || r.recipient_role_id), r.email || r.recipient_email || null);
-  });
-  try {
-    await pool.query(
-      `INSERT INTO notification_recipients
-         (notification_id, recipient_role, recipient_role_id, recipient_email)
-       VALUES ${values}
-       ON CONFLICT ON CONSTRAINT uniq_notif_recipient_per_role DO NOTHING`,
-      params
-    );
-  } catch (err) {
-    // Detailed logging to aid debugging when inserts fail
-    try {
-      console.error('[notifications] insertNotificationRecipients failed for notificationId=', notificationId, 'error=', err && err.message);
-      const sample = recipients.slice(0,5).map(r => ({ role: r.role || r.recipient_role, role_id: r.role_id || r.recipient_role_id, email: r.email || r.recipient_email }));
-      console.error('[notifications] recipients sample:', JSON.stringify(sample));
-    } catch (logErr) {
-      console.error('[notifications] insertNotificationRecipients logging failed', logErr);
-    }
-  }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS  (both /notifications/* and /api/notifications/*)
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** Unread count for the current user */
 async function getUnreadCount(projectId, userRole, userId) {
-  const { rows } = await pool.query(
-    `SELECT COUNT(DISTINCT n.id) AS count
-     FROM notifications n
-     JOIN notification_recipients nr
-       ON nr.notification_id = n.id
-      AND nr.recipient_role    = $2
-      AND nr.recipient_role_id = $3
-      AND nr.is_read           = false
-     WHERE n.project_id  = $1
-       AND n.is_deleted  = false
-       AND NOT (n.added_by_id = $3 AND n.added_by_role = $2)`,
-    [projectId, userRole, userId]
-  );
-  return parseInt(rows[0].count, 10);
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(DISTINCT n.id) AS count
+       FROM notifications n
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+       WHERE n.project_id = $1 AND n.added_by_id != $3
+         AND (nr.is_read = false OR nr.id IS NULL)`,
+      [projectId, userRole, userId]
+    );
+    return parseInt(result.rows[0].count, 10);
+  } catch (err) {
+    if (err.message.includes('column') && err.message.includes('does not exist')) {
+      console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
+      const result = await pool.query(
+        `SELECT COUNT(DISTINCT n.id) AS count
+         FROM notifications n
+         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         WHERE n.project_id = $1 AND n.added_by_id != $2
+           AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
+        [projectId, userId]
+      );
+      return parseInt(result.rows[0].count, 10);
+    }
+    throw err;
+  }
 }
 
-/** All notifications for the current user, newest first */
 async function getNotifications(projectId, userRole, userId) {
-  const { rows } = await pool.query(
-    `SELECT n.id,
-            n.entity_type,
-            n.entity_id,
-            n.notification_type,
-            n.message,
-            n.added_by_role,
-            n.created_at,
-            COALESCE(nr.is_read, false) AS is_read
-     FROM notifications n
-     JOIN notification_recipients nr
-       ON nr.notification_id = n.id
-      AND nr.recipient_role    = $2
-      AND nr.recipient_role_id = $3
-     WHERE n.project_id = $1
-       AND n.is_deleted  = false
-       AND NOT (n.added_by_id = $3 AND n.added_by_role = $2)
-     ORDER BY n.created_at DESC
-     LIMIT 100`,
-    [projectId, userRole, userId]
-  );
-  return rows;
+  let notifs = [];
+  try {
+    const { rows } = await pool.query(
+      `SELECT n.id, n.entity_type, n.entity_id, n.message,
+              n.added_by_role, n.created_at,
+              COALESCE(nr.is_read, false) AS is_read
+       FROM notifications n
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+       WHERE n.project_id = $1 AND n.added_by_id != $3
+       ORDER BY n.created_at DESC`,
+      [projectId, userRole, userId]
+    );
+    notifs = rows;
+  } catch (err) {
+    if (err.message.includes('column') && err.message.includes('does not exist')) {
+      console.warn('[getNotifications] Schema upgrade pending. Using legacy query.');
+      const { rows } = await pool.query(
+        `SELECT n.id, n.entity_type, n.entity_id, n.message,
+                n.added_by_role, n.created_at,
+                COALESCE(nr.is_read, false) AS is_read
+         FROM notifications n
+         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         WHERE n.project_id = $1 AND n.added_by_id != $2
+         ORDER BY n.created_at DESC`,
+        [projectId, userId]
+      );
+      notifs = rows;
+    } else {
+      throw err;
+    }
+  }
+  
+  for (const n of notifs) {
+    try {
+      await pool.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
+         SELECT $1, $2, $3, $4, false
+         WHERE NOT EXISTS (
+           SELECT 1 FROM notification_recipients nr
+           WHERE nr.notification_id = $1
+             AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+                  OR (nr.recipient_role IS NULL AND nr.user_id = $2))
+         )`,
+        [n.id, userId, userRole, userId]
+      ).catch(() => {});
+    } catch (err) {
+      if (err.message.includes('column') && err.message.includes('does not exist')) {
+        await pool.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+           SELECT $1, $2, false
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1 AND nr.user_id = $2
+           )`,
+          [n.id, userId]
+        ).catch(() => {});
+      }
+    }
+  }
+  return notifs;
 }
 
 for (const prefix of ['/notifications', '/api/notifications']) {
-
-  /** GET unread count */
   app.get(`${prefix}/unread-count`, authenticateToken, async (req, res) => {
     try {
-      const count = await getUnreadCount(
-        req.query.projectId,
-        req.user.role,
-        req.user.user_id
-      );
+      const count = await getUnreadCount(req.query.projectId, req.user.role, req.user.user_id);
       res.json({ count });
-    } catch (err) {
-      console.error('Unread count error:', err);
-      res.status(500).json({ count: 0 });
-    }
+    } catch (err) { console.error('Unread count error:', err); res.status(500).json({ count: 0 }); }
   });
 
-  /** GET all notifications for current user */
   app.get(`${prefix}`, authenticateToken, async (req, res) => {
     try {
-      const notifications = await getNotifications(
-        req.query.projectId,
-        req.user.role,
-        req.user.user_id
-      );
+      const notifications = await getNotifications(req.query.projectId, req.user.role, req.user.user_id);
       res.json({ notifications });
-    } catch (err) {
-      console.error('Fetch notifications error:', err);
-      res.status(500).json({ notifications: [] });
-    }
+    } catch (err) { console.error('Fetch notifications error:', err); res.status(500).json({ notifications: [] }); }
   });
 
-  /** PUT mark one notification read */
   app.put(`${prefix}/:id/read`, authenticateToken, async (req, res) => {
     try {
-      await pool.query(
-        `UPDATE notification_recipients
-         SET is_read = true, read_at = NOW()
-         WHERE notification_id   = $1
-           AND recipient_role    = $2
-           AND recipient_role_id = $3`,
-        [req.params.id, req.user.role, req.user.user_id]
-      );
+      let result;
+      try {
+        result = await pool.query(
+          `UPDATE notification_recipients
+           SET is_read = true, read_at = NOW()
+           WHERE notification_id = $1
+             AND recipient_role = $2
+             AND recipient_role_id = $3`,
+          [req.params.id, req.user.role, req.user.user_id]
+        );
+      } catch (err) {
+        if (err.message.includes('column') && err.message.includes('does not exist')) {
+          console.warn('[mark read] Schema upgrade pending. Using legacy update.');
+          result = await pool.query(
+            `UPDATE notification_recipients
+             SET is_read = true, read_at = NOW()
+             WHERE notification_id = $1 AND user_id = $2`,
+            [req.params.id, req.user.user_id]
+          );
+        } else {
+          throw err;
+        }
+      }
+      if (result.rowCount === 0) {
+        await pool.query(
+          `UPDATE notification_recipients
+           SET is_read = true, read_at = NOW()
+           WHERE notification_id = $1
+             AND recipient_role IS NULL
+             AND user_id = $2`,
+          [req.params.id, req.user.user_id]
+        );
+      }
       res.json({ success: true });
-    } catch (err) {
-      console.error('Mark read error:', err);
-      res.status(500).json({ success: false });
-    }
+    } catch (err) { console.error('Mark read error:', err); res.status(500).json({ success: false }); }
   });
 
-  /** POST mark many notifications read at once */
   app.post(`${prefix}/mark-all-read`, authenticateToken, async (req, res) => {
     const { notificationIds } = req.body;
-    if (!Array.isArray(notificationIds) || !notificationIds.length) {
-      return res.json({ success: true, updated: 0 });
-    }
+    if (!Array.isArray(notificationIds) || !notificationIds.length) return res.json({ success: true, updated: 0 });
     try {
-      const result = await pool.query(
-        `UPDATE notification_recipients
-         SET is_read = true, read_at = NOW()
-         WHERE notification_id   = ANY($1::int[])
-           AND recipient_role    = $2
-           AND recipient_role_id = $3
-           AND is_read           = false`,
-        [notificationIds, req.user.role, req.user.user_id]
-      );
-      res.json({ success: true, updated: result.rowCount });
-    } catch (err) {
-      console.error('Mark all read error:', err);
-      res.status(500).json({ success: false });
-    }
+      let updated = 0;
+      for (const notifId of notificationIds) {
+        let result;
+        try {
+          result = await pool.query(
+            `UPDATE notification_recipients
+             SET is_read = true, read_at = NOW()
+             WHERE notification_id = $1
+               AND recipient_role = $2
+               AND recipient_role_id = $3`,
+            [notifId, req.user.role, req.user.user_id]
+          );
+        } catch (err) {
+          if (err.message.includes('column') && err.message.includes('does not exist')) {
+            result = await pool.query(
+              `UPDATE notification_recipients
+               SET is_read = true, read_at = NOW()
+               WHERE notification_id = $1 AND user_id = $2`,
+              [notifId, req.user.user_id]
+            );
+          } else {
+            throw err;
+          }
+        }
+        if (result.rowCount === 0) {
+          await pool.query(
+            `UPDATE notification_recipients
+             SET is_read = true, read_at = NOW()
+             WHERE notification_id = $1
+               AND recipient_role IS NULL
+               AND user_id = $2`,
+            [notifId, req.user.user_id]
+          );
+        }
+        updated += 1;
+      }
+      res.json({ success: true, updated });
+    } catch (err) { console.error('Mark all read error:', err); res.status(500).json({ success: false }); }
   });
 }
 
@@ -2254,111 +1891,65 @@ async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
-
     const table = resolveTable(req.body.recordType);
-    if (!table)     return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
-    if (!projectId) return res.status(400).json({ success: false, message: 'projectId is required.' });
-    if (!title)     return res.status(400).json({ success: false, message: 'title is required.' });
-
-    // Verify the user is assigned to this project
+    if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
+    if (!projectId || !title) return res.status(400).json({ success: false, message: 'projectId and title are required.' });
     const memberCheck = await pool.query(
       `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
-       UNION ALL
-       SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
+       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
        LIMIT 1`,
       [projectId, userId, role]
     );
-    if (!memberCheck.rows.length) {
-      return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
-    }
-
-    // Upload attachment to Cloudinary if provided
+    if (!memberCheck.rows.length) return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
     let filePath = null, attachmentId = null;
     if (req.file) {
       try {
         const r = await new Promise((resolve, reject) => {
           const stream = cloudinary.uploader.upload_stream(
-            {
-              folder:        'oneproject/records',
-              resource_type: 'auto',
-              public_id:     `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}`,
-            },
-            (err, result) => (err ? reject(err) : resolve(result))
+            { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
+            (err, result) => err ? reject(err) : resolve(result)
           );
           Readable.from(req.file.buffer).pipe(stream);
         });
-        filePath     = r.secure_url;
-        attachmentId = r.public_id;
+        filePath = r.secure_url; attachmentId = r.public_id;
       } catch (uploadErr) {
         console.error('Cloudinary upload error:', uploadErr);
         return res.status(500).json({ success: false, message: 'File upload failed.' });
       }
     }
-
     const resolvedKind = recordKind || (noticeTiedId ? 'notice' : 'new');
     const noticeTied   = noticeTiedId ? Number(noticeTiedId) : null;
-
     if (noticeTied) {
-      const parentCheck = await pool.query(
-        `SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`,
-        [noticeTied, projectId]
-      );
-      if (!parentCheck.rows.length) {
-        return res.status(400).json({ success: false, message: 'The parent record this notice is tied to no longer exists.' });
-      }
+      const parentCheck = await pool.query(`SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`, [noticeTied, projectId]);
+      if (!parentCheck.rows.length) return res.status(400).json({ success: false, message: 'The parent record this notice is tied to no longer exists.' });
     }
-
-    // ── STEP 1: Save the record in its own transaction ──────────────────────
-    let recordId;
     const dbClient = await pool.connect();
     try {
       await dbClient.query('BEGIN');
       const recRes = await dbClient.query(
-        `INSERT INTO ${table}
-           (project_id, title, description, file_path, attachment_id,
-            uploaded_by, role, record_kind, notice_tied_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         RETURNING id`,
-        [projectId, title, description || null, filePath, attachmentId,
-         userId, role, resolvedKind, noticeTied]
+        `INSERT INTO ${table} (project_id, title, description, file_path, attachment_id, uploaded_by, role, record_kind, notice_tied_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+        [projectId, title, description || null, filePath, attachmentId, userId, role, resolvedKind, noticeTied]
       );
-      recordId = recRes.rows[0].id;
+      const recordId = recRes.rows[0].id;
+      const notifMsg = noticeTied
+        ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
+        : `New record added by ${role}: "${title}"`;
+      const notifRes = await dbClient.query(
+        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [projectId, recordId, table, notifMsg, userId, role]
+      );
+      const notificationId = notifRes.rows[0].id;
+      const recipients = await getProjectRecipientKeys(projectId, userId, role);
+      await insertNotificationRecipients(dbClient, notificationId, recipients);
       await dbClient.query('COMMIT');
+      res.json({ success: true, message: 'Record saved.', recordId, notificationId, attachmentId, recordKind: resolvedKind });
     } catch (err) {
       await dbClient.query('ROLLBACK');
       console.error('Error saving record:', err);
-      return res.status(500).json({ success: false, message: 'Server error saving record.' });
-    } finally {
-      dbClient.release();
-    }
-
-    // ── Record is committed. Respond immediately so the user isn't blocked. ─
-    res.json({ success: true, message: 'Record saved.', recordId, attachmentId, recordKind: resolvedKind });
-
-    // ── STEP 2: Fire notifications asynchronously ────────────────────────────
-    //    Runs after response is sent — a failure here never affects the save.
-    (async () => {
-      try {
-        const notifMsg = noticeTied
-          ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
-          : `New record added by ${role}: "${title}"`;
-
-        const notifRes = await pool.query(
-          `INSERT INTO notifications
-             (project_id, entity_id, entity_type, notification_type, message, added_by_id, added_by_role)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           RETURNING id`,
-          [projectId, recordId, table, 'record_created', notifMsg, userId, role]
-        );
-        const notificationId = notifRes.rows[0].id;
-
-        const recipients = await getProjectRecipientKeys(projectId, userId, role);
-        await insertNotificationRecipients(notificationId, recipients);
-      } catch (notifErr) {
-        console.error('[notifications] record_created — non-fatal error:', notifErr);
-      }
-    })();
-
+      res.status(500).json({ success: false, message: 'Server error saving record.' });
+    } finally { dbClient.release(); }
   } catch (err) {
     console.error('Add record route error:', err);
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -2373,167 +1964,91 @@ app.post('/records',        authenticateToken, upload.single('attachment'), hand
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const { projectId, recordType } = req.body;
-  const table    = resolveTable(recordType);
+  const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-
   const userId   = req.user.user_id;
   const userRole = req.user.role;
   const userSide = getSide(userRole);
   const userIsDM = isDecisionMaker(userRole);
-
   try {
     const { rows: records } = await pool.query(
       `SELECT r.id, r.title, r.description, r.file_path,
               r.issued_date, r.role AS uploader_role,
               r.uploaded_by, r.status, r.record_kind, r.notice_tied_id
-       FROM ${table} r
-       WHERE r.project_id = $1
-       ORDER BY r.issued_date DESC`,
+       FROM ${table} r WHERE r.project_id = $1 ORDER BY r.issued_date DESC`,
       [projectId]
     );
-
     const enriched = await Promise.all(records.map(async rec => {
       const { rows: reviews } = await pool.query(
         `SELECT dr.reviewer_id, dr.reviewer_role, dr.action, dr.action_date,
                 dr.comment, dr.reviewer_email, dr.reviewer_position
-         FROM document_reviews dr
-         WHERE dr.record_type = $1 AND dr.record_id = $2
-         ORDER BY dr.action_date ASC`,
+         FROM document_reviews dr WHERE dr.record_type = $1 AND dr.record_id = $2 ORDER BY dr.action_date ASC`,
         [table, rec.id]
       );
-
-      const annotatedReviews = reviews.map(r => ({
-        ...r,
-        is_decision_maker: isDecisionMaker(r.reviewer_role),
-      }));
-
-      const isUploader = String(rec.uploaded_by) === String(userId)
-        && getSide(rec.uploader_role) === getSide(userRole);
-
+      const annotatedReviews = reviews.map(r => ({ ...r, is_decision_maker: isDecisionMaker(r.reviewer_role) }));
+      const isUploader = String(rec.uploaded_by) === String(userId) && getSide(rec.uploader_role) === getSide(userRole);
       let isViewed = isUploader;
       if (!isUploader) {
         const { rows: viewed } = await pool.query(
-          `SELECT 1 FROM document_reviews
-           WHERE record_type=$1 AND record_id=$2
-             AND reviewer_id=$3 AND reviewer_role=$4
-           LIMIT 1`,
+          `SELECT 1 FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 AND reviewer_role=$4 LIMIT 1`,
           [table, rec.id, userId, userRole]
         );
         isViewed = viewed.length > 0;
       }
-
-      const myReviewRow = reviews.find(
-        r => String(r.reviewer_id) === String(userId)
-          && getSide(r.reviewer_role) === getSide(userRole)
-      );
-      const myReview = myReviewRow
-        ? { action: myReviewRow.action, comment: myReviewRow.comment || '' }
-        : {};
-
-      const uploaderSide = getSide(rec.uploader_role);
-      const step2SideMap = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
-      const step2Side    = step2SideMap[uploaderSide];
-      const isLocked     = rec.status === 'approved_record'
-        || annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
-
+      const myReviewRow = reviews.find(r => String(r.reviewer_id) === String(userId) && getSide(r.reviewer_role) === getSide(userRole));
+      const myReview    = myReviewRow ? { action: myReviewRow.action, comment: myReviewRow.comment || '' } : {};
+      const uploaderSide  = getSide(rec.uploader_role);
+      const step2SideMap  = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
+      const step2Side     = step2SideMap[uploaderSide];
+      const isLocked      = rec.status === 'approved_record' || annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
       const stepMap = {
-        contractor: [
-          { side: 'consultant', step: 1, label: 'Consultant Approval',  action: 'approved' },
-          { side: 'client',     step: 2, label: 'Client Acceptance',    action: 'accepted' },
-        ],
-        consultant: [
-          { side: 'client',     step: 1, label: 'Client Approval',      action: 'approved' },
-          { side: 'contractor', step: 2, label: 'Contractor Acceptance', action: 'accepted' },
-        ],
-        client: [
-          { side: 'consultant', step: 1, label: 'Consultant Approval',  action: 'approved' },
-          { side: 'contractor', step: 2, label: 'Contractor Acceptance', action: 'accepted' },
-        ],
+        contractor: [{ side:'consultant',step:1,label:'Consultant Approval',action:'approved'},{side:'client',step:2,label:'Client Acceptance',action:'accepted'}],
+        consultant: [{ side:'client',step:1,label:'Client Approval',action:'approved'},{side:'contractor',step:2,label:'Contractor Acceptance',action:'accepted'}],
+        client:     [{ side:'consultant',step:1,label:'Consultant Approval',action:'approved'},{side:'contractor',step:2,label:'Contractor Acceptance',action:'accepted'}],
       };
-
       const steps = uploaderSide ? stepMap[uploaderSide] : null;
       const workflowSteps = steps ? steps.map(s => {
-        const doneReview     = annotatedReviews.find(r =>
-          getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
-        const rejectedReview = annotatedReviews.find(r =>
-          getSide(r.reviewer_role) === s.side && r.action === 'rejected');
+        const doneReview     = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
+        const rejectedReview = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && r.action === 'rejected');
         let status;
-        if (isLocked)        status = 'locked';
+        if (isLocked) status = 'locked';
         else if (doneReview) status = 'done';
         else if (rejectedReview) status = 'rejected';
-        else                 status = 'pending';
+        else status = 'pending';
         return { label: s.label, status };
       }) : [];
-
       let btnState = 'none', pendingRole = null, approveLabel = null;
-      if (isUploader) {
-        btnState = 'uploader';
-      } else if (isLocked) {
-        btnState = 'locked';
-      } else if (!userIsDM) {
-        btnState = 'team_member';
-      } else if (userSide === uploaderSide) {
-        btnState = 'none';
-      } else {
+      if (isUploader) { btnState = 'uploader'; }
+      else if (isLocked) { btnState = 'locked'; }
+      else if (!userIsDM) { btnState = 'team_member'; }
+      else if (userSide === uploaderSide) { btnState = 'none'; }
+      else {
         const workflowActions = ['approved', 'accepted', 'rejected'];
         const alreadyActed = myReviewRow && workflowActions.includes(myReviewRow.action);
-        if (alreadyActed) {
-          btnState = 'acted';
-        } else if (steps) {
+        if (alreadyActed) { btnState = 'acted'; }
+        else if (steps) {
           const myStep = steps.find(s => s.side === userSide);
-          if (!myStep) {
-            btnState = 'none';
-          } else if (myStep.step === 2) {
-            const step1     = steps.find(s => s.step === 1);
-            const step1Done = annotatedReviews.some(
-              r => getSide(r.reviewer_role) === step1.side
-                && (r.action === 'approved' || r.action === 'accepted')
-            );
-            if (!step1Done) {
-              btnState = 'awaiting'; pendingRole = step1.side;
-            } else {
-              btnState = 'can_approve';
-              approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
-            }
-          } else {
-            btnState     = 'can_approve';
-            approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve';
-          }
+          if (!myStep) { btnState = 'none'; }
+          else if (myStep.step === 2) {
+            const step1 = steps.find(s => s.step === 1);
+            const step1Done = annotatedReviews.some(r => getSide(r.reviewer_role) === step1.side && (r.action === 'approved' || r.action === 'accepted'));
+            if (!step1Done) { btnState = 'awaiting'; pendingRole = step1.side; }
+            else { btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve'; }
+          } else { btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve'; }
         }
       }
-
       const { rows: myNotices } = await pool.query(
-        `SELECT id, title FROM ${table}
-         WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 AND role=$4`,
+        `SELECT id, title FROM ${table} WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 AND role=$4`,
         [rec.id, projectId, userId, userRole]
       );
       const myIssuedNotice = myNotices.length > 0 ? myNotices[0] : null;
-
       let tiedRecordTitle = null;
       if (rec.notice_tied_id) {
-        const { rows: tied } = await pool.query(
-          `SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]
-        );
+        const { rows: tied } = await pool.query(`SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]);
         tiedRecordTitle = tied[0]?.title || null;
       }
-
-      return {
-        ...rec,
-        reviews:          annotatedReviews,
-        is_uploader:      isUploader,
-        is_viewed:        isViewed,
-        is_locked:        isLocked,
-        is_decision_maker: userIsDM,
-        btn_state:        btnState,
-        pending_role:     pendingRole,
-        approve_label:    approveLabel,
-        my_review:        myReview,
-        workflow_steps:   workflowSteps,
-        my_issued_notice: myIssuedNotice,
-        tied_record_title: tiedRecordTitle,
-      };
+      return { ...rec, reviews: annotatedReviews, is_uploader: isUploader, is_viewed: isViewed, is_locked: isLocked, is_decision_maker: userIsDM, btn_state: btnState, pending_role: pendingRole, approve_label: approveLabel, my_review: myReview, workflow_steps: workflowSteps, my_issued_notice: myIssuedNotice, tied_record_title: tiedRecordTitle };
     }));
-
     res.json({ records: enriched });
   } catch (err) {
     console.error('Fetch tab records error:', err);
@@ -2546,45 +2061,21 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const { recordId, projectId, recordType } = req.body;
-  const reviewerId   = req.user.user_id;
-  const reviewerRole = req.user.role;
-  const table        = resolveTable(recordType);
+  const reviewerId = req.user.user_id, reviewerRole = req.user.role;
+  const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-
   try {
-    const { rows: rec } = await pool.query(
-      `SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`,
-      [recordId, projectId]
-    );
+    const { rows: rec } = await pool.query(`SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
-    if (String(rec[0].uploaded_by) === String(reviewerId)
-        && getSide(rec[0].role) === getSide(reviewerRole)) {
-      return res.json({ success: true, skipped: true });
-    }
-
-    const assignRow = await pool.query(
-      `SELECT av.role_email AS email, av.position
-       FROM assignments_view av
-       WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3
-       LIMIT 1`,
-      [projectId, reviewerId, reviewerRole]
-    );
-
+    if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) return res.json({ success: true, skipped: true });
+    const assignRow = await pool.query(`SELECT av.role_email AS email, av.position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
     await pool.query(
-      `INSERT INTO document_reviews
-         (record_type, record_id, record_kind, reviewer_id, reviewer_role,
-          reviewer_email, reviewer_position, action)
-       VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action')
-       ON CONFLICT (record_type, record_id, reviewer_id, reviewer_role) DO NOTHING`,
-      [table, recordId, reviewerId, reviewerRole,
-       assignRow.rows[0]?.email || null, assignRow.rows[0]?.position || null]
+      `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action)
+       VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action') ON CONFLICT (record_type, record_id, reviewer_id, reviewer_role) DO NOTHING`,
+      [table, recordId, reviewerId, reviewerRole, assignRow.rows[0]?.email || null, assignRow.rows[0]?.position || null]
     );
-
     res.json({ success: true });
-  } catch (err) {
-    console.error('Mark viewed error:', err);
-    res.status(500).json({ error: 'Failed to mark as viewed.' });
-  }
+  } catch (err) { console.error('Mark viewed error:', err); res.status(500).json({ error: 'Failed to mark as viewed.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2592,217 +2083,86 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/review-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType, action, comment, actorType } = req.body;
-  const reviewerId   = req.user.user_id;
-  const reviewerRole = req.user.role;
-  const table        = resolveTable(recordType);
+  const reviewerId = req.user.user_id, reviewerRole = req.user.role;
+  const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-
-  const workflowActions     = ['approved', 'accepted', 'rejected'];
-  const isWorkflow          = workflowActions.includes(action);
+  const workflowActions = ['approved', 'accepted', 'rejected'];
+  const isWorkflow = workflowActions.includes(action);
   const isDecisionMakerActor = isDecisionMaker(reviewerRole) && actorType !== 'team_member';
-
-  if (!isWorkflow && action !== 'no_action') {
-    return res.status(400).json({ error: 'Invalid action.' });
-  }
-  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') {
-    return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
-  }
-
+  if (!isWorkflow && action !== 'no_action') return res.status(400).json({ error: 'Invalid action.' });
+  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
   try {
-    const { rows: recRows } = await pool.query(
-      `SELECT id, role, uploaded_by FROM ${table} WHERE id=$1 AND project_id=$2`,
-      [recordId, projectId]
-    );
+    const { rows: recRows } = await pool.query(`SELECT id, role, uploaded_by FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!recRows.length) return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
     const rec = recRows[0];
-
-    if (String(rec.uploaded_by) === String(reviewerId)
-        && getSide(rec.role) === getSide(reviewerRole)) {
-      return res.status(403).json({ error: 'You cannot review your own record.' });
-    }
-
-    const assignRow = await pool.query(
-      `SELECT av.role_email AS email, av.position
-       FROM assignments_view av
-       WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3
-       LIMIT 1`,
-      [projectId, reviewerId, reviewerRole]
-    );
-    const reviewerEmail    = assignRow.rows[0]?.email    || null;
-    const reviewerPosition = assignRow.rows[0]?.position || null;
-
-    const { rows: existing } = await pool.query(
-      `SELECT id, action FROM document_reviews
-       WHERE record_type=$1 AND record_id=$2
-         AND reviewer_id=$3 AND reviewer_role=$4
-       LIMIT 1`,
-      [table, recordId, reviewerId, reviewerRole]
-    );
-
-    // Comment-only path
+    if (String(rec.uploaded_by) === String(reviewerId) && getSide(rec.role) === getSide(reviewerRole)) return res.status(403).json({ error: 'You cannot review your own record.' });
+    const assignRow = await pool.query(`SELECT av.role_email AS email, av.position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
+    const reviewerEmail = assignRow.rows[0]?.email || null, reviewerPosition = assignRow.rows[0]?.position || null;
+    const { rows: existing } = await pool.query(`SELECT id, action FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 AND reviewer_role=$4 LIMIT 1`, [table, recordId, reviewerId, reviewerRole]);
     if (action === 'no_action' && comment?.trim()) {
-      if (existing.length > 0) {
-        await pool.query(
-          `UPDATE document_reviews SET comment=$1, action_date=NOW() WHERE id=$2`,
-          [comment.trim(), existing[0].id]
-        );
-      } else {
-        await pool.query(
-          `INSERT INTO document_reviews
-             (record_type,record_id,record_kind,reviewer_id,reviewer_role,
-              reviewer_email,reviewer_position,action,comment)
-           VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action',$7)`,
-          [table, recordId, reviewerId, reviewerRole,
-           reviewerEmail, reviewerPosition, comment.trim()]
-        );
-      }
+      if (existing.length > 0) { await pool.query(`UPDATE document_reviews SET comment=$1, action_date=NOW() WHERE id=$2`, [comment.trim(), existing[0].id]); }
+      else { await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action',$7)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, comment.trim()]); }
       return res.json({ success: true, message: 'Comment saved.' });
     }
-
-    // Workflow action
     if (existing.length > 0) {
-      if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) {
-        return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
-      }
-      await pool.query(
-        `UPDATE document_reviews
-         SET action=$1, action_date=NOW(), comment=COALESCE($2,comment)
-         WHERE id=$3`,
-        [action, comment?.trim() || null, existing[0].id]
-      );
+      if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
+      await pool.query(`UPDATE document_reviews SET action=$1, action_date=NOW(), comment=COALESCE($2,comment) WHERE id=$3`, [action, comment?.trim() || null, existing[0].id]);
     } else {
-      await pool.query(
-        `INSERT INTO document_reviews
-           (record_type,record_id,record_kind,reviewer_id,reviewer_role,
-            reviewer_email,reviewer_position,action,comment)
-         VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8)`,
-        [table, recordId, reviewerId, reviewerRole,
-         reviewerEmail, reviewerPosition, action, comment?.trim() || null]
-      );
+      await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, action, comment?.trim() || null]);
     }
-
-    // Update record status
     if (isDecisionMakerActor && isWorkflow) {
       const uploaderSide = getSide(rec.role);
       let newStatus;
-      if (action === 'rejected') {
-        newStatus = 'rejected';
-      } else if (action === 'accepted') {
-        newStatus = 'approved_record';
-      } else {
-        const m = {
-          contractor: 'pending_client_acceptance',
-          consultant: 'pending_contractor_acceptance',
-          client:     'pending_contractor_acceptance',
-        };
-        newStatus = m[uploaderSide] || 'pending_review';
-      }
-      await pool.query(
-        `UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`,
-        [newStatus, recordId, projectId]
-      );
-
-      // Fire notification asynchronously — never blocks the response
-      res.json({ success: true, message: `Action '${action}' recorded successfully.` });
-
-      (async () => {
-        try {
-          const notifMsg = `${reviewerRole} ${action} record #${recordId} (uploaded by ${rec.role})`;
-          const notifRes = await pool.query(
-            `INSERT INTO notifications
-               (project_id, entity_id, entity_type, notification_type, message, added_by_id, added_by_role)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)
-             RETURNING id`,
-            [projectId, recordId, table, 'record_reviewed', notifMsg, reviewerId, reviewerRole]
-          );
-          const recipients = await getProjectRecipientKeys(projectId, reviewerId, reviewerRole);
-          await insertNotificationRecipients(notifRes.rows[0].id, recipients);
-        } catch (notifErr) {
-          console.error('[notifications] record_reviewed — non-fatal error:', notifErr);
-        }
-      })();
-
-      return; // response already sent above
+      if (action === 'rejected') { newStatus = 'rejected'; }
+      else if (action === 'accepted') { newStatus = 'approved_record'; }
+      else { const m = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' }; newStatus = m[uploaderSide] || 'pending_review'; }
+      await pool.query(`UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, recordId, projectId]);
+      const notifMsg = `${reviewerRole} ${action} record #${recordId} (uploaded by ${rec.role})`;
+      const dbClient = await pool.connect();
+      try {
+        await dbClient.query('BEGIN');
+        const notifRes = await dbClient.query(`INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`, [projectId, recordId, table, notifMsg, reviewerId, reviewerRole]);
+        const notificationId = notifRes.rows[0].id;
+        const recipients = await getProjectRecipientKeys(projectId, reviewerId, reviewerRole);
+        await insertNotificationRecipients(dbClient, notificationId, recipients);
+        await dbClient.query('COMMIT');
+      } catch (notifErr) { await dbClient.query('ROLLBACK'); console.error('Notification insert error (non-fatal):', notifErr); } finally { dbClient.release(); }
     }
-
     res.json({ success: true, message: `Action '${action}' recorded successfully.` });
-  } catch (err) {
-    console.error('Review record error:', err);
-    res.status(500).json({ error: 'Failed to process review.' });
-  }
+  } catch (err) { console.error('Review record error:', err); res.status(500).json({ error: 'Failed to process review.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DOWNLOAD FILE
+//  DOWNLOAD / DELETE RECORD
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/download-file', authenticateToken, async (req, res) => {
   const { recordId, recordType } = req.query;
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
-    const { rows } = await pool.query(
-      `SELECT file_path FROM ${table} WHERE id=$1`, [recordId]
-    );
-    if (!rows.length || !rows[0].file_path) {
-      return res.status(404).json({ error: 'File not found.' });
-    }
+    const { rows } = await pool.query(`SELECT file_path FROM ${table} WHERE id=$1`, [recordId]);
+    if (!rows.length || !rows[0].file_path) return res.status(404).json({ error: 'File not found.' });
     const filePath = rows[0].file_path;
-    if (filePath.startsWith('http')) {
-      return res.json({ url: filePath, fileName: filePath.split('/').pop() || 'download' });
-    }
+    if (filePath.startsWith('http')) return res.json({ url: filePath, fileName: filePath.split('/').pop() || 'download' });
     res.status(404).json({ error: 'File not accessible.' });
-  } catch (err) {
-    console.error('Download file error:', err);
-    res.status(500).json({ error: 'Failed to download file.' });
-  }
+  } catch (err) { console.error('Download file error:', err); res.status(500).json({ error: 'Failed to download file.' }); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  DELETE RECORD
-// ─────────────────────────────────────────────────────────────────────────────
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
   const { projectId, recordId, recordType } = req.body;
   const userId = req.user.user_id;
   const table  = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
-
   try {
-    const { rows } = await pool.query(
-      `SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`,
-      [recordId, projectId]
-    );
+    const { rows } = await pool.query(`SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Record not found.' });
-    if (String(rows[0].uploaded_by) !== String(userId)
-        || getSide(rows[0].role) !== getSide(req.user.role)) {
-      return res.status(403).json({ error: 'Only the uploader can delete this record.' });
-    }
-
-    // Clean up notifications for this record first
-    await pool.query(
-      `DELETE FROM notification_recipients
-       WHERE notification_id IN (
-         SELECT id FROM notifications WHERE entity_id=$1 AND entity_type=$2
-       )`,
-      [recordId, table]
-    );
-    await pool.query(
-      `DELETE FROM notifications WHERE entity_id=$1 AND entity_type=$2`,
-      [recordId, table]
-    );
-    await pool.query(
-      `DELETE FROM document_reviews WHERE record_type=$1 AND record_id=$2`,
-      [table, recordId]
-    );
-    await pool.query(
-      `DELETE FROM ${table} WHERE id=$1 AND project_id=$2`,
-      [recordId, projectId]
-    );
-
+    if (String(rows[0].uploaded_by) !== String(userId) || getSide(rows[0].role) !== getSide(req.user.role)) return res.status(403).json({ error: 'Only the uploader can delete this record.' });
+    await pool.query(`DELETE FROM notification_recipients WHERE notification_id IN (SELECT id FROM notifications WHERE entity_id=$1 AND entity_type=$2)`, [recordId, table]);
+    await pool.query('DELETE FROM notifications WHERE entity_id=$1 AND entity_type=$2', [recordId, table]);
+    await pool.query('DELETE FROM document_reviews WHERE record_type=$1 AND record_id=$2', [table, recordId]);
+    await pool.query(`DELETE FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     res.json({ success: true, message: 'Record deleted successfully.' });
-  } catch (err) {
-    console.error('Delete record error:', err);
-    res.status(500).json({ error: 'Failed to delete record.' });
-  }
+  } catch (err) { console.error('Delete record error:', err); res.status(500).json({ error: 'Failed to delete record.' }); }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2847,24 +2207,15 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), async 
     const notifMsg = scope === 'side'
       ? `New ${meeting_type} meeting scheduled by ${req.user.role} for ${scope_value || 'your'} side: "${title}" on ${date_time}`
       : `New ${meeting_type} meeting scheduled by ${req.user.role}: "${title}" on ${date_time}`;
-    // Commit the meeting save first so notifications can't block meeting creation
+    const notifRes = await client.query(
+      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [project_id, meeting.id, 'meetings', notifMsg, req.user.user_id, req.user.role]
+    );
+    const notificationId = notifRes.rows[0].id;
+    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
+    await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json(meeting);
-
-    // Perform notification creation asynchronously and outside the transaction.
-    (async () => {
-      try {
-        const notifRes = await pool.query(
-          `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-          [project_id, meeting.id, 'meetings', notifMsg, req.user.user_id, req.user.role]
-        );
-        const notificationId = notifRes.rows[0].id;
-        const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-        await insertNotificationRecipients(notificationId, recipients);
-      } catch (notifyErr) {
-        console.error('POST /api/meetings: notification creation failed', notifyErr);
-      }
-    })();
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings:', err); res.status(500).json({ error: 'Failed to create meeting' }); } finally { client.release(); }
 });
 
@@ -2894,23 +2245,15 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
     const notifMsg = scope === 'side'
       ? `Meeting minutes recorded by ${req.user.role} for ${scope_value || 'your'} side: "${meetingTitle}"`
       : `Meeting minutes recorded by ${req.user.role}: "${meetingTitle}"`;
+    const notifRes = await client.query(
+      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [project_id, minute.id, 'meeting_minutes', notifMsg, req.user.user_id, req.user.role]
+    );
+    const notificationId = notifRes.rows[0].id;
+    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
+    await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json({ minute });
-
-    // Create notifications asynchronously so failures don't rollback the minute save
-    (async () => {
-      try {
-        const notifRes = await pool.query(
-          `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-          [project_id, minute.id, 'meeting_minutes', notifMsg, req.user.user_id, req.user.role]
-        );
-        const notificationId = notifRes.rows[0].id;
-        const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-        await insertNotificationRecipients(notificationId, recipients);
-      } catch (notifyErr) {
-        console.error('POST /api/meetings/:id/minute: notification creation failed', notifyErr);
-      }
-    })();
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings/:id/minute:', err); res.status(500).json({ error: 'Failed to save minute' }); } finally { client.release(); }
 });
 
@@ -3059,23 +2402,16 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     const planned=parseFloat(ms.quantity)||0,exec=parseFloat(ms.executed)||0;
     if (planned>0&&exec<planned) return res.status(422).json({ error:`Cannot complete: only ${exec} of ${planned} ${ms.unit||''} executed` });
     await client.query(`UPDATE ${table} SET activity_status='completed',progress_pct=100,completed_at=now(),updated_at=now() WHERE id=$1`,[milestoneId]);
+    const notifMsg = `${isExt ? 'Additional milestone' : 'Milestone'} completed by ${req.user.role}: "${ms.title || `#${milestoneId}`}"`;
+    const notifRes = await client.query(
+      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [projectId, milestoneId, table, notifMsg, req.user.user_id, req.user.role]
+    );
+    const notificationId = notifRes.rows[0].id;
+    const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
+    await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
     res.json({ success:true,completedAt:new Date().toISOString() });
-
-    // Fire milestone-completed notification asynchronously
-    (async () => {
-      try {
-        const notifMsg = `${isExt ? 'Additional milestone' : 'Milestone'} completed by ${req.user.role}: "${ms.title || `#${milestoneId}`}"`;
-        const notifRes = await pool.query(
-          `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-          [projectId, milestoneId, table, notifMsg, req.user.user_id, req.user.role]
-        );
-        const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
-        await insertNotificationRecipients(notifRes.rows[0].id, recipients);
-      } catch (notifyErr) {
-        console.error('[POST /api/complete-milestone] notification creation failed', notifyErr);
-      }
-    })();
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/complete-milestone]',err);res.status(500).json({error:'Failed to complete milestone'});}finally{client.release();}
 });
 
@@ -3899,7 +3235,7 @@ app.get('/api/work-center/team-members', authenticateToken, async (req, res) => 
     if (!side) return res.status(403).json({ error: 'Your role cannot manage tasks.' });
 
     const result = await pool.query(`
-      SELECT t.id, t.email, tma.position, tma.name, tma.telephone
+      SELECT t.id, t.email, tma.position, tma.title, tma.telephone
       FROM   team_member_assignments tma
       JOIN   team_members t ON t.id = tma.team_member_id
       WHERE  tma.project_id   = $1
@@ -4213,11 +3549,11 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
         SELECT p.*,
                t.email       AS member_email,
                tma.position  AS member_position,
-               tma.name      AS member_title
+               tma.title     AS member_title
         FROM   workspace_work_center_progress p
         JOIN   team_members t ON t.id = p.member_id
         LEFT JOIN LATERAL (
-               SELECT position, name
+               SELECT position, title
                FROM   team_member_assignments
                WHERE  team_member_id = p.member_id
                  AND  project_id = $2
@@ -4831,7 +4167,6 @@ app.use((err, _req, res, _next) => {
 //  START
 // ─────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-await ensureArretSchema();
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 
 setInterval(() => {
