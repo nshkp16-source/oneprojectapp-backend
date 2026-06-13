@@ -1086,12 +1086,33 @@ app.post('/commit-account', upload.single('clientPicture'), async (req, res) => 
     }
 
     const clientResult = await pool.query(
-      `INSERT INTO clients (company_name,company_email,representative,title,telephone,password_hash,verified,created_at,profile_picture,profile_picture_id)
-       VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7,$8)
-       ON CONFLICT (company_email) DO UPDATE SET company_name=EXCLUDED.company_name,representative=EXCLUDED.representative,title=EXCLUDED.title,telephone=EXCLUDED.telephone,password_hash=EXCLUDED.password_hash,profile_picture=EXCLUDED.profile_picture,profile_picture_id=EXCLUDED.profile_picture_id,verified=true
-       RETURNING id,company_email`,
-      [client?.company_name||null,client?.company_email||null,client?.representative||null,client?.title||null,client?.telephone||null,hashedPassword,clientPictureUrl,clientPictureId]
-    );
+  `INSERT INTO clients (company_name,company_email,representative,title,telephone,password_hash,verified,created_at,profile_picture,profile_picture_id)
+   VALUES ($1,$2,$3,$4,$5,$6,true,NOW(),$7,$8)
+   ON CONFLICT (company_email) DO UPDATE SET
+     company_name       = EXCLUDED.company_name,
+     representative     = EXCLUDED.representative,
+     title              = CASE 
+                            WHEN EXCLUDED.title IS NOT NULL AND EXCLUDED.title != EXCLUDED.company_email 
+                            THEN EXCLUDED.title 
+                            ELSE clients.title 
+                          END,
+     telephone          = EXCLUDED.telephone,
+     password_hash      = EXCLUDED.password_hash,
+     profile_picture    = COALESCE(EXCLUDED.profile_picture, clients.profile_picture),
+     profile_picture_id = COALESCE(EXCLUDED.profile_picture_id, clients.profile_picture_id),
+     verified           = true
+   RETURNING id, company_email`,
+  [
+    client?.company_name   || null,
+    client?.company_email  || null,
+    client?.representative || null,
+    client?.title && client.title !== client.company_email ? client.title : null,
+    client?.telephone      || null,
+    hashedPassword,
+    clientPictureUrl,
+    clientPictureId,
+  ]
+);
     const client_id = clientResult.rows[0].id;
 
     const projectResult = await pool.query(
