@@ -439,14 +439,6 @@ function sideRoles(side) {
 //  CHAT HELPERS
 // =============================================================================
 
-/**
- * Common LEFT JOINs used in both group and direct message queries.
- * Resolves: sender_display_name, sender_position, reply-to fields, read_by.
- *
- * NOTE: contractor_assignments and consultant_assignments use title_position
- * (not a separate position column). PM assignment tables have no position col.
- * Only team_member_assignments has a real position column.
- */
 const CHAT_SENDER_JOINS = `
   LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
   LEFT JOIN project_chat_messages rm ON m.reply_to_message_id = rm.id
@@ -478,17 +470,9 @@ const CHAT_SENDER_JOINS = `
     ON tma_rep.team_member_id = tm.id
 `;
 
-/**
- * SELECT fields for resolved display name, position, read_by, and reply-to.
- *
- * FIX: contractor/consultant use title_position (not position).
- *      PM tables have no position column — use NULL or name fallback.
- *      Only team_member_assignments has a real position column.
- */
 const CHAT_SENDER_FIELDS = `
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
 
-  -- Display name = representative (or email/company) — the "who" label
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.representative,          c.company_name,         c.company_email)
     WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,     ct.email,               ca_rep.company_name)
@@ -500,78 +484,53 @@ const CHAT_SENDER_FIELDS = `
     ELSE m.sender_email
   END AS sender_display_name,
 
-  -- Position / title for sub-label in group chat bubbles
-  -- Contractor/Consultant: use title_position (merged col)
-  -- PM tables: no position col — fall back to name
-  -- TeamMember: real position col
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.title,                                         '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,                           '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position,                          '')
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,                                   '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,                                 '')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,                                 '')
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,  tma_rep.name,                 '')
+    WHEN 'Client'       THEN COALESCE(c.title,               '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,  '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position, '')
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,          '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,        '')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,        '')
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position, tma_rep.name, '')
     ELSE ''
   END AS sender_position,
 
-  -- Company / title for the "title" part of the display name
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.company_name,            c.title,              '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,       ca_rep.title_position,'')
+    WHEN 'Client'       THEN COALESCE(c.company_name,            c.title,               '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,       ca_rep.title_position, '')
     WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,      csa_rep.title_position,'')
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,                                   '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,                                 '')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,                                 '')
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,                                    '')
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,             '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,           '')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,           '')
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,              '')
     ELSE ''
   END AS sender_company,
 
-  -- Reply-to fields (pre-joined so the frontend doesn't need a second request)
   rm.id           AS reply_to_message_id,
   rm.content      AS reply_to_content,
   rm.sender_role  AS reply_to_sender_role,
   rm.sender_email AS reply_to_sender_email
 `;
 
-/**
- * GROUP BY clause — matches all non-aggregated columns in CHAT_SENDER_FIELDS.
- *
- * FIX: replaced a.position / a.title references with the correct column names
- *      per table. PM tables only have name/telephone/task — no position/title.
- *      contractor/consultant use title_position instead of separate cols.
- */
 const CHAT_GROUP_BY = `
   GROUP BY
     m.id,
-    -- Client
     c.id, c.representative, c.company_name, c.company_email, c.title,
-    -- Contractor join rows
     ca_rep.id, ca_rep.representative, ca_rep.company_name, ca_rep.title_position,
     ct.id, ct.email,
-    -- Consultant join rows
     csa_rep.id, csa_rep.representative, csa_rep.company_name, csa_rep.title_position,
     cns.id, cns.email,
-    -- ClientPM join rows
     cpma_rep.id, cpma_rep.name,
     cpm_u.id, cpm_u.email,
-    -- ContractorPM join rows
     ctrpma_rep.id, ctrpma_rep.name,
     ctrpm_u.id, ctrpm_u.email,
-    -- ConsultantPM join rows
     cnspma_rep.id, cnspma_rep.name,
     cnspm_u.id, cnspm_u.email,
-    -- TeamMember join rows
-    tma_rep.id, tma_rep.name, tma_rep.position,
+    tma_rep.id, tma_rep.name, tma_rep.position, tma_rep.assigned_part,
     tm.id, tm.email,
-    -- Reply-to message
     rm.id, rm.content, rm.sender_role, rm.sender_email
 `;
 
-/**
- * Batch-insert read receipts efficiently using a single query with unnest.
- * Falls back to the loop if the batch fails.
- */
 async function markMessagesRead(messageIds, userId, userRole) {
   if (!messageIds.length) return;
   try {
@@ -597,18 +556,12 @@ async function markMessagesRead(messageIds, userId, userRole) {
 //  CHAT ROUTES
 // =============================================================================
 
-/**
- * GET /chat/members
- * Returns all project members (used by the sidebar).
- */
 app.get('/chat/members', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
   if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
-
   try {
     const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
     if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project' });
-
     const members = await getProjectMembers(projectId);
     res.json({ success: true, members });
   } catch (err) {
@@ -617,10 +570,6 @@ app.get('/chat/members', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * GET /chat/conversations
- * Returns sidebar data: group info + per-member last message, time, unread count.
- */
 app.get('/chat/conversations', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
   if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
@@ -656,9 +605,9 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       ),
     ]);
 
-    const messages       = messageRows.rows;
-    const groupMessages  = messages.filter(m => m.is_group === true);
-    const lastGroupMsg   = groupMessages[0] || null;
+    const messages      = messageRows.rows;
+    const groupMessages = messages.filter(m => m.is_group === true);
+    const lastGroupMsg  = groupMessages[0] || null;
 
     const groupUnread = groupMessages.reduce((count, msg) => {
       const isMine = msg.sender_role === normalizedUserRole && Number(msg.sender_id) === userId;
@@ -670,9 +619,9 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
     const conversationMap = new Map();
     for (const msg of messages) {
       if (msg.is_group) continue;
-      const isIncoming  = msg.recipient_role === normalizedUserRole && Number(msg.recipient_id) === userId;
-      const otherRole   = isIncoming ? msg.sender_role    : msg.recipient_role;
-      const otherId     = isIncoming ? Number(msg.sender_id) : Number(msg.recipient_id);
+      const isIncoming = msg.recipient_role === normalizedUserRole && Number(msg.recipient_id) === userId;
+      const otherRole  = isIncoming ? msg.sender_role        : msg.recipient_role;
+      const otherId    = isIncoming ? Number(msg.sender_id)  : Number(msg.recipient_id);
       if (!otherRole || !otherId) continue;
 
       const key      = `${otherRole}-${otherId}`;
@@ -697,16 +646,38 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       conversationMap.set(key, existing);
     }
 
+    // ── THE FIX: build display_name from actual schema fields ──────────────
     const enrichedMembers = members.map(member => {
       const key          = `${member.role}-${member.role_id}`;
       const conversation = conversationMap.get(key);
+      const role         = normalizeRole(member.role);
 
-      const nameParts = [
-        member.company_name || member.title || '',
-        member.role,
-        member.position || '',
-      ].filter(Boolean);
-      const displayName = nameParts.join(' · ') || member.display_name || member.email || member.role;
+      let displayName;
+      if (role === 'Client') {
+        // representative - title - Client
+        displayName = [member.representative, member.title, 'Client']
+          .filter(Boolean).join(' - ');
+      } else if (role === 'Contractor' || role === 'Consultant') {
+        // representative - title_position - Role
+        displayName = [member.representative, member.title_position, role]
+          .filter(Boolean).join(' - ');
+      } else if (role === 'ContractorPM' || role === 'ConsultantPM' || role === 'ClientPM') {
+        // name - Human PM label
+        // getProjectMembers aliases assignment.name → member.title for PM rows
+        const pmLabel = {
+          ContractorPM: 'Contractor PM',
+          ConsultantPM: 'Consultant PM',
+          ClientPM:     'Client PM',
+        }[role];
+        displayName = [member.title, pmLabel].filter(Boolean).join(' - ');
+      } else if (role === 'TeamMember') {
+        // name - position - assigned_part - Team Member
+        // getProjectMembers aliases assignment.name → member.title for TM rows
+        displayName = [member.title, member.position, member.assigned_part, 'Team Member']
+          .filter(Boolean).join(' - ');
+      } else {
+        displayName = member.display_name || member.email || role;
+      }
 
       return {
         ...member,
@@ -738,10 +709,6 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * GET /chat/messages
- * Returns all messages for a group or direct conversation.
- */
 app.get('/chat/messages', authenticateToken, async (req, res) => {
   const { projectId, recipientRole, recipientId, isGroup } = req.query;
   if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
@@ -814,10 +781,6 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * POST /chat/messages
- * Send a new message (group or direct).
- */
 app.post('/chat/messages', authenticateToken, async (req, res) => {
   const {
     projectId, recipientRole, recipientId, content, isGroup,
@@ -840,9 +803,9 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
     const isGroupChat          = isGroup === true || isGroup === 'true' || isGroup === 1 || isGroup === '1';
     const normalizedSenderRole = normalizeRole(req.user.role);
 
-    let recipientEmail        = null;
-    let normalizedRecipRole   = null;
-    let resolvedRecipId       = null;
+    let recipientEmail      = null;
+    let normalizedRecipRole = null;
+    let resolvedRecipId     = null;
 
     if (!isGroupChat) {
       if (!recipientRole || !recipientId) {
@@ -911,9 +874,6 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * POST /chat/mark-read
- */
 app.post('/chat/mark-read', authenticateToken, async (req, res) => {
   const { messageIds, projectId } = req.body;
 
@@ -932,21 +892,18 @@ app.post('/chat/mark-read', authenticateToken, async (req, res) => {
     const client         = await pool.connect();
     try {
       await client.query('BEGIN');
-
       await client.query(
         `INSERT INTO project_chat_read_receipts (message_id, user_id, user_role, read_at)
          SELECT unnest($1::int[]), $2, $3, NOW()
          ON CONFLICT (message_id, user_id) DO NOTHING`,
         [messageIds.map(Number), req.user.user_id, normalizedRole]
       );
-
       await client.query(
         `UPDATE project_chat_messages
          SET delivered = true, delivered_at = NOW()
          WHERE id = ANY($1::int[]) AND delivered = false`,
         [messageIds.map(Number)]
       );
-
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK');
@@ -962,9 +919,6 @@ app.post('/chat/mark-read', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * GET /chat/unread-count
- */
 app.get('/chat/unread-count', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
   if (!projectId) return res.status(400).json({ success: false, error: 'projectId is required' });
@@ -999,10 +953,6 @@ app.get('/chat/unread-count', authenticateToken, async (req, res) => {
   }
 });
 
-/**
- * DELETE /chat/messages/:messageId
- * Soft-delete for the original sender only.
- */
 app.delete('/chat/messages/:messageId', authenticateToken, async (req, res) => {
   const messageId = Number(req.params.messageId);
   const { projectId } = req.query;
