@@ -232,86 +232,133 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
   }
 }
 
+// =============================================================================
+//  getProjectMembers — FIXED: a.position → correct columns per table
+//
+//  Schema reality:
+//    contractor_assignments  → title_position (merged col, no separate position)
+//    consultant_assignments  → title_position (merged col, no separate position)
+//    client_pm_assignments   → no position col at all
+//    contractor_pm_assignments → no position col at all
+//    consultant_pm_assignments → no position col at all
+//    team_member_assignments → position ✓
+//    clients                 → title (no position)
+// =============================================================================
 async function getProjectMembers(projectId) {
   const { rows } = await pool.query(`
-    SELECT 'Client' AS role, p.client_id AS role_id,
-           COALESCE(c.representative, c.company_name, c.company_email) AS display_name,
-           c.company_email AS email,
-           c.company_name, c.title,
-           NULL::text AS position,   -- clients have no position
-           c.profile_picture
+    -- Client
+    SELECT
+      'Client'                                                      AS role,
+      p.client_id                                                   AS role_id,
+      COALESCE(c.representative, c.company_name, c.company_email)  AS display_name,
+      c.company_email                                               AS email,
+      c.company_name,
+      c.title,
+      NULL::text                                                    AS position,
+      c.profile_picture,
+      NULL::text                                                    AS assigned_part
     FROM projects p
     JOIN clients c ON p.client_id = c.id
     WHERE p.id = $1
 
     UNION ALL
-    SELECT 'Contractor' AS role, a.contractor_id AS role_id,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
-           c.email AS email,
-           a.company_name,
-           a.title_position AS title,
-           a.title_position AS position,  -- ← was a.position
-           c.profile_picture
+
+    -- Contractor
+    SELECT
+      'Contractor'                                                  AS role,
+      a.contractor_id                                               AS role_id,
+      COALESCE(a.representative, c.email, a.company_name)          AS display_name,
+      c.email                                                       AS email,
+      a.company_name,
+      a.title_position                                              AS title,
+      a.title_position                                              AS position,
+      c.profile_picture,
+      NULL::text                                                    AS assigned_part
     FROM contractor_assignments a
     JOIN contractors c ON a.contractor_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-    SELECT 'Consultant' AS role, a.consultant_id AS role_id,
-           COALESCE(a.representative, c.email, a.company_name) AS display_name,
-           c.email AS email,
-           a.company_name,
-           a.title_position AS title,
-           a.title_position AS position,  -- ← was a.position
-           c.profile_picture
+
+    -- Consultant
+    SELECT
+      'Consultant'                                                  AS role,
+      a.consultant_id                                               AS role_id,
+      COALESCE(a.representative, c.email, a.company_name)          AS display_name,
+      c.email                                                       AS email,
+      a.company_name,
+      a.title_position                                              AS title,
+      a.title_position                                              AS position,
+      c.profile_picture,
+      NULL::text                                                    AS assigned_part
     FROM consultant_assignments a
     JOIN consultants c ON a.consultant_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-    SELECT 'ClientPM' AS role, a.client_pm_id AS role_id,
-           COALESCE(a.representative, c.email, a.name) AS display_name,
-           c.email AS email,
-           NULL AS company_name,
-           a.name AS title,
-           NULL::text AS position,   -- ← no position col on this table
-           c.profile_picture
+
+    -- ClientPM
+    SELECT
+      'ClientPM'                                                    AS role,
+      a.client_pm_id                                                AS role_id,
+      COALESCE(a.name, c.email)                                     AS display_name,
+      c.email                                                       AS email,
+      NULL::text                                                    AS company_name,
+      a.name                                                        AS title,
+      NULL::text                                                    AS position,
+      c.profile_picture,
+      NULL::text                                                    AS assigned_part
     FROM client_pm_assignments a
     JOIN client_project_managers c ON a.client_pm_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-    SELECT 'ContractorPM' AS role, a.contractor_pm_id AS role_id,
-           COALESCE(a.representative, c.email, a.name) AS display_name,
-           c.email AS email,
-           NULL AS company_name,
-           a.name AS title,
-           NULL::text AS position,   -- ← no position col on this table
-           c.profile_picture
+
+    -- ContractorPM
+    SELECT
+      'ContractorPM'                                                AS role,
+      a.contractor_pm_id                                            AS role_id,
+      COALESCE(a.name, c.email)                                     AS display_name,
+      c.email                                                       AS email,
+      NULL::text                                                    AS company_name,
+      a.name                                                        AS title,
+      NULL::text                                                    AS position,
+      c.profile_picture,
+      NULL::text                                                    AS assigned_part
     FROM contractor_pm_assignments a
     JOIN contractor_project_managers c ON a.contractor_pm_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-    SELECT 'ConsultantPM' AS role, a.consultant_pm_id AS role_id,
-           COALESCE(a.representative, c.email, a.name) AS display_name,
-           c.email AS email,
-           NULL AS company_name,
-           a.name AS title,
-           NULL::text AS position,   -- ← no position col on this table
-           c.profile_picture
+
+    -- ConsultantPM
+    SELECT
+      'ConsultantPM'                                                AS role,
+      a.consultant_pm_id                                            AS role_id,
+      COALESCE(a.name, c.email)                                     AS display_name,
+      c.email                                                       AS email,
+      NULL::text                                                    AS company_name,
+      a.name                                                        AS title,
+      NULL::text                                                    AS position,
+      c.profile_picture,
+      NULL::text                                                    AS assigned_part
     FROM consultant_pm_assignments a
     JOIN consultant_project_managers c ON a.consultant_pm_id = c.id
     WHERE a.project_id = $1
 
     UNION ALL
-    SELECT 'TeamMember' AS role, a.team_member_id AS role_id,
-           COALESCE(a.representative, c.email, a.name) AS display_name,
-           c.email AS email,
-           NULL AS company_name,
-           a.name AS title,
-           a.position AS position,   -- ← team_members DO have position
-           c.profile_picture
+
+    -- TeamMember
+    SELECT
+      'TeamMember'                                                  AS role,
+      a.team_member_id                                              AS role_id,
+      COALESCE(a.name, c.email)                                     AS display_name,
+      c.email                                                       AS email,
+      NULL::text                                                    AS company_name,
+      a.name                                                        AS title,
+      a.position                                                    AS position,
+      c.profile_picture,
+      a.assigned_part                                               AS assigned_part
     FROM team_member_assignments a
     JOIN team_members c ON a.team_member_id = c.id
     WHERE a.project_id = $1
@@ -337,10 +384,10 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
       return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
     })
     .map(m => ({
-      recipient_role: m.role,
+      recipient_role:    m.role,
       recipient_role_id: Number(m.role_id),
-      recipient_email: m.email || null,
-      user_id: Number(m.role_id),
+      recipient_email:   m.email || null,
+      user_id:           Number(m.role_id),
     }));
 }
 
@@ -395,6 +442,10 @@ function sideRoles(side) {
 /**
  * Common LEFT JOINs used in both group and direct message queries.
  * Resolves: sender_display_name, sender_position, reply-to fields, read_by.
+ *
+ * NOTE: contractor_assignments and consultant_assignments use title_position
+ * (not a separate position column). PM assignment tables have no position col.
+ * Only team_member_assignments has a real position column.
  */
 const CHAT_SENDER_JOINS = `
   LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
@@ -429,45 +480,50 @@ const CHAT_SENDER_JOINS = `
 
 /**
  * SELECT fields for resolved display name, position, read_by, and reply-to.
- * The display name format is:  company/title · role · position
- * matching the frontend buildContactDisplayName() logic.
+ *
+ * FIX: contractor/consultant use title_position (not position).
+ *      PM tables have no position column — use NULL or name fallback.
+ *      Only team_member_assignments has a real position column.
  */
 const CHAT_SENDER_FIELDS = `
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
 
   -- Display name = representative (or email/company) — the "who" label
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.representative,        c.company_name,         c.company_email)
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,   ct.email,               ca_rep.company_name)
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,  cns.email,              csa_rep.company_name)
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.representative, cpm_u.email,            cpma_rep.company_name)
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.representative, ctrpm_u.email,        ctrpma_rep.company_name)
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.representative, cnspm_u.email,        cnspma_rep.company_name)
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.representative,  tm.email,               tma_rep.company_name)
+    WHEN 'Client'       THEN COALESCE(c.representative,          c.company_name,         c.company_email)
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.representative,     ct.email,               ca_rep.company_name)
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.representative,    cns.email,              csa_rep.company_name)
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,             cpm_u.email)
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,           ctrpm_u.email)
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,           cnspm_u.email)
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,              tm.email)
     ELSE m.sender_email
   END AS sender_display_name,
 
   -- Position / title for sub-label in group chat bubbles
+  -- Contractor/Consultant: use title_position (merged col)
+  -- PM tables: no position col — fall back to name
+  -- TeamMember: real position col
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.title,                                                            '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.position,   ca_rep.title,   ca_rep.company_name,             '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.position,  csa_rep.title,  csa_rep.company_name,            '')
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.position, cpma_rep.title, cpma_rep.company_name,           '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.position, ctrpma_rep.title, ctrpma_rep.company_name,     '')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.position, cnspma_rep.title, cnspma_rep.company_name,     '')
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,  tma_rep.title,  tma_rep.company_name,            '')
+    WHEN 'Client'       THEN COALESCE(c.title,                                         '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.title_position,                           '')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.title_position,                          '')
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,                                   '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,                                 '')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,                                 '')
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.position,  tma_rep.name,                 '')
     ELSE ''
   END AS sender_position,
 
   -- Company / title for the "title" part of the display name
   CASE m.sender_role
-    WHEN 'Client'       THEN COALESCE(c.company_name,         c.title,          '')
-    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,    ca_rep.title,     '')
-    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,   csa_rep.title,    '')
-    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.company_name,  cpma_rep.title,   '')
-    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.company_name, ctrpma_rep.title,'')
-    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.company_name, cnspma_rep.title,'')
-    WHEN 'TeamMember'   THEN COALESCE(tma_rep.company_name,   tma_rep.title,    '')
+    WHEN 'Client'       THEN COALESCE(c.company_name,            c.title,              '')
+    WHEN 'Contractor'   THEN COALESCE(ca_rep.company_name,       ca_rep.title_position,'')
+    WHEN 'Consultant'   THEN COALESCE(csa_rep.company_name,      csa_rep.title_position,'')
+    WHEN 'ClientPM'     THEN COALESCE(cpma_rep.name,                                   '')
+    WHEN 'ContractorPM' THEN COALESCE(ctrpma_rep.name,                                 '')
+    WHEN 'ConsultantPM' THEN COALESCE(cnspma_rep.name,                                 '')
+    WHEN 'TeamMember'   THEN COALESCE(tma_rep.name,                                    '')
     ELSE ''
   END AS sender_company,
 
@@ -478,23 +534,37 @@ const CHAT_SENDER_FIELDS = `
   rm.sender_email AS reply_to_sender_email
 `;
 
-/** GROUP BY clause that matches all non-aggregated columns in CHAT_SENDER_FIELDS */
+/**
+ * GROUP BY clause — matches all non-aggregated columns in CHAT_SENDER_FIELDS.
+ *
+ * FIX: replaced a.position / a.title references with the correct column names
+ *      per table. PM tables only have name/telephone/task — no position/title.
+ *      contractor/consultant use title_position instead of separate cols.
+ */
 const CHAT_GROUP_BY = `
   GROUP BY
     m.id,
+    -- Client
     c.id, c.representative, c.company_name, c.company_email, c.title,
-    ca_rep.id, ca_rep.representative, ca_rep.company_name, ca_rep.title, ca_rep.position,
+    -- Contractor join rows
+    ca_rep.id, ca_rep.representative, ca_rep.company_name, ca_rep.title_position,
     ct.id, ct.email,
-    csa_rep.id, csa_rep.representative, csa_rep.company_name, csa_rep.title, csa_rep.position,
+    -- Consultant join rows
+    csa_rep.id, csa_rep.representative, csa_rep.company_name, csa_rep.title_position,
     cns.id, cns.email,
-    cpma_rep.id, cpma_rep.representative, cpma_rep.company_name, cpma_rep.title, cpma_rep.position,
+    -- ClientPM join rows
+    cpma_rep.id, cpma_rep.name,
     cpm_u.id, cpm_u.email,
-    ctrpma_rep.id, ctrpma_rep.representative, ctrpma_rep.company_name, ctrpma_rep.title, ctrpma_rep.position,
+    -- ContractorPM join rows
+    ctrpma_rep.id, ctrpma_rep.name,
     ctrpm_u.id, ctrpm_u.email,
-    cnspma_rep.id, cnspma_rep.representative, cnspma_rep.company_name, cnspma_rep.title, cnspma_rep.position,
+    -- ConsultantPM join rows
+    cnspma_rep.id, cnspma_rep.name,
     cnspm_u.id, cnspm_u.email,
-    tma_rep.id, tma_rep.representative, tma_rep.company_name, tma_rep.title, tma_rep.position,
+    -- TeamMember join rows
+    tma_rep.id, tma_rep.name, tma_rep.position,
     tm.id, tm.email,
+    -- Reply-to message
     rm.id, rm.content, rm.sender_role, rm.sender_email
 `;
 
@@ -550,8 +620,6 @@ app.get('/chat/members', authenticateToken, async (req, res) => {
 /**
  * GET /chat/conversations
  * Returns sidebar data: group info + per-member last message, time, unread count.
- * Contact display name is built as:  company · role · position
- * (matches frontend buildContactDisplayName).
  */
 app.get('/chat/conversations', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
@@ -592,7 +660,6 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
     const groupMessages  = messages.filter(m => m.is_group === true);
     const lastGroupMsg   = groupMessages[0] || null;
 
-    // Count unread group messages (not sent by current user and not read by them)
     const groupUnread = groupMessages.reduce((count, msg) => {
       const isMine = msg.sender_role === normalizedUserRole && Number(msg.sender_id) === userId;
       if (isMine) return count;
@@ -600,7 +667,6 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       return readBy.map(Number).includes(userId) ? count : count + 1;
     }, 0);
 
-    // Build per-conversation map for direct messages
     const conversationMap = new Map();
     for (const msg of messages) {
       if (msg.is_group) continue;
@@ -631,12 +697,10 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       conversationMap.set(key, existing);
     }
 
-    // Enrich members with conversation metadata + build display name
     const enrichedMembers = members.map(member => {
       const key          = `${member.role}-${member.role_id}`;
       const conversation = conversationMap.get(key);
 
-      // Display name = company/title · role · position  (mirrors frontend logic)
       const nameParts = [
         member.company_name || member.title || '',
         member.role,
@@ -646,7 +710,7 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
 
       return {
         ...member,
-        display_name: displayName,   // overwrite with formatted name
+        display_name: displayName,
         lastMessage:  conversation?.lastMessage || 'Tap to chat',
         time:         conversation?.time        || '',
         sortAt:       conversation?.lastAt      || null,
@@ -677,9 +741,6 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
 /**
  * GET /chat/messages
  * Returns all messages for a group or direct conversation.
- * Auto-marks fetched messages as read for the requesting user.
- * Returns sender_display_name, sender_position, sender_company for the
- * frontend to render  "company · role · position"  labels in group chat.
  */
 app.get('/chat/messages', authenticateToken, async (req, res) => {
   const { projectId, recipientRole, recipientId, isGroup } = req.query;
@@ -695,7 +756,6 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
     let rows;
 
     if (isGroup === 'true' || isGroup === '1') {
-      // ── GROUP CHAT ──
       const result = await pool.query(
         `SELECT m.*, ${CHAT_SENDER_FIELDS}
          FROM project_chat_messages m
@@ -707,7 +767,6 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       );
       rows = result.rows;
     } else {
-      // ── DIRECT CHAT ──
       if (!recipientRole || !recipientId) {
         return res.status(400).json({
           success: false,
@@ -733,7 +792,6 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       rows = result.rows;
     }
 
-    // Identify messages that are unread for this user (not sent by them, not yet receipted)
     const unreadIds = rows
       .filter(m => {
         const isMine = m.sender_role === normalizedUserRole && Number(m.sender_id) === userId;
@@ -743,7 +801,6 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       })
       .map(m => m.id);
 
-    // Fire-and-forget: mark as read asynchronously
     if (unreadIds.length) {
       markMessagesRead(unreadIds, userId, normalizedUserRole).catch(e =>
         console.error('[GET /chat/messages] markMessagesRead error:', e.message)
@@ -759,13 +816,7 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
 
 /**
  * POST /chat/messages
- * Send a new message (group or direct). Supports:
- *   - content text
- *   - attachment (pre-uploaded via /api/upload-attachment)
- *   - reply_to_message_id
- * Auto-inserts a read receipt for the sender so their own message
- * starts with readBy = [senderId] — this means ✓ (sent) not ✓✓ (read)
- * on the frontend until someone else reads it.
+ * Send a new message (group or direct).
  */
 app.post('/chat/messages', authenticateToken, async (req, res) => {
   const {
@@ -803,7 +854,6 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
       normalizedRecipRole = normalizeRole(recipientRole);
       resolvedRecipId     = Number(recipientId);
 
-      // Verify recipient is actually a member of this project
       const members   = await getProjectMembers(projectId);
       const recipient = members.find(
         m => normalizeRole(m.role) === normalizedRecipRole && Number(m.role_id) === resolvedRecipId
@@ -814,7 +864,6 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
       recipientEmail = recipient.email;
     }
 
-    // Validate reply target belongs to the same project (prevents cross-project reply spoofing)
     let resolvedReplyId = null;
     if (replyToMessageId) {
       const replyCheck = await pool.query(
@@ -851,8 +900,6 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
 
     const messageId = rows[0].id;
 
-    // Insert sender's own read receipt so readBy starts as [senderId]
-    // Frontend uses readByOthers (filtered) for the ✓✓ display — this is correct.
     markMessagesRead([messageId], req.user.user_id, normalizedSenderRole).catch(e =>
       console.error('[POST /chat/messages] sender receipt error:', e.message)
     );
@@ -866,8 +913,6 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
 
 /**
  * POST /chat/mark-read
- * Explicitly mark a list of messageIds as read by the current user.
- * Also sets delivered=true on the messages.
  */
 app.post('/chat/mark-read', authenticateToken, async (req, res) => {
   const { messageIds, projectId } = req.body;
@@ -888,7 +933,6 @@ app.post('/chat/mark-read', authenticateToken, async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // Batch upsert receipts
       await client.query(
         `INSERT INTO project_chat_read_receipts (message_id, user_id, user_role, read_at)
          SELECT unnest($1::int[]), $2, $3, NOW()
@@ -896,7 +940,6 @@ app.post('/chat/mark-read', authenticateToken, async (req, res) => {
         [messageIds.map(Number), req.user.user_id, normalizedRole]
       );
 
-      // Mark delivered
       await client.query(
         `UPDATE project_chat_messages
          SET delivered = true, delivered_at = NOW()
@@ -921,8 +964,6 @@ app.post('/chat/mark-read', authenticateToken, async (req, res) => {
 
 /**
  * GET /chat/unread-count
- * Returns total unread message count across all conversations for this user + project.
- * Useful for notification badges in the dashboard.
  */
 app.get('/chat/unread-count', authenticateToken, async (req, res) => {
   const { projectId } = req.query;
@@ -954,14 +995,13 @@ app.get('/chat/unread-count', authenticateToken, async (req, res) => {
     res.json({ success: true, count: parseInt(rows[0].count, 10) });
   } catch (err) {
     console.error('[GET /chat/unread-count]', err);
-    res.status(500).json({ success: false, count: 0 });
+    res.status(500).json({ success: true, count: 0 });
   }
 });
 
 /**
  * DELETE /chat/messages/:messageId
- * Soft-delete (clear content + attachments) for the original sender only.
- * Keeps the row so reply previews don't break.
+ * Soft-delete for the original sender only.
  */
 app.delete('/chat/messages/:messageId', authenticateToken, async (req, res) => {
   const messageId = Number(req.params.messageId);
@@ -984,7 +1024,6 @@ app.delete('/chat/messages/:messageId', authenticateToken, async (req, res) => {
       return res.status(403).json({ success: false, error: 'Only the sender can delete this message' });
     }
 
-    // Soft-delete: blank out content and attachment info
     await pool.query(
       `UPDATE project_chat_messages
        SET content = '', attachment_url = NULL, attachment_name = NULL, attachment_mime = NULL
@@ -1124,8 +1163,8 @@ app.post('/commit-account', upload.single('clientPicture'), async (req, res) => 
         role_id = roleResult.rows[0].id;
       }
       await pool.query(
-        `INSERT INTO ${assignmentTable} (project_id,${fkColumn},company_name,title,position,telephone,task,representative,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`,
-        [project_id,role_id,user.company_name||null,user.title||null,user.position||null,user.telephone||null,user.task||null,user.representative||null]
+        `INSERT INTO ${assignmentTable} (project_id,${fkColumn},company_name,title_position,telephone,task,representative,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fkColumn}) DO NOTHING`,
+        [project_id,role_id,user.company_name||null,user.title_position||user.title||null,user.telephone||null,user.task||null,user.representative||null]
       );
     }
 
@@ -1420,7 +1459,7 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         rows=r.rows;
       } else {
         const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
-        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
+        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.title_position';
         const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1`,[req.user.user_id]);
         rows=r.rows;
       }
@@ -1439,7 +1478,7 @@ function buildProfileRoutes({routePrefix,jwtRole,dbTable,emailCol,cloudFolder,as
         project=r.rows[0];
       } else {
         const baseFields = 'p.id,p.name,p.location,p.contract_reference,p.created_at';
-        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.position';
+        const extraFields = assignmentTable === 'team_member_assignments' ? ',a.position,a.assigned_part' : ',a.title_position';
         const r=await pool.query(`SELECT ${baseFields}${extraFields} FROM ${assignmentTable} a JOIN projects p ON a.project_id=p.id WHERE a.${assignmentFk}=$1 AND p.id=$2`,[req.user.user_id,projectId]);
         if (!r.rows.length) return res.status(404).json({error:'Project not found or not assigned'});
         project=r.rows[0];
@@ -1535,7 +1574,7 @@ app.post('/project-save', async (req, res) => {
       let id;
       if (!r.rows.length){const ins=await pool.query(`INSERT INTO ${partyTable} (email,verified,created_at) VALUES ($1,true,NOW()) RETURNING id`,[party.email]);id=ins.rows[0].id;}
       else id=r.rows[0].id;
-      await pool.query(`INSERT INTO ${assignTable} (project_id,${fk},company_name,representative,title,position,telephone,task,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`,[project_id,id,party.company_name||null,party.representative||null,party.title||null,party.position||null,party.telephone||null,party.task||null]);
+      await pool.query(`INSERT INTO ${assignTable} (project_id,${fk},company_name,representative,title_position,telephone,task,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT (project_id,${fk}) DO NOTHING`,[project_id,id,party.company_name||null,party.representative||null,party.title_position||party.title||null,party.telephone||null,party.task||null]);
     }
     await upsertAndAssign(contractor,'contractors','contractor_assignments','contractor_id');
     await upsertAndAssign(consultant,'consultants','consultant_assignments','consultant_id');
@@ -1603,10 +1642,10 @@ app.post('/assign-team', async (req, res) => {
         if (a.role==='Project Manager'){
           const pmTableMap={client:{pmTable:'client_project_managers',aTable:'client_pm_assignments',fk:'client_pm_id'},contractor:{pmTable:'contractor_project_managers',aTable:'contractor_pm_assignments',fk:'contractor_pm_id'},consultant:{pmTable:'consultant_project_managers',aTable:'consultant_pm_assignments',fk:'consultant_pm_id'}};
           const pm=pmTableMap[side];
-          await client.query(`INSERT INTO ${pm.aTable} (project_id,${pm.fk},company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM ${pm.pmTable} WHERE email=$2),$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,[projectId,a.email,a.company_name,a.title,a.position,a.telephone,a.task,a.representative]);
+          await client.query(`INSERT INTO ${pm.aTable} (project_id,${pm.fk},name,telephone,task) VALUES ($1,(SELECT id FROM ${pm.pmTable} WHERE email=$2),$3,$4,$5) ON CONFLICT DO NOTHING`,[projectId,a.email,a.name||null,a.telephone||null,a.task||null]);
         } else if (a.role==='Team Member'){
           const assignedPart=a.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
-          await client.query(`INSERT INTO team_member_assignments (project_id,team_member_id,company_name,title,position,telephone,task,representative,assigned_part,assigned_by) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`,[projectId,a.email,a.company_name,a.title,a.position,a.telephone,a.task,a.representative,assignedPart,a.assigned_by||userId]);
+          await client.query(`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,[projectId,a.email,a.name||null,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId,a.assigned_by_role||role]);
         }
       }
       const pmCheckMap={client:'SELECT 1 FROM client_pm_assignments WHERE project_id=$1 LIMIT 1',contractor:'SELECT 1 FROM contractor_pm_assignments WHERE project_id=$1 LIMIT 1',consultant:'SELECT 1 FROM consultant_pm_assignments WHERE project_id=$1 LIMIT 1'};
@@ -1631,22 +1670,22 @@ app.post('/assign', async (req, res) => {
       let insertQuery,params,roleLabel;
       if (assignment.role==='Client Project Manager'){
         await client.query(`INSERT INTO client_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO client_pm_assignments (project_id,client_pm_id,company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM client_project_managers WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING client_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative]; roleLabel='Client';
+        insertQuery=`INSERT INTO client_pm_assignments (project_id,client_pm_id,name,telephone,task) VALUES ($1,(SELECT id FROM client_project_managers WHERE email=$2),$3,$4,$5) RETURNING client_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||null,assignment.telephone||null,assignment.task||null]; roleLabel='Client';
       } else if (assignment.role==='Contractor Project Manager'){
         await client.query(`INSERT INTO contractor_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO contractor_pm_assignments (project_id,contractor_pm_id,company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM contractor_project_managers WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING contractor_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative]; roleLabel='Contractor';
+        insertQuery=`INSERT INTO contractor_pm_assignments (project_id,contractor_pm_id,name,telephone,task) VALUES ($1,(SELECT id FROM contractor_project_managers WHERE email=$2),$3,$4,$5) RETURNING contractor_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||null,assignment.telephone||null,assignment.task||null]; roleLabel='Contractor';
       } else if (assignment.role==='Consultant Project Manager'){
         await client.query(`INSERT INTO consultant_project_managers (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        insertQuery=`INSERT INTO consultant_pm_assignments (project_id,consultant_pm_id,company_name,title,position,telephone,task,representative) VALUES ($1,(SELECT id FROM consultant_project_managers WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING consultant_pm_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative]; roleLabel='Consultant';
+        insertQuery=`INSERT INTO consultant_pm_assignments (project_id,consultant_pm_id,name,telephone,task) VALUES ($1,(SELECT id FROM consultant_project_managers WHERE email=$2),$3,$4,$5) RETURNING consultant_pm_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||null,assignment.telephone||null,assignment.task||null]; roleLabel='Consultant';
       } else if (assignment.role==='Team Member'){
         await client.query(`INSERT INTO team_members (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
         const side=getSide(jwtRole);
         const assignedPart=assignment.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
-        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,company_name,title,position,telephone,task,representative,assigned_part,assigned_by) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8,$9,$10) RETURNING team_member_id AS assigned_id`;
-        params=[projectId,assignment.email,assignment.company_name,assignment.title,assignment.position,assignment.telephone,assignment.task,assignment.representative,assignedPart,assignment.assigned_by||userId]; roleLabel='TeamMember';
+        insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING team_member_id AS assigned_id`;
+        params=[projectId,assignment.email,assignment.name||null,assignment.position||null,assignment.telephone||null,assignedPart,assignment.assigned_by||userId,assignment.assigned_by_role||jwtRole]; roleLabel='TeamMember';
       } else {
         return res.status(400).json({success:false,error:'Unsupported role'});
       }
@@ -1754,7 +1793,7 @@ async function getNotifications(projectId, userRole, userId) {
       throw err;
     }
   }
-  
+
   for (const n of notifs) {
     try {
       await pool.query(
@@ -1821,9 +1860,7 @@ for (const prefix of ['/notifications', '/api/notifications']) {
              WHERE notification_id = $1 AND user_id = $2`,
             [req.params.id, req.user.user_id]
           );
-        } else {
-          throw err;
-        }
+        } else { throw err; }
       }
       if (result.rowCount === 0) {
         await pool.query(
@@ -1863,9 +1900,7 @@ for (const prefix of ['/notifications', '/api/notifications']) {
                WHERE notification_id = $1 AND user_id = $2`,
               [notifId, req.user.user_id]
             );
-          } else {
-            throw err;
-          }
+          } else { throw err; }
         }
         if (result.rowCount === 0) {
           await pool.query(
@@ -2068,7 +2103,7 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     const { rows: rec } = await pool.query(`SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
     if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) return res.json({ success: true, skipped: true });
-    const assignRow = await pool.query(`SELECT av.role_email AS email, av.position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
+    const assignRow = await pool.query(`SELECT av.role_email AS email, av.title_position AS position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
     await pool.query(
       `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action)
        VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action') ON CONFLICT (record_type, record_id, reviewer_id, reviewer_role) DO NOTHING`,
@@ -2096,7 +2131,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     if (!recRows.length) return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
     const rec = recRows[0];
     if (String(rec.uploaded_by) === String(reviewerId) && getSide(rec.role) === getSide(reviewerRole)) return res.status(403).json({ error: 'You cannot review your own record.' });
-    const assignRow = await pool.query(`SELECT av.role_email AS email, av.position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
+    const assignRow = await pool.query(`SELECT av.role_email AS email, av.title_position AS position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
     const reviewerEmail = assignRow.rows[0]?.email || null, reviewerPosition = assignRow.rows[0]?.position || null;
     const { rows: existing } = await pool.query(`SELECT id, action FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 AND reviewer_role=$4 LIMIT 1`, [table, recordId, reviewerId, reviewerRole]);
     if (action === 'no_action' && comment?.trim()) {
