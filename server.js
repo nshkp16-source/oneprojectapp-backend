@@ -453,6 +453,7 @@ function sideRoles(side) {
 
 const CHAT_SENDER_JOINS = `
   LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+  LEFT JOIN project_chat_delivered_receipts d ON d.message_id = m.id
   LEFT JOIN project_chat_messages rm ON m.reply_to_message_id = rm.id
   LEFT JOIN clients c
     ON m.sender_role = 'Client' AND m.sender_id = c.id
@@ -484,6 +485,7 @@ const CHAT_SENDER_JOINS = `
 
 const CHAT_SENDER_FIELDS = `
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
+  COALESCE(json_agg(DISTINCT d.user_id) FILTER (WHERE d.user_id IS NOT NULL), '[]') AS delivered_to,
 
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.representative,          c.company_name,         c.company_email)
@@ -593,31 +595,47 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
     const normalizedUserRole = normalizeRole(req.user.role);
     const userId             = req.user.user_id;
 
-    const [members, messageRows] = await Promise.all([
-      getProjectMembers(projectId),
-      pool.query(
-        `SELECT m.id, m.is_group, m.sender_role, m.sender_id,
-                m.recipient_role, m.recipient_id,
-                m.content, m.attachment_name, m.attachment_mime, m.created_at,
-                COALESCE(
-                  json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL),
-                  '[]'
-                ) AS read_by
-         FROM project_chat_messages m
-         LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
-         WHERE m.project_id = $1
-           AND (
-             m.is_group = true
-             OR (m.sender_role = $2 AND m.sender_id = $3)
-             OR (m.recipient_role = $2 AND m.recipient_id = $3)
-           )
-         GROUP BY m.id
-         ORDER BY m.created_at DESC`,
-        [projectId, normalizedUserRole, userId]
-      ),
-    ]);
+    // Load members first
+    const members = await getProjectMembers(projectId);
 
-    const messages      = messageRows.rows;
+    // Insert a per-recipient delivered receipt when user opens chat overview
+    // This records that this user's client has received the message (for delivered state)
+    await pool.query(
+      `INSERT INTO project_chat_delivered_receipts (message_id, user_id, user_role, delivered_at)
+       SELECT m.id, $2, $3, NOW()
+       FROM project_chat_messages m
+       WHERE m.project_id = $1
+         AND NOT (m.sender_role = $2 AND m.sender_id = $3)
+         AND (
+           m.is_group = true
+           OR (m.recipient_role = $2 AND m.recipient_id = $3)
+         )
+       ON CONFLICT (message_id, user_id) DO NOTHING`,
+      [projectId, normalizedUserRole, userId]
+    ).catch(() => {});
+
+    const messageRows = await pool.query(
+      `SELECT m.id, m.is_group, m.sender_role, m.sender_id,
+              m.recipient_role, m.recipient_id,
+              m.content, m.attachment_name, m.attachment_mime, m.created_at,
+              COALESCE(
+                json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL),
+                '[]'
+              ) AS read_by
+       FROM project_chat_messages m
+       LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+       WHERE m.project_id = $1
+         AND (
+           m.is_group = true
+           OR (m.sender_role = $2 AND m.sender_id = $3)
+           OR (m.recipient_role = $2 AND m.recipient_id = $3)
+         )
+       GROUP BY m.id
+       ORDER BY m.created_at DESC`,
+      [projectId, normalizedUserRole, userId]
+    );
+
+    const messages = messageRows.rows;
     const groupMessages = messages.filter(m => m.is_group === true);
     const lastGroupMsg  = groupMessages[0] || null;
 
@@ -1441,12 +1459,50 @@ app.post('/cleanup-tokens', async (req, res) => {
   } catch(err){console.error('Cleanup error:',err);res.status(500).json({success:false,error:'Failed to cleanup tokens.'});}
 });
 
-setInterval(async () => {
+// Resilient scheduled cleanup: avoid spamming logs when DB is down.
+let _dbAvailable = true;
+let _dbErrorLogged = false;
+async function _probeDb() {
   try {
-    const r=await pool.query('DELETE FROM email_tokens WHERE expires_at<NOW() AND verified=false');
-    if(r.rowCount>0) console.log(`Scheduled cleanup: ${r.rowCount} expired tokens deleted.`);
-  } catch(err){console.error('Scheduled cleanup error:',err);}
-}, 3*60*1000);
+    await pool.query('SELECT 1');
+    _dbAvailable = true;
+    _dbErrorLogged = false;
+    return true;
+  } catch (e) {
+    _dbAvailable = false;
+    return false;
+  }
+}
+
+setInterval(async () => {
+  // If DB previously unavailable, try a light probe first.
+  if (!_dbAvailable) {
+    const ok = await _probeDb();
+    if (!ok) {
+      if (!_dbErrorLogged) {
+        console.warn('Scheduled cleanup: database unavailable, will retry probes.');
+        _dbErrorLogged = true;
+      }
+      return;
+    }
+  }
+
+  try {
+    const r = await pool.query('DELETE FROM email_tokens WHERE expires_at<NOW() AND verified=false');
+    if (r.rowCount > 0) console.log(`Scheduled cleanup: ${r.rowCount} expired tokens deleted.`);
+  } catch (err) {
+    // Handle connection-refused specially to avoid noisy stack traces
+    if (err && err.code === 'ECONNREFUSED') {
+      _dbAvailable = false;
+      if (!_dbErrorLogged) {
+        console.warn('Scheduled cleanup error: DB connection refused — will suppress further errors until probe succeeds.');
+        _dbErrorLogged = true;
+      }
+      return;
+    }
+    console.error('Scheduled cleanup error:', err);
+  }
+}, 3 * 60 * 1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  PROFILE ROUTES
@@ -4237,10 +4293,23 @@ app.use((err, _req, res, _next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 
-setInterval(() => {
-  fetch('https://oneprojectapp-backend.onrender.com/')
-    .then(r => console.log('Keep-alive ping:', r.status))
-    .catch(err => console.error('Keep-alive error:', err));
-}, 14 * 60 * 1000);
+// Keep-alive ping (optional): use KEEP_ALIVE_URL env to enable.
+const KEEP_ALIVE_URL = process.env.KEEP_ALIVE_URL || null;
+if (KEEP_ALIVE_URL) {
+  let keepAliveFailCount = 0;
+  setInterval(async () => {
+    try {
+      const r = await fetch(KEEP_ALIVE_URL);
+      console.log('Keep-alive ping:', r.status);
+      keepAliveFailCount = 0;
+    } catch (err) {
+      keepAliveFailCount += 1;
+      // Log first few failures and then periodically to avoid noise
+      if (keepAliveFailCount <= 3 || keepAliveFailCount % 12 === 0) {
+        console.warn('Keep-alive error:', err.message || err);
+      }
+    }
+  }, 14 * 60 * 1000);
+}
 
 export default app;
