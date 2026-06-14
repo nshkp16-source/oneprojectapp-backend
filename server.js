@@ -11,6 +11,11 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { v2 as cloudinary } from 'cloudinary';
 import { Readable } from 'stream';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -1018,6 +1023,16 @@ app.delete('/chat/messages/:messageId', authenticateToken, async (req, res) => {
 //  ROOT
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.send('Backend is running successfully!'));
+
+app.get('/adit-information', (_req, res) => {
+  const file = path.join(__dirname, '..', 'frontend', 'adit-information.html');
+  res.sendFile(file, (err) => {
+    if (err) {
+      console.error('Serve adit-information error:', err);
+      res.status(err.status || 404).send('Not found');
+    }
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GENERIC PROFILE / ATTACHMENT ROUTES
