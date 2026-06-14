@@ -1763,33 +1763,37 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
 //  NOTIFICATIONS  (both /notifications/* and /api/notifications/*)
 // ─────────────────────────────────────────────────────────────────────────────
 async function getUnreadCount(projectId, userRole, userId) {
-  try {
+  // Check whether `notification_recipients.user_id` exists in the schema
+  const colCheck = await pool.query(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'notification_recipients' AND column_name = 'user_id' LIMIT 1`
+  );
+
+  if (colCheck.rows.length === 0) {
+    // Legacy schema without user_id column
     const result = await pool.query(
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
        LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-       WHERE n.project_id = $1 AND n.added_by_id != $3
-         AND (nr.is_read = false OR nr.id IS NULL)`,
-      [projectId, userRole, userId]
+       WHERE n.project_id = $1 AND n.added_by_id != $2
+         AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
+      [projectId, userId]
     );
     return parseInt(result.rows[0].count, 10);
-  } catch (err) {
-    if (err.message.includes('column') && err.message.includes('does not exist')) {
-      console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
-      const result = await pool.query(
-        `SELECT COUNT(DISTINCT n.id) AS count
-         FROM notifications n
-         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND n.added_by_id != $2
-           AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
-        [projectId, userId]
-      );
-      return parseInt(result.rows[0].count, 10);
-    }
-    throw err;
   }
+
+  // Newer schema: use recipient_role/recipient_role_id OR user_id
+  const result = await pool.query(
+    `SELECT COUNT(DISTINCT n.id) AS count
+     FROM notifications n
+     LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+       AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+            OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+     WHERE n.project_id = $1 AND n.added_by_id != $3
+       AND (nr.is_read = false OR nr.id IS NULL)`,
+    [projectId, userRole, userId]
+  );
+  return parseInt(result.rows[0].count, 10);
 }
 
 async function getNotifications(projectId, userRole, userId) {
