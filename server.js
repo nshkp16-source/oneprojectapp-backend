@@ -34,7 +34,7 @@ cloudinary.config({
 
 // ─── Multer ───────────────────────────────────────────────────────────────────
 const upload = multer({
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB — supports video attachments
   storage: multer.memoryStorage(),
   fileFilter: (_req, _file, cb) => cb(null, true),
 });
@@ -593,7 +593,7 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       pool.query(
         `SELECT m.id, m.is_group, m.sender_role, m.sender_id,
                 m.recipient_role, m.recipient_id,
-                m.content, m.attachment_name, m.created_at,
+                m.content, m.attachment_name, m.attachment_mime, m.created_at,
                 COALESCE(
                   json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL),
                   '[]'
@@ -639,7 +639,16 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       if (!existing.lastAt || new Date(msg.created_at) > new Date(existing.lastAt)) {
         existing.lastAt      = msg.created_at;
         existing.lastMessage = msg.content
-          || (msg.attachment_name ? `📎 ${msg.attachment_name}` : 'Attachment');
+          || (() => {
+            const mime = msg.attachment_mime || '';
+            const name = msg.attachment_name || '';
+            if (mime.startsWith('audio/') || /\.(mp3|wav|ogg|webm|m4a|aac)$/i.test(name))
+              return '🎤 Voice message';
+            if (mime.startsWith('video/') || /\.(mp4|mov|webm|avi|mkv)$/i.test(name))
+              return '🎥 Video';
+            if (name) return `📎 ${name}`;
+            return 'Attachment';
+          })();
         existing.time = new Date(msg.created_at).toLocaleTimeString([], {
           hour: '2-digit', minute: '2-digit',
         });
@@ -699,8 +708,18 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
     res.json({
       success: true,
       group: {
-        lastMessage:  lastGroupMsg?.content
-          || (lastGroupMsg?.attachment_name ? `📎 ${lastGroupMsg.attachment_name}` : 'Group chat for the project'),
+        lastMessage: lastGroupMsg?.content
+          || (() => {
+            if (!lastGroupMsg) return 'Group chat for the project';
+            const mime = lastGroupMsg.attachment_mime || '';
+            const name = lastGroupMsg.attachment_name || '';
+            if (mime.startsWith('audio/') || /\.(mp3|wav|ogg|webm|m4a|aac)$/i.test(name))
+              return '🎤 Voice message';
+            if (mime.startsWith('video/') || /\.(mp4|mov|webm|avi|mkv)$/i.test(name))
+              return '🎥 Video';
+            if (name) return `📎 ${name}`;
+            return 'Group chat for the project';
+          })(),
         time:         lastGroupMsg
           ? new Date(lastGroupMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           : '',
@@ -1018,8 +1037,29 @@ app.post('/api/profile-picture', authenticateToken, upload.single('picture'), as
 app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const result = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/attachments');
-    res.json({ success: true, url: result.secure_url, name: req.file.originalname, mime: req.file.mimetype });
+
+    // Determine resource type for Cloudinary
+    const mime = req.file.mimetype || '';
+    let resourceType = 'auto';
+    if (mime.startsWith('image/'))  resourceType = 'image';
+    if (mime.startsWith('video/'))  resourceType = 'video';
+    if (mime.startsWith('audio/'))  resourceType = 'video'; // Cloudinary stores audio under 'video'
+
+    const result = await uploadToCloudinary(
+      req.file.buffer,
+      'oneprojectapp/attachments',
+      resourceType
+    );
+
+    res.json({
+      success:  true,
+      url:      result.secure_url,
+      name:     req.file.originalname,
+      mime:     req.file.mimetype,
+      duration: result.duration || null,   // seconds — Cloudinary returns this for audio/video
+      width:    result.width    || null,
+      height:   result.height   || null,
+    });
   } catch (err) {
     console.error('Attachment upload error:', err);
     res.status(500).json({ error: 'Failed to upload attachment' });
