@@ -4385,6 +4385,51 @@ app.post('/api/project-replace-member', authenticateToken, async (req, res) => {
   }
 });
 
+// ── POST /api/project-update-member ──────────────────────────────────────────
+// Update name / position / telephone on a team_member_assignments row.
+// The team_member_id (user) is NOT changed — only the assignment metadata.
+app.post('/api/project-update-member', authenticateToken, async (req, res) => {
+  const { projectId, memberId, name, position, telephone } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid)      return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!memberId) return res.status(400).json({ success: false, error: 'memberId is required.' });
+  if (!position) return res.status(400).json({ success: false, error: 'position is required.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    // Fetch assignment to check side-based permission
+    const assignRes = await pool.query(
+      `SELECT assigned_part FROM team_member_assignments WHERE id = $1 AND project_id = $2`,
+      [memberId, pid]
+    );
+    if (!assignRes.rows.length)
+      return res.status(404).json({ success: false, error: 'Team member not found.' });
+
+    const memberSide = (assignRes.rows[0].assigned_part || '').toLowerCase();
+    const userSide   = getSide(req.user.role);
+
+    // Must be a leader/PM and same-side OR client-side
+    if (!userSide)
+      return res.status(403).json({ success: false, error: 'Team members cannot edit member info.' });
+    if (userSide !== memberSide && userSide !== 'client')
+      return res.status(403).json({ success: false, error: 'You can only edit members on your own side.' });
+
+    await pool.query(
+      `UPDATE team_member_assignments
+       SET name = $1, position = $2, telephone = $3
+       WHERE id = $4 AND project_id = $5`,
+      [name || null, position, telephone || null, memberId, pid]
+    );
+
+    return res.json({ success: true, message: 'Member updated.' });
+  } catch (err) {
+    console.error('[POST /api/project-update-member]', err);
+    return res.status(500).json({ success: false, error: 'Server error updating member.' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  GLOBAL ERROR HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
