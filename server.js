@@ -11,11 +11,6 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { v2 as cloudinary } from 'cloudinary';
 import { Readable } from 'stream';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -453,7 +448,6 @@ function sideRoles(side) {
 
 const CHAT_SENDER_JOINS = `
   LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
-  LEFT JOIN project_chat_delivered_receipts d ON d.message_id = m.id
   LEFT JOIN project_chat_messages rm ON m.reply_to_message_id = rm.id
   LEFT JOIN clients c
     ON m.sender_role = 'Client' AND m.sender_id = c.id
@@ -485,7 +479,6 @@ const CHAT_SENDER_JOINS = `
 
 const CHAT_SENDER_FIELDS = `
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
-  COALESCE(json_agg(DISTINCT d.user_id) FILTER (WHERE d.user_id IS NOT NULL), '[]') AS delivered_to,
 
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.representative,          c.company_name,         c.company_email)
@@ -595,47 +588,31 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
     const normalizedUserRole = normalizeRole(req.user.role);
     const userId             = req.user.user_id;
 
-    // Load members first
-    const members = await getProjectMembers(projectId);
+    const [members, messageRows] = await Promise.all([
+      getProjectMembers(projectId),
+      pool.query(
+        `SELECT m.id, m.is_group, m.sender_role, m.sender_id,
+                m.recipient_role, m.recipient_id,
+                m.content, m.attachment_name, m.created_at,
+                COALESCE(
+                  json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL),
+                  '[]'
+                ) AS read_by
+         FROM project_chat_messages m
+         LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+         WHERE m.project_id = $1
+           AND (
+             m.is_group = true
+             OR (m.sender_role = $2 AND m.sender_id = $3)
+             OR (m.recipient_role = $2 AND m.recipient_id = $3)
+           )
+         GROUP BY m.id
+         ORDER BY m.created_at DESC`,
+        [projectId, normalizedUserRole, userId]
+      ),
+    ]);
 
-    // Insert a per-recipient delivered receipt when user opens chat overview
-    // This records that this user's client has received the message (for delivered state)
-    await pool.query(
-      `INSERT INTO project_chat_delivered_receipts (message_id, user_id, user_role, delivered_at)
-       SELECT m.id, $2, $3, NOW()
-       FROM project_chat_messages m
-       WHERE m.project_id = $1
-         AND NOT (m.sender_role = $2 AND m.sender_id = $3)
-         AND (
-           m.is_group = true
-           OR (m.recipient_role = $2 AND m.recipient_id = $3)
-         )
-       ON CONFLICT (message_id, user_id) DO NOTHING`,
-      [projectId, normalizedUserRole, userId]
-    ).catch(() => {});
-
-    const messageRows = await pool.query(
-      `SELECT m.id, m.is_group, m.sender_role, m.sender_id,
-              m.recipient_role, m.recipient_id,
-              m.content, m.attachment_name, m.attachment_mime, m.created_at,
-              COALESCE(
-                json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL),
-                '[]'
-              ) AS read_by
-       FROM project_chat_messages m
-       LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
-       WHERE m.project_id = $1
-         AND (
-           m.is_group = true
-           OR (m.sender_role = $2 AND m.sender_id = $3)
-           OR (m.recipient_role = $2 AND m.recipient_id = $3)
-         )
-       GROUP BY m.id
-       ORDER BY m.created_at DESC`,
-      [projectId, normalizedUserRole, userId]
-    );
-
-    const messages = messageRows.rows;
+    const messages      = messageRows.rows;
     const groupMessages = messages.filter(m => m.is_group === true);
     const lastGroupMsg  = groupMessages[0] || null;
 
@@ -662,16 +639,7 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
       if (!existing.lastAt || new Date(msg.created_at) > new Date(existing.lastAt)) {
         existing.lastAt      = msg.created_at;
         existing.lastMessage = msg.content
-          || (() => {
-            const mime = msg.attachment_mime || '';
-            const name = msg.attachment_name || '';
-            if (mime.startsWith('audio/') || /\.(mp3|wav|ogg|webm|m4a|aac)$/i.test(name))
-              return '🎤 Voice message';
-            if (mime.startsWith('video/') || /\.(mp4|mov|webm|avi|mkv)$/i.test(name))
-              return '🎥 Video';
-            if (name) return `📎 ${name}`;
-            return 'Attachment';
-          })();
+          || (msg.attachment_name ? `📎 ${msg.attachment_name}` : 'Attachment');
         existing.time = new Date(msg.created_at).toLocaleTimeString([], {
           hour: '2-digit', minute: '2-digit',
         });
@@ -731,18 +699,8 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
     res.json({
       success: true,
       group: {
-        lastMessage: lastGroupMsg?.content
-          || (() => {
-            if (!lastGroupMsg) return 'Group chat for the project';
-            const mime = lastGroupMsg.attachment_mime || '';
-            const name = lastGroupMsg.attachment_name || '';
-            if (mime.startsWith('audio/') || /\.(mp3|wav|ogg|webm|m4a|aac)$/i.test(name))
-              return '🎤 Voice message';
-            if (mime.startsWith('video/') || /\.(mp4|mov|webm|avi|mkv)$/i.test(name))
-              return '🎥 Video';
-            if (name) return `📎 ${name}`;
-            return 'Group chat for the project';
-          })(),
+        lastMessage:  lastGroupMsg?.content
+          || (lastGroupMsg?.attachment_name ? `📎 ${lastGroupMsg.attachment_name}` : 'Group chat for the project'),
         time:         lastGroupMsg
           ? new Date(lastGroupMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           : '',
@@ -1042,16 +1000,6 @@ app.delete('/chat/messages/:messageId', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.send('Backend is running successfully!'));
 
-app.get('/adit-information', (_req, res) => {
-  const file = path.join(__dirname, '..', 'frontend', 'adit-information.html');
-  res.sendFile(file, (err) => {
-    if (err) {
-      console.error('Serve adit-information error:', err);
-      res.status(err.status || 404).send('Not found');
-    }
-  });
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  GENERIC PROFILE / ATTACHMENT ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1070,29 +1018,8 @@ app.post('/api/profile-picture', authenticateToken, upload.single('picture'), as
 app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
-    // Determine resource type for Cloudinary
-    const mime = req.file.mimetype || '';
-    let resourceType = 'auto';
-    if (mime.startsWith('image/'))  resourceType = 'image';
-    if (mime.startsWith('video/'))  resourceType = 'video';
-    if (mime.startsWith('audio/'))  resourceType = 'video'; // Cloudinary stores audio under 'video'
-
-    const result = await uploadToCloudinary(
-      req.file.buffer,
-      'oneprojectapp/attachments',
-      resourceType
-    );
-
-    res.json({
-      success:  true,
-      url:      result.secure_url,
-      name:     req.file.originalname,
-      mime:     req.file.mimetype,
-      duration: result.duration || null,   // seconds — Cloudinary returns this for audio/video
-      width:    result.width    || null,
-      height:   result.height   || null,
-    });
+    const result = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/attachments');
+    res.json({ success: true, url: result.secure_url, name: req.file.originalname, mime: req.file.mimetype });
   } catch (err) {
     console.error('Attachment upload error:', err);
     res.status(500).json({ error: 'Failed to upload attachment' });
@@ -1459,50 +1386,12 @@ app.post('/cleanup-tokens', async (req, res) => {
   } catch(err){console.error('Cleanup error:',err);res.status(500).json({success:false,error:'Failed to cleanup tokens.'});}
 });
 
-// Resilient scheduled cleanup: avoid spamming logs when DB is down.
-let _dbAvailable = true;
-let _dbErrorLogged = false;
-async function _probeDb() {
-  try {
-    await pool.query('SELECT 1');
-    _dbAvailable = true;
-    _dbErrorLogged = false;
-    return true;
-  } catch (e) {
-    _dbAvailable = false;
-    return false;
-  }
-}
-
 setInterval(async () => {
-  // If DB previously unavailable, try a light probe first.
-  if (!_dbAvailable) {
-    const ok = await _probeDb();
-    if (!ok) {
-      if (!_dbErrorLogged) {
-        console.warn('Scheduled cleanup: database unavailable, will retry probes.');
-        _dbErrorLogged = true;
-      }
-      return;
-    }
-  }
-
   try {
-    const r = await pool.query('DELETE FROM email_tokens WHERE expires_at<NOW() AND verified=false');
-    if (r.rowCount > 0) console.log(`Scheduled cleanup: ${r.rowCount} expired tokens deleted.`);
-  } catch (err) {
-    // Handle connection-refused specially to avoid noisy stack traces
-    if (err && err.code === 'ECONNREFUSED') {
-      _dbAvailable = false;
-      if (!_dbErrorLogged) {
-        console.warn('Scheduled cleanup error: DB connection refused — will suppress further errors until probe succeeds.');
-        _dbErrorLogged = true;
-      }
-      return;
-    }
-    console.error('Scheduled cleanup error:', err);
-  }
-}, 3 * 60 * 1000);
+    const r=await pool.query('DELETE FROM email_tokens WHERE expires_at<NOW() AND verified=false');
+    if(r.rowCount>0) console.log(`Scheduled cleanup: ${r.rowCount} expired tokens deleted.`);
+  } catch(err){console.error('Scheduled cleanup error:',err);}
+}, 3*60*1000);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  PROFILE ROUTES
@@ -1832,8 +1721,8 @@ async function getUnreadCount(projectId, userRole, userId) {
     );
     return parseInt(result.rows[0].count, 10);
   } catch (err) {
-    // If the column doesn't exist in older schemas, fallback to legacy query
-    if (err && (err.code === '42703' || (err.message && err.message.includes('does not exist')))) {
+    if (err.message.includes('column') && err.message.includes('does not exist')) {
+      console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
       const result = await pool.query(
         `SELECT COUNT(DISTINCT n.id) AS count
          FROM notifications n
@@ -3900,6 +3789,603 @@ app.post('/api/mark-work-center-viewed', authenticateToken, async (req, res) => 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  PROJECT INFO PAGE ROUTES
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── GET /api/project-info/:projectId ─────────────────────────────────────────
+// Loads all project data: project fields, client, contractor, consultant,
+// all PMs, and team members. Used by project-information.html on page load.
+app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.params.projectId);
+  if (!projectId) return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+
+  try {
+    // Verify the requesting user has access to this project
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, projectId);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied to this project.' });
+
+    // ── Project base fields ──────────────────────────────────────────────────
+    const projRes = await pool.query(
+      `SELECT id, name, location, contract_reference, created_at
+       FROM projects WHERE id = $1`,
+      [projectId]
+    );
+    if (!projRes.rows.length)
+      return res.status(404).json({ success: false, error: 'Project not found.' });
+    const project = projRes.rows[0];
+
+    // ── Client ───────────────────────────────────────────────────────────────
+    // clients table: company_name, company_email, representative, title, telephone
+    // No task column on clients — task comes from context, left null here
+    const clientRes = await pool.query(
+      `SELECT c.company_name, c.company_email AS email, c.telephone,
+              c.representative, c.title
+       FROM projects p
+       JOIN clients c ON p.client_id = c.id
+       WHERE p.id = $1`,
+      [projectId]
+    );
+    const client = clientRes.rows[0] || null;
+
+    // ── Contractor ───────────────────────────────────────────────────────────
+    // contractor_assignments: company_name, telephone, task, representative,
+    //                         title_position
+    const contractorRes = await pool.query(
+      `SELECT ca.company_name, c.email, ca.telephone,
+              ca.representative, ca.title_position, ca.task
+       FROM contractor_assignments ca
+       JOIN contractors c ON ca.contractor_id = c.id
+       WHERE ca.project_id = $1
+       LIMIT 1`,
+      [projectId]
+    );
+    const contractor = contractorRes.rows[0] || null;
+
+    // ── Consultant ───────────────────────────────────────────────────────────
+    const consultantRes = await pool.query(
+      `SELECT co.company_name, c.email, co.telephone,
+              co.representative, co.title_position, co.task
+       FROM consultant_assignments co
+       JOIN consultants c ON co.consultant_id = c.id
+       WHERE co.project_id = $1
+       LIMIT 1`,
+      [projectId]
+    );
+    const consultant = consultantRes.rows[0] || null;
+
+    // ── Client PM ────────────────────────────────────────────────────────────
+    // client_pm_assignments: name, telephone, task
+    // client_project_managers: email
+    const clientPMRes = await pool.query(
+      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task
+       FROM client_pm_assignments cpa
+       JOIN client_project_managers pm ON cpa.client_pm_id = pm.id
+       WHERE cpa.project_id = $1
+       LIMIT 1`,
+      [projectId]
+    );
+    const client_pm = clientPMRes.rows[0] || null;
+
+    // ── Contractor PM ─────────────────────────────────────────────────────────
+    const contractorPMRes = await pool.query(
+      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task
+       FROM contractor_pm_assignments cpa
+       JOIN contractor_project_managers pm ON cpa.contractor_pm_id = pm.id
+       WHERE cpa.project_id = $1
+       LIMIT 1`,
+      [projectId]
+    );
+    const contractor_pm = contractorPMRes.rows[0] || null;
+
+    // ── Consultant PM ─────────────────────────────────────────────────────────
+    const consultantPMRes = await pool.query(
+      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task
+       FROM consultant_pm_assignments cpa
+       JOIN consultant_project_managers pm ON cpa.consultant_pm_id = pm.id
+       WHERE cpa.project_id = $1
+       LIMIT 1`,
+      [projectId]
+    );
+    const consultant_pm = consultantPMRes.rows[0] || null;
+
+    // ── Team Members ─────────────────────────────────────────────────────────
+    // team_member_assignments: name, position, telephone, assigned_part
+    // team_members: email
+    const teamRes = await pool.query(
+      `SELECT tma.id, tma.name, tm.email, tma.position,
+              tma.telephone, tma.assigned_part
+       FROM team_member_assignments tma
+       JOIN team_members tm ON tma.team_member_id = tm.id
+       WHERE tma.project_id = $1
+       ORDER BY tma.assigned_part, tma.created_at`,
+      [projectId]
+    );
+    const team_members = teamRes.rows;
+
+    return res.json({
+      success: true,
+      project: {
+        ...project,
+        client,
+        contractor,
+        consultant,
+        client_pm,
+        contractor_pm,
+        consultant_pm,
+        team_members,
+      },
+    });
+  } catch (err) {
+    console.error('[GET /api/project-info/:projectId]', err);
+    return res.status(500).json({ success: false, error: 'Server error loading project data.' });
+  }
+});
+
+
+// ── POST /api/project-edit ────────────────────────────────────────────────────
+// Edit project base fields (name, location, contract_reference).
+// Only Client / ClientPM can call this (enforced in frontend + here).
+app.post('/api/project-edit', authenticateToken, async (req, res) => {
+  const { projectId, name, location, contract_reference } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid) return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!name || !location || !contract_reference)
+    return res.status(400).json({ success: false, error: 'name, location and contract_reference are required.' });
+
+  // Only client-side roles may edit project base fields
+  const userSide = getSide(req.user.role);
+  if (userSide !== 'client')
+    return res.status(403).json({ success: false, error: 'Only the client side can edit project information.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    // Ensure the new name doesn't clash with another project owned by the same client
+    const clientRes = await pool.query('SELECT client_id FROM projects WHERE id = $1', [pid]);
+    if (!clientRes.rows.length) return res.status(404).json({ success: false, error: 'Project not found.' });
+    const clientId = clientRes.rows[0].client_id;
+
+    const clash = await pool.query(
+      `SELECT id FROM projects
+       WHERE name = $1 AND client_id = $2 AND id != $3`,
+      [name, clientId, pid]
+    );
+    if (clash.rows.length)
+      return res.status(409).json({ success: false, error: 'Another project with this name already exists.' });
+
+    await pool.query(
+      `UPDATE projects SET name = $1, location = $2, contract_reference = $3
+       WHERE id = $4`,
+      [name, location, contract_reference, pid]
+    );
+
+    return res.json({ success: true, message: 'Project info updated.' });
+  } catch (err) {
+    console.error('[POST /api/project-edit]', err);
+    return res.status(500).json({ success: false, error: 'Server error updating project.' });
+  }
+});
+
+
+// ── POST /api/project-edit-party ─────────────────────────────────────────────
+// Edit client / contractor / consultant party fields.
+// Each side can only edit their own party row.
+// Columns differ: clients uses (company_email, title) not (email, title_position).
+app.post('/api/project-edit-party', authenticateToken, async (req, res) => {
+  const {
+    projectId, side,
+    company_name, email, telephone, representative,
+    title_position, task,
+    title,          // client-specific alias sent by frontend
+  } = req.body;
+
+  const pid = normalizeProjectId(projectId);
+  if (!pid)   return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!side)  return res.status(400).json({ success: false, error: 'side is required.' });
+  if (!['client', 'contractor', 'consultant'].includes(side))
+    return res.status(400).json({ success: false, error: 'side must be client, contractor or consultant.' });
+
+  // Enforce: you can only edit your own side
+  const userSide = getSide(req.user.role);
+  if (userSide !== side)
+    return res.status(403).json({ success: false, error: 'You can only edit your own party information.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    if (side === 'client') {
+      // clients row: update via projects.client_id join
+      // company_email is the unique key so we do NOT let them change it here
+      // title_position sent by frontend maps to clients.title for the client side
+      const effectiveTitle = title || title_position || null;
+      await pool.query(
+        `UPDATE clients SET
+           company_name   = $1,
+           representative = $2,
+           title          = $3,
+           telephone      = $4
+         WHERE id = (SELECT client_id FROM projects WHERE id = $5)`,
+        [company_name, representative, effectiveTitle, telephone, pid]
+      );
+    } else if (side === 'contractor') {
+      // contractor_assignments row
+      await pool.query(
+        `UPDATE contractor_assignments SET
+           company_name   = $1,
+           representative = $2,
+           title_position = $3,
+           telephone      = $4,
+           task           = $5
+         WHERE project_id = $6`,
+        [company_name, representative, title_position, telephone, task, pid]
+      );
+      // Also update email on the contractors row if it changed
+      if (email) {
+        await pool.query(
+          `UPDATE contractors SET email = $1
+           WHERE id = (
+             SELECT contractor_id FROM contractor_assignments WHERE project_id = $2
+           )`,
+          [email, pid]
+        );
+      }
+    } else {
+      // consultant_assignments row
+      await pool.query(
+        `UPDATE consultant_assignments SET
+           company_name   = $1,
+           representative = $2,
+           title_position = $3,
+           telephone      = $4,
+           task           = $5
+         WHERE project_id = $6`,
+        [company_name, representative, title_position, telephone, task, pid]
+      );
+      if (email) {
+        await pool.query(
+          `UPDATE consultants SET email = $1
+           WHERE id = (
+             SELECT consultant_id FROM consultant_assignments WHERE project_id = $2
+           )`,
+          [email, pid]
+        );
+      }
+    }
+
+    return res.json({ success: true, message: `${side} info updated.` });
+  } catch (err) {
+    console.error('[POST /api/project-edit-party]', err);
+    return res.status(500).json({ success: false, error: 'Server error updating party.' });
+  }
+});
+
+
+// ── POST /api/project-delete-party ───────────────────────────────────────────
+// Remove contractor or consultant (and their PM) from a project.
+// Only client-side roles can do this. Client itself cannot be deleted.
+app.post('/api/project-delete-party', authenticateToken, async (req, res) => {
+  const { projectId, side } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid)  return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!side) return res.status(400).json({ success: false, error: 'side is required.' });
+  if (!['contractor', 'consultant'].includes(side))
+    return res.status(400).json({ success: false, error: 'Only contractor or consultant can be deleted.' });
+
+  // Only client side may delete parties
+  if (getSide(req.user.role) !== 'client')
+    return res.status(403).json({ success: false, error: 'Only the client side can remove parties.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    const dbClient = await pool.connect();
+    try {
+      await dbClient.query('BEGIN');
+
+      if (side === 'contractor') {
+        // Delete PM assignment first (FK cascade may handle it, but be explicit)
+        await dbClient.query(
+          `DELETE FROM contractor_pm_assignments WHERE project_id = $1`, [pid]
+        );
+        await dbClient.query(
+          `DELETE FROM contractor_assignments WHERE project_id = $1`, [pid]
+        );
+      } else {
+        await dbClient.query(
+          `DELETE FROM consultant_pm_assignments WHERE project_id = $1`, [pid]
+        );
+        await dbClient.query(
+          `DELETE FROM consultant_assignments WHERE project_id = $1`, [pid]
+        );
+      }
+
+      await dbClient.query('COMMIT');
+    } catch (e) {
+      await dbClient.query('ROLLBACK');
+      throw e;
+    } finally {
+      dbClient.release();
+    }
+
+    return res.json({ success: true, message: `${side} removed from project.` });
+  } catch (err) {
+    console.error('[POST /api/project-delete-party]', err);
+    return res.status(500).json({ success: false, error: 'Server error deleting party.' });
+  }
+});
+
+
+// ── POST /api/project-replace-pm ─────────────────────────────────────────────
+// Replace (or create) the PM for a given side.
+// Inserts into the *_project_managers table if email is new,
+// then deletes the old *_pm_assignments row and inserts a fresh one.
+// Auth: same-side leaders/PMs, or client-side for any party.
+app.post('/api/project-replace-pm', authenticateToken, async (req, res) => {
+  const { projectId, side, name, email, telephone, task } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid)   return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!side)  return res.status(400).json({ success: false, error: 'side is required.' });
+  if (!name || !email || !task)
+    return res.status(400).json({ success: false, error: 'name, email and task are required.' });
+  if (!['client', 'contractor', 'consultant'].includes(side))
+    return res.status(400).json({ success: false, error: 'side must be client, contractor or consultant.' });
+
+  const userSide = getSide(req.user.role);
+  // Must be the same side OR client-side (client can manage all PMs)
+  if (userSide !== side && userSide !== 'client')
+    return res.status(403).json({ success: false, error: 'You cannot manage PMs for another side.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    // Map side → tables
+    const map = {
+      client:     { pmTable: 'client_project_managers',     assignTable: 'client_pm_assignments',     fk: 'client_pm_id' },
+      contractor: { pmTable: 'contractor_project_managers', assignTable: 'contractor_pm_assignments', fk: 'contractor_pm_id' },
+      consultant: { pmTable: 'consultant_project_managers', assignTable: 'consultant_pm_assignments', fk: 'consultant_pm_id' },
+    }[side];
+
+    const dbClient = await pool.connect();
+    try {
+      await dbClient.query('BEGIN');
+
+      // Upsert PM user row
+      await dbClient.query(
+        `INSERT INTO ${map.pmTable} (email, verified)
+         VALUES ($1, true)
+         ON CONFLICT (email) DO NOTHING`,
+        [email]
+      );
+      const pmRes = await dbClient.query(
+        `SELECT id FROM ${map.pmTable} WHERE email = $1`, [email]
+      );
+      const pmId = pmRes.rows[0].id;
+
+      // Remove old assignment for this project (there can only be one PM per side)
+      await dbClient.query(
+        `DELETE FROM ${map.assignTable} WHERE project_id = $1`, [pid]
+      );
+
+      // Insert new assignment
+      await dbClient.query(
+        `INSERT INTO ${map.assignTable} (project_id, ${map.fk}, name, telephone, task)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [pid, pmId, name, telephone || null, task]
+      );
+
+      await dbClient.query('COMMIT');
+    } catch (e) {
+      await dbClient.query('ROLLBACK');
+      throw e;
+    } finally {
+      dbClient.release();
+    }
+
+    return res.json({ success: true, message: `${side} PM replaced.` });
+  } catch (err) {
+    console.error('[POST /api/project-replace-pm]', err);
+    return res.status(500).json({ success: false, error: 'Server error replacing PM.' });
+  }
+});
+
+
+// ── POST /api/project-remove-pm ──────────────────────────────────────────────
+// Remove the PM assignment for a given side from this project.
+// The *_project_managers user row is kept (they may be on other projects).
+app.post('/api/project-remove-pm', authenticateToken, async (req, res) => {
+  const { projectId, side } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid)  return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!side) return res.status(400).json({ success: false, error: 'side is required.' });
+  if (!['client', 'contractor', 'consultant'].includes(side))
+    return res.status(400).json({ success: false, error: 'side must be client, contractor or consultant.' });
+
+  const userSide = getSide(req.user.role);
+  if (userSide !== side && userSide !== 'client')
+    return res.status(403).json({ success: false, error: 'You cannot manage PMs for another side.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    const assignTable = {
+      client:     'client_pm_assignments',
+      contractor: 'contractor_pm_assignments',
+      consultant: 'consultant_pm_assignments',
+    }[side];
+
+    const result = await pool.query(
+      `DELETE FROM ${assignTable} WHERE project_id = $1 RETURNING id`, [pid]
+    );
+
+    if (!result.rows.length)
+      return res.status(404).json({ success: false, error: `No ${side} PM found on this project.` });
+
+    return res.json({ success: true, message: `${side} PM removed.` });
+  } catch (err) {
+    console.error('[POST /api/project-remove-pm]', err);
+    return res.status(500).json({ success: false, error: 'Server error removing PM.' });
+  }
+});
+
+
+// ── POST /api/project-remove-member ──────────────────────────────────────────
+// Remove a team member assignment from a project.
+// Allowed if: the member themselves, same-side leader/PM, or client-side.
+app.post('/api/project-remove-member', authenticateToken, async (req, res) => {
+  const { projectId, memberId } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid)      return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!memberId) return res.status(400).json({ success: false, error: 'memberId is required.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    // Fetch the assignment to check side and ownership
+    const assignRes = await pool.query(
+      `SELECT tma.id, tma.assigned_part, tm.email
+       FROM team_member_assignments tma
+       JOIN team_members tm ON tma.team_member_id = tm.id
+       WHERE tma.id = $1 AND tma.project_id = $2`,
+      [memberId, pid]
+    );
+    if (!assignRes.rows.length)
+      return res.status(404).json({ success: false, error: 'Team member not found on this project.' });
+
+    const assignment   = assignRes.rows[0];
+    const memberSide   = (assignment.assigned_part || '').toLowerCase();
+    const userSide     = getSide(req.user.role);
+    const isSelf       = req.user.role === 'TeamMember' &&
+                         req.user.email?.toLowerCase() === assignment.email?.toLowerCase();
+    const isSameSide   = userSide === memberSide;
+    const isClientSide = userSide === 'client';
+
+    if (!isSelf && !isSameSide && !isClientSide)
+      return res.status(403).json({ success: false, error: 'You do not have permission to remove this member.' });
+
+    await pool.query(
+      `DELETE FROM team_member_assignments WHERE id = $1 AND project_id = $2`,
+      [memberId, pid]
+    );
+
+    return res.json({ success: true, message: 'Team member removed from project.' });
+  } catch (err) {
+    console.error('[POST /api/project-remove-member]', err);
+    return res.status(500).json({ success: false, error: 'Server error removing team member.' });
+  }
+});
+
+
+// ── POST /api/project-replace-member ─────────────────────────────────────────
+// Replace a team member with a new one.
+// Upserts the new person into team_members, removes old assignment,
+// inserts new assignment inheriting the same assigned_part and assigned_by.
+// Only same-side or client-side leaders/PMs can do this (not self).
+app.post('/api/project-replace-member', authenticateToken, async (req, res) => {
+  const { projectId, oldMemberId, name, email, position, telephone } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid)         return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!oldMemberId) return res.status(400).json({ success: false, error: 'oldMemberId is required.' });
+  if (!name || !email || !position)
+    return res.status(400).json({ success: false, error: 'name, email and position are required.' });
+
+  // Only leaders/PMs can replace members (not team members themselves)
+  const userSide = getSide(req.user.role);
+  if (!userSide)
+    return res.status(403).json({ success: false, error: 'Only leaders and PMs can replace team members.' });
+
+  try {
+    const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
+    if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    // Fetch old assignment to inherit side + assigner info
+    const oldRes = await pool.query(
+      `SELECT id, assigned_part, assigned_by, assigned_by_role
+       FROM team_member_assignments
+       WHERE id = $1 AND project_id = $2`,
+      [oldMemberId, pid]
+    );
+    if (!oldRes.rows.length)
+      return res.status(404).json({ success: false, error: 'Original team member not found.' });
+
+    const old            = oldRes.rows[0];
+    const memberSide     = (old.assigned_part || '').toLowerCase();
+    const isClientSide   = userSide === 'client';
+
+    if (userSide !== memberSide && !isClientSide)
+      return res.status(403).json({ success: false, error: 'You can only replace members on your own side.' });
+
+    const dbClient = await pool.connect();
+    try {
+      await dbClient.query('BEGIN');
+
+      // Upsert the new team member user row
+      await dbClient.query(
+        `INSERT INTO team_members (email, verified)
+         VALUES ($1, true)
+         ON CONFLICT (email) DO NOTHING`,
+        [email]
+      );
+      const newTMRes = await dbClient.query(
+        `SELECT id FROM team_members WHERE email = $1`, [email]
+      );
+      const newTMId = newTMRes.rows[0].id;
+
+      // Check the new member isn't already assigned to this project
+      const dupeCheck = await dbClient.query(
+        `SELECT id FROM team_member_assignments
+         WHERE project_id = $1 AND team_member_id = $2`,
+        [pid, newTMId]
+      );
+      if (dupeCheck.rows.length) {
+        await dbClient.query('ROLLBACK');
+        return res.status(409).json({
+          success: false,
+          error: 'The replacement member is already assigned to this project.',
+        });
+      }
+
+      // Remove old assignment
+      await dbClient.query(
+        `DELETE FROM team_member_assignments WHERE id = $1 AND project_id = $2`,
+        [oldMemberId, pid]
+      );
+
+      // Insert new assignment, inheriting side/assigner from the old one
+      await dbClient.query(
+        `INSERT INTO team_member_assignments
+           (project_id, team_member_id, name, position, telephone,
+            assigned_part, assigned_by, assigned_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          pid, newTMId, name, position, telephone || null,
+          old.assigned_part,
+          old.assigned_by     || req.user.user_id,
+          old.assigned_by_role || req.user.role,
+        ]
+      );
+
+      await dbClient.query('COMMIT');
+    } catch (e) {
+      await dbClient.query('ROLLBACK');
+      throw e;
+    } finally {
+      dbClient.release();
+    }
+
+    return res.json({ success: true, message: 'Team member replaced.' });
+  } catch (err) {
+    console.error('[POST /api/project-replace-member]', err);
+    return res.status(500).json({ success: false, error: 'Server error replacing team member.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  GLOBAL ERROR HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
 // -----------------------------------------------------------------------------
@@ -4293,23 +4779,10 @@ app.use((err, _req, res, _next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 
-// Keep-alive ping (optional): use KEEP_ALIVE_URL env to enable.
-const KEEP_ALIVE_URL = process.env.KEEP_ALIVE_URL || null;
-if (KEEP_ALIVE_URL) {
-  let keepAliveFailCount = 0;
-  setInterval(async () => {
-    try {
-      const r = await fetch(KEEP_ALIVE_URL);
-      console.log('Keep-alive ping:', r.status);
-      keepAliveFailCount = 0;
-    } catch (err) {
-      keepAliveFailCount += 1;
-      // Log first few failures and then periodically to avoid noise
-      if (keepAliveFailCount <= 3 || keepAliveFailCount % 12 === 0) {
-        console.warn('Keep-alive error:', err.message || err);
-      }
-    }
-  }, 14 * 60 * 1000);
-}
+setInterval(() => {
+  fetch('https://oneprojectapp-backend.onrender.com/')
+    .then(r => console.log('Keep-alive ping:', r.status))
+    .catch(err => console.error('Keep-alive error:', err));
+}, 14 * 60 * 1000);
 
 export default app;
