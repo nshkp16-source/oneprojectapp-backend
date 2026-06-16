@@ -1722,7 +1722,7 @@ async function getUnreadCount(projectId, userRole, userId) {
        LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
        WHERE n.project_id = $1
          AND n.added_by_id != $3
-         AND n.entity_type != 'arrets'
+         AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
          AND (
            (nr_current.id IS NOT NULL AND nr_current.is_read = false)
            OR nr_any.id IS NULL
@@ -1742,7 +1742,7 @@ async function getUnreadCount(projectId, userRole, userId) {
          LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
          WHERE n.project_id = $1
            AND n.added_by_id != $3
-           AND n.entity_type != 'arrets'
+           AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
            AND (
              (nr_current.id IS NOT NULL AND nr_current.is_read = false)
              OR nr_any.id IS NULL
@@ -1769,7 +1769,7 @@ async function getNotifications(projectId, userRole, userId) {
        LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
        WHERE n.project_id = $1
          AND n.added_by_id != $3
-         AND n.entity_type != 'arrets'
+         AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
          AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
        GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
        ORDER BY n.created_at DESC`,
@@ -1790,7 +1790,7 @@ async function getNotifications(projectId, userRole, userId) {
          LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
          WHERE n.project_id = $1
            AND n.added_by_id != $3
-           AND n.entity_type != 'arrets'
+           AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
            AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
          GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
          ORDER BY n.created_at DESC`,
