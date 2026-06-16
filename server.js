@@ -2340,6 +2340,43 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       } catch (cdErr) { console.error('[save-schedule] Cloudinary upload failed for milestone', realId, cdErr); }
     }
     await client.query('COMMIT');
+    
+    // Create notification for schedule creation/update
+    try {
+      const notifMsg = newIds.size > 0 
+        ? `New project schedule created by ${req.user.role}: ${tl.duration} days planned`
+        : `Project schedule updated by ${req.user.role}`;
+      const notifRes = await pool.query(
+        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [projectId, schedId, 'project_schedules', notifMsg, req.user.user_id, req.user.role]
+      );
+      const notificationId = notifRes.rows[0].id;
+      const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
+      // Insert notification recipients
+      for (const recipient of recipients) {
+        try {
+          await pool.query(
+            `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email, is_read)
+             VALUES ($1, $2, $3, $4, $5, false)
+             ON CONFLICT (notification_id, user_id) DO NOTHING`,
+            [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
+          );
+        } catch (recErr) {
+          if (recErr.message.includes('column') && recErr.message.includes('recipient_role')) {
+            await pool.query(
+              `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+               SELECT $1, $2, false
+               WHERE NOT EXISTS (SELECT 1 FROM notification_recipients WHERE notification_id = $1 AND user_id = $2)`,
+              [notificationId, recipient.user_id]
+            );
+          }
+        }
+      }
+    } catch (notifErr) {
+      console.warn('[save-schedule] Notification creation failed (non-critical):', notifErr.message);
+    }
+    
     const freshMs = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [schedId]);
     const savedLocation = schedRes.rows[0]?.location || location || null;
     const extRows2 = await pool.query(`SELECT id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [schedId]);
@@ -3183,7 +3220,9 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
        FROM arrets a
        LEFT JOIN arret_views av ON av.arret_id = a.id
        WHERE a.project_id = $1
-       GROUP BY a.id
+       GROUP BY a.id, a.project_id, a.title, a.description, a.attachment_url, a.attachment_name,
+                a.issued_date, a.created_by, a.creator_role, a.creator_email, a.status, 
+                a.is_resolved, a.created_at, a.updated_at
        ORDER BY a.issued_date DESC`,
       [projectId, userId]
     );
@@ -3285,8 +3324,8 @@ app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
     // Record view
     await pool.query(
       `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
-       SELECT $1, $2, $3, $4
-       ON CONFLICT (arret_id, viewer_id, viewer_role) DO NOTHING`,
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (arret_id, viewer_id) DO NOTHING`,
       [id, userId, req.user.role, req.user.email]
     );
 
