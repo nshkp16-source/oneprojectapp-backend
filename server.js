@@ -86,12 +86,8 @@ function authenticateToken(req, res, next) {
 }
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
-const connectionString = process.env.DATABASE_URL || process.env.COCKROACH_URL;
-if (!connectionString) {
-  throw new Error('Missing database connection string. Set DATABASE_URL or COCKROACH_URL.');
-}
 const pool = new Pool({
-  connectionString,
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
@@ -199,34 +195,38 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 }
 
 async function insertNotificationRecipients(dbClient, notificationId, recipients) {
-  if (!recipients || !recipients.length) {
-    console.warn(`[insertNotificationRecipients] No recipients to insert for notification ${notificationId}`);
-    return;
-  }
-  console.log(`[insertNotificationRecipients] Inserting ${recipients.length} recipients for notification ${notificationId}`);
+  if (!recipients || !recipients.length) return;
   for (const recipient of recipients) {
     try {
       await dbClient.query(
-        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email, is_read)
-         VALUES ($1, $2, $3, $4, $5, false)
-         ON CONFLICT ON CONSTRAINT uniq_notif_recipient_per_role DO NOTHING`,
+        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
+         SELECT $1, $2, $3, $4, $5
+         WHERE NOT EXISTS (
+           SELECT 1 FROM notification_recipients nr
+           WHERE nr.notification_id = $1
+             AND (
+               (nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+               OR (nr.recipient_role IS NULL AND nr.user_id = $2)
+             )
+         )`,
         [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
       );
     } catch (err) {
-      if (err.message.includes('constraint') || err.message.includes('column') || err.message.includes('relation')) {
-        console.warn('[insertNotificationRecipients] Fallback insert for legacy schema or missing constraint:', err.message);
-        try {
-          await dbClient.query(
-            `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-             VALUES ($1, $2, false)
-             ON CONFLICT DO NOTHING`,
-            [notificationId, recipient.user_id]
-          );
-        } catch (legacyErr) {
-          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr.message);
-        }
+      if (err.message.includes('column') && err.message.includes('does not exist')) {
+        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
+        await dbClient.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+           SELECT $1, $2, false
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1 AND nr.user_id = $2
+           )`,
+          [notificationId, recipient.user_id]
+        ).catch((legacyErr) => {
+          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
+        });
       } else {
-        console.error('[insertNotificationRecipients] Error inserting recipient:', err.message);
+        throw err;
       }
     }
   }
@@ -371,8 +371,6 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
   `, [projectId]);
 
-  console.log(`[getProjectMembers] projectId=${projectId}, found ${rows.length} members:`, rows.map(r => `${r.role}(${r.role_id})`).join(', '));
-
   return rows.map(r => ({
     ...r,
     role_id:      Number(r.role_id),
@@ -382,39 +380,22 @@ async function getProjectMembers(projectId) {
 
 async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, scope = 'global', scopeValue = null) {
   const members = await getProjectMembers(projectId);
-  console.log(`[getProjectRecipientKeys] projectId=${projectId}, excludeUserId=${excludeUserId}, excludeRole=${excludeRole}, total members=${members.length}`);
   const normalizedExcludeRole = normalizeRole(excludeRole);
   const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
 
-  // Filter out the user who created the notification
-  // They should not receive notifications for their own actions
-  const filtered = members
-    .filter(m => {
-      const isSameUser = Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole;
-      if (isSameUser) {
-        console.log(`[getProjectRecipientKeys] Excluding creator: ${m.role}(${m.role_id})`);
-        return false;
-      }
-      return true;
-    })
+  return members
+    .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
     .filter(m => {
       if (!targetSide) return true;
       const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
       return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
-    });
-  
-  console.log(`[getProjectRecipientKeys] Filtered to ${filtered.length} recipients:`, filtered.map(m => `${m.role}(${m.role_id})`).join(', '));
-  
-  if (filtered.length === 0) {
-    console.warn(`[getProjectRecipientKeys] WARNING: No recipients found for notification! Check project membership.`);
-  }
-  
-  return filtered.map(m => ({
-    recipient_role:    m.role,
-    recipient_role_id: Number(m.role_id),
-    recipient_email:   m.email || null,
-    user_id:           Number(m.role_id),
-  }));
+    })
+    .map(m => ({
+      recipient_role:    m.role,
+      recipient_role_id: Number(m.role_id),
+      recipient_email:   m.email || null,
+      user_id:           Number(m.role_id),
+    }));
 }
 
 async function userHasProjectAccess(userId, role, projectId) {
@@ -1731,30 +1712,24 @@ async function getUnreadCount(projectId, userRole, userId) {
     const result = await pool.query(
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
-       INNER JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
-         AND nr_current.recipient_role = $2
-         AND nr_current.recipient_role_id = $3
-       WHERE n.project_id = $1
-         AND n.added_by_id != $3
-         AND nr_current.is_read = false`,
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+       WHERE n.project_id = $1 AND n.added_by_id != $3
+         AND (nr.is_read = false OR nr.id IS NULL)`,
       [projectId, userRole, userId]
     );
-    const count = parseInt(result.rows[0].count, 10);
-    console.log(`[getUnreadCount] projectId=${projectId}, userId=${userId}, userRole=${userRole}, count=${count}`);
-    return count;
+    return parseInt(result.rows[0].count, 10);
   } catch (err) {
     if (err.message.includes('column') && err.message.includes('does not exist')) {
       console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
       const result = await pool.query(
         `SELECT COUNT(DISTINCT n.id) AS count
          FROM notifications n
-         LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
-           AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
-                OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
-         WHERE n.project_id = $1
-           AND n.added_by_id != $3
-           AND nr_current.is_read = false`,
-        [projectId, userRole, userId]
+         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         WHERE n.project_id = $1 AND n.added_by_id != $2
+           AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
+        [projectId, userId]
       );
       return parseInt(result.rows[0].count, 10);
     }
@@ -1768,36 +1743,28 @@ async function getNotifications(projectId, userRole, userId) {
     const { rows } = await pool.query(
       `SELECT n.id, n.entity_type, n.entity_id, n.message,
               n.added_by_role, n.created_at,
-              COALESCE(nr_current.is_read, false) AS is_read
+              COALESCE(nr.is_read, false) AS is_read
        FROM notifications n
-       INNER JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
-         AND nr_current.recipient_role = $2
-         AND nr_current.recipient_role_id = $3
-       WHERE n.project_id = $1
-         AND n.added_by_id != $3
-         AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
+       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
+       WHERE n.project_id = $1 AND n.added_by_id != $3
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
-    console.log(`[getNotifications] projectId=${projectId}, userId=${userId}, found ${rows.length} notifications`);
     notifs = rows;
   } catch (err) {
-    if (err.message.includes('relation') && err.message.includes('notification')) {
-      console.warn('[getNotifications] Notification tables not yet created:', err.message);
-      notifs = [];
-    } else if (err.message.includes('column') && err.message.includes('does not exist')) {
+    if (err.message.includes('column') && err.message.includes('does not exist')) {
       console.warn('[getNotifications] Schema upgrade pending. Using legacy query.');
       const { rows } = await pool.query(
         `SELECT n.id, n.entity_type, n.entity_id, n.message,
                 n.added_by_role, n.created_at,
-                COALESCE(nr_current.is_read, false) AS is_read
+                COALESCE(nr.is_read, false) AS is_read
          FROM notifications n
-         INNER JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
-         WHERE n.project_id = $1
-           AND n.added_by_id != $3
-         GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
+         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
+         WHERE n.project_id = $1 AND n.added_by_id != $2
          ORDER BY n.created_at DESC`,
-        [projectId, userRole, userId]
+        [projectId, userId]
       );
       notifs = rows;
     } else {
@@ -1805,6 +1772,33 @@ async function getNotifications(projectId, userRole, userId) {
     }
   }
 
+  for (const n of notifs) {
+    try {
+      await pool.query(
+        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
+         SELECT $1, $2, $3, $4, false
+         WHERE NOT EXISTS (
+           SELECT 1 FROM notification_recipients nr
+           WHERE nr.notification_id = $1
+             AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
+                  OR (nr.recipient_role IS NULL AND nr.user_id = $2))
+         )`,
+        [n.id, userId, userRole, userId]
+      ).catch(() => {});
+    } catch (err) {
+      if (err.message.includes('column') && err.message.includes('does not exist')) {
+        await pool.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+           SELECT $1, $2, false
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1 AND nr.user_id = $2
+           )`,
+          [n.id, userId]
+        ).catch(() => {});
+      }
+    }
+  }
   return notifs;
 }
 
@@ -1960,7 +1954,6 @@ async function handleAddRecord(req, res) {
         [projectId, recordId, table, notifMsg, userId, role]
       );
       const notificationId = notifRes.rows[0].id;
-      console.log(`[handleAddRecord] Created notification ${notificationId}: entity_type=${table}, added_by_id=${userId}, message="${notifMsg}"`);
       const recipients = await getProjectRecipientKeys(projectId, userId, role);
       await insertNotificationRecipients(dbClient, notificationId, recipients);
       await dbClient.query('COMMIT');
@@ -2347,43 +2340,6 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       } catch (cdErr) { console.error('[save-schedule] Cloudinary upload failed for milestone', realId, cdErr); }
     }
     await client.query('COMMIT');
-    
-    // Create notification for schedule creation/update
-    try {
-      const notifMsg = newIds.size > 0 
-        ? `New project schedule created by ${req.user.role}: ${tl.duration} days planned`
-        : `Project schedule updated by ${req.user.role}`;
-      const notifRes = await pool.query(
-        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [projectId, schedId, 'project_schedules', notifMsg, req.user.user_id, req.user.role]
-      );
-      const notificationId = notifRes.rows[0].id;
-      const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
-      // Insert notification recipients
-      for (const recipient of recipients) {
-        try {
-          await pool.query(
-            `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email, is_read)
-             VALUES ($1, $2, $3, $4, $5, false)
-             ON CONFLICT (notification_id, user_id) DO NOTHING`,
-            [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
-          );
-        } catch (recErr) {
-          if (recErr.message.includes('column') && recErr.message.includes('recipient_role')) {
-            await pool.query(
-              `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-               SELECT $1, $2, false
-               WHERE NOT EXISTS (SELECT 1 FROM notification_recipients WHERE notification_id = $1 AND user_id = $2)`,
-              [notificationId, recipient.user_id]
-            );
-          }
-        }
-      }
-    } catch (notifErr) {
-      console.warn('[save-schedule] Notification creation failed (non-critical):', notifErr.message);
-    }
-    
     const freshMs = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [schedId]);
     const savedLocation = schedRes.rows[0]?.location || location || null;
     const extRows2 = await pool.query(`SELECT id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [schedId]);
@@ -3198,263 +3154,6 @@ app.get('/api/planning-execution-tracking/download/:entryId',
   }
 });
 
-// =============================================================================
-//  ARRET ROUTES (Stop-Work Issue Reporting)
-// =============================================================================
-
-app.get('/api/arrets', authenticateToken, async (req, res) => {
-  try {
-    const { projectId } = req.query;
-    const { user_id: userId, role } = req.user;
-    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
-
-    // Verify user is assigned to project
-    const memberCheck = await pool.query(
-      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
-       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
-       LIMIT 1`,
-      [projectId, userId, role]
-    );
-    if (!memberCheck.rows.length) return res.status(403).json({ error: 'Not assigned to this project' });
-
-    const { rows } = await pool.query(
-      `SELECT 
-         a.id, a.project_id, a.title, a.description, a.attachment_url, a.attachment_name,
-         a.issued_date, a.created_by, a.creator_role, a.creator_email, a.status, 
-         a.is_resolved, a.created_at, a.updated_at,
-         COUNT(DISTINCT av.viewer_id) as view_count,
-         COALESCE(bool_or(av.viewer_id = $2 OR a.created_by = $2), false) as is_viewed
-       FROM arrets a
-       LEFT JOIN arret_views av ON av.arret_id = a.id
-       WHERE a.project_id = $1
-       GROUP BY a.id, a.project_id, a.title, a.description, a.attachment_url, a.attachment_name,
-                a.issued_date, a.created_by, a.creator_role, a.creator_email, a.status, 
-                a.is_resolved, a.created_at, a.updated_at
-       ORDER BY a.issued_date DESC`,
-      [projectId, userId]
-    );
-
-    res.json({ arrets: rows });
-  } catch (err) {
-    console.error('GET /api/arrets:', err);
-    res.status(500).json({ error: 'Failed to fetch arrets' });
-  }
-});
-
-app.post('/api/arrets/view', authenticateToken, async (req, res) => {
-  try {
-    const { arretId, projectId } = req.body;
-    const { user_id: userId, role, email } = req.user;
-
-    if (!projectId || !arretId) return res.status(400).json({ error: 'arretId and projectId are required' });
-
-    const memberCheck = await pool.query(
-      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
-       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
-       LIMIT 1`,
-      [projectId, userId, role]
-    );
-    if (!memberCheck.rows.length) return res.status(403).json({ error: 'Not assigned to this project' });
-
-    const arretCheck = await pool.query(
-      `SELECT 1 FROM arrets WHERE id = $1 AND project_id = $2`,
-      [arretId, projectId]
-    );
-    if (!arretCheck.rows.length) return res.status(404).json({ error: 'Arret not found' });
-
-    await pool.query(
-      `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT DO NOTHING`,
-      [arretId, userId, role, email]
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('POST /api/arrets/view:', err);
-    res.status(500).json({ error: 'Failed to record arret view' });
-  }
-});
-
-app.post('/api/arrets', authenticateToken, upload.single('attachment'), async (req, res) => {
-  try {
-    const { projectId, title, description } = req.body;
-    const { user_id: userId, role, email } = req.user;
-
-    if (!projectId || !title) return res.status(400).json({ error: 'projectId and title are required' });
-
-    // Verify user is assigned to project
-    const memberCheck = await pool.query(
-      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
-       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
-       LIMIT 1`,
-      [projectId, userId, role]
-    );
-    if (!memberCheck.rows.length) return res.status(403).json({ error: 'Not assigned to this project' });
-
-    let attachmentUrl = null, attachmentName = null, attachmentMime = null, attachmentPublicId = null;
-    if (req.file) {
-      try {
-        const r = await uploadToCloudinary(req.file.buffer, 'oneproject/arrets');
-        attachmentUrl = r.secure_url;
-        attachmentName = req.file.originalname;
-        attachmentMime = req.file.mimetype;
-        attachmentPublicId = r.public_id;
-      } catch (uploadErr) {
-        console.error('Arret attachment upload error:', uploadErr);
-        return res.status(500).json({ error: 'File upload failed' });
-      }
-    }
-
-    const dbClient = await pool.connect();
-    try {
-      await dbClient.query('BEGIN');
-
-      // Create arret
-      const { rows: arrets } = await dbClient.query(
-        `INSERT INTO arrets (project_id, title, description, attachment_url, attachment_name, 
-           attachment_mime, attachment_public_id, created_by, creator_role, creator_email, status, is_resolved)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-        [projectId, title, description || null, attachmentUrl, attachmentName, attachmentMime, 
-         attachmentPublicId, userId, role, email, 'open', false]
-      );
-      const arret = arrets[0];
-
-      const notifRes = await dbClient.query(
-        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [projectId, arret.id, 'arrets', `New arret created by ${role}: "${title}"`, userId, role]
-      );
-      const notificationId = notifRes.rows[0].id;
-      const recipients = await getProjectRecipientKeys(projectId, userId, role);
-      await insertNotificationRecipients(dbClient, notificationId, recipients);
-
-      await dbClient.query('COMMIT');
-      res.status(201).json({ success: true, arret, notificationId });
-    } catch (err) {
-      await dbClient.query('ROLLBACK');
-      console.error('Error creating arret:', err);
-      res.status(500).json({ error: 'Failed to create arret' });
-    } finally {
-      dbClient.release();
-    }
-  } catch (err) {
-    console.error('POST /api/arrets:', err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { projectId } = req.query;
-    const { user_id: userId } = req.user;
-
-    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
-
-    const { rows } = await pool.query(
-      `SELECT a.* FROM arrets a WHERE a.id = $1 AND a.project_id = $2`,
-      [id, projectId]
-    );
-
-    if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
-
-    // Record view
-    await pool.query(
-      `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (arret_id, viewer_id) DO NOTHING`,
-      [id, userId, req.user.role, req.user.email]
-    );
-
-    res.json({ arret: rows[0] });
-  } catch (err) {
-    console.error('GET /api/arrets/:id:', err);
-    res.status(500).json({ error: 'Failed to fetch arret' });
-  }
-});
-
-app.put('/api/arrets/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { projectId, status, is_resolved } = req.body;
-    const { user_id: userId, role } = req.user;
-
-    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
-
-    // Check arret exists and user has permission
-    const { rows: arrets } = await pool.query(
-      `SELECT * FROM arrets WHERE id = $1 AND project_id = $2`,
-      [id, projectId]
-    );
-
-    if (!arrets.length) return res.status(404).json({ error: 'Arret not found' });
-
-    // Update arret
-    const updateFields = [];
-    const params = [id, projectId];
-    let paramIndex = 3;
-
-    if (status !== undefined) {
-      updateFields.push(`status = $${paramIndex}`);
-      params.push(status);
-      paramIndex++;
-    }
-
-    if (is_resolved !== undefined) {
-      updateFields.push(`is_resolved = $${paramIndex}`);
-      params.push(is_resolved);
-      paramIndex++;
-    }
-
-    if (updateFields.length === 0) return res.json({ arret: arrets[0] });
-
-    updateFields.push('updated_at = NOW()');
-
-    const { rows: updated } = await pool.query(
-      `UPDATE arrets SET ${updateFields.join(', ')} 
-       WHERE id = $1 AND project_id = $2 
-       RETURNING *`,
-      params
-    );
-
-    // Create notification if resolved
-    if (is_resolved === true && !arrets[0].is_resolved) {
-      // no notification is created for arret resolution; arrets are tracked separately
-      // in the arret badge and detail flow.
-    }
-
-    res.json({ success: true, arret: updated[0] });
-  } catch (err) {
-    console.error('PUT /api/arrets/:id:', err);
-    res.status(500).json({ error: 'Failed to update arret' });
-  }
-});
-
-app.delete('/api/arrets/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { projectId } = req.body;
-    const { user_id: userId } = req.user;
-
-    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
-
-    // Only creator can delete
-    const { rows: arrets } = await pool.query(
-      `SELECT * FROM arrets WHERE id = $1 AND project_id = $2 AND created_by = $3`,
-      [id, projectId, userId]
-    );
-
-    if (!arrets.length) return res.status(403).json({ error: 'Cannot delete this arret' });
-
-    await pool.query(`DELETE FROM arrets WHERE id = $1`, [id]);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('DELETE /api/arrets/:id:', err);
-    res.status(500).json({ error: 'Failed to delete arret' });
-  }
-});
 
 // =============================================================================
 //  WORK CENTER ROUTES
