@@ -199,7 +199,11 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 }
 
 async function insertNotificationRecipients(dbClient, notificationId, recipients) {
-  if (!recipients || !recipients.length) return;
+  if (!recipients || !recipients.length) {
+    console.warn(`[insertNotificationRecipients] No recipients to insert for notification ${notificationId}`);
+    return;
+  }
+  console.log(`[insertNotificationRecipients] Inserting ${recipients.length} recipients for notification ${notificationId}`);
   for (const recipient of recipients) {
     try {
       await dbClient.query(
@@ -375,6 +379,8 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
   `, [projectId]);
 
+  console.log(`[getProjectMembers] projectId=${projectId}, found ${rows.length} members:`, rows.map(r => `${r.role}(${r.role_id})`).join(', '));
+
   return rows.map(r => ({
     ...r,
     role_id:      Number(r.role_id),
@@ -384,22 +390,26 @@ async function getProjectMembers(projectId) {
 
 async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, scope = 'global', scopeValue = null) {
   const members = await getProjectMembers(projectId);
+  console.log(`[getProjectRecipientKeys] projectId=${projectId}, excludeUserId=${excludeUserId}, excludeRole=${excludeRole}, total members=${members.length}`);
   const normalizedExcludeRole = normalizeRole(excludeRole);
   const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
 
-  return members
+  const filtered = members
     .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
     .filter(m => {
       if (!targetSide) return true;
       const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
       return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
-    })
-    .map(m => ({
-      recipient_role:    m.role,
-      recipient_role_id: Number(m.role_id),
-      recipient_email:   m.email || null,
-      user_id:           Number(m.role_id),
-    }));
+    });
+  
+  console.log(`[getProjectRecipientKeys] filtered recipients count=${filtered.length}`);
+  
+  return filtered.map(m => ({
+    recipient_role:    m.role,
+    recipient_role_id: Number(m.role_id),
+    recipient_email:   m.email || null,
+    user_id:           Number(m.role_id),
+  }));
 }
 
 async function userHasProjectAccess(userId, role, projectId) {
@@ -1729,7 +1739,9 @@ async function getUnreadCount(projectId, userRole, userId) {
          )`,
       [projectId, userRole, userId]
     );
-    return parseInt(result.rows[0].count, 10);
+    const count = parseInt(result.rows[0].count, 10);
+    console.log(`[getUnreadCount] projectId=${projectId}, userId=${userId}, userRole=${userRole}, count=${count}`);
+    return count;
   } catch (err) {
     if (err.message.includes('column') && err.message.includes('does not exist')) {
       console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
@@ -1775,6 +1787,7 @@ async function getNotifications(projectId, userRole, userId) {
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
+    console.log(`[getNotifications] projectId=${projectId}, userId=${userId}, found ${rows.length} notifications`);
     notifs = rows;
   } catch (err) {
     if (err.message.includes('column') && err.message.includes('does not exist')) {
@@ -1984,6 +1997,7 @@ async function handleAddRecord(req, res) {
         [projectId, recordId, table, notifMsg, userId, role]
       );
       const notificationId = notifRes.rows[0].id;
+      console.log(`[handleAddRecord] Created notification ${notificationId}: entity_type=${table}, added_by_id=${userId}, message="${notifMsg}"`);
       const recipients = await getProjectRecipientKeys(projectId, userId, role);
       await insertNotificationRecipients(dbClient, notificationId, recipients);
       await dbClient.query('COMMIT');
