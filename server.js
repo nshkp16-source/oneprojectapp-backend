@@ -388,15 +388,28 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
   const normalizedExcludeRole = normalizeRole(excludeRole);
   const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
 
+  // Filter out the user who created the notification
+  // They should not receive notifications for their own actions
   const filtered = members
-    .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
+    .filter(m => {
+      const isSameUser = Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole;
+      if (isSameUser) {
+        console.log(`[getProjectRecipientKeys] Excluding creator: ${m.role}(${m.role_id})`);
+        return false;
+      }
+      return true;
+    })
     .filter(m => {
       if (!targetSide) return true;
       const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
       return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
     });
   
-  console.log(`[getProjectRecipientKeys] filtered recipients count=${filtered.length}`);
+  console.log(`[getProjectRecipientKeys] Filtered to ${filtered.length} recipients:`, filtered.map(m => `${m.role}(${m.role_id})`).join(', '));
+  
+  if (filtered.length === 0) {
+    console.warn(`[getProjectRecipientKeys] WARNING: No recipients found for notification! Check project membership.`);
+  }
   
   return filtered.map(m => ({
     recipient_role:    m.role,
@@ -1767,38 +1780,33 @@ async function getNotifications(projectId, userRole, userId) {
     const { rows } = await pool.query(
       `SELECT n.id, n.entity_type, n.entity_id, n.message,
               n.added_by_role, n.created_at,
-              COALESCE(BOOL_OR(nr_current.is_read), false) AS is_read
+              COALESCE(nr_current.is_read, false) AS is_read
        FROM notifications n
-       LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
-         AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
-              OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
-       LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
+       INNER JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
+         AND nr_current.recipient_role = $2
+         AND nr_current.recipient_role_id = $3
        WHERE n.project_id = $1
          AND n.added_by_id != $3
          AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
-         AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
-       GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
     console.log(`[getNotifications] projectId=${projectId}, userId=${userId}, found ${rows.length} notifications`);
     notifs = rows;
   } catch (err) {
-    if (err.message.includes('column') && err.message.includes('does not exist')) {
+    if (err.message.includes('relation') && err.message.includes('notification')) {
+      console.warn('[getNotifications] Notification tables not yet created:', err.message);
+      notifs = [];
+    } else if (err.message.includes('column') && err.message.includes('does not exist')) {
       console.warn('[getNotifications] Schema upgrade pending. Using legacy query.');
       const { rows } = await pool.query(
         `SELECT n.id, n.entity_type, n.entity_id, n.message,
                 n.added_by_role, n.created_at,
-                COALESCE(BOOL_OR(nr_current.is_read), false) AS is_read
+                COALESCE(nr_current.is_read, false) AS is_read
          FROM notifications n
-         LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
-           AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
-                OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
-         LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
+         INNER JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
          WHERE n.project_id = $1
            AND n.added_by_id != $3
-           AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
-           AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
          GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
          ORDER BY n.created_at DESC`,
         [projectId, userRole, userId]
