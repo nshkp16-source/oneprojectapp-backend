@@ -384,11 +384,9 @@ async function getProjectMembers(projectId) {
 
 async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, scope = 'global', scopeValue = null) {
   const members = await getProjectMembers(projectId);
-  const normalizedExcludeRole = normalizeRole(excludeRole);
   const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
 
   return members
-    .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
     .filter(m => {
       if (!targetSide) return true;
       const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
@@ -1721,7 +1719,6 @@ async function getUnreadCount(projectId, userRole, userId) {
               OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
        LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
        WHERE n.project_id = $1
-         AND n.added_by_id != $3
          AND (
            (nr_current.id IS NOT NULL AND nr_current.is_read = false)
            OR nr_any.id IS NULL
@@ -1740,7 +1737,6 @@ async function getUnreadCount(projectId, userRole, userId) {
                 OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
          LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
          WHERE n.project_id = $1
-           AND n.added_by_id != $3
            AND (
              (nr_current.id IS NOT NULL AND nr_current.is_read = false)
              OR nr_any.id IS NULL
@@ -1766,7 +1762,6 @@ async function getNotifications(projectId, userRole, userId) {
               OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
        LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
        WHERE n.project_id = $1
-         AND n.added_by_id != $3
          AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
        GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
        ORDER BY n.created_at DESC`,
@@ -1786,7 +1781,6 @@ async function getNotifications(projectId, userRole, userId) {
                 OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
          LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
          WHERE n.project_id = $1
-           AND n.added_by_id != $3
            AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
          GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
          ORDER BY n.created_at DESC`,
@@ -3257,6 +3251,41 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('GET /api/arrets:', err);
     res.status(500).json({ error: 'Failed to fetch arrets' });
+  }
+});
+
+app.post('/api/arrets/view', authenticateToken, async (req, res) => {
+  try {
+    const { arretId, projectId } = req.body;
+    const { user_id: userId, role, email } = req.user;
+
+    if (!projectId || !arretId) return res.status(400).json({ error: 'arretId and projectId are required' });
+
+    const memberCheck = await pool.query(
+      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
+       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
+       LIMIT 1`,
+      [projectId, userId, role]
+    );
+    if (!memberCheck.rows.length) return res.status(403).json({ error: 'Not assigned to this project' });
+
+    const arretCheck = await pool.query(
+      `SELECT 1 FROM arrets WHERE id = $1 AND project_id = $2`,
+      [arretId, projectId]
+    );
+    if (!arretCheck.rows.length) return res.status(404).json({ error: 'Arret not found' });
+
+    await pool.query(
+      `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (arret_id, viewer_id) DO NOTHING`,
+      [arretId, userId, role, email]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/arrets/view:', err);
+    res.status(500).json({ error: 'Failed to record arret view' });
   }
 });
 
