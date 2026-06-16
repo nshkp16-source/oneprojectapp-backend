@@ -206,16 +206,15 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
   console.log(`[insertNotificationRecipients] Inserting ${recipients.length} recipients for notification ${notificationId}`);
   for (const recipient of recipients) {
     try {
-      // Use ON CONFLICT DO NOTHING to gracefully handle duplicates across both old and new schema
       await dbClient.query(
         `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email, is_read)
          VALUES ($1, $2, $3, $4, $5, false)
-         ON CONFLICT DO NOTHING`,
+         ON CONFLICT ON CONSTRAINT uniq_notif_recipient_per_role DO NOTHING`,
         [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
       );
     } catch (err) {
-      if (err.message.includes('column') && err.message.includes('does not exist')) {
-        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
+      if (err.message.includes('constraint') || err.message.includes('column') || err.message.includes('relation')) {
+        console.warn('[insertNotificationRecipients] Fallback insert for legacy schema or missing constraint:', err.message);
         try {
           await dbClient.query(
             `INSERT INTO notification_recipients (notification_id, user_id, is_read)
@@ -224,11 +223,10 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
             [notificationId, recipient.user_id]
           );
         } catch (legacyErr) {
-          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
+          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr.message);
         }
       } else {
         console.error('[insertNotificationRecipients] Error inserting recipient:', err.message);
-        // Don't throw - notifications are non-critical, continue with other recipients
       }
     }
   }
@@ -1733,17 +1731,12 @@ async function getUnreadCount(projectId, userRole, userId) {
     const result = await pool.query(
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
-       LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
-         AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
-              OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
-       LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
+       INNER JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
+         AND nr_current.recipient_role = $2
+         AND nr_current.recipient_role_id = $3
        WHERE n.project_id = $1
          AND n.added_by_id != $3
-         AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
-         AND (
-           (nr_current.id IS NOT NULL AND nr_current.is_read = false)
-           OR nr_any.id IS NULL
-         )`,
+         AND nr_current.is_read = false`,
       [projectId, userRole, userId]
     );
     const count = parseInt(result.rows[0].count, 10);
@@ -1758,21 +1751,15 @@ async function getUnreadCount(projectId, userRole, userId) {
          LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
            AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
                 OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
-         LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
          WHERE n.project_id = $1
            AND n.added_by_id != $3
-           AND (n.entity_type IS NULL OR n.entity_type != 'arrets')
-           AND (
-             (nr_current.id IS NOT NULL AND nr_current.is_read = false)
-             OR nr_any.id IS NULL
-           )`,
+           AND nr_current.is_read = false`,
         [projectId, userRole, userId]
       );
       return parseInt(result.rows[0].count, 10);
     }
     throw err;
-  }
-}
+  }\n}
 
 async function getNotifications(projectId, userRole, userId) {
   let notifs = [];
@@ -1817,33 +1804,6 @@ async function getNotifications(projectId, userRole, userId) {
     }
   }
 
-  for (const n of notifs) {
-    try {
-      await pool.query(
-        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
-         SELECT $1, $2, $3, $4, false
-         WHERE NOT EXISTS (
-           SELECT 1 FROM notification_recipients nr
-           WHERE nr.notification_id = $1
-             AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
-                  OR (nr.recipient_role IS NULL AND nr.user_id = $2))
-         )`,
-        [n.id, userId, userRole, userId]
-      ).catch(() => {});
-    } catch (err) {
-      if (err.message.includes('column') && err.message.includes('does not exist')) {
-        await pool.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-           SELECT $1, $2, false
-           WHERE NOT EXISTS (
-             SELECT 1 FROM notification_recipients nr
-             WHERE nr.notification_id = $1 AND nr.user_id = $2
-           )`,
-          [n.id, userId]
-        ).catch(() => {});
-      }
-    }
-  }
   return notifs;
 }
 
@@ -3304,7 +3264,7 @@ app.post('/api/arrets/view', authenticateToken, async (req, res) => {
     await pool.query(
       `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
        VALUES ($1, $2, $3, $4)
-       ON CONFLICT (arret_id, viewer_id) DO NOTHING`,
+       ON CONFLICT DO NOTHING`,
       [arretId, userId, role, email]
     );
 
@@ -3359,8 +3319,17 @@ app.post('/api/arrets', authenticateToken, upload.single('attachment'), async (r
       );
       const arret = arrets[0];
 
+      const notifRes = await dbClient.query(
+        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [projectId, arret.id, 'arrets', `New arret created by ${role}: "${title}"`, userId, role]
+      );
+      const notificationId = notifRes.rows[0].id;
+      const recipients = await getProjectRecipientKeys(projectId, userId, role);
+      await insertNotificationRecipients(dbClient, notificationId, recipients);
+
       await dbClient.query('COMMIT');
-      res.status(201).json({ success: true, arret });
+      res.status(201).json({ success: true, arret, notificationId });
     } catch (err) {
       await dbClient.query('ROLLBACK');
       console.error('Error creating arret:', err);
