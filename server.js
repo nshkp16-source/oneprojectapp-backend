@@ -86,8 +86,12 @@ function authenticateToken(req, res, next) {
 }
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
+const connectionString = process.env.DATABASE_URL || process.env.COCKROACH_URL;
+if (!connectionString) {
+  throw new Error('Missing database connection string. Set DATABASE_URL or COCKROACH_URL.');
+}
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString,
   ssl: { rejectUnauthorized: false },
 });
 
@@ -1755,7 +1759,7 @@ async function getNotifications(projectId, userRole, userId) {
     const { rows } = await pool.query(
       `SELECT n.id, n.entity_type, n.entity_id, n.message,
               n.added_by_role, n.created_at,
-              COALESCE(nr_current.is_read, false) AS is_read
+              COALESCE(BOOL_OR(nr_current.is_read), false) AS is_read
        FROM notifications n
        LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
          AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
@@ -1764,6 +1768,7 @@ async function getNotifications(projectId, userRole, userId) {
        WHERE n.project_id = $1
          AND n.added_by_id != $3
          AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
+       GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
@@ -1774,7 +1779,7 @@ async function getNotifications(projectId, userRole, userId) {
       const { rows } = await pool.query(
         `SELECT n.id, n.entity_type, n.entity_id, n.message,
                 n.added_by_role, n.created_at,
-                COALESCE(nr_current.is_read, false) AS is_read
+                COALESCE(BOOL_OR(nr_current.is_read), false) AS is_read
          FROM notifications n
          LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
            AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
@@ -1783,6 +1788,7 @@ async function getNotifications(projectId, userRole, userId) {
          WHERE n.project_id = $1
            AND n.added_by_id != $3
            AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
+         GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
          ORDER BY n.created_at DESC`,
         [projectId, userRole, userId]
       );
