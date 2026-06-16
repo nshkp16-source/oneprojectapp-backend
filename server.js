@@ -384,9 +384,11 @@ async function getProjectMembers(projectId) {
 
 async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, scope = 'global', scopeValue = null) {
   const members = await getProjectMembers(projectId);
+  const normalizedExcludeRole = normalizeRole(excludeRole);
   const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
 
   return members
+    .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
     .filter(m => {
       if (!targetSide) return true;
       const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
@@ -1719,6 +1721,8 @@ async function getUnreadCount(projectId, userRole, userId) {
               OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
        LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
        WHERE n.project_id = $1
+         AND n.added_by_id != $3
+         AND n.entity_type != 'arrets'
          AND (
            (nr_current.id IS NOT NULL AND nr_current.is_read = false)
            OR nr_any.id IS NULL
@@ -1737,6 +1741,8 @@ async function getUnreadCount(projectId, userRole, userId) {
                 OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
          LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
          WHERE n.project_id = $1
+           AND n.added_by_id != $3
+           AND n.entity_type != 'arrets'
            AND (
              (nr_current.id IS NOT NULL AND nr_current.is_read = false)
              OR nr_any.id IS NULL
@@ -1762,6 +1768,8 @@ async function getNotifications(projectId, userRole, userId) {
               OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
        LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
        WHERE n.project_id = $1
+         AND n.added_by_id != $3
+         AND n.entity_type != 'arrets'
          AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
        GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
        ORDER BY n.created_at DESC`,
@@ -1781,6 +1789,8 @@ async function getNotifications(projectId, userRole, userId) {
                 OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
          LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
          WHERE n.project_id = $1
+           AND n.added_by_id != $3
+           AND n.entity_type != 'arrets'
            AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
          GROUP BY n.id, n.entity_type, n.entity_id, n.message, n.added_by_role, n.created_at
          ORDER BY n.created_at DESC`,
@@ -3236,7 +3246,7 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
          a.issued_date, a.created_by, a.creator_role, a.creator_email, a.status, 
          a.is_resolved, a.created_at, a.updated_at,
          COUNT(DISTINCT av.viewer_id) as view_count,
-         bool_or(av.viewer_id = $2) as is_viewed
+         COALESCE(bool_or(av.viewer_id = $2 OR a.created_by = $2), false) as is_viewed
        FROM arrets a
        LEFT JOIN arret_views av ON av.arret_id = a.id
        WHERE a.project_id = $1
@@ -3333,19 +3343,6 @@ app.post('/api/arrets', authenticateToken, upload.single('attachment'), async (r
       );
       const arret = arrets[0];
 
-      // Create notification
-      const notifMsg = `⛔ ARRET issued by ${role}: "${title}"`;
-      const notifRes = await dbClient.query(
-        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [projectId, arret.id, 'arrets', notifMsg, userId, role]
-      );
-      const notificationId = notifRes.rows[0].id;
-
-      // Get all project members as recipients
-      const recipients = await getProjectRecipientKeys(projectId, userId, role);
-      await insertNotificationRecipients(dbClient, notificationId, recipients);
-
       await dbClient.query('COMMIT');
       res.status(201).json({ success: true, arret });
     } catch (err) {
@@ -3437,12 +3434,8 @@ app.put('/api/arrets/:id', authenticateToken, async (req, res) => {
 
     // Create notification if resolved
     if (is_resolved === true && !arrets[0].is_resolved) {
-      const notifMsg = `✅ ARRET resolved: "${arrets[0].title}"`;
-      await pool.query(
-        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [projectId, id, 'arrets', notifMsg, userId, role]
-      );
+      // no notification is created for arret resolution; arrets are tracked separately
+      // in the arret badge and detail flow.
     }
 
     res.json({ success: true, arret: updated[0] });
