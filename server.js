@@ -1712,11 +1712,16 @@ async function getUnreadCount(projectId, userRole, userId) {
     const result = await pool.query(
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
-       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-       WHERE n.project_id = $1 AND n.added_by_id != $3
-         AND (nr.is_read = false OR nr.id IS NULL)`,
+       LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
+         AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
+              OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
+       LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
+       WHERE n.project_id = $1
+         AND n.added_by_id != $3
+         AND (
+           (nr_current.id IS NOT NULL AND nr_current.is_read = false)
+           OR nr_any.id IS NULL
+         )`,
       [projectId, userRole, userId]
     );
     return parseInt(result.rows[0].count, 10);
@@ -1726,10 +1731,17 @@ async function getUnreadCount(projectId, userRole, userId) {
       const result = await pool.query(
         `SELECT COUNT(DISTINCT n.id) AS count
          FROM notifications n
-         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND n.added_by_id != $2
-           AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
-        [projectId, userId]
+         LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
+           AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
+                OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
+         LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
+         WHERE n.project_id = $1
+           AND n.added_by_id != $3
+           AND (
+             (nr_current.id IS NOT NULL AND nr_current.is_read = false)
+             OR nr_any.id IS NULL
+           )`,
+        [projectId, userRole, userId]
       );
       return parseInt(result.rows[0].count, 10);
     }
@@ -1743,12 +1755,15 @@ async function getNotifications(projectId, userRole, userId) {
     const { rows } = await pool.query(
       `SELECT n.id, n.entity_type, n.entity_id, n.message,
               n.added_by_role, n.created_at,
-              COALESCE(nr.is_read, false) AS is_read
+              COALESCE(nr_current.is_read, false) AS is_read
        FROM notifications n
-       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-       WHERE n.project_id = $1 AND n.added_by_id != $3
+       LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
+         AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
+              OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
+       LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
+       WHERE n.project_id = $1
+         AND n.added_by_id != $3
+         AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
@@ -1759,12 +1774,17 @@ async function getNotifications(projectId, userRole, userId) {
       const { rows } = await pool.query(
         `SELECT n.id, n.entity_type, n.entity_id, n.message,
                 n.added_by_role, n.created_at,
-                COALESCE(nr.is_read, false) AS is_read
+                COALESCE(nr_current.is_read, false) AS is_read
          FROM notifications n
-         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND n.added_by_id != $2
+         LEFT JOIN notification_recipients nr_current ON nr_current.notification_id = n.id
+           AND ((nr_current.recipient_role = $2 AND nr_current.recipient_role_id = $3)
+                OR (nr_current.recipient_role IS NULL AND nr_current.user_id = $3))
+         LEFT JOIN notification_recipients nr_any ON nr_any.notification_id = n.id
+         WHERE n.project_id = $1
+           AND n.added_by_id != $3
+           AND (nr_current.id IS NOT NULL OR nr_any.id IS NULL)
          ORDER BY n.created_at DESC`,
-        [projectId, userId]
+        [projectId, userRole, userId]
       );
       notifs = rows;
     } else {
