@@ -1759,7 +1759,8 @@ async function getUnreadCount(projectId, userRole, userId) {
       return parseInt(result.rows[0].count, 10);
     }
     throw err;
-  }\n}
+  }
+}
 
 async function getNotifications(projectId, userRole, userId) {
   let notifs = [];
