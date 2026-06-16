@@ -1609,11 +1609,11 @@ app.post('/assign-team', async (req, res) => {
     const {sub:userId,role}=decoded;
     const {projectId,assignments}=req.body;
     if (!projectId||!Array.isArray(assignments)) return res.status(400).json({success:false,error:'Invalid payload'});
+    if (!await userHasProjectAccess(userId, role, projectId)) {
+      return res.status(403).json({success:false,error:'Project not linked to this user'});
+    }
     const side=getSide(role);
-    if (!side) return res.status(400).json({success:false,error:'Unsupported role'});
-    const projectCheckMap={client:'SELECT 1 FROM projects WHERE id=$1 AND client_id=$2',contractor:'SELECT 1 FROM contractor_assignments WHERE project_id=$1 AND contractor_id=$2',consultant:'SELECT 1 FROM consultant_assignments WHERE project_id=$1 AND consultant_id=$2'};
-    const check=await pool.query(projectCheckMap[side],[projectId,userId]);
-    if (!check.rows.length) return res.status(403).json({success:false,error:'Project not linked to this user'});
+    if (!side) return res.status(403).json({success:false,error:'Unsupported role'});
     const client=await pool.connect();
     try {
       for (const a of assignments) {
@@ -1643,6 +1643,11 @@ app.post('/assign', async (req, res) => {
     const {sub:userId,role:jwtRole}=decoded;
     const {projectId,assignment}=req.body;
     if (!projectId||!assignment?.role||!assignment?.email) return res.status(400).json({success:false,error:'Invalid payload'});
+    if (!await userHasProjectAccess(userId, jwtRole, projectId)) {
+      return res.status(403).json({success:false,error:'Project not linked to this user'});
+    }
+    const side=getSide(jwtRole);
+    if (!side) return res.status(403).json({success:false,error:'Unsupported role'});
     const client=await pool.connect();
     try {
       let insertQuery,params,roleLabel;
@@ -1660,7 +1665,6 @@ app.post('/assign', async (req, res) => {
         params=[projectId,assignment.email,assignment.name||null,assignment.telephone||null,assignment.task||null]; roleLabel='Consultant';
       } else if (assignment.role==='Team Member'){
         await client.query(`INSERT INTO team_members (email,verified) VALUES ($1,true) ON CONFLICT (email) DO NOTHING`,[assignment.email]);
-        const side=getSide(jwtRole);
         const assignedPart=assignment.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
         insertQuery=`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8) RETURNING team_member_id AS assigned_id`;
         params=[projectId,assignment.email,assignment.name||null,assignment.position||null,assignment.telephone||null,assignedPart,assignment.assigned_by||userId,assignment.assigned_by_role||jwtRole]; roleLabel='TeamMember';
@@ -1971,6 +1975,178 @@ async function handleAddRecord(req, res) {
 
 app.post('/api/add-record', authenticateToken, upload.single('attachment'), handleAddRecord);
 app.post('/records',        authenticateToken, upload.single('attachment'), handleAddRecord);
+
+app.get('/api/arrets', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.query.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not assigned to this project.' });
+
+    const { rows: arrets } = await pool.query(
+      `SELECT a.*, 
+              EXISTS(
+                SELECT 1 FROM arret_views v
+                WHERE v.arret_id = a.id AND v.viewer_id = $2
+              ) AS is_viewed
+       FROM arrets a
+       WHERE a.project_id = $1
+       ORDER BY a.issued_date DESC, a.id DESC`,
+      [projectId, req.user.user_id]
+    );
+
+    const arretIds = arrets.map(r => r.id).filter(Boolean);
+    const attachmentsByArret = {};
+    if (arretIds.length) {
+      try {
+        const { rows: attachments } = await pool.query(
+          `SELECT arret_id, file_name, file_mime, file_url, public_id
+           FROM arret_attachments
+           WHERE arret_id = ANY($1::int[])`,
+          [arretIds]
+        );
+        for (const attachment of attachments) {
+          attachmentsByArret[attachment.arret_id] = attachmentsByArret[attachment.arret_id] || [];
+          attachmentsByArret[attachment.arret_id].push(attachment);
+        }
+      } catch (err) {
+        if (!err.message.includes('relation "arret_attachments" does not exist')) throw err;
+      }
+    }
+
+    const result = arrets.map(arret => ({
+      ...arret,
+      is_viewed: Boolean(arret.is_viewed),
+      attachments: attachmentsByArret[arret.id] || (arret.attachment_url ? [{
+        file_name: arret.attachment_name,
+        file_mime: arret.attachment_mime,
+        file_url: arret.attachment_url,
+        public_id: arret.attachment_public_id,
+      }] : []),
+    }));
+
+    return res.json({ arrets: result });
+  } catch (err) {
+    console.error('GET /api/arrets:', err);
+    return res.status(500).json({ error: 'Failed to load arrets' });
+  }
+});
+
+app.post('/api/arrets', authenticateToken, upload.array('attachments'), async (req, res) => {
+  const projectId = normalizeProjectId(req.body.projectId);
+  const title = (req.body.title || '').trim();
+  const description = (req.body.description || '').trim();
+  if (!projectId || !title || !description)
+    return res.status(400).json({ success: false, message: 'projectId, title, and description are required.' });
+
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const arretRes = await client.query(
+        `INSERT INTO arrets (project_id, title, description, issued_date, created_by, creator_role, creator_email, status, is_resolved, created_at, updated_at)
+         VALUES ($1,$2,$3,NOW(),$4,$5,$6,'open',false,NOW(),NOW()) RETURNING *`,
+        [projectId, title, description, req.user.user_id, req.user.role, req.user.email || null]
+      );
+      const arret = arretRes.rows[0];
+      const attachments = [];
+
+      for (const file of req.files || []) {
+        const uploaded = await scheduleCloudinaryUpload(
+          file.buffer, file.originalname, 'oneproject/arrets'
+        );
+        const attachment = {
+          arret_id: arret.id,
+          file_name: file.originalname,
+          file_mime: file.mimetype,
+          file_url: uploaded.secure_url || uploaded.url || null,
+          public_id: uploaded.public_id || null,
+        };
+
+        try {
+          await client.query(
+            `INSERT INTO arret_attachments (arret_id, file_name, file_mime, file_url, public_id)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [attachment.arret_id, attachment.file_name, attachment.file_mime, attachment.file_url, attachment.public_id]
+          );
+        } catch (err) {
+          if (err.message.includes('relation "arret_attachments" does not exist')) {
+            await client.query(
+              `UPDATE arrets SET attachment_url=$1, attachment_name=$2, attachment_mime=$3, attachment_public_id=$4 WHERE id=$5`,
+              [attachment.file_url, attachment.file_name, attachment.file_mime, attachment.public_id, arret.id]
+            );
+          } else {
+            throw err;
+          }
+        }
+        attachments.push(attachment);
+      }
+
+      const notifRes = await client.query(
+        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [projectId, arret.id, 'arrets', `New arret issued by ${req.user.role}: "${title}"`, req.user.user_id, req.user.role]
+      );
+      const notificationId = notifRes.rows[0].id;
+      const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
+      await insertNotificationRecipients(client, notificationId, recipients);
+      await client.query('COMMIT');
+
+      return res.status(201).json({ success: true, arret: { ...arret, attachments }, message: 'Arret saved.' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('POST /api/arrets transaction error:', err);
+      return res.status(500).json({ success: false, message: 'Failed to save arret.' });
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('POST /api/arrets:', err);
+    return res.status(500).json({ success: false, message: 'Server error.' });
+  }
+});
+
+app.post('/api/arrets/view', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.body.projectId);
+  const arretId = parseInt(req.body.arretId, 10);
+  if (!projectId || !arretId) return res.status(400).json({ error: 'projectId and arretId are required' });
+
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not assigned to this project.' });
+
+    const { rows } = await pool.query(`SELECT 1 FROM arrets WHERE id=$1 AND project_id=$2`, [arretId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
+
+    await pool.query('DELETE FROM arret_views WHERE arret_id=$1 AND viewer_id=$2', [arretId, req.user.user_id]);
+    try {
+      await pool.query(
+        `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email, viewed_at)
+         VALUES ($1,$2,$3,$4,NOW())`,
+        [arretId, req.user.user_id, req.user.role, req.user.email || null]
+      );
+    } catch (err) {
+      if (err.message.includes('column "viewer_email" does not exist')) {
+        await pool.query(
+          `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewed_at)
+           VALUES ($1,$2,$3,NOW())`,
+          [arretId, req.user.user_id, req.user.role]
+        );
+      } else {
+        throw err;
+      }
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/arrets/view:', err);
+    return res.status(500).json({ error: 'Failed to mark arret as viewed' });
+  }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  FETCH TAB RECORDS
@@ -3248,7 +3424,7 @@ app.get('/api/work-center/team-members', authenticateToken, async (req, res) => 
     if (!side) return res.status(403).json({ error: 'Your role cannot manage tasks.' });
 
     const result = await pool.query(`
-      SELECT t.id, t.email, tma.position, tma.title, tma.telephone
+      SELECT t.id, t.email, tma.position, tma.name AS title, tma.telephone
       FROM   team_member_assignments tma
       JOIN   team_members t ON t.id = tma.team_member_id
       WHERE  tma.project_id   = $1
@@ -3562,11 +3738,11 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
         SELECT p.*,
                t.email       AS member_email,
                tma.position  AS member_position,
-               tma.title     AS member_title
+               tma.name      AS member_title
         FROM   workspace_work_center_progress p
         JOIN   team_members t ON t.id = p.member_id
         LEFT JOIN LATERAL (
-               SELECT position, title
+               SELECT position, name
                FROM   team_member_assignments
                WHERE  team_member_id = p.member_id
                  AND  project_id = $2
