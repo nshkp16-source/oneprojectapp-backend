@@ -3154,6 +3154,234 @@ app.get('/api/planning-execution-tracking/download/:entryId',
   }
 });
 
+// =============================================================================
+//  ARRET ROUTES (Stop-Work Issue Reporting)
+// =============================================================================
+
+app.get('/api/arrets', authenticateToken, async (req, res) => {
+  try {
+    const { projectId } = req.query;
+    const { user_id: userId, role } = req.user;
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+
+    // Verify user is assigned to project
+    const memberCheck = await pool.query(
+      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
+       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
+       LIMIT 1`,
+      [projectId, userId, role]
+    );
+    if (!memberCheck.rows.length) return res.status(403).json({ error: 'Not assigned to this project' });
+
+    const { rows } = await pool.query(
+      `SELECT 
+         a.id, a.project_id, a.title, a.description, a.attachment_url, a.attachment_name,
+         a.issued_date, a.created_by, a.creator_role, a.creator_email, a.status, 
+         a.is_resolved, a.created_at, a.updated_at,
+         COUNT(DISTINCT av.viewer_id) as view_count,
+         bool_or(av.viewer_id = $2) as is_viewed
+       FROM arrets a
+       LEFT JOIN arret_views av ON av.arret_id = a.id
+       WHERE a.project_id = $1
+       GROUP BY a.id
+       ORDER BY a.issued_date DESC`,
+      [projectId, userId]
+    );
+
+    res.json({ arrets: rows });
+  } catch (err) {
+    console.error('GET /api/arrets:', err);
+    res.status(500).json({ error: 'Failed to fetch arrets' });
+  }
+});
+
+app.post('/api/arrets', authenticateToken, upload.single('attachment'), async (req, res) => {
+  try {
+    const { projectId, title, description } = req.body;
+    const { user_id: userId, role, email } = req.user;
+
+    if (!projectId || !title) return res.status(400).json({ error: 'projectId and title are required' });
+
+    // Verify user is assigned to project
+    const memberCheck = await pool.query(
+      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
+       UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
+       LIMIT 1`,
+      [projectId, userId, role]
+    );
+    if (!memberCheck.rows.length) return res.status(403).json({ error: 'Not assigned to this project' });
+
+    let attachmentUrl = null, attachmentName = null, attachmentMime = null, attachmentPublicId = null;
+    if (req.file) {
+      try {
+        const r = await uploadToCloudinary(req.file.buffer, 'oneproject/arrets');
+        attachmentUrl = r.secure_url;
+        attachmentName = req.file.originalname;
+        attachmentMime = req.file.mimetype;
+        attachmentPublicId = r.public_id;
+      } catch (uploadErr) {
+        console.error('Arret attachment upload error:', uploadErr);
+        return res.status(500).json({ error: 'File upload failed' });
+      }
+    }
+
+    const dbClient = await pool.connect();
+    try {
+      await dbClient.query('BEGIN');
+
+      // Create arret
+      const { rows: arrets } = await dbClient.query(
+        `INSERT INTO arrets (project_id, title, description, attachment_url, attachment_name, 
+           attachment_mime, attachment_public_id, created_by, creator_role, creator_email, status, is_resolved)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+        [projectId, title, description || null, attachmentUrl, attachmentName, attachmentMime, 
+         attachmentPublicId, userId, role, email, 'open', false]
+      );
+      const arret = arrets[0];
+
+      // Create notification
+      const notifMsg = `⛔ ARRET issued by ${role}: "${title}"`;
+      const notifRes = await dbClient.query(
+        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [projectId, arret.id, 'arrets', notifMsg, userId, role]
+      );
+      const notificationId = notifRes.rows[0].id;
+
+      // Get all project members as recipients
+      const recipients = await getProjectRecipientKeys(projectId, userId, role);
+      await insertNotificationRecipients(dbClient, notificationId, recipients);
+
+      await dbClient.query('COMMIT');
+      res.status(201).json({ success: true, arret });
+    } catch (err) {
+      await dbClient.query('ROLLBACK');
+      console.error('Error creating arret:', err);
+      res.status(500).json({ error: 'Failed to create arret' });
+    } finally {
+      dbClient.release();
+    }
+  } catch (err) {
+    console.error('POST /api/arrets:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { projectId } = req.query;
+    const { user_id: userId } = req.user;
+
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+
+    const { rows } = await pool.query(
+      `SELECT a.* FROM arrets a WHERE a.id = $1 AND a.project_id = $2`,
+      [id, projectId]
+    );
+
+    if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
+
+    // Record view
+    await pool.query(
+      `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email)
+       SELECT $1, $2, $3, $4
+       ON CONFLICT (arret_id, viewer_id, viewer_role) DO NOTHING`,
+      [id, userId, req.user.role, req.user.email]
+    );
+
+    res.json({ arret: rows[0] });
+  } catch (err) {
+    console.error('GET /api/arrets/:id:', err);
+    res.status(500).json({ error: 'Failed to fetch arret' });
+  }
+});
+
+app.put('/api/arrets/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { projectId, status, is_resolved } = req.body;
+    const { user_id: userId, role } = req.user;
+
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+
+    // Check arret exists and user has permission
+    const { rows: arrets } = await pool.query(
+      `SELECT * FROM arrets WHERE id = $1 AND project_id = $2`,
+      [id, projectId]
+    );
+
+    if (!arrets.length) return res.status(404).json({ error: 'Arret not found' });
+
+    // Update arret
+    const updateFields = [];
+    const params = [id, projectId];
+    let paramIndex = 3;
+
+    if (status !== undefined) {
+      updateFields.push(`status = $${paramIndex}`);
+      params.push(status);
+      paramIndex++;
+    }
+
+    if (is_resolved !== undefined) {
+      updateFields.push(`is_resolved = $${paramIndex}`);
+      params.push(is_resolved);
+      paramIndex++;
+    }
+
+    if (updateFields.length === 0) return res.json({ arret: arrets[0] });
+
+    updateFields.push('updated_at = NOW()');
+
+    const { rows: updated } = await pool.query(
+      `UPDATE arrets SET ${updateFields.join(', ')} 
+       WHERE id = $1 AND project_id = $2 
+       RETURNING *`,
+      params
+    );
+
+    // Create notification if resolved
+    if (is_resolved === true && !arrets[0].is_resolved) {
+      const notifMsg = `✅ ARRET resolved: "${arrets[0].title}"`;
+      await pool.query(
+        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [projectId, id, 'arrets', notifMsg, userId, role]
+      );
+    }
+
+    res.json({ success: true, arret: updated[0] });
+  } catch (err) {
+    console.error('PUT /api/arrets/:id:', err);
+    res.status(500).json({ error: 'Failed to update arret' });
+  }
+});
+
+app.delete('/api/arrets/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { projectId } = req.body;
+    const { user_id: userId } = req.user;
+
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+
+    // Only creator can delete
+    const { rows: arrets } = await pool.query(
+      `SELECT * FROM arrets WHERE id = $1 AND project_id = $2 AND created_by = $3`,
+      [id, projectId, userId]
+    );
+
+    if (!arrets.length) return res.status(403).json({ error: 'Cannot delete this arret' });
+
+    await pool.query(`DELETE FROM arrets WHERE id = $1`, [id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/arrets/:id:', err);
+    res.status(500).json({ error: 'Failed to delete arret' });
+  }
+});
 
 // =============================================================================
 //  WORK CENTER ROUTES
