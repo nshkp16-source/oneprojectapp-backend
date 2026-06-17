@@ -204,10 +204,8 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
          WHERE NOT EXISTS (
            SELECT 1 FROM notification_recipients nr
            WHERE nr.notification_id = $1
-             AND (
-               (nr.recipient_role = $3 AND nr.recipient_role_id = $4)
-               OR (nr.recipient_role IS NULL AND nr.user_id = $2)
-             )
+             AND nr.recipient_role = $3
+             AND nr.recipient_role_id = $4
          )`,
         [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
       );
@@ -1717,9 +1715,8 @@ async function getUnreadCount(projectId, userRole, userId) {
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
        LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-       WHERE n.project_id = $1 AND n.added_by_id != $3
+         AND (nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+       WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $3)
          AND (nr.is_read = false OR nr.id IS NULL)`,
       [projectId, userRole, userId]
     );
@@ -1731,7 +1728,7 @@ async function getUnreadCount(projectId, userRole, userId) {
         `SELECT COUNT(DISTINCT n.id) AS count
          FROM notifications n
          LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND n.added_by_id != $2
+         WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $2)
            AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
         [projectId, userId]
       );
@@ -1750,9 +1747,8 @@ async function getNotifications(projectId, userRole, userId) {
               COALESCE(nr.is_read, false) AS is_read
        FROM notifications n
        LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND ((nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-              OR (nr.recipient_role IS NULL AND nr.user_id = $3))
-       WHERE n.project_id = $1 AND n.added_by_id != $3
+         AND (nr.recipient_role = $2 AND nr.recipient_role_id = $3)
+       WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $3)
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
@@ -1766,7 +1762,7 @@ async function getNotifications(projectId, userRole, userId) {
                 COALESCE(nr.is_read, false) AS is_read
          FROM notifications n
          LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND n.added_by_id != $2
+         WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $2)
          ORDER BY n.created_at DESC`,
         [projectId, userId]
       );
@@ -1784,11 +1780,13 @@ async function getNotifications(projectId, userRole, userId) {
          WHERE NOT EXISTS (
            SELECT 1 FROM notification_recipients nr
            WHERE nr.notification_id = $1
-             AND ((nr.recipient_role = $3 AND nr.recipient_role_id = $4)
-                  OR (nr.recipient_role IS NULL AND nr.user_id = $2))
+             AND nr.recipient_role = $3
+             AND nr.recipient_role_id = $4
          )`,
         [n.id, userId, userRole, userId]
-      ).catch(() => {});
+      ).catch((err) => {
+        console.warn('[getNotifications] Auto-insert recipient failed (non-fatal):', err.message);
+      });
     } catch (err) {
       if (err.message.includes('column') && err.message.includes('does not exist')) {
         await pool.query(
