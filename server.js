@@ -1714,94 +1714,41 @@ async function getUnreadCount(projectId, userRole, userId) {
     const result = await pool.query(
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
-       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND (nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-       WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $3)
-         AND (nr.is_read = false OR nr.id IS NULL)`,
+       INNER JOIN notification_recipients nr ON nr.notification_id = n.id
+       WHERE n.project_id = $1
+         AND (n.added_by_id IS NULL OR n.added_by_id != $3)
+         AND nr.recipient_role = $2
+         AND nr.recipient_role_id = $3
+         AND nr.is_read = false`,
       [projectId, userRole, userId]
     );
     return parseInt(result.rows[0].count, 10);
   } catch (err) {
-    if (err.message.includes('column') && err.message.includes('does not exist')) {
-      console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
-      const result = await pool.query(
-        `SELECT COUNT(DISTINCT n.id) AS count
-         FROM notifications n
-         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $2)
-           AND (nr.is_read = false OR nr.id IS NULL OR nr.user_id = $2)`,
-        [projectId, userId]
-      );
-      return parseInt(result.rows[0].count, 10);
-    }
+    console.error('[getUnreadCount] Error:', err.message);
     throw err;
   }
 }
 
 async function getNotifications(projectId, userRole, userId) {
-  let notifs = [];
   try {
     const { rows } = await pool.query(
       `SELECT n.id, n.entity_type, n.entity_id, n.message,
               n.added_by_role, n.created_at,
-              COALESCE(nr.is_read, false) AS is_read
+              nr.is_read
        FROM notifications n
-       LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         AND (nr.recipient_role = $2 AND nr.recipient_role_id = $3)
-       WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $3)
+       INNER JOIN notification_recipients nr ON nr.notification_id = n.id
+       WHERE n.project_id = $1
+         AND (n.added_by_id IS NULL OR n.added_by_id != $3)
+         AND nr.recipient_role = $2
+         AND nr.recipient_role_id = $3
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
-    notifs = rows;
+    return rows;
   } catch (err) {
-    if (err.message.includes('column') && err.message.includes('does not exist')) {
-      console.warn('[getNotifications] Schema upgrade pending. Using legacy query.');
-      const { rows } = await pool.query(
-        `SELECT n.id, n.entity_type, n.entity_id, n.message,
-                n.added_by_role, n.created_at,
-                COALESCE(nr.is_read, false) AS is_read
-         FROM notifications n
-         LEFT JOIN notification_recipients nr ON nr.notification_id = n.id
-         WHERE n.project_id = $1 AND (n.added_by_id IS NULL OR n.added_by_id != $2)
-         ORDER BY n.created_at DESC`,
-        [projectId, userId]
-      );
-      notifs = rows;
-    } else {
-      throw err;
-    }
+    console.error('[getNotifications] Error:', err.message);
+    throw err;
   }
-
-  for (const n of notifs) {
-    try {
-      await pool.query(
-        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, is_read)
-         SELECT $1, $2, $3, $4, false
-         WHERE NOT EXISTS (
-           SELECT 1 FROM notification_recipients nr
-           WHERE nr.notification_id = $1
-             AND nr.recipient_role = $3
-             AND nr.recipient_role_id = $4
-         )`,
-        [n.id, userId, userRole, userId]
-      ).catch((err) => {
-        console.warn('[getNotifications] Auto-insert recipient failed (non-fatal):', err.message);
-      });
-    } catch (err) {
-      if (err.message.includes('column') && err.message.includes('does not exist')) {
-        await pool.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-           SELECT $1, $2, false
-           WHERE NOT EXISTS (
-             SELECT 1 FROM notification_recipients nr
-             WHERE nr.notification_id = $1 AND nr.user_id = $2
-           )`,
-          [n.id, userId]
-        ).catch(() => {});
-      }
-    }
-  }
-  return notifs;
 }
 
 for (const prefix of ['/notifications', '/api/notifications']) {
