@@ -195,9 +195,16 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 }
 
 async function insertNotificationRecipients(dbClient, notificationId, recipients) {
-  if (!recipients || !recipients.length) return;
+  if (!recipients || !recipients.length) {
+    console.warn(`[insertNotificationRecipients] ⚠️ No recipients to insert for notificationId=${notificationId}`);
+    return;
+  }
+  
+  console.log(`[insertNotificationRecipients] Inserting ${recipients.length} recipients for notificationId=${notificationId}`);
+  
   for (const recipient of recipients) {
     try {
+      console.log(`[insertNotificationRecipients] Inserting: role=${recipient.recipient_role}, roleId=${recipient.recipient_role_id}`);
       await dbClient.query(
         `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
          SELECT $1, $2, $3, $4, $5
@@ -378,10 +385,13 @@ async function getProjectMembers(projectId) {
 
 async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, scope = 'global', scopeValue = null) {
   const members = await getProjectMembers(projectId);
+  console.log(`[getProjectRecipientKeys] projectId=${projectId}, excludeUserId=${excludeUserId}, excludeRole=${excludeRole}, totalMembers=${members.length}`);
+  if (members.length === 0) console.warn('[getProjectRecipientKeys] ⚠️ No members found for project');
+  
   const normalizedExcludeRole = normalizeRole(excludeRole);
   const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
 
-  return members
+  const filtered = members
     .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
     .filter(m => {
       if (!targetSide) return true;
@@ -394,7 +404,9 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
       recipient_email:   m.email || null,
       user_id:           Number(m.role_id),
     }));
-}
+  
+  console.log(`[getProjectRecipientKeys] After filtering: ${filtered.length} recipients`);
+  return filtered;
 
 async function userHasProjectAccess(userId, role, projectId) {
   const projectCheck = {
@@ -1711,6 +1723,7 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 async function getUnreadCount(projectId, userRole, userId) {
   try {
+    console.log(`[getUnreadCount] Fetching: projectId=${projectId}, userRole=${userRole}, userId=${userId}`);
     const result = await pool.query(
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
@@ -1720,7 +1733,9 @@ async function getUnreadCount(projectId, userRole, userId) {
          AND (nr.is_read = false OR nr.id IS NULL)`,
       [projectId, userRole, userId]
     );
-    return parseInt(result.rows[0].count, 10);
+    const count = parseInt(result.rows[0].count, 10);
+    console.log(`[getUnreadCount] Result: ${count} unread notifications`);
+    return count;
   } catch (err) {
     if (err.message.includes('column') && err.message.includes('does not exist')) {
       console.warn('[getUnreadCount] Schema upgrade pending. Using legacy query.');
@@ -1741,6 +1756,7 @@ async function getUnreadCount(projectId, userRole, userId) {
 async function getNotifications(projectId, userRole, userId) {
   let notifs = [];
   try {
+    console.log(`[getNotifications] Fetching: projectId=${projectId}, userRole=${userRole}, userId=${userId}`);
     const { rows } = await pool.query(
       `SELECT n.id, n.entity_type, n.entity_id, n.message,
               n.added_by_role, n.created_at,
@@ -1752,6 +1768,10 @@ async function getNotifications(projectId, userRole, userId) {
        ORDER BY n.created_at DESC`,
       [projectId, userRole, userId]
     );
+    console.log(`[getNotifications] Result: ${rows.length} notifications returned`);
+    if (rows.length > 0) {
+      console.log(`[getNotifications] First notification:`, rows[0]);
+    }
     notifs = rows;
   } catch (err) {
     if (err.message.includes('column') && err.message.includes('does not exist')) {
@@ -1805,6 +1825,83 @@ async function getNotifications(projectId, userRole, userId) {
 }
 
 for (const prefix of ['/notifications', '/api/notifications']) {
+  app.get(`${prefix}/debug/:projectId`, authenticateToken, async (req, res) => {
+    try {
+      const { projectId } = req.params;
+      const { user_id, role } = req.user;
+      
+      console.log(`[DEBUG] Diagnosing projectId=${projectId} for user=${user_id}, role=${role}`);
+      
+      // 1. Check if project exists
+      const projectCheck = await pool.query('SELECT id, name FROM projects WHERE id = $1', [projectId]);
+      const project = projectCheck.rows[0] || null;
+      
+      // 2. Check if user is member
+      const memberCheck = await pool.query(`
+        SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
+        UNION ALL SELECT 1 FROM projects WHERE id = $1 AND client_id = $2 AND $3 = 'Client'
+        LIMIT 1
+      `, [projectId, user_id, role]);
+      const isMember = memberCheck.rows.length > 0;
+      
+      // 3. Check all members in project
+      const members = await pool.query(`
+        SELECT 'Client' as role, p.client_id as role_id FROM projects p WHERE p.id = $1
+        UNION ALL SELECT 'Contractor', a.contractor_id FROM contractor_assignments a WHERE a.project_id = $1
+        UNION ALL SELECT 'Consultant', a.consultant_id FROM consultant_assignments a WHERE a.project_id = $1
+        UNION ALL SELECT 'ClientPM', a.client_pm_id FROM client_pm_assignments a WHERE a.project_id = $1
+        UNION ALL SELECT 'ContractorPM', a.contractor_pm_id FROM contractor_pm_assignments a WHERE a.project_id = $1
+        UNION ALL SELECT 'ConsultantPM', a.consultant_pm_id FROM consultant_pm_assignments a WHERE a.project_id = $1
+        UNION ALL SELECT 'TeamMember', a.team_member_id FROM team_member_assignments a WHERE a.project_id = $1
+      `, [projectId]);
+      
+      // 4. Check all notifications
+      const notifs = await pool.query(`
+        SELECT n.id, n.message, n.added_by_id, n.added_by_role, n.created_at,
+               COUNT(nr.id) as recipient_count, 
+               SUM(CASE WHEN nr.is_read = true THEN 1 ELSE 0 END) as read_count
+        FROM notifications n
+        LEFT JOIN notification_recipients nr ON n.id = nr.notification_id
+        WHERE n.project_id = $1
+        GROUP BY n.id, n.message, n.added_by_id, n.added_by_role, n.created_at
+        ORDER BY n.created_at DESC
+        LIMIT 10
+      `, [projectId]);
+      
+      // 5. Check recipients for current user
+      const myRecipients = await pool.query(`
+        SELECT nr.* FROM notification_recipients nr
+        JOIN notifications n ON n.id = nr.notification_id
+        WHERE n.project_id = $1 AND nr.recipient_role = $2 AND nr.recipient_role_id = $3
+        ORDER BY nr.created_at DESC
+        LIMIT 5
+      `, [projectId, role, user_id]);
+      
+      res.json({
+        timestamp: new Date().toISOString(),
+        diagnostics: {
+          project,
+          user: { id: user_id, role },
+          isMember,
+          memberCount: members.rows.length,
+          members: members.rows,
+          notificationCount: notifs.rows.length,
+          notifications: notifs.rows,
+          myRecipientsCount: myRecipients.rows.length,
+          myRecipients: myRecipients.rows,
+          query: {
+            projectId,
+            userRole: role,
+            userId: user_id
+          }
+        }
+      });
+    } catch (err) {
+      console.error('[DEBUG] Error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get(`${prefix}/unread-count`, authenticateToken, async (req, res) => {
     try {
       const count = await getUnreadCount(req.query.projectId, req.user.role, req.user.user_id);
