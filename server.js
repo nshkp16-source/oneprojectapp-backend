@@ -196,8 +196,10 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 
 async function insertNotificationRecipients(dbClient, notificationId, recipients) {
   if (!recipients || !recipients.length) return;
+  console.log(`[notifications] insertNotificationRecipients: notif=${notificationId} recipients=${recipients.length}`);
   for (const recipient of recipients) {
     try {
+      console.log(`[notifications] inserting recipient for notif=${notificationId} user=${recipient.user_id} role=${recipient.recipient_role} role_id=${recipient.recipient_role_id}`);
       await dbClient.query(
         `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
          SELECT $1, $2, $3, $4, $5
@@ -210,6 +212,7 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
         [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
       );
     } catch (err) {
+      console.warn(`[insertNotificationRecipients] insert failed for notif=${notificationId} user=${recipient.user_id} err=${err.message}`);
       if (err.message.includes('column') && err.message.includes('does not exist')) {
         console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
         await dbClient.query(
@@ -1897,12 +1900,14 @@ async function handleAddRecord(req, res) {
       const notifMsg = noticeTied
         ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
         : `New record added by ${role}: "${title}"`;
+      console.log('[notifications] creating notification', { projectId, entity_id: recordId, entity_type: table, message: notifMsg, added_by_id: userId, added_by_role: role });
       const notifRes = await dbClient.query(
         `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
         [projectId, recordId, table, notifMsg, userId, role]
       );
       const notificationId = notifRes.rows[0].id;
+      console.log('[notifications] created', { notificationId, projectId, entity_id: recordId });
       const recipients = await getProjectRecipientKeys(projectId, userId, role);
       await insertNotificationRecipients(dbClient, notificationId, recipients);
       await dbClient.query('COMMIT');
@@ -2031,12 +2036,14 @@ app.post('/api/arrets', authenticateToken, upload.array('attachments'), async (r
         attachments.push(attachment);
       }
 
+      console.log('[notifications] creating notification', { projectId, entity_id: arret.id, entity_type: 'arrets', message: `New arret issued by ${req.user.role}: "${title}"`, added_by_id: req.user.user_id, added_by_role: req.user.role });
       const notifRes = await client.query(
         `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
          VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
         [projectId, arret.id, 'arrets', `New arret issued by ${req.user.role}: "${title}"`, req.user.user_id, req.user.role]
       );
       const notificationId = notifRes.rows[0].id;
+      console.log('[notifications] created', { notificationId, projectId, entity_id: arret.id });
       const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
       await insertNotificationRecipients(client, notificationId, recipients);
       await client.query('COMMIT');
@@ -2255,8 +2262,10 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       const dbClient = await pool.connect();
       try {
         await dbClient.query('BEGIN');
+        console.log('[notifications] creating notification', { projectId, entity_id: recordId, entity_type: table, message: notifMsg, added_by_id: reviewerId, added_by_role: reviewerRole });
         const notifRes = await dbClient.query(`INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`, [projectId, recordId, table, notifMsg, reviewerId, reviewerRole]);
         const notificationId = notifRes.rows[0].id;
+        console.log('[notifications] created', { notificationId, projectId, entity_id: recordId });
         const recipients = await getProjectRecipientKeys(projectId, reviewerId, reviewerRole);
         await insertNotificationRecipients(dbClient, notificationId, recipients);
         await dbClient.query('COMMIT');
@@ -2341,11 +2350,13 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), async 
     const notifMsg = scope === 'side'
       ? `New ${meeting_type} meeting scheduled by ${req.user.role} for ${scope_value || 'your'} side: "${title}" on ${date_time}`
       : `New ${meeting_type} meeting scheduled by ${req.user.role}: "${title}" on ${date_time}`;
+    console.log('[notifications] creating notification', { projectId: project_id, entity_id: meeting.id, entity_type: 'meetings', message: notifMsg, added_by_id: req.user.user_id, added_by_role: req.user.role, scope, scope_value });
     const notifRes = await client.query(
       `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
       [project_id, meeting.id, 'meetings', notifMsg, req.user.user_id, req.user.role]
     );
     const notificationId = notifRes.rows[0].id;
+    console.log('[notifications] created', { notificationId, projectId: project_id, entity_id: meeting.id });
     const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
     await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
@@ -2537,11 +2548,13 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     if (planned>0&&exec<planned) return res.status(422).json({ error:`Cannot complete: only ${exec} of ${planned} ${ms.unit||''} executed` });
     await client.query(`UPDATE ${table} SET activity_status='completed',progress_pct=100,completed_at=now(),updated_at=now() WHERE id=$1`,[milestoneId]);
     const notifMsg = `${isExt ? 'Additional milestone' : 'Milestone'} completed by ${req.user.role}: "${ms.title || `#${milestoneId}`}"`;
+    console.log('[notifications] creating notification', { projectId, entity_id: milestoneId, entity_type: table, message: notifMsg, added_by_id: req.user.user_id, added_by_role: req.user.role });
     const notifRes = await client.query(
       `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
       [projectId, milestoneId, table, notifMsg, req.user.user_id, req.user.role]
     );
     const notificationId = notifRes.rows[0].id;
+    console.log('[notifications] created', { notificationId, projectId, entity_id: milestoneId });
     const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
     await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
