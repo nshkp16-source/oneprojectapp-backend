@@ -204,88 +204,31 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
   let skipCount = 0;
 
   for (const recipient of recipients) {
-    if (!recipient.user_id && (recipient.recipient_role == null || recipient.recipient_role_id == null)) {
-      console.warn(`[insertNotificationRecipients] Skipping invalid recipient: notif=${notificationId}, user_id=${recipient.user_id}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`);
-      continue;
-    }
-
     try {
-      const hasRoleKey = recipient.recipient_role != null && recipient.recipient_role_id != null;
-      const label = hasRoleKey
-        ? `role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`
-        : `legacy user_id=${recipient.user_id}`;
-      console.log(`[insertNotificationRecipients] inserting: notif=${notificationId}, ${label}, email=${recipient.recipient_email}`);
-
-      let res;
-      if (hasRoleKey) {
-        res = await dbClient.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
-           SELECT $1, $2, $3, $4, $5
-           WHERE NOT EXISTS (
-             SELECT 1 FROM notification_recipients nr
-             WHERE nr.notification_id = $1
-               AND nr.recipient_role = $3
-               AND nr.recipient_role_id = $4
-           )
-           RETURNING id`,
-          [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
-        );
-      } else {
-        res = await dbClient.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, recipient_email)
-           SELECT $1, $2, $3
-           WHERE NOT EXISTS (
-             SELECT 1 FROM notification_recipients nr
-             WHERE nr.notification_id = $1
-               AND nr.user_id = $2
-           )
-           RETURNING id`,
-          [notificationId, recipient.user_id, recipient.recipient_email]
-        );
-      }
-
+      console.log(`[insertNotificationRecipients] inserting: notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}, email=${recipient.recipient_email}`);
+      const res = await dbClient.query(
+        `INSERT INTO notification_recipients
+           (notification_id, recipient_role, recipient_role_id, recipient_email, is_read, created_at)
+         SELECT $1, $2, $3, $4, false, NOW()
+         WHERE NOT EXISTS (
+           SELECT 1 FROM notification_recipients nr
+           WHERE nr.notification_id = $1
+             AND nr.recipient_role = $2
+             AND nr.recipient_role_id = $3
+         )
+         RETURNING id`,
+        [notificationId, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
+      );
       if (res.rows.length > 0) {
         console.log(`[insertNotificationRecipients] ✓ Inserted notification_recipients row ${res.rows[0].id}`);
         successCount++;
       } else {
-        console.log(`[insertNotificationRecipients] ⊘ Skipped (already exists): notif=${notificationId}, ${label}`);
+        console.log(`[insertNotificationRecipients] ⊘ Skipped (already exists): notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`);
         skipCount++;
       }
     } catch (err) {
-      console.warn(`[insertNotificationRecipients] ✗ Insert failed for notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}, user_id=${recipient.user_id}: ${err.message}`);
-      if (err.message.includes('column') && err.message.includes('does not exist')) {
-        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using fallback insertion.');
-        if (recipient.user_id) {
-          await dbClient.query(
-            `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-             SELECT $1, $2, false
-             WHERE NOT EXISTS (
-               SELECT 1 FROM notification_recipients nr
-               WHERE nr.notification_id = $1 AND nr.user_id = $2
-             )`,
-            [notificationId, recipient.user_id]
-          ).catch((legacyErr) => {
-            console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
-          });
-        }
-      } else if (err.message.includes('null value in column "recipient_role_id"') || err.message.includes('null value in column "recipient_role"')) {
-        console.warn('[insertNotificationRecipients] Missing role fields, falling back to user_id-only insertion.');
-        if (recipient.user_id) {
-          await dbClient.query(
-            `INSERT INTO notification_recipients (notification_id, user_id, recipient_email)
-             SELECT $1, $2, $3
-             WHERE NOT EXISTS (
-               SELECT 1 FROM notification_recipients nr
-               WHERE nr.notification_id = $1 AND nr.user_id = $2
-             )`,
-            [notificationId, recipient.user_id, recipient.recipient_email]
-          ).catch((legacyErr) => {
-            console.error('[insertNotificationRecipients] Fallback insertion also failed:', legacyErr);
-          });
-        }
-      } else {
-        throw err;
-      }
+      console.warn(`[insertNotificationRecipients] ✗ Insert failed for notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}: ${err.message}`);
+      throw err;
     }
   }
 
@@ -1936,39 +1879,19 @@ for (const prefix of ['/notifications', '/api/notifications']) {
 
   app.put(`${prefix}/:id/read`, authenticateToken, async (req, res) => {
     try {
-      let result;
-      try {
-        result = await pool.query(
-          `UPDATE notification_recipients
-           SET is_read = true, read_at = NOW()
-           WHERE notification_id = $1
-             AND recipient_role = $2
-             AND recipient_role_id = $3`,
-          [req.params.id, req.user.role, req.user.user_id]
-        );
-      } catch (err) {
-        if (err.message.includes('column') && err.message.includes('does not exist')) {
-          console.warn('[mark read] Schema upgrade pending. Using legacy update.');
-          result = await pool.query(
-            `UPDATE notification_recipients
-             SET is_read = true, read_at = NOW()
-             WHERE notification_id = $1 AND user_id = $2`,
-            [req.params.id, req.user.user_id]
-          );
-        } else { throw err; }
-      }
-      if (result.rowCount === 0) {
-        await pool.query(
-          `UPDATE notification_recipients
-           SET is_read = true, read_at = NOW()
-           WHERE notification_id = $1
-             AND recipient_role IS NULL
-             AND user_id = $2`,
-          [req.params.id, req.user.user_id]
-        );
-      }
+      await pool.query(
+        `UPDATE notification_recipients
+         SET is_read = true, read_at = NOW()
+         WHERE notification_id = $1
+           AND recipient_role = $2
+           AND recipient_role_id = $3`,
+        [req.params.id, req.user.role, req.user.user_id]
+      );
       res.json({ success: true });
-    } catch (err) { console.error('Mark read error:', err); res.status(500).json({ success: false }); }
+    } catch (err) {
+      console.error('Mark read error:', err);
+      res.status(500).json({ success: false });
+    }
   });
 
   app.post(`${prefix}/mark-all-read`, authenticateToken, async (req, res) => {
@@ -1977,36 +1900,14 @@ for (const prefix of ['/notifications', '/api/notifications']) {
     try {
       let updated = 0;
       for (const notifId of notificationIds) {
-        let result;
-        try {
-          result = await pool.query(
-            `UPDATE notification_recipients
-             SET is_read = true, read_at = NOW()
-             WHERE notification_id = $1
-               AND recipient_role = $2
-               AND recipient_role_id = $3`,
-            [notifId, req.user.role, req.user.user_id]
-          );
-        } catch (err) {
-          if (err.message.includes('column') && err.message.includes('does not exist')) {
-            result = await pool.query(
-              `UPDATE notification_recipients
-               SET is_read = true, read_at = NOW()
-               WHERE notification_id = $1 AND user_id = $2`,
-              [notifId, req.user.user_id]
-            );
-          } else { throw err; }
-        }
-        if (result.rowCount === 0) {
-          await pool.query(
-            `UPDATE notification_recipients
-             SET is_read = true, read_at = NOW()
-             WHERE notification_id = $1
-               AND recipient_role IS NULL
-               AND user_id = $2`,
-            [notifId, req.user.user_id]
-          );
-        }
+        await pool.query(
+          `UPDATE notification_recipients
+           SET is_read = true, read_at = NOW()
+           WHERE notification_id = $1
+             AND recipient_role = $2
+             AND recipient_role_id = $3`,
+          [notifId, req.user.role, req.user.user_id]
+        );
         updated += 1;
       }
       res.json({ success: true, updated });
@@ -2079,9 +1980,9 @@ async function handleAddRecord(req, res) {
         try {
           await notifClient.query('BEGIN');
           const notifRes = await notifClient.query(
-            `INSERT INTO notifications (project_id, entity_id, entity_type, notification_type, message, added_by_id, added_by_role)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-            [projectId, recordId, table, 'record_added', notifMsg, userId, role]
+            `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [projectId, recordId, table, notifMsg, userId, role]
           );
           notificationId = notifRes.rows[0].id;
           const recipients = await getProjectRecipientKeys(projectId, userId, role);
