@@ -1602,6 +1602,53 @@ app.post('/project-resend', async (req, res) => {
   } catch(err){console.error('Project resend error:',err);res.status(500).json({success:false,error:'Failed to resend project code.'});}
 });
 
+app.post('/project-check-existence', async (req, res) => {
+  const { clientEmail, projectName, contractReference } = req.body;
+  if (!clientEmail || !projectName || !contractReference) {
+    return res.status(400).json({ success: false, error: 'clientEmail, projectName, and contractReference are required.' });
+  }
+
+  try {
+    const clientResult = await pool.query(
+      `SELECT id FROM clients WHERE TRIM(LOWER(company_email)) = TRIM(LOWER($1))`,
+      [clientEmail]
+    );
+
+    if (!clientResult.rows.length) {
+      return res.json({ success: true, exists: false });
+    }
+
+    const clientId = clientResult.rows[0].id;
+    const existing = await pool.query(
+      `SELECT name, contract_reference FROM projects
+       WHERE client_id = $1
+         AND (TRIM(LOWER(name)) = TRIM(LOWER($2))
+           OR TRIM(LOWER(contract_reference)) = TRIM(LOWER($3)))
+       LIMIT 1`,
+      [clientId, projectName, contractReference]
+    );
+
+    if (!existing.rows.length) {
+      return res.json({ success: true, exists: false });
+    }
+
+    const conflict = existing.rows[0];
+    const sameName = conflict.name && conflict.name.trim().toLowerCase() === projectName.trim().toLowerCase();
+    const sameReference = conflict.contract_reference && conflict.contract_reference.trim().toLowerCase() === contractReference.trim().toLowerCase();
+    let message = 'A project with this name or contract reference already exists for your account.';
+    if (sameName && !sameReference) {
+      message = 'A project with this name already exists for your account.';
+    } else if (sameReference && !sameName) {
+      message = 'A project with this contract reference already exists for your account.';
+    }
+
+    res.json({ success: true, exists: true, message });
+  } catch (err) {
+    console.error('[POST /project-check-existence]', err);
+    res.status(500).json({ success: false, error: 'Server error checking project uniqueness.' });
+  }
+});
+
 app.post('/project-verify', async (req, res) => {
   const {email,token}=req.body;
   try {
