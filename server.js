@@ -1964,26 +1964,46 @@ async function handleAddRecord(req, res) {
     const dbClient = await pool.connect();
     try {
       await dbClient.query('BEGIN');
+
+      // 1. Insert the record
       const recRes = await dbClient.query(
         `INSERT INTO ${table} (project_id, title, description, file_path, attachment_id, uploaded_by, role, record_kind, notice_tied_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
         [projectId, title, description || null, filePath, attachmentId, userId, role, resolvedKind, noticeTied]
       );
       const recordId = recRes.rows[0].id;
-      const notifMsg = noticeTied
-        ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
-        : `New record added by ${role}: "${title}"`;
-      console.log('[notifications] creating notification', { projectId, entity_id: recordId, entity_type: table, message: notifMsg, added_by_id: userId, added_by_role: role });
-      const notifRes = await dbClient.query(
-        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [projectId, recordId, table, notifMsg, userId, role]
-      );
-      const notificationId = notifRes.rows[0].id;
-      console.log('[notifications] created', { notificationId, projectId, entity_id: recordId });
-      const recipients = await getProjectRecipientKeys(projectId, userId, role);
-      await insertNotificationRecipients(dbClient, notificationId, recipients);
+
+      // 2. Commit the record first so it's never lost even if notification fails
       await dbClient.query('COMMIT');
+
+      // 3. Create notification in a separate operation (non-fatal)
+      let notificationId = null;
+      try {
+        const notifMsg = noticeTied
+          ? `New ${resolvedKind === 'rejection_notice' ? 'rejection notice' : 'notice of determination'} issued by ${role} (tied to record #${noticeTied})`
+          : `New record added by ${role}: "${title}"`;
+
+        const notifClient = await pool.connect();
+        try {
+          await notifClient.query('BEGIN');
+          const notifRes = await notifClient.query(
+            `INSERT INTO notifications (project_id, entity_id, entity_type, notification_type, message, added_by_id, added_by_role)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            [projectId, recordId, table, 'record_added', notifMsg, userId, role]
+          );
+          notificationId = notifRes.rows[0].id;
+          const recipients = await getProjectRecipientKeys(projectId, userId, role);
+          await insertNotificationRecipients(notifClient, notificationId, recipients);
+          await notifClient.query('COMMIT');
+          console.log('[notifications] ✓ created notif', notificationId, 'with', recipients.length, 'recipients');
+        } catch (notifErr) {
+          await notifClient.query('ROLLBACK');
+          console.error('[notifications] ✗ failed (non-fatal):', notifErr.message);
+        } finally { notifClient.release(); }
+      } catch (notifErr) {
+        console.error('[notifications] ✗ outer error (non-fatal):', notifErr.message);
+      }
+
       res.json({ success: true, message: 'Record saved.', recordId, notificationId, attachmentId, recordKind: resolvedKind });
     } catch (err) {
       await dbClient.query('ROLLBACK');
