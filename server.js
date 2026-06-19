@@ -246,10 +246,6 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
   }
   console.log(`[insertNotificationRecipients] ✓ Complete: notif=${notificationId}, ${successCount} inserted, ${skipCount} skipped`);
 }
-      }
-    }
-  }
-}
 
 // =============================================================================
 //  getProjectMembers — FIXED: a.position → correct columns per table
