@@ -195,12 +195,17 @@ async function getProjectMemberUserIds(projectId, excludeUserId) {
 }
 
 async function insertNotificationRecipients(dbClient, notificationId, recipients) {
-  if (!recipients || !recipients.length) return;
-  console.log(`[notifications] insertNotificationRecipients: notif=${notificationId} recipients=${recipients.length}`);
+  if (!recipients || !recipients.length) {
+    console.warn(`[insertNotificationRecipients] No recipients to insert for notif=${notificationId}`);
+    return;
+  }
+  console.log(`[insertNotificationRecipients] ⏳ Starting insert: notif=${notificationId}, ${recipients.length} recipients`);
+  let successCount = 0;
+  let skipCount = 0;
   for (const recipient of recipients) {
     try {
-      console.log(`[notifications] inserting recipient for notif=${notificationId} user=${recipient.user_id} role=${recipient.recipient_role} role_id=${recipient.recipient_role_id}`);
-      await dbClient.query(
+      console.log(`[insertNotificationRecipients] inserting: notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}, email=${recipient.recipient_email}`);
+      const res = await dbClient.query(
         `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
          SELECT $1, $2, $3, $4, $5
          WHERE NOT EXISTS (
@@ -208,11 +213,19 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
            WHERE nr.notification_id = $1
              AND nr.recipient_role = $3
              AND nr.recipient_role_id = $4
-         )`,
+         )
+         RETURNING id`,
         [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
       );
+      if (res.rows.length > 0) {
+        console.log(`[insertNotificationRecipients] ✓ Inserted notification_recipients row ${res.rows[0].id}`);
+        successCount++;
+      } else {
+        console.log(`[insertNotificationRecipients] ⊘ Skipped (already exists): notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`);
+        skipCount++;
+      }
     } catch (err) {
-      console.warn(`[insertNotificationRecipients] insert failed for notif=${notificationId} user=${recipient.user_id} err=${err.message}`);
+      console.warn(`[insertNotificationRecipients] ✗ Insert failed for notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}: ${err.message}`);
       if (err.message.includes('column') && err.message.includes('does not exist')) {
         console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
         await dbClient.query(
@@ -228,6 +241,11 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
         });
       } else {
         throw err;
+      }
+    }
+  }
+  console.log(`[insertNotificationRecipients] ✓ Complete: notif=${notificationId}, ${successCount} inserted, ${skipCount} skipped`);
+}
       }
     }
   }
@@ -383,14 +401,32 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
   const members = await getProjectMembers(projectId);
   const normalizedExcludeRole = normalizeRole(excludeRole);
   const targetSide = scope === 'side' && scopeValue ? getSide(scopeValue) : null;
+  
+  console.log(`[getProjectRecipientKeys] projectId=${projectId}, excludeUserId=${excludeUserId}, excludeRole=${excludeRole} (normalized=${normalizedExcludeRole}), scope=${scope}, scopeValue=${scopeValue}, targetSide=${targetSide}`);
+  console.log(`[getProjectRecipientKeys] Total members from getProjectMembers: ${members.length}`);
+  if (members.length > 0) {
+    console.log('[getProjectRecipientKeys] Sample members:', members.slice(0, 3).map(m => ({role: m.role, role_id: m.role_id, email: m.email})));
+  }
 
-  return members
-    .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole))
-    .filter(m => {
-      if (!targetSide) return true;
-      const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
-      return memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
-    })
+  const filtered1 = members
+    .filter(m => !(Number(m.role_id) === Number(excludeUserId) && normalizeRole(m.role) === normalizedExcludeRole));
+  console.log(`[getProjectRecipientKeys] After excluding creator: ${filtered1.length}`);
+  
+  const filtered2 = filtered1.filter(m => {
+    if (!targetSide) return true;
+    const memberSide = getSide(m.role) || (m.role === 'TeamMember' ? m.assigned_part : null);
+    const match = memberSide && memberSide.toLowerCase() === targetSide.toLowerCase();
+    if (!match && m.role.includes('PM')) {
+      console.warn(`[getProjectRecipientKeys] PM role mismatch: ${m.role} getSide=${getSide(m.role)} memberSide=${memberSide} targetSide=${targetSide}`);
+    }
+    return match;
+  });
+  console.log(`[getProjectRecipientKeys] After scope filter: ${filtered2.length}`);
+  if (filtered2.length > 0) {
+    console.log('[getProjectRecipientKeys] Final recipients:', filtered2.map(m => ({role: m.role, role_id: m.role_id, email: m.email})));
+  }
+
+  return filtered2
     .map(m => ({
       recipient_role:    m.role,
       recipient_role_id: Number(m.role_id),
@@ -1979,12 +2015,12 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
       `SELECT a.*, 
               EXISTS(
                 SELECT 1 FROM arret_views v
-                WHERE v.arret_id = a.id AND v.viewer_id = $2
+                WHERE v.arret_id = a.id AND v.viewer_id = $2 AND v.viewer_role = $3
               ) AS is_viewed
        FROM arrets a
        WHERE a.project_id = $1
        ORDER BY a.issued_date DESC, a.id DESC`,
-      [projectId, req.user.user_id]
+      [projectId, req.user.user_id, req.user.role]
     );
 
     const arretIds = arrets.map(r => r.id).filter(Boolean);
@@ -2115,18 +2151,22 @@ app.post('/api/arrets/view', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(`SELECT 1 FROM arrets WHERE id=$1 AND project_id=$2`, [arretId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
 
-    await pool.query('DELETE FROM arret_views WHERE arret_id=$1 AND viewer_id=$2', [arretId, req.user.user_id]);
+    // Use upsert pattern to ensure role-scoped view records (prevents users with same ID across roles from clobbering each other's views)
     try {
       await pool.query(
         `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewer_email, viewed_at)
-         VALUES ($1,$2,$3,$4,NOW())`,
+         VALUES ($1,$2,$3,$4,NOW())
+         ON CONFLICT (arret_id, viewer_id, viewer_role)
+         DO UPDATE SET viewed_at = NOW(), viewer_email = EXCLUDED.viewer_email`,
         [arretId, req.user.user_id, req.user.role, req.user.email || null]
       );
     } catch (err) {
       if (err.message.includes('column "viewer_email" does not exist')) {
         await pool.query(
           `INSERT INTO arret_views (arret_id, viewer_id, viewer_role, viewed_at)
-           VALUES ($1,$2,$3,NOW())`,
+           VALUES ($1,$2,$3,NOW())
+           ON CONFLICT (arret_id, viewer_id, viewer_role)
+           DO UPDATE SET viewed_at = NOW()`,
           [arretId, req.user.user_id, req.user.role]
         );
       } else {
