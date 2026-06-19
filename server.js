@@ -202,48 +202,93 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
   console.log(`[insertNotificationRecipients] ⏳ Starting insert: notif=${notificationId}, ${recipients.length} recipients`);
   let successCount = 0;
   let skipCount = 0;
+
   for (const recipient of recipients) {
+    if (!recipient.user_id && (recipient.recipient_role == null || recipient.recipient_role_id == null)) {
+      console.warn(`[insertNotificationRecipients] Skipping invalid recipient: notif=${notificationId}, user_id=${recipient.user_id}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`);
+      continue;
+    }
+
     try {
-      console.log(`[insertNotificationRecipients] inserting: notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}, email=${recipient.recipient_email}`);
-      const res = await dbClient.query(
-        `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
-         SELECT $1, $2, $3, $4, $5
-         WHERE NOT EXISTS (
-           SELECT 1 FROM notification_recipients nr
-           WHERE nr.notification_id = $1
-             AND nr.recipient_role = $3
-             AND nr.recipient_role_id = $4
-         )
-         RETURNING id`,
-        [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
-      );
+      const hasRoleKey = recipient.recipient_role != null && recipient.recipient_role_id != null;
+      const label = hasRoleKey
+        ? `role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`
+        : `legacy user_id=${recipient.user_id}`;
+      console.log(`[insertNotificationRecipients] inserting: notif=${notificationId}, ${label}, email=${recipient.recipient_email}`);
+
+      let res;
+      if (hasRoleKey) {
+        res = await dbClient.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, recipient_role, recipient_role_id, recipient_email)
+           SELECT $1, $2, $3, $4, $5
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1
+               AND nr.recipient_role = $3
+               AND nr.recipient_role_id = $4
+           )
+           RETURNING id`,
+          [notificationId, recipient.user_id, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
+        );
+      } else {
+        res = await dbClient.query(
+          `INSERT INTO notification_recipients (notification_id, user_id, recipient_email)
+           SELECT $1, $2, $3
+           WHERE NOT EXISTS (
+             SELECT 1 FROM notification_recipients nr
+             WHERE nr.notification_id = $1
+               AND nr.user_id = $2
+           )
+           RETURNING id`,
+          [notificationId, recipient.user_id, recipient.recipient_email]
+        );
+      }
+
       if (res.rows.length > 0) {
         console.log(`[insertNotificationRecipients] ✓ Inserted notification_recipients row ${res.rows[0].id}`);
         successCount++;
       } else {
-        console.log(`[insertNotificationRecipients] ⊘ Skipped (already exists): notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`);
+        console.log(`[insertNotificationRecipients] ⊘ Skipped (already exists): notif=${notificationId}, ${label}`);
         skipCount++;
       }
     } catch (err) {
-      console.warn(`[insertNotificationRecipients] ✗ Insert failed for notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}: ${err.message}`);
+      console.warn(`[insertNotificationRecipients] ✗ Insert failed for notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}, user_id=${recipient.user_id}: ${err.message}`);
       if (err.message.includes('column') && err.message.includes('does not exist')) {
-        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using legacy user_id-only insertion.');
-        await dbClient.query(
-          `INSERT INTO notification_recipients (notification_id, user_id, is_read)
-           SELECT $1, $2, false
-           WHERE NOT EXISTS (
-             SELECT 1 FROM notification_recipients nr
-             WHERE nr.notification_id = $1 AND nr.user_id = $2
-           )`,
-          [notificationId, recipient.user_id]
-        ).catch((legacyErr) => {
-          console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
-        });
+        console.warn('[insertNotificationRecipients] Schema upgrade pending. Using fallback insertion.');
+        if (recipient.user_id) {
+          await dbClient.query(
+            `INSERT INTO notification_recipients (notification_id, user_id, is_read)
+             SELECT $1, $2, false
+             WHERE NOT EXISTS (
+               SELECT 1 FROM notification_recipients nr
+               WHERE nr.notification_id = $1 AND nr.user_id = $2
+             )`,
+            [notificationId, recipient.user_id]
+          ).catch((legacyErr) => {
+            console.error('[insertNotificationRecipients] Legacy insertion also failed:', legacyErr);
+          });
+        }
+      } else if (err.message.includes('null value in column "recipient_role_id"') || err.message.includes('null value in column "recipient_role"')) {
+        console.warn('[insertNotificationRecipients] Missing role fields, falling back to user_id-only insertion.');
+        if (recipient.user_id) {
+          await dbClient.query(
+            `INSERT INTO notification_recipients (notification_id, user_id, recipient_email)
+             SELECT $1, $2, $3
+             WHERE NOT EXISTS (
+               SELECT 1 FROM notification_recipients nr
+               WHERE nr.notification_id = $1 AND nr.user_id = $2
+             )`,
+            [notificationId, recipient.user_id, recipient.recipient_email]
+          ).catch((legacyErr) => {
+            console.error('[insertNotificationRecipients] Fallback insertion also failed:', legacyErr);
+          });
+        }
       } else {
         throw err;
       }
     }
   }
+
   console.log(`[insertNotificationRecipients] ✓ Complete: notif=${notificationId}, ${successCount} inserted, ${skipCount} skipped`);
 }
 
