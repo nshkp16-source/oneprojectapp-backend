@@ -115,10 +115,10 @@ function resolveTable(recordType) {
 
 function getSide(role) {
   if (!role) return null;
-  const r = role.toLowerCase().replace(/[\s_-]+/g, '_');
-  if (r === 'contractor' || r === 'contractor_project_manager') return 'contractor';
-  if (r === 'consultant' || r === 'consultant_project_manager') return 'consultant';
-  if (r === 'client'     || r === 'client_project_manager')     return 'client';
+  const r = role.toLowerCase().replace(/[\s_-]+/g, '');
+  if (r === 'contractor' || r === 'contractorpm') return 'contractor';
+  if (r === 'consultant' || r === 'consultantpm') return 'consultant';
+  if (r === 'client'     || r === 'clientpm')     return 'client';
   return null;
 }
 
@@ -871,9 +871,8 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
 
     const messageId = rows[0].id;
 
-    markMessagesRead([messageId], req.user.user_id, normalizedSenderRole).catch(e =>
-      console.error('[POST /chat/messages] sender receipt error:', e.message)
-    );
+    // Do not mark the sender's own message as read/delivered here.
+    // The recipient should generate a read receipt when they open the message.
 
     res.status(201).json({ success: true, message: 'Message saved', chatMessage: rows[0] });
   } catch (err) {
