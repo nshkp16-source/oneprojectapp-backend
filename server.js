@@ -776,10 +776,23 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       })
       .map(m => m.id);
 
+    // Log all attachment URLs in messages for debugging
+    const messagesWithAttachments = rows.filter(m => m.attachment_url);
+    if (messagesWithAttachments.length) {
+      console.log(`[GET /chat/messages] Returning ${messagesWithAttachments.length} messages with attachments:`, 
+        messagesWithAttachments.map(m => ({
+          id: m.id,
+          url: m.attachment_url,
+          mime: m.attachment_mime,
+          name: m.attachment_name
+        }))
+      );
+    }
+
     // Validate attachment metadata is present for audio/media playback
     rows.forEach(m => {
       if (m.attachment_url && !m.attachment_mime) {
-        console.warn(`[GET /chat/messages] missing attachment_mime for message id=${m.id}, url=${m.attachment_url}, name=${m.attachment_name}`);
+        console.warn(`[GET /chat/messages] ⚠️ MISSING attachment_mime for message id=${m.id}, url=${m.attachment_url}, name=${m.attachment_name}`);
       }
     });
 
@@ -879,13 +892,17 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
     const messageId = rows[0].id;
     const chatMsg = rows[0];
 
+    console.log('[POST /chat/messages] Message inserted:', {id: messageId, content: contentText?.substring(0,50), attachment_url: chatMsg.attachment_url, attachment_mime: chatMsg.attachment_mime, attachment_name: chatMsg.attachment_name});
+
     // Do not mark the sender's own message as read/delivered here.
     // The recipient should generate a read receipt when they open the message.
 
     // Validate attachment fields are preserved for playback/rendering
     if (attachmentUrl || attachmentName || attachmentMime) {
       if (!chatMsg.attachment_url || !chatMsg.attachment_mime) {
-        console.warn(`[POST /chat/messages] attachment metadata missing in response: id=${messageId}, url=${chatMsg.attachment_url}, mime=${chatMsg.attachment_mime}, name=${chatMsg.attachment_name}`);
+        console.warn(`[POST /chat/messages] ⚠️ CRITICAL: attachment metadata missing in DB response: id=${messageId}, sent_url=${attachmentUrl}, returned_url=${chatMsg.attachment_url}, sent_mime=${attachmentMime}, returned_mime=${chatMsg.attachment_mime}, sent_name=${attachmentName}`);
+      } else {
+        console.log(`[POST /chat/messages] ✓ Attachment metadata preserved in DB: url exists, mime=${chatMsg.attachment_mime}`);
       }
     }
 
@@ -1032,12 +1049,18 @@ app.post('/api/profile-picture', authenticateToken, upload.single('picture'), as
 
 app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!req.file) {
+      console.error('[POST /api/upload-attachment] No file in request');
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    console.log('[POST /api/upload-attachment] File received:', {name: req.file.originalname, mime: req.file.mimetype, size: req.file.size});
     const resourceType = req.file.mimetype?.startsWith('image/') ? 'image'
       : req.file.mimetype?.startsWith('video/') ? 'video'
       : req.file.mimetype?.startsWith('audio/') ? 'raw'
       : 'raw';
+    console.log('[POST /api/upload-attachment] resourceType:', resourceType);
     const result = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/attachments', resourceType);
+    console.log('[POST /api/upload-attachment] Cloudinary response:', {url: result.secure_url});
     res.json({ success: true, url: result.secure_url, name: req.file.originalname, mime: req.file.mimetype });
   } catch (err) {
     console.error('Attachment upload error:', err);
