@@ -776,6 +776,13 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
       })
       .map(m => m.id);
 
+    // Validate attachment metadata is present for audio/media playback
+    rows.forEach(m => {
+      if (m.attachment_url && !m.attachment_mime) {
+        console.warn(`[GET /chat/messages] missing attachment_mime for message id=${m.id}, url=${m.attachment_url}, name=${m.attachment_name}`);
+      }
+    });
+
     if (unreadIds.length) {
       markMessagesRead(unreadIds, userId, normalizedUserRole).catch(e =>
         console.error('[GET /chat/messages] markMessagesRead error:', e.message)
@@ -870,11 +877,19 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
     );
 
     const messageId = rows[0].id;
+    const chatMsg = rows[0];
 
     // Do not mark the sender's own message as read/delivered here.
     // The recipient should generate a read receipt when they open the message.
 
-    res.status(201).json({ success: true, message: 'Message saved', chatMessage: rows[0] });
+    // Validate attachment fields are preserved for playback/rendering
+    if (attachmentUrl || attachmentName || attachmentMime) {
+      if (!chatMsg.attachment_url || !chatMsg.attachment_mime) {
+        console.warn(`[POST /chat/messages] attachment metadata missing in response: id=${messageId}, url=${chatMsg.attachment_url}, mime=${chatMsg.attachment_mime}, name=${chatMsg.attachment_name}`);
+      }
+    }
+
+    res.status(201).json({ success: true, message: 'Message saved', chatMessage: chatMsg });
   } catch (err) {
     console.error('[POST /chat/messages]', err);
     res.status(500).json({ success: false, error: 'Failed to send chat message' });
@@ -1018,7 +1033,11 @@ app.post('/api/profile-picture', authenticateToken, upload.single('picture'), as
 app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const result = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/attachments');
+    const resourceType = req.file.mimetype?.startsWith('image/') ? 'image'
+      : req.file.mimetype?.startsWith('video/') ? 'video'
+      : req.file.mimetype?.startsWith('audio/') ? 'raw'
+      : 'raw';
+    const result = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/attachments', resourceType);
     res.json({ success: true, url: result.secure_url, name: req.file.originalname, mime: req.file.mimetype });
   } catch (err) {
     console.error('Attachment upload error:', err);
