@@ -2517,9 +2517,23 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
   const projectId = normalizeProjectId(req.body.projectId);
   if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
   let tl, rawMilestones, newIds, editedIds, unchangedIds, deletedIds;
+  let addlRawMs, newAddlIds, editedAddlIds, unchangedAddlIds, deletedAddlIds;
   const location = parseJsonSafe(req.body.location);
-  try { tl=JSON.parse(req.body.timeline); rawMilestones=JSON.parse(req.body.milestones); newIds=new Set(JSON.parse(req.body.newIds||'[]')); editedIds=new Set(JSON.parse(req.body.editedIds||'[]')); unchangedIds=new Set(JSON.parse(req.body.unchangedIds||'[]')); deletedIds=JSON.parse(req.body.deletedIds||'[]'); }
-  catch { return res.status(400).json({ error: 'Invalid JSON in timeline, milestones, or id lists' }); }
+  try {
+    tl = JSON.parse(req.body.timeline);
+    rawMilestones = JSON.parse(req.body.milestones);
+    newIds = new Set(JSON.parse(req.body.newIds||'[]'));
+    editedIds = new Set(JSON.parse(req.body.editedIds||'[]'));
+    unchangedIds = new Set(JSON.parse(req.body.unchangedIds||'[]'));
+    deletedIds = JSON.parse(req.body.deletedIds||'[]');
+    addlRawMs = JSON.parse(req.body.additionalMilestones||'[]');
+    newAddlIds = new Set(JSON.parse(req.body.newAddlIds||'[]'));
+    editedAddlIds = new Set(JSON.parse(req.body.editedAddlIds||'[]'));
+    unchangedAddlIds = new Set(JSON.parse(req.body.unchangedAddlIds||'[]'));
+    deletedAddlIds = JSON.parse(req.body.deletedAddlIds||'[]');
+  } catch {
+    return res.status(400).json({ error: 'Invalid JSON in timeline, milestones, or additional milestone lists' });
+  }
   const fileMap = {};
   (req.files||[]).forEach(f => { fileMap[f.fieldname.replace(/^file_/,'')] = f; });
   const client = await pool.connect();
@@ -2532,6 +2546,12 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       if (!check.rows.length) continue;
       if (parseFloat(check.rows[0].executed) > 0) { console.warn(`[save-schedule] Skipping delete of milestone ${dbId}: has recorded progress`); continue; }
       await client.query('DELETE FROM milestones WHERE id=$1 AND schedule_id=$2', [dbId, schedId]);
+    }
+    for (const dbId of deletedAddlIds) {
+      const check = await client.query('SELECT executed FROM additional_milestones WHERE id=$1 AND schedule_id=$2', [dbId, schedId]);
+      if (!check.rows.length) continue;
+      if (parseFloat(check.rows[0].executed) > 0) { console.warn(`[save-schedule] Skipping delete of additional milestone ${dbId}: has recorded progress`); continue; }
+      await client.query('DELETE FROM additional_milestones WHERE id=$1 AND schedule_id=$2', [dbId, schedId]);
     }
     const totalDur = rawMilestones.reduce((sum, ms) => sum + Math.max(1, daysBetween(ms.start, ms.end)), 0);
     const tempToReal = {};
@@ -2554,12 +2574,43 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
         await client.query('UPDATE milestones SET sort_order=$1 WHERE id=$2 AND schedule_id=$3', [i, ms.id, schedId]);
       }
     }
+
+    // Additional milestones created in the extension period
+    const addlTempToReal = {};
+    for (const ms of addlRawMs) { if (!newAddlIds.has(ms.id)) addlTempToReal[ms.id] = ms.id; }
+    const addlNeedsAttachment = [];
+    for (let i = 0; i < addlRawMs.length; i++) {
+      const ms = addlRawMs[i];
+      const dur = Math.max(1, daysBetween(ms.start, ms.end));
+      const float = Math.max(0, daysBetween(ms.end, tl.finish));
+      const depId = ms.dep && ms.dep !== 'None' ? ms.dep : null;
+      const weight = parseFloat(ms.weight_pct || 0) || 0;
+      const isCritical = ms.is_critical ? true : false;
+      if (newAddlIds.has(ms.id)) {
+        const ins = await client.query(`INSERT INTO additional_milestones (schedule_id,project_id,title,description,sort_order,planned_start,planned_end,duration_days,float_days,is_critical,weight_pct,quantity,unit,depends_on_baseline,added_by_user_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`, [schedId,projectId,ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,isCritical,weight,parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,req.user.user_id,req.user.role]);
+        const realId = ins.rows[0].id; addlTempToReal[ms.id] = realId;
+        if (fileMap[ms.id]) addlNeedsAttachment.push({ realId, tempId: ms.id });
+      } else if (editedAddlIds.has(ms.id)) {
+        await client.query(`UPDATE additional_milestones SET title=$1,description=$2,sort_order=$3,planned_start=$4,planned_end=$5,duration_days=$6,float_days=$7,is_critical=$8,weight_pct=$9,quantity=$10,unit=$11,depends_on_baseline=$12,updated_at=now() WHERE id=$13 AND schedule_id=$14`, [ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,isCritical,weight,parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,ms.id,schedId]);
+        if (fileMap[ms.id]) addlNeedsAttachment.push({ realId: ms.id, tempId: ms.id });
+      } else if (unchangedAddlIds.has(ms.id)) {
+        await client.query('UPDATE additional_milestones SET sort_order=$1 WHERE id=$2 AND schedule_id=$3', [i, ms.id, schedId]);
+      }
+    }
+
     for (const { realId, tempId } of needsAttachment) {
       const file = fileMap[tempId]; if (!file) continue;
       try {
         const cdResult = await scheduleCloudinaryUpload(file.buffer, file.originalname, `oneprojectapp/schedules/${projectId}/milestones`);
         await client.query(`INSERT INTO milestone_attachments (milestone_id,file_name,file_size,mime_type,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (cloudinary_public_id) DO NOTHING`, [realId,file.originalname,file.size,file.mimetype,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]);
       } catch (cdErr) { console.error('[save-schedule] Cloudinary upload failed for milestone', realId, cdErr); }
+    }
+    for (const { realId, tempId } of addlNeedsAttachment) {
+      const file = fileMap[tempId]; if (!file) continue;
+      try {
+        const cdResult = await scheduleCloudinaryUpload(file.buffer, file.originalname, `oneprojectapp/schedules/${projectId}/additional`);
+        await client.query(`INSERT INTO additional_milestone_attachments (additional_milestone_id,file_name,file_size,mime_type,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (cloudinary_public_id) DO NOTHING`, [realId,file.originalname,file.size,file.mimetype,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]);
+      } catch (cdErr) { console.error('[save-schedule] Cloudinary upload failed for additional milestone', realId, cdErr); }
     }
     await client.query('COMMIT');
     const freshMs = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [schedId]);
