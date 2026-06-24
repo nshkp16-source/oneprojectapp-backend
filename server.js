@@ -1732,7 +1732,7 @@ app.post('/assign-team', async (req, res) => {
           await client.query(`INSERT INTO ${pm.aTable} (project_id,${pm.fk},name,telephone,task) VALUES ($1,(SELECT id FROM ${pm.pmTable} WHERE email=$2),$3,$4,$5) ON CONFLICT DO NOTHING`,[projectId,a.email,a.name||null,a.telephone||null,a.task||null]);
         } else if (a.role==='Team Member'){
           const assignedPart=a.assigned_part||(side==='client'?'Client':side==='contractor'?'Contractor':'Consultant');
-          await client.query(`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,[projectId,a.email,a.name||null,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId,a.assigned_by_role||role]);
+          await client.query(`INSERT INTO team_member_assignments (project_id,team_member_id,name,position,telephone,assigned_part,assigned_by,assigned_by_role) VALUES ($1,(SELECT id FROM team_members WHERE email=$2),$3,$4,$5,$6,$7,$8) ON CONFLICT (project_id,team_member_id) DO NOTHING`,[projectId,a.email,a.name||null,a.position||null,a.telephone||null,assignedPart,a.assigned_by||userId,a.assigned_by_role||role]);
         }
       }
       const pmCheckMap={client:'SELECT 1 FROM client_pm_assignments WHERE project_id=$1 LIMIT 1',contractor:'SELECT 1 FROM contractor_pm_assignments WHERE project_id=$1 LIMIT 1',consultant:'SELECT 1 FROM consultant_pm_assignments WHERE project_id=$1 LIMIT 1'};
@@ -1805,7 +1805,7 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
       side = wcSide(role);
     } else if (role === 'TeamMember') {
       const result = await pool.query(
-        `SELECT assigned_part FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2`,
+        `SELECT assigned_part FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 ORDER BY id DESC LIMIT 1`,
         [projectId, user_id]
       );
       if (result.rows.length > 0) side = result.rows[0].assigned_part;
