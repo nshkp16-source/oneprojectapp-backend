@@ -1852,7 +1852,8 @@ async function getNotifications(projectId, userRole, userId) {
          AND (n.added_by_id IS NULL OR n.added_by_id != $3)
          AND nr.recipient_role = $2
          AND nr.recipient_role_id = $3
-       ORDER BY n.created_at DESC`,
+       ORDER BY n.created_at DESC
+       LIMIT 100`,
       [projectId, userRole, userId]
     );
     return rows;
@@ -1898,19 +1899,15 @@ for (const prefix of ['/notifications', '/api/notifications']) {
     const { notificationIds } = req.body;
     if (!Array.isArray(notificationIds) || !notificationIds.length) return res.json({ success: true, updated: 0 });
     try {
-      let updated = 0;
-      for (const notifId of notificationIds) {
-        await pool.query(
-          `UPDATE notification_recipients
-           SET is_read = true, read_at = NOW()
-           WHERE notification_id = $1
-             AND recipient_role = $2
-             AND recipient_role_id = $3`,
-          [notifId, req.user.role, req.user.user_id]
-        );
-        updated += 1;
-      }
-      res.json({ success: true, updated });
+      const result = await pool.query(
+        `UPDATE notification_recipients
+         SET is_read = true, read_at = NOW()
+         WHERE notification_id = ANY($1::int[])
+           AND recipient_role = $2
+           AND recipient_role_id = $3`,
+        [notificationIds, req.user.role, req.user.user_id]
+      );
+      res.json({ success: true, updated: result.rowCount });
     } catch (err) { console.error('Mark all read error:', err); res.status(500).json({ success: false }); }
   });
 }
