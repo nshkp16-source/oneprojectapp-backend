@@ -2151,18 +2151,7 @@ app.post('/api/arrets', authenticateToken, upload.array('attachments'), async (r
         attachments.push(attachment);
       }
 
-      console.log('[notifications] creating notification', { projectId, entity_id: arret.id, entity_type: 'arrets', message: `New arret issued by ${req.user.role}: "${title}"`, added_by_id: req.user.user_id, added_by_role: req.user.role });
-      const notifRes = await client.query(
-        `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [projectId, arret.id, 'arrets', `New arret issued by ${req.user.role}: "${title}"`, req.user.user_id, req.user.role]
-      );
-      const notificationId = notifRes.rows[0].id;
-      console.log('[notifications] created', { notificationId, projectId, entity_id: arret.id });
-      const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
-      await insertNotificationRecipients(client, notificationId, recipients);
       await client.query('COMMIT');
-
       return res.status(201).json({ success: true, arret: { ...arret, attachments }, message: 'Arret saved.' });
     } catch (err) {
       await client.query('ROLLBACK');
@@ -2207,6 +2196,8 @@ app.post('/api/arrets/view', authenticateToken, async (req, res) => {
            DO UPDATE SET viewed_at = NOW()`,
           [arretId, req.user.user_id, req.user.role]
         );
+      } else if (err.message.includes('relation "arret_views" does not exist')) {
+        console.warn('[POST /api/arrets/view] arret_views table missing; skipping view record.', err.message);
       } else {
         throw err;
       }
@@ -2275,60 +2266,36 @@ app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT /api/arrets/:id — Update arret status (open/closed/resolved)
+// PUT /api/arrets/:id — Update arret title/description and optionally status by creator only
 app.put('/api/arrets/:id', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const arretId = parseInt(req.params.id, 10);
-  const { status, is_resolved } = req.body;
+  const { title, description, status } = req.body;
 
   if (!projectId || !arretId) return res.status(400).json({ error: 'projectId and arretId are required' });
-  if (!status || !['open', 'closed', 'resolved'].includes(status)) 
+  if (!title || !description) return res.status(400).json({ error: 'Title and description are required.' });
+  if (status && !['open', 'closed', 'resolved'].includes(status))
     return res.status(400).json({ error: 'Valid status required: open, closed, resolved' });
 
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
       return res.status(403).json({ error: 'You are not assigned to this project.' });
 
-    // Check arret exists and get current state
     const { rows } = await pool.query(`SELECT * FROM arrets WHERE id=$1 AND project_id=$2`, [arretId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
 
     const arret = rows[0];
-    const wasResolved = arret.is_resolved;
-    const isNowResolved = status === 'resolved' || is_resolved === true;
-
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      // Update arret
-      const updateRes = await client.query(
-        `UPDATE arrets SET status=$1, is_resolved=$2, updated_at=NOW() WHERE id=$3 RETURNING *`,
-        [status, isNowResolved, arretId]
-      );
-      const updatedArret = updateRes.rows[0];
-
-      // Create resolution notification if transitioning to resolved
-      if (!wasResolved && isNowResolved) {
-        const notifMsg = `Arret resolved by ${req.user.role}: "${arret.title}"`;
-        const notifRes = await client.query(
-          `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
-           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-          [projectId, arretId, 'arrets', notifMsg, req.user.user_id, req.user.role]
-        );
-        const notificationId = notifRes.rows[0].id;
-        const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
-        await insertNotificationRecipients(client, notificationId, recipients);
-      }
-
-      await client.query('COMMIT');
-      return res.json({ success: true, arret: updatedArret, message: `Arret ${status}.` });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
+    if (Number(arret.created_by) !== Number(req.user.user_id) || String(arret.creator_role) !== String(req.user.role)) {
+      return res.status(403).json({ error: 'Only the arret creator can edit this arret.' });
     }
+
+    const updatedFields = [title.trim(), description.trim(), status || arret.status, arretId];
+    const updateRes = await pool.query(
+      `UPDATE arrets SET title=$1, description=$2, status=$3, is_resolved=($3 = 'resolved'), updated_at=NOW() WHERE id=$4 RETURNING *`,
+      updatedFields
+    );
+
+    return res.json({ success: true, arret: updateRes.rows[0], message: 'Arret updated.' });
   } catch (err) {
     console.error('PUT /api/arrets/:id:', err);
     return res.status(500).json({ error: 'Failed to update arret' });
@@ -2351,7 +2318,7 @@ app.delete('/api/arrets/:id', authenticateToken, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
 
     const arret = rows[0];
-    if (Number(arret.created_by) !== Number(req.user.user_id)) {
+    if (Number(arret.created_by) !== Number(req.user.user_id) || String(arret.creator_role) !== String(req.user.role)) {
       return res.status(403).json({ error: 'Only the arret creator can delete it.' });
     }
 
