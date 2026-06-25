@@ -412,7 +412,7 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
 
   return filtered2
     .map(m => ({
-      recipient_role:    m.role,
+      recipient_role:    normalizeRole(m.role),
       recipient_role_id: Number(m.role_id),
       recipient_email:   m.email || null,
       user_id:           Number(m.role_id),
@@ -1822,6 +1822,7 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 async function getUnreadCount(projectId, userRole, userId) {
   try {
+    const normalizedRole = normalizeRole(userRole);
     const result = await pool.query(
       `SELECT COUNT(DISTINCT n.id) AS count
        FROM notifications n
@@ -1831,7 +1832,7 @@ async function getUnreadCount(projectId, userRole, userId) {
          AND nr.recipient_role = $2
          AND nr.recipient_role_id = $3
          AND nr.is_read = false`,
-      [projectId, userRole, userId]
+      [projectId, normalizedRole, userId]
     );
     return parseInt(result.rows[0].count, 10);
   } catch (err) {
@@ -1842,6 +1843,7 @@ async function getUnreadCount(projectId, userRole, userId) {
 
 async function getNotifications(projectId, userRole, userId) {
   try {
+    const normalizedRole = normalizeRole(userRole);
     const { rows } = await pool.query(
       `SELECT n.id, n.entity_type, n.entity_id, n.message,
               n.added_by_role, n.created_at,
@@ -1853,7 +1855,7 @@ async function getNotifications(projectId, userRole, userId) {
          AND nr.recipient_role = $2
          AND nr.recipient_role_id = $3
        ORDER BY n.created_at DESC`,
-      [projectId, userRole, userId]
+      [projectId, normalizedRole, userId]
     );
     return rows;
   } catch (err) {

@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "backfill-notifs": "node tools/backfill_notifications.js"
+    "backfill-notifs": "node tools/backfill_notifications.js",
+    "apply-notification-schema": "node tools/apply-notification-schema.js"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
