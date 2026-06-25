@@ -205,11 +205,11 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
 
   for (const recipient of recipients) {
     try {
-      console.log(`[insertNotificationRecipients] inserting: notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}, email=${recipient.recipient_email}`);
+      console.log(`[insertNotificationRecipients] inserting: notif=${notificationId}, role=${recipient.recipient_role}, role_id=${recipient.recipient_role_id}`);
       const res = await dbClient.query(
         `INSERT INTO notification_recipients
-           (notification_id, recipient_role, recipient_role_id, recipient_email, is_read, created_at)
-         SELECT $1, $2, $3, $4, false, NOW()
+           (notification_id, recipient_role, recipient_role_id, is_read, created_at)
+         SELECT $1, $2, $3, false, NOW()
          WHERE NOT EXISTS (
            SELECT 1 FROM notification_recipients nr
            WHERE nr.notification_id = $1
@@ -217,7 +217,7 @@ async function insertNotificationRecipients(dbClient, notificationId, recipients
              AND nr.recipient_role_id = $3
          )
          RETURNING id`,
-        [notificationId, recipient.recipient_role, recipient.recipient_role_id, recipient.recipient_email]
+        [notificationId, recipient.recipient_role, recipient.recipient_role_id]
       );
       if (res.rows.length > 0) {
         console.log(`[insertNotificationRecipients] ✓ Inserted notification_recipients row ${res.rows[0].id}`);
@@ -414,7 +414,6 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
     .map(m => ({
       recipient_role:    normalizeRole(m.role),
       recipient_role_id: Number(m.role_id),
-      recipient_email:   m.email || null,
       user_id:           Number(m.role_id),
     }));
 }
