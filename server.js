@@ -1913,6 +1913,34 @@ for (const prefix of ['/notifications', '/api/notifications']) {
       res.json({ success: true, updated });
     } catch (err) { console.error('Mark all read error:', err); res.status(500).json({ success: false }); }
   });
+
+  // Diagnostic endpoint: lightweight DB checks for notifications
+  app.get(`${prefix}/diagnose`, authenticateToken, async (req, res) => {
+    const projectId = normalizeProjectId(req.query.projectId);
+    try {
+      const t1 = await pool.query("SELECT to_regclass('public.notifications') AS reg");
+      const t2 = await pool.query("SELECT to_regclass('public.notification_recipients') AS reg");
+      const tableExists = { notifications: !!t1.rows[0].reg, notification_recipients: !!t2.rows[0].reg };
+
+      let counts = { notifications: null, notification_recipients: null, orphaned_notifications: null };
+      if (projectId && tableExists.notifications && tableExists.notification_recipients) {
+        const r1 = await pool.query('SELECT COUNT(*) FROM notifications WHERE project_id = $1', [projectId]);
+        const r2 = await pool.query('SELECT COUNT(nr.*) FROM notification_recipients nr JOIN notifications n ON n.id = nr.notification_id WHERE n.project_id = $1', [projectId]);
+        const r3 = await pool.query('SELECT COUNT(n.id) FROM notifications n LEFT JOIN notification_recipients nr ON nr.notification_id = n.id WHERE n.project_id = $1 AND nr.id IS NULL', [projectId]);
+        counts.notifications = Number(r1.rows[0].count);
+        counts.notification_recipients = Number(r2.rows[0].count);
+        counts.orphaned_notifications = Number(r3.rows[0].count);
+      }
+
+      const fnRes = await pool.query("SELECT proname FROM pg_proc WHERE proname = 'create_notification_for_project' LIMIT 1");
+      const functions = { create_notification_for_project: fnRes.rows.length > 0 };
+
+      res.json({ tables: tableExists, counts, functions });
+    } catch (err) {
+      console.error('[diagnose] error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2790,6 +2818,31 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       } catch (cdErr) { console.error('[save-schedule] Cloudinary upload failed for additional milestone', realId, cdErr); }
     }
     await client.query('COMMIT');
+
+    // Notify project members that the schedule was edited
+    try {
+      const notifClient = await pool.connect();
+      try {
+        await notifClient.query('BEGIN');
+        const notifMsg = `Schedule updated by ${req.user.role}`;
+        const notifRes = await notifClient.query(
+          `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [projectId, schedId, 'project_schedules', notifMsg, req.user.user_id, req.user.role]
+        );
+        const notificationId = notifRes.rows[0].id;
+        const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
+        await insertNotificationRecipients(notifClient, notificationId, recipients);
+        await notifClient.query('COMMIT');
+        console.log('[notifications] created schedule update notification', { notificationId, projectId, schedId, recipients: recipients.length });
+      } catch (notifErr) {
+        await notifClient.query('ROLLBACK');
+        console.error('[notifications] failed to create schedule notification (non-fatal):', notifErr.message);
+      } finally { notifClient.release(); }
+    } catch (outerNotifErr) {
+      console.error('[notifications] outer error creating schedule notification (non-fatal):', outerNotifErr.message);
+    }
+
     const freshMs = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [schedId]);
     const savedLocation = schedRes.rows[0]?.location || location || null;
     const extRows2 = await pool.query(`SELECT id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [schedId]);
@@ -2916,6 +2969,31 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
       }
     }
     await client.query('COMMIT');
+
+    // Create a notification for the extension so recipients are informed
+    try {
+      const notifClient = await pool.connect();
+      try {
+        await notifClient.query('BEGIN');
+        const notifMsg = `Schedule extension requested by ${req.user.role}: "${reason}"`;
+        const notifRes = await notifClient.query(
+          `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [projectId, extensionId, 'schedule_extensions', notifMsg, req.user.user_id, req.user.role]
+        );
+        const notificationId = notifRes.rows[0].id;
+        const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role);
+        await insertNotificationRecipients(notifClient, notificationId, recipients);
+        await notifClient.query('COMMIT');
+        console.log('[notifications] created extension notification', { notificationId, projectId, extensionId, recipients: recipients.length });
+      } catch (notifErr) {
+        await notifClient.query('ROLLBACK');
+        console.error('[notifications] failed to create extension notification (non-fatal):', notifErr.message);
+      } finally { notifClient.release(); }
+    } catch (outerNotifErr) {
+      console.error('[notifications] outer error creating extension notification (non-fatal):', outerNotifErr.message);
+    }
+
     res.json({success:true,extension:{id:extensionId,extensionDays,newPlannedFinish,reason,extensionType,status:'pending',newMilestonesAdded:insertedAdditional.length}});
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/save-extension]',err);res.status(500).json({error:'Failed to save extension'});}finally{client.release();}
 });
