@@ -1827,7 +1827,7 @@ async function getUnreadCount(projectId, userRole, userId) {
        FROM notifications n
        INNER JOIN notification_recipients nr ON nr.notification_id = n.id
        WHERE n.project_id = $1
-         AND (n.added_by_id IS NULL OR n.added_by_id != $3)
+         AND NOT (n.added_by_id = $3 AND n.added_by_role = $2)
          AND nr.recipient_role = $2
          AND nr.recipient_role_id = $3
          AND nr.is_read = false`,
@@ -1850,7 +1850,7 @@ async function getNotifications(projectId, userRole, userId) {
        FROM notifications n
        INNER JOIN notification_recipients nr ON nr.notification_id = n.id
        WHERE n.project_id = $1
-         AND (n.added_by_id IS NULL OR n.added_by_id != $3)
+         AND NOT (n.added_by_id = $3 AND n.added_by_role = $2)
          AND nr.recipient_role = $2
          AND nr.recipient_role_id = $3
        ORDER BY n.created_at DESC`,
