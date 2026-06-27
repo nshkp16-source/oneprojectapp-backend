@@ -10,6 +10,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { v2 as cloudinary } from 'cloudinary';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { Readable } from 'stream';
 
 const { v4: uuidv4 } = pkg;
@@ -2663,10 +2664,9 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
 
     if (recRows[0].file_path) {
       try {
-        const { PDFDocument, rgb, StandardFonts } = await import('pdf-lib');
-        const fetch2 = (await import('node-fetch')).default;
-
-        const fileResp   = await fetch2(recRows[0].file_path);
+        // PDFDocument, rgb, StandardFonts imported at top of file
+        // fetch is built-in Node 18+
+        const fileResp   = await fetch(recRows[0].file_path);
         const fileBuffer = Buffer.from(await fileResp.arrayBuffer());
         const contentType = fileResp.headers.get('content-type') || '';
 
@@ -2705,7 +2705,7 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
 
           if (stampProfile.stamp_image_url) {
             try {
-              const si = await fetch2(stampProfile.stamp_image_url);
+              const si = await fetch(stampProfile.stamp_image_url);
               const sb = Buffer.from(await si.arrayBuffer());
               const sc = si.headers.get('content-type') || '';
               const se = sc.includes('png') ? await pdfDoc.embedPng(sb) : await pdfDoc.embedJpg(sb);
