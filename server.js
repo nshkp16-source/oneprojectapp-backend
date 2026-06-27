@@ -2641,40 +2641,76 @@ app.post('/api/my-stamp', authenticateToken, upload.single('stampImage'), async 
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/sign-record', authenticateToken, async (req, res) => {
   const { user_id, role } = req.user;
-  if (!isDecisionMaker(role)) return res.status(403).json({ error: 'Only decision makers can sign records.' });
+  console.log('[sign-record] 📝 Request received', { user_id, role, body: req.body });
+  
+  if (!isDecisionMaker(role)) {
+    console.log('[sign-record] ❌ User is not a decision maker:', role);
+    return res.status(403).json({ error: 'Only decision makers can sign records.' });
+  }
+  
   const { recordId, recordType, projectId, stampType } = req.body;
   const table = resolveTable(recordType);
-  if (!table) return res.status(400).json({ error: 'Invalid recordType.' });
+  
+  if (!table) {
+    console.log('[sign-record] ❌ Invalid recordType:', recordType);
+    return res.status(400).json({ error: 'Invalid recordType.' });
+  }
+  
+  console.log('[sign-record] 🔍 Resolved table:', table, '| Looking for record:', recordId);
+  
   try {
     const { rows: recRows } = await pool.query(
       `SELECT id, file_path, signed_at FROM ${table} WHERE id=$1 AND project_id=$2`,
       [recordId, projectId]
     );
-    if (!recRows.length) return res.status(404).json({ error: 'Record not found.' });
-    if (recRows[0].signed_at) return res.status(409).json({ error: 'Record already signed.' });
+    
+    console.log('[sign-record] 🔎 Query result rows:', recRows.length);
+    if (!recRows.length) {
+      console.log('[sign-record] ❌ Record not found in', table, 'with id:', recordId, 'project:', projectId);
+      return res.status(404).json({ error: 'Record not found.' });
+    }
+    
+    if (recRows[0].signed_at) {
+      console.log('[sign-record] ❌ Record already signed at:', recRows[0].signed_at);
+      return res.status(409).json({ error: 'Record already signed.' });
+    }
 
     const { rows: stampRows } = await pool.query(
       `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
       [user_id, role]
     );
-    if (!stampRows.length) return res.status(400).json({ error: 'No stamp profile found. Set up your stamp first.' });
+    console.log('[sign-record] 🖋️ Stamp profile check:', { found: stampRows.length > 0, user_id, role });
+    
+    if (!stampRows.length) {
+      console.log('[sign-record] ❌ No stamp profile found for user:', user_id, 'role:', role);
+      return res.status(400).json({ error: 'No stamp profile found. Set up your stamp first.' });
+    }
+    
     const stampProfile = stampRows[0];
+    console.log('[sign-record] ✅ Stamp profile loaded:', { 
+      has_signature: !!stampProfile.signature_image,
+      has_stamp_image: !!stampProfile.stamp_image_url
+    });
 
     let stampedDocUrl = null, signatureHash = null;
 
     if (recRows[0].file_path) {
+      console.log('[sign-record] 📄 File found, starting PDF processing:', recRows[0].file_path.substring(0, 50));
       try {
         // PDFDocument, rgb, StandardFonts imported at top of file
         // fetch is built-in Node 18+
         const fileResp   = await fetch(recRows[0].file_path);
         const fileBuffer = Buffer.from(await fileResp.arrayBuffer());
         const contentType = fileResp.headers.get('content-type') || '';
+        console.log('[sign-record] 📥 File fetched:', { contentType, bufferSize: fileBuffer.length });
 
         let pdfBytes = null;
 
         if (contentType.includes('pdf') || /\.pdf$/i.test(recRows[0].file_path)) {
+          console.log('[sign-record] 📎 File is PDF');
           pdfBytes = fileBuffer;
         } else if (contentType.startsWith('image/') || /\.(jpe?g|png)$/i.test(recRows[0].file_path)) {
+          console.log('[sign-record] 🖼️ File is image, converting to PDF');
           const tmpDoc = await PDFDocument.create();
           const img = contentType.includes('png') || /\.png$/i.test(recRows[0].file_path)
             ? await tmpDoc.embedPng(fileBuffer)
@@ -2682,9 +2718,11 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
           const pg = tmpDoc.addPage([img.width, img.height]);
           pg.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
           pdfBytes = await tmpDoc.save();
+          console.log('[sign-record] ✅ Image converted to PDF');
         }
 
         if (pdfBytes) {
+          console.log('[sign-record] 🎨 Drawing stamp on PDF...');
           const pdfDoc = await PDFDocument.load(pdfBytes);
           const page   = pdfDoc.getPages()[pdfDoc.getPageCount() - 1];
           const { width, height } = page.getSize();
@@ -2705,40 +2743,56 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
 
           if (stampProfile.stamp_image_url) {
             try {
+              console.log('[sign-record] 🏢 Embedding company stamp...');
               const si = await fetch(stampProfile.stamp_image_url);
               const sb = Buffer.from(await si.arrayBuffer());
               const sc = si.headers.get('content-type') || '';
               const se = sc.includes('png') ? await pdfDoc.embedPng(sb) : await pdfDoc.embedJpg(sb);
               page.drawImage(se, { x: bx+8, y: by+4, width: 48, height: 48 });
-            } catch(_) {}
+              console.log('[sign-record] ✅ Company stamp embedded');
+            } catch(e) { console.warn('[sign-record] ⚠️ Failed to embed stamp image:', e.message); }
           }
           if (stampProfile.signature_image) {
             try {
+              console.log('[sign-record] ✍️ Embedding signature...');
               const sd = stampProfile.signature_image.replace(/^data:image\/\w+;base64,/, '');
               const si2 = await pdfDoc.embedPng(Buffer.from(sd, 'base64'));
               page.drawImage(si2, { x: bx+70, y: by+4, width: 120, height: 50 });
-            } catch(_) {}
+              console.log('[sign-record] ✅ Signature embedded');
+            } catch(e) { console.warn('[sign-record] ⚠️ Failed to embed signature:', e.message); }
           }
 
           const finalBytes = await pdfDoc.save();
           signatureHash = crypto.createHash('sha256').update(finalBytes).digest('hex');
+          console.log('[sign-record] 🔐 Signature hash computed:', signatureHash.substring(0, 8) + '...');
+          
+          console.log('[sign-record] ☁️ Uploading stamped PDF to Cloudinary...');
           const cr = await uploadToCloudinary(Buffer.from(finalBytes), 'oneproject/stamped', 'raw');
           stampedDocUrl = cr.secure_url;
+          console.log('[sign-record] ✅ Uploaded:', stampedDocUrl.substring(0, 50) + '...');
+        } else {
+          console.log('[sign-record] ⚠️ No PDF bytes generated (unsupported file type?)');
         }
       } catch (pdfErr) {
-        console.error('[sign-record] PDF stamp failed (non-fatal):', pdfErr.message);
+        console.error('[sign-record] ❌ PDF stamp failed (non-fatal):', pdfErr.message);
       }
+    } else {
+      console.log('[sign-record] ℹ️ No file_path - stamp will be metadata only');
     }
 
+    console.log('[sign-record] 💾 Updating database with stamp metadata...');
     await pool.query(
       `UPDATE ${table} SET signed_by_id=$1, signed_by_role=$2, signed_at=NOW(),
        stamp_type=$3, stamped_doc_url=$4, signature_hash=$5 WHERE id=$6 AND project_id=$7`,
       [user_id, role, stampType || null, stampedDocUrl, signatureHash, recordId, projectId]
     );
+    console.log('[sign-record] ✅ Database updated successfully');
 
-    res.json({ success: true, signed_at: new Date().toISOString(), stamped_doc_url: stampedDocUrl, signature_hash: signatureHash });
+    const response = { success: true, signed_at: new Date().toISOString(), stamped_doc_url: stampedDocUrl, signature_hash: signatureHash };
+    console.log('[sign-record] 🎉 Stamp applied successfully:', response);
+    res.json(response);
   } catch (err) {
-    console.error('POST sign-record:', err);
+    console.error('[sign-record] ❌ FATAL ERROR:', err.message, err.stack);
     res.status(500).json({ error: 'Failed to sign record.' });
   }
 });
