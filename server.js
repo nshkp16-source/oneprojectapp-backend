@@ -2378,14 +2378,16 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     const { rows: records } = await pool.query(
       `SELECT r.id, r.title, r.description, r.file_path,
               r.issued_date, r.role AS uploader_role,
-              r.uploaded_by, r.status, r.record_kind, r.notice_tied_id
+              r.uploaded_by, r.status, r.record_kind, r.notice_tied_id,
+              r.signed_by_id, r.signed_by_role, r.signed_at,
+              r.stamp_type, r.stamped_doc_url, r.signature_hash
        FROM ${table} r WHERE r.project_id = $1 ORDER BY r.issued_date DESC`,
       [projectId]
     );
     const enriched = await Promise.all(records.map(async rec => {
       const { rows: reviews } = await pool.query(
         `SELECT dr.reviewer_id, dr.reviewer_role, dr.action, dr.action_date,
-                dr.comment, dr.reviewer_email, dr.reviewer_position
+                dr.comment, dr.reviewer_email, dr.reviewer_position, dr.reviewer_assigned_part
          FROM document_reviews dr WHERE dr.record_type = $1 AND dr.record_id = $2 ORDER BY dr.action_date ASC`,
         [table, rec.id]
       );
@@ -2441,17 +2443,45 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
           } else { btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve'; }
         }
       }
-      const { rows: myNotices } = await pool.query(
-        `SELECT id, title FROM ${table} WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 AND role=$4`,
-        [rec.id, projectId, userId, userRole]
+      // All notices tied to this record — full data, newest first, for card embedding
+      const { rows: embeddedNotices } = await pool.query(
+        `SELECT id, title, description, file_path, issued_date,
+                role AS uploader_role, record_kind,
+                signed_by_id, signed_by_role, signed_at, stamp_type, stamped_doc_url
+         FROM ${table}
+         WHERE notice_tied_id = $1 AND project_id = $2
+         ORDER BY issued_date DESC`,
+        [rec.id, projectId]
       );
-      const myIssuedNotice = myNotices.length > 0 ? myNotices[0] : null;
+      // Notice issued by the current user (for button state)
+      const { rows: myNoticeRows } = await pool.query(
+        `SELECT id FROM ${table} WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 LIMIT 1`,
+        [rec.id, projectId, userId]
+      );
+      const myIssuedNotice = myNoticeRows.length > 0
+        ? { id: myNoticeRows[0].id }
+        : null;
       let tiedRecordTitle = null;
       if (rec.notice_tied_id) {
         const { rows: tied } = await pool.query(`SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]);
         tiedRecordTitle = tied[0]?.title || null;
       }
-      return { ...rec, reviews: annotatedReviews, is_uploader: isUploader, is_viewed: isViewed, is_locked: isLocked, is_decision_maker: userIsDM, btn_state: btnState, pending_role: pendingRole, approve_label: approveLabel, my_review: myReview, workflow_steps: workflowSteps, my_issued_notice: myIssuedNotice, tied_record_title: tiedRecordTitle };
+      return {
+        ...rec,
+        reviews: annotatedReviews,
+        is_uploader: isUploader,
+        is_viewed: isViewed,
+        is_locked: isLocked,
+        is_decision_maker: userIsDM,
+        btn_state: btnState,
+        pending_role: pendingRole,
+        approve_label: approveLabel,
+        my_review: myReview,
+        workflow_steps: workflowSteps,
+        my_issued_notice: myIssuedNotice,
+        embedded_notices: embeddedNotices,
+        tied_record_title: tiedRecordTitle,
+      };
     }));
     res.json({ records: enriched });
   } catch (err) {
@@ -2505,14 +2535,23 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
     const { rows: existing } = await pool.query(`SELECT id, action FROM document_reviews WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 AND reviewer_role=$4 LIMIT 1`, [table, recordId, reviewerId, reviewerRole]);
     if (action === 'no_action' && comment?.trim()) {
       if (existing.length > 0) { await pool.query(`UPDATE document_reviews SET comment=$1, action_date=NOW() WHERE id=$2`, [comment.trim(), existing[0].id]); }
-      else { await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,'no_action',$7)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, comment.trim()]); }
+      else {
+        let _cap = null;
+        if (reviewerRole === 'TeamMember') { const {rows:_tr} = await pool.query(`SELECT assigned_part FROM team_member_assignments WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`,[projectId,reviewerId]); _cap=_tr[0]?.assigned_part||null; }
+        await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,reviewer_assigned_part,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,$7,'no_action',$8)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, _cap, comment.trim()]);
+      }
       return res.json({ success: true, message: 'Comment saved.' });
     }
     if (existing.length > 0) {
       if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
       await pool.query(`UPDATE document_reviews SET action=$1, action_date=NOW(), comment=COALESCE($2,comment) WHERE id=$3`, [action, comment?.trim() || null, existing[0].id]);
     } else {
-      await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, action, comment?.trim() || null]);
+      let reviewerAssignedPart = null;
+      if (reviewerRole === 'TeamMember') {
+        const { rows: tmRows } = await pool.query(`SELECT assigned_part FROM team_member_assignments WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`, [projectId, reviewerId]);
+        reviewerAssignedPart = tmRows[0]?.assigned_part || null;
+      }
+      await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,reviewer_assigned_part,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8,$9)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, reviewerAssignedPart, action, comment?.trim() || null]);
     }
     if (isDecisionMakerActor && isWorkflow) {
       const uploaderSide = getSide(rec.role);
@@ -2552,6 +2591,156 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
     if (filePath.startsWith('http')) return res.json({ url: filePath, fileName: filePath.split('/').pop() || 'download' });
     res.status(404).json({ error: 'File not accessible.' });
   } catch (err) { console.error('Download file error:', err); res.status(500).json({ error: 'Failed to download file.' }); }
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  STAMP PROFILE   GET /api/my-stamp   POST /api/my-stamp
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/my-stamp', authenticateToken, async (req, res) => {
+  const { user_id, role } = req.user;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, signature_image, stamp_image_url, updated_at
+       FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
+      [user_id, role]
+    );
+    res.json({ stamp: rows[0] || null });
+  } catch (err) { console.error('GET my-stamp:', err); res.status(500).json({ error: 'Failed.' }); }
+});
+
+app.post('/api/my-stamp', authenticateToken, upload.single('stampImage'), async (req, res) => {
+  const { user_id, role } = req.user;
+  if (!isDecisionMaker(role)) return res.status(403).json({ error: 'Only decision makers can create a stamp.' });
+  try {
+    const { signatureBase64 } = req.body;
+    let stampImageUrl = null;
+    if (req.file) {
+      const r = await uploadToCloudinary(req.file.buffer, 'oneproject/stamps', 'image');
+      stampImageUrl = r.secure_url;
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO user_stamps (user_id, user_role, signature_image, stamp_image_url, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT ON CONSTRAINT uniq_user_stamp
+       DO UPDATE SET
+         signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
+         stamp_image_url = COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url),
+         updated_at      = NOW()
+       RETURNING id, signature_image, stamp_image_url, updated_at`,
+      [user_id, role, signatureBase64 || null, stampImageUrl]
+    );
+    res.json({ success: true, stamp: rows[0] });
+  } catch (err) { console.error('POST my-stamp:', err); res.status(500).json({ error: 'Failed to save stamp.' }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SIGN RECORD   POST /api/sign-record
+//  Burns stamp onto PDF/image at upload time when user opts in.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/sign-record', authenticateToken, async (req, res) => {
+  const { user_id, role } = req.user;
+  if (!isDecisionMaker(role)) return res.status(403).json({ error: 'Only decision makers can sign records.' });
+  const { recordId, recordType, projectId, stampType } = req.body;
+  const table = resolveTable(recordType);
+  if (!table) return res.status(400).json({ error: 'Invalid recordType.' });
+  try {
+    const { rows: recRows } = await pool.query(
+      `SELECT id, file_path, signed_at FROM ${table} WHERE id=$1 AND project_id=$2`,
+      [recordId, projectId]
+    );
+    if (!recRows.length) return res.status(404).json({ error: 'Record not found.' });
+    if (recRows[0].signed_at) return res.status(409).json({ error: 'Record already signed.' });
+
+    const { rows: stampRows } = await pool.query(
+      `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
+      [user_id, role]
+    );
+    if (!stampRows.length) return res.status(400).json({ error: 'No stamp profile found. Set up your stamp first.' });
+    const stampProfile = stampRows[0];
+
+    let stampedDocUrl = null, signatureHash = null;
+
+    if (recRows[0].file_path) {
+      try {
+        const { PDFDocument, rgb, StandardFonts } = await import('pdf-lib');
+        const fetch2 = (await import('node-fetch')).default;
+
+        const fileResp   = await fetch2(recRows[0].file_path);
+        const fileBuffer = Buffer.from(await fileResp.arrayBuffer());
+        const contentType = fileResp.headers.get('content-type') || '';
+
+        let pdfBytes = null;
+
+        if (contentType.includes('pdf') || /\.pdf$/i.test(recRows[0].file_path)) {
+          pdfBytes = fileBuffer;
+        } else if (contentType.startsWith('image/') || /\.(jpe?g|png)$/i.test(recRows[0].file_path)) {
+          const tmpDoc = await PDFDocument.create();
+          const img = contentType.includes('png') || /\.png$/i.test(recRows[0].file_path)
+            ? await tmpDoc.embedPng(fileBuffer)
+            : await tmpDoc.embedJpg(fileBuffer);
+          const pg = tmpDoc.addPage([img.width, img.height]);
+          pg.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+          pdfBytes = await tmpDoc.save();
+        }
+
+        if (pdfBytes) {
+          const pdfDoc = await PDFDocument.load(pdfBytes);
+          const page   = pdfDoc.getPages()[pdfDoc.getPageCount() - 1];
+          const { width, height } = page.getSize();
+          const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+          const bx = width - 220, by = 20, bw = 200, bh = 110;
+          page.drawRectangle({ x: bx, y: by, width: bw, height: bh,
+            color: rgb(0.98, 0.98, 0.98), borderColor: rgb(0.2, 0.48, 0.53), borderWidth: 1.5 });
+
+          const label = (stampType || 'SIGNED').toUpperCase();
+          const lc = label === 'REJECTED' ? rgb(0.6,0.1,0.1)
+                   : label === 'APPROVED'  ? rgb(0.04,0.37,0.27)
+                   : rgb(0.07,0.44,0.52);
+          page.drawText(label, { x: bx+8, y: by+bh-18, size: 13, font, color: lc });
+          page.drawText(role,  { x: bx+8, y: by+bh-34, size: 9,  font, color: rgb(0.2,0.2,0.2) });
+          page.drawText(new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}),
+            { x: bx+8, y: by+bh-46, size: 9, font, color: rgb(0.4,0.4,0.4) });
+
+          if (stampProfile.stamp_image_url) {
+            try {
+              const si = await fetch2(stampProfile.stamp_image_url);
+              const sb = Buffer.from(await si.arrayBuffer());
+              const sc = si.headers.get('content-type') || '';
+              const se = sc.includes('png') ? await pdfDoc.embedPng(sb) : await pdfDoc.embedJpg(sb);
+              page.drawImage(se, { x: bx+8, y: by+4, width: 48, height: 48 });
+            } catch(_) {}
+          }
+          if (stampProfile.signature_image) {
+            try {
+              const sd = stampProfile.signature_image.replace(/^data:image\/\w+;base64,/, '');
+              const si2 = await pdfDoc.embedPng(Buffer.from(sd, 'base64'));
+              page.drawImage(si2, { x: bx+70, y: by+4, width: 120, height: 50 });
+            } catch(_) {}
+          }
+
+          const finalBytes = await pdfDoc.save();
+          signatureHash = crypto.createHash('sha256').update(finalBytes).digest('hex');
+          const cr = await uploadToCloudinary(Buffer.from(finalBytes), 'oneproject/stamped', 'raw');
+          stampedDocUrl = cr.secure_url;
+        }
+      } catch (pdfErr) {
+        console.error('[sign-record] PDF stamp failed (non-fatal):', pdfErr.message);
+      }
+    }
+
+    await pool.query(
+      `UPDATE ${table} SET signed_by_id=$1, signed_by_role=$2, signed_at=NOW(),
+       stamp_type=$3, stamped_doc_url=$4, signature_hash=$5 WHERE id=$6 AND project_id=$7`,
+      [user_id, role, stampType || null, stampedDocUrl, signatureHash, recordId, projectId]
+    );
+
+    res.json({ success: true, signed_at: new Date().toISOString(), stamped_doc_url: stampedDocUrl, signature_hash: signatureHash });
+  } catch (err) {
+    console.error('POST sign-record:', err);
+    res.status(500).json({ error: 'Failed to sign record.' });
+  }
 });
 
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
