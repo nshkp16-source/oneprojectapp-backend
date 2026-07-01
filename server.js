@@ -1992,6 +1992,9 @@ async function handleAddRecord(req, res) {
       }
     }
 
+    let stampWarning = null;
+    let finalStampType = null;
+
     if ((saveAsPdf || stampAction === 'stamp') && filePath) {
       try {
         console.log('[add-record] 🔄 Converting file to PDF before saving...');
@@ -2002,10 +2005,6 @@ async function handleAddRecord(req, res) {
         console.warn('[add-record] ⚠️ PDF conversion failed, continuing with original file:', convertErr.message);
       }
     }
-
-    // ─── Apply stamp if requested (BEFORE database save) ───────────────
-    let stampWarning = stampWarning || null;
-    let finalStampType = null;
     let stampApplied = false;
 
     if (stampAction === 'stamp' && filePath) {
