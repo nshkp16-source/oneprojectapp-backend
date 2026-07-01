@@ -1998,13 +1998,13 @@ async function handleAddRecord(req, res) {
         filePath = await convertFileToPdf(filePath);
         console.log('[add-record] ✅ File converted to PDF');
       } catch (convertErr) {
-        console.error('[add-record] ❌ PDF conversion failed:', convertErr.message);
-        return res.status(400).json({ success: false, message: 'PDF conversion failed: ' + convertErr.message });
+        stampWarning = `PDF conversion failed: ${convertErr.message}`;
+        console.warn('[add-record] ⚠️ PDF conversion failed, continuing with original file:', convertErr.message);
       }
     }
 
     // ─── Apply stamp if requested (BEFORE database save) ───────────────
-    let stampWarning = null;
+    let stampWarning = stampWarning || null;
     let finalStampType = null;
     let stampApplied = false;
 
@@ -2012,13 +2012,15 @@ async function handleAddRecord(req, res) {
       console.log('[add-record] 🖋️ Stamp requested, checking eligibility...');
 
       if (!isDecisionMaker(role)) {
-        stampWarning = 'Only decision makers can stamp documents.';
+        const reason = 'Only decision makers can stamp documents.';
+        stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
         console.warn('[add-record] ⚠️ Stamp skipped because user is not a decision maker.');
       } else {
         const isStampable = /\.(pdf|jpe?g|png)$/i.test(filePath);
         if (!isStampable) {
           const ext = filePath.split('.').pop()?.toUpperCase() || 'UNKNOWN';
-          stampWarning = `Cannot stamp ${ext} files. Supported: PDF, JPG, PNG.`;
+          const reason = `Cannot stamp ${ext} files. Supported: PDF, JPG, PNG.`;
+          stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
           console.warn('[add-record] ⚠️ Stamp skipped because the file type is not supported:', ext);
         } else {
           try {
@@ -2028,7 +2030,8 @@ async function handleAddRecord(req, res) {
             );
 
             if (!stampRows.length) {
-              stampWarning = 'No stamp profile found. Set up your stamp first.';
+              const reason = 'No stamp profile found. Set up your stamp first.';
+              stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
               console.warn('[add-record] ⚠️ Stamp skipped because no stamp profile exists.');
             } else {
               const stampProfile = { ...stampRows[0], role };
@@ -2047,8 +2050,9 @@ async function handleAddRecord(req, res) {
               console.log('[add-record] ✅ Stamp applied successfully');
             }
           } catch (stampErr) {
+            const reason = 'Stamp application failed: ' + stampErr.message;
+            stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
             console.error('[add-record] ❌ Stamp application failed:', stampErr.message);
-            stampWarning = 'Stamp application failed: ' + stampErr.message;
           }
         }
       }
@@ -2687,9 +2691,30 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(`SELECT file_path FROM ${table} WHERE id=$1`, [recordId]);
     if (!rows.length || !rows[0].file_path) return res.status(404).json({ error: 'File not found.' });
     const filePath = rows[0].file_path;
-    if (filePath.startsWith('http')) return res.json({ url: filePath, fileName: filePath.split('/').pop() || 'download' });
+    if (filePath.startsWith('http')) {
+      const remoteRes = await fetch(filePath);
+      if (!remoteRes.ok) {
+        console.error('Download proxy failed:', filePath, remoteRes.status, remoteRes.statusText);
+        return res.status(502).json({ error: 'Failed to fetch remote file.' });
+      }
+      const contentType = remoteRes.headers.get('content-type') || 'application/octet-stream';
+      const fileName = filePath.split('/').pop() || 'download';
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      if (remoteRes.body && typeof remoteRes.body.pipe === 'function') {
+        remoteRes.body.pipe(res);
+      } else if (remoteRes.body) {
+        Readable.fromWeb(remoteRes.body).pipe(res);
+      } else {
+        res.status(502).json({ error: 'No response body from file source.' });
+      }
+      return;
+    }
     res.status(404).json({ error: 'File not accessible.' });
-  } catch (err) { console.error('Download file error:', err); res.status(500).json({ error: 'Failed to download file.' }); }
+  } catch (err) {
+    console.error('Download file error:', err);
+    res.status(500).json({ error: 'Failed to download file.' });
+  }
 });
 
 
@@ -2788,7 +2813,7 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
         const sb = Buffer.from(await si.arrayBuffer());
         const sc = si.headers.get('content-type') || '';
         const se = sc.includes('png') ? await pdfDoc.embedPng(sb) : await pdfDoc.embedJpg(sb);
-        page.drawImage(se, { x: bx+8, y: by+4, width: 48, height: 48 });
+        page.drawImage(se, { x: boxX + 8, y: boxY + 4, width: 48, height: 48 });
         console.log('[applyStamp] ✅ Company stamp embedded');
       } catch(e) { console.warn('[applyStamp] ⚠️ Failed to embed stamp image:', e.message); }
     }
@@ -2798,9 +2823,11 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
         console.log('[applyStamp] ✍️ Embedding signature...');
         const sd = stampProfile.signature_image.replace(/^data:image\/\w+;base64,/, '');
         const si2 = await pdfDoc.embedPng(Buffer.from(sd, 'base64'));
-        page.drawImage(si2, { x: bx+70, y: by+4, width: 120, height: 50 });
+        page.drawImage(si2, { x: boxX + 70, y: boxY + 4, width: 120, height: 50 });
         console.log('[applyStamp] ✅ Signature embedded');
-      } catch(e) { console.warn('[applyStamp] ⚠️ Failed to embed signature:', e.message); }
+      } catch(e) {
+        console.warn('[applyStamp] ⚠️ Failed to embed signature:', e.message);
+      }
     }
 
     const finalBytes = await pdfDoc.save();
@@ -5804,5 +5831,3 @@ setInterval(() => {
     .then(r => console.log('Keep-alive ping:', r.status))
     .catch(err => console.error('Keep-alive error:', err));
 }, 14 * 60 * 1000);
-
-export default app;
