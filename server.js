@@ -2687,9 +2687,13 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
-    const { rows } = await pool.query(`SELECT file_path FROM ${table} WHERE id=$1`, [recordId]);
-    if (!rows.length || !rows[0].file_path) return res.status(404).json({ error: 'File not found.' });
-    const filePath = rows[0].file_path;
+    const { rows } = await pool.query(`SELECT file_path, stamped_doc_url FROM ${table} WHERE id=$1`, [recordId]);
+    if (!rows.length) return res.status(404).json({ error: 'File not found.' });
+    const filePath = rows[0].stamped_doc_url || rows[0].file_path;
+    if (!filePath) return res.status(404).json({ error: 'File not found.' });
+    if (rows[0].stamped_doc_url) {
+      console.log('Download proxy using stamped_doc_url for record', recordId);
+    }
     if (filePath.startsWith('http')) {
       const remoteRes = await fetch(filePath);
       if (!remoteRes.ok) {
@@ -2820,9 +2824,20 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
     if (stampProfile.signature_image) {
       try {
         console.log('[applyStamp] ✍️ Embedding signature...');
-        const sd = stampProfile.signature_image.replace(/^data:image\/\w+;base64,/, '');
-        const si2 = await pdfDoc.embedPng(Buffer.from(sd, 'base64'));
-        page.drawImage(si2, { x: boxX + 70, y: boxY + 4, width: 120, height: 50 });
+        const sigData = String(stampProfile.signature_image);
+        const sigMatch = sigData.match(/^data:image\/(png|jpeg|jpg);base64,(.+)$/i);
+        let signatureImage;
+        if (sigMatch) {
+          const [, sigType, base64Data] = sigMatch;
+          const sigBuffer = Buffer.from(base64Data, 'base64');
+          signatureImage = sigType.toLowerCase() === 'png'
+            ? await pdfDoc.embedPng(sigBuffer)
+            : await pdfDoc.embedJpg(sigBuffer);
+        } else {
+          const rawData = Buffer.from(sigData.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+          signatureImage = await pdfDoc.embedPng(rawData);
+        }
+        page.drawImage(signatureImage, { x: boxX + 70, y: boxY + 4, width: 120, height: 50 });
         console.log('[applyStamp] ✅ Signature embedded');
       } catch(e) {
         console.warn('[applyStamp] ⚠️ Failed to embed signature:', e.message);
