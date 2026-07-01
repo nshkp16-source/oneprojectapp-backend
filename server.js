@@ -1952,7 +1952,8 @@ async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind, stampType } = req.body;
-    console.log('[add-record] 📝 Request:', { userId, role, stampType: stampType || 'none' });
+    const saveAsPdf = req.body.saveAsPdf === 'true' || req.body.saveAsPdf === true;
+    console.log('[add-record] 📝 Request:', { userId, role, stampType: stampType || 'none', saveAsPdf });
     
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
@@ -1984,6 +1985,17 @@ async function handleAddRecord(req, res) {
       } catch (uploadErr) {
         console.error('[add-record] ❌ Cloudinary upload error:', uploadErr);
         return res.status(500).json({ success: false, message: 'File upload failed.' });
+      }
+    }
+
+    if (saveAsPdf && filePath) {
+      try {
+        console.log('[add-record] 🔄 Converting file to PDF before saving...');
+        filePath = await convertFileToPdf(filePath);
+        console.log('[add-record] ✅ File converted to PDF');
+      } catch (convertErr) {
+        console.error('[add-record] ❌ PDF conversion failed:', convertErr.message);
+        return res.status(400).json({ success: false, message: 'PDF conversion failed: ' + convertErr.message });
       }
     }
 
@@ -2677,6 +2689,31 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  HELPER: Apply stamp to a file buffer/URL
 // ─────────────────────────────────────────────────────────────────────────────
+async function convertFileToPdf(fileUrl) {
+  const fileResp = await fetch(fileUrl);
+  const fileBuffer = Buffer.from(await fileResp.arrayBuffer());
+  const contentType = fileResp.headers.get('content-type') || '';
+
+  if (contentType.includes('pdf') || /\.pdf$/i.test(fileUrl)) {
+    return fileUrl;
+  }
+
+  if (contentType.startsWith('image/') || /\.(jpe?g|png)$/i.test(fileUrl)) {
+    const tmpDoc = await PDFDocument.create();
+    const img = contentType.includes('png') || /\.png$/i.test(fileUrl)
+      ? await tmpDoc.embedPng(fileBuffer)
+      : await tmpDoc.embedJpg(fileBuffer);
+    const page = tmpDoc.addPage([img.width, img.height]);
+    page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+    const pdfBytes = await tmpDoc.save();
+    const cr = await uploadToCloudinary(Buffer.from(pdfBytes), 'oneproject/converted-pdf', 'raw');
+    return cr.secure_url;
+  }
+
+  const ext = (fileUrl.split('.').pop() || 'unknown').toUpperCase();
+  throw new Error(`PDF conversion is not supported for ${ext} files. Upload a PDF, JPG, or PNG instead.`);
+}
+
 async function applyStampToFile(fileUrl, stampType, stampProfile) {
   console.log('[applyStamp] 📝 Starting stamp application:', { stampType, hasSignature: !!stampProfile.signature_image, hasStampImage: !!stampProfile.stamp_image_url });
   
