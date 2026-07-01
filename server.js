@@ -2000,53 +2000,53 @@ async function handleAddRecord(req, res) {
     }
 
     // ─── Apply stamp if requested (BEFORE database save) ───────────────
+    let stampWarning = null;
+    let finalStampType = null;
+    let stampApplied = false;
+
     if (stampType && filePath) {
       console.log('[add-record] 🖋️ Stamp requested, checking eligibility...');
-      
+
       if (!isDecisionMaker(role)) {
-        return res.status(403).json({ success: false, message: 'Only decision makers can stamp documents.' });
-      }
+        stampWarning = 'Only decision makers can stamp documents.';
+        console.warn('[add-record] ⚠️ Stamp skipped because user is not a decision maker.');
+      } else {
+        const isStampable = /\.(pdf|jpe?g|png)$/i.test(filePath);
+        if (!isStampable) {
+          const ext = filePath.split('.').pop()?.toUpperCase() || 'UNKNOWN';
+          stampWarning = `Cannot stamp ${ext} files. Supported: PDF, JPG, PNG.`;
+          console.warn('[add-record] ⚠️ Stamp skipped because the file type is not supported:', ext);
+        } else {
+          try {
+            const { rows: stampRows } = await pool.query(
+              `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
+              [userId, role]
+            );
 
-      const isStampable = /\.(pdf|jpe?g|png)$/i.test(filePath);
-      if (!isStampable) {
-        const ext = filePath.split('.').pop()?.toUpperCase() || 'UNKNOWN';
-        return res.status(400).json({ 
-          success: false, 
-          message: `Cannot stamp ${ext} files. Supported: PDF, JPG, PNG.` 
-        });
-      }
+            if (!stampRows.length) {
+              stampWarning = 'No stamp profile found. Set up your stamp first.';
+              console.warn('[add-record] ⚠️ Stamp skipped because no stamp profile exists.');
+            } else {
+              const stampProfile = { ...stampRows[0], role };
+              console.log('[add-record] 🖋️ Applying stamp...');
 
-      try {
-        const { rows: stampRows } = await pool.query(
-          `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
-          [userId, role]
-        );
+              const stampResult = await applyStampToFile(filePath, stampType, stampProfile);
+              stampedDocUrl = stampResult.stampedDocUrl;
+              signatureHash = stampResult.signatureHash;
+              signedByUserId = userId;
+              signedByRole = role;
 
-        if (!stampRows.length) {
-          return res.status(400).json({ 
-            success: false, 
-            message: 'No stamp profile found. Set up your stamp first.' 
-          });
+              // Use stamped PDF as the file path
+              filePath = stampedDocUrl;
+              finalStampType = stampType;
+              stampApplied = true;
+              console.log('[add-record] ✅ Stamp applied successfully');
+            }
+          } catch (stampErr) {
+            console.error('[add-record] ❌ Stamp application failed:', stampErr.message);
+            stampWarning = 'Stamp application failed: ' + stampErr.message;
+          }
         }
-
-        const stampProfile = { ...stampRows[0], role };
-        console.log('[add-record] 🖋️ Applying stamp...');
-        
-        const stampResult = await applyStampToFile(filePath, stampType, stampProfile);
-        stampedDocUrl = stampResult.stampedDocUrl;
-        signatureHash = stampResult.signatureHash;
-        signedByUserId = userId;
-        signedByRole = role;
-
-        // Use stamped PDF as the file path
-        filePath = stampedDocUrl;
-        console.log('[add-record] ✅ Stamp applied successfully');
-      } catch (stampErr) {
-        console.error('[add-record] ❌ Stamp application failed:', stampErr.message);
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Stamp application failed: ' + stampErr.message 
-        });
       }
     }
 
@@ -2073,7 +2073,7 @@ async function handleAddRecord(req, res) {
         [
           projectId, title, description || null, filePath, attachmentId,
           userId, role, resolvedKind, noticeTied,
-          signedByUserId, signedByRole, stampType || null, stampedDocUrl, signatureHash
+          signedByUserId, signedByRole, finalStampType || null, stampedDocUrl, signatureHash
         ]
       );
       const recordId = recRes.rows[0].id;
@@ -2112,12 +2112,15 @@ async function handleAddRecord(req, res) {
 
       res.json({ 
         success: true, 
-        message: stampType ? 'Record saved with stamp.' : 'Record saved.',
+        message: stampWarning
+          ? 'Record saved (stamp could not be applied).'
+          : (stampApplied ? 'Record saved with stamp.' : 'Record saved.'),
         recordId, 
         notificationId, 
         attachmentId, 
         recordKind: resolvedKind,
-        stamped: !!stampedDocUrl
+        stamped: stampApplied,
+        stampWarning
       });
     } catch (err) {
       await dbClient.query('ROLLBACK');
