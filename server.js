@@ -1951,9 +1951,13 @@ for (const prefix of ['/notifications', '/api/notifications']) {
 async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
-    const { title, description, projectId, noticeTiedId, recordKind, stampType } = req.body;
+    const { title, description, projectId, noticeTiedId, recordKind } = req.body;
     const saveAsPdf = req.body.saveAsPdf === 'true' || req.body.saveAsPdf === true;
-    console.log('[add-record] 📝 Request:', { userId, role, stampType: stampType || 'none', saveAsPdf });
+    const stampAction = req.body.stampAction === 'stamp' ? 'stamp' : null;
+    const stampPage = Number(req.body.stampPage || 1);
+    const stampX = Number(req.body.stampX || 0.8);
+    const stampY = Number(req.body.stampY || 0.08);
+    console.log('[add-record] 📝 Request:', { userId, role, stampAction, stampPage, stampX, stampY, saveAsPdf });
     
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
@@ -1988,7 +1992,7 @@ async function handleAddRecord(req, res) {
       }
     }
 
-    if (saveAsPdf && filePath) {
+    if ((saveAsPdf || stampAction === 'stamp') && filePath) {
       try {
         console.log('[add-record] 🔄 Converting file to PDF before saving...');
         filePath = await convertFileToPdf(filePath);
@@ -2004,7 +2008,7 @@ async function handleAddRecord(req, res) {
     let finalStampType = null;
     let stampApplied = false;
 
-    if (stampType && filePath) {
+    if (stampAction === 'stamp' && filePath) {
       console.log('[add-record] 🖋️ Stamp requested, checking eligibility...');
 
       if (!isDecisionMaker(role)) {
@@ -2030,7 +2034,7 @@ async function handleAddRecord(req, res) {
               const stampProfile = { ...stampRows[0], role };
               console.log('[add-record] 🖋️ Applying stamp...');
 
-              const stampResult = await applyStampToFile(filePath, stampType, stampProfile);
+              const stampResult = await applyStampToFile(filePath, 'STAMPED', stampProfile, { page: stampPage, x: stampX, y: stampY });
               stampedDocUrl = stampResult.stampedDocUrl;
               signatureHash = stampResult.signatureHash;
               signedByUserId = userId;
@@ -2038,7 +2042,7 @@ async function handleAddRecord(req, res) {
 
               // Use stamped PDF as the file path
               filePath = stampedDocUrl;
-              finalStampType = stampType;
+              finalStampType = 'STAMPED';
               stampApplied = true;
               console.log('[add-record] ✅ Stamp applied successfully');
             }
@@ -2717,8 +2721,11 @@ async function convertFileToPdf(fileUrl) {
   throw new Error(`PDF conversion is not supported for ${ext} files. Upload a PDF, JPG, or PNG instead.`);
 }
 
-async function applyStampToFile(fileUrl, stampType, stampProfile) {
-  console.log('[applyStamp] 📝 Starting stamp application:', { stampType, hasSignature: !!stampProfile.signature_image, hasStampImage: !!stampProfile.stamp_image_url });
+async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) {
+  const pageNumber = Math.max(1, parseInt(options.page || 1, 10));
+  const xRatio = Math.min(Math.max(Number(options.x ?? 0.8), 0), 1);
+  const yRatio = Math.min(Math.max(Number(options.y ?? 0.08), 0), 1);
+  console.log('[applyStamp] 📝 Starting stamp application:', { stampType, pageNumber, xRatio, yRatio, hasSignature: !!stampProfile.signature_image, hasStampImage: !!stampProfile.stamp_image_url });
   
   try {
     const fileResp = await fetch(fileUrl);
@@ -2748,13 +2755,17 @@ async function applyStampToFile(fileUrl, stampType, stampProfile) {
 
     console.log('[applyStamp] 🎨 Drawing stamp box on PDF...');
     const pdfDoc = await PDFDocument.load(pdfBytes);
-    const page = pdfDoc.getPages()[pdfDoc.getPageCount() - 1];
+    const pageCount = pdfDoc.getPageCount();
+    const targetPageIndex = Math.min(Math.max(pageNumber - 1, 0), Math.max(pageCount - 1, 0));
+    const page = pdfDoc.getPages()[targetPageIndex];
     const { width, height } = page.getSize();
     const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-    const bx = width - 220, by = 20, bw = 200, bh = 110;
+    const bw = 200, bh = 110;
+    const boxX = Math.round(Math.min(Math.max(xRatio * width, 10), width - bw - 10));
+    const boxY = Math.round(Math.min(Math.max(height - (yRatio * height) - bh, 10), height - bh - 10));
     page.drawRectangle({
-      x: bx, y: by, width: bw, height: bh,
+      x: boxX, y: boxY, width: bw, height: bh,
       color: rgb(0.98, 0.98, 0.98),
       borderColor: rgb(0.2, 0.48, 0.53),
       borderWidth: 1.5
@@ -2765,10 +2776,10 @@ async function applyStampToFile(fileUrl, stampType, stampProfile) {
              : label === 'APPROVED'  ? rgb(0.04, 0.37, 0.27)
              : rgb(0.07, 0.44, 0.52);
     
-    page.drawText(label, { x: bx+8, y: by+bh-18, size: 13, font, color: lc });
-    page.drawText(stampProfile.role || 'User', { x: bx+8, y: by+bh-34, size: 9, font, color: rgb(0.2,0.2,0.2) });
+    page.drawText(label, { x: boxX+8, y: boxY+bh-18, size: 13, font, color: lc });
+    page.drawText(stampProfile.role || 'User', { x: boxX+8, y: boxY+bh-34, size: 9, font, color: rgb(0.2,0.2,0.2) });
     page.drawText(new Date().toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' }),
-      { x: bx+8, y: by+bh-46, size: 9, font, color: rgb(0.4,0.4,0.4) });
+      { x: boxX+8, y: boxY+bh-46, size: 9, font, color: rgb(0.4,0.4,0.4) });
 
     if (stampProfile.stamp_image_url) {
       try {
