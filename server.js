@@ -1954,6 +1954,7 @@ async function handleAddRecord(req, res) {
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
     const saveAsPdf = req.body.saveAsPdf === 'true' || req.body.saveAsPdf === true;
     const stampAction = req.body.stampAction === 'stamp' ? 'stamp' : null;
+    const stampType = (req.body.stampType || 'STAMPED').toUpperCase();
     const stampPage = Number(req.body.stampPage || 1);
     const stampX = Number(req.body.stampX || 0.8);
     const stampY = Number(req.body.stampY || 0.08);
@@ -2036,7 +2037,7 @@ async function handleAddRecord(req, res) {
               const stampProfile = { ...stampRows[0], role };
               console.log('[add-record] 🖋️ Applying stamp...');
 
-              const stampResult = await applyStampToFile(filePath, 'STAMPED', stampProfile, { page: stampPage, x: stampX, y: stampY });
+              const stampResult = await applyStampToFile(filePath, stampType, stampProfile, { page: stampPage, x: stampX, y: stampY });
               stampedDocUrl = stampResult.stampedDocUrl;
               signatureHash = stampResult.signatureHash;
               signedByUserId = userId;
@@ -2044,7 +2045,7 @@ async function handleAddRecord(req, res) {
 
               // Use stamped PDF as the file path
               filePath = stampedDocUrl;
-              finalStampType = 'STAMPED';
+              finalStampType = stampType;
               stampApplied = true;
               console.log('[add-record] ✅ Stamp applied successfully');
             }
