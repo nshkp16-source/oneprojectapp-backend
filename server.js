@@ -1954,6 +1954,7 @@ async function handleAddRecord(req, res) {
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
     const saveAsPdf = req.body.saveAsPdf === 'true' || req.body.saveAsPdf === true;
     const stampAction = req.body.stampAction === 'stamp' ? 'stamp' : null;
+    const stampType = (req.body.stampType || 'STAMPED').toUpperCase();
     const stampPage = Number(req.body.stampPage || 1);
     const stampX = Number(req.body.stampX || 0.8);
     const stampY = Number(req.body.stampY || 0.08);
@@ -1972,13 +1973,13 @@ async function handleAddRecord(req, res) {
     if (!memberCheck.rows.length) return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
     
     let filePath = null, attachmentId = null;
-
+    let signedByUserId = null, signedByRole = null, stampedDocUrl = null, signatureHash = null;
+    
     if (req.file) {
       try {
         const r = await new Promise((resolve, reject) => {
           const stream = cloudinary.uploader.upload_stream(
-            { folder: 'oneproject/records', resource_type: 'auto',
-              public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
+            { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
             (err, result) => err ? reject(err) : resolve(result)
           );
           Readable.from(req.file.buffer).pipe(stream);
@@ -1992,9 +1993,70 @@ async function handleAddRecord(req, res) {
       }
     }
 
-    // Stamp is applied on download — only save intent metadata here
-    const stampApplied = stampAction === 'stamp' && !!filePath && isDecisionMaker(role);
-    const finalStampType = stampApplied ? (stampType || 'STAMPED') : null;
+    let stampWarning = null;
+    let finalStampType = null;
+
+    if ((saveAsPdf || stampAction === 'stamp') && filePath) {
+      try {
+        console.log('[add-record] 🔄 Converting file to PDF before saving...');
+        filePath = await convertFileToPdf(filePath);
+        console.log('[add-record] ✅ File converted to PDF');
+      } catch (convertErr) {
+        stampWarning = `PDF conversion failed: ${convertErr.message}`;
+        console.warn('[add-record] ⚠️ PDF conversion failed, continuing with original file:', convertErr.message);
+      }
+    }
+    let stampApplied = false;
+
+    if (stampAction === 'stamp' && filePath) {
+      console.log('[add-record] 🖋️ Stamp requested, checking eligibility...');
+
+      if (!isDecisionMaker(role)) {
+        const reason = 'Only decision makers can stamp documents.';
+        stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
+        console.warn('[add-record] ⚠️ Stamp skipped because user is not a decision maker.');
+      } else {
+        const isStampable = /\.(pdf|jpe?g|png)$/i.test(filePath);
+        if (!isStampable) {
+          const ext = filePath.split('.').pop()?.toUpperCase() || 'UNKNOWN';
+          const reason = `Cannot stamp ${ext} files. Supported: PDF, JPG, PNG.`;
+          stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
+          console.warn('[add-record] ⚠️ Stamp skipped because the file type is not supported:', ext);
+        } else {
+          try {
+            const { rows: stampRows } = await pool.query(
+              `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
+              [userId, role]
+            );
+
+            if (!stampRows.length) {
+              const reason = 'No stamp profile found. Set up your stamp first.';
+              stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
+              console.warn('[add-record] ⚠️ Stamp skipped because no stamp profile exists.');
+            } else {
+              const stampProfile = { ...stampRows[0], role };
+              console.log('[add-record] 🖋️ Applying stamp...');
+
+              const stampResult = await applyStampToFile(filePath, 'STAMPED', stampProfile, { page: stampPage, x: stampX, y: stampY });
+              stampedDocUrl = stampResult.stampedDocUrl;
+              signatureHash = stampResult.signatureHash;
+              signedByUserId = userId;
+              signedByRole = role;
+
+              // Use stamped PDF as the file path
+              filePath = stampedDocUrl;
+              finalStampType = 'STAMPED';
+              stampApplied = true;
+              console.log('[add-record] ✅ Stamp applied successfully');
+            }
+          } catch (stampErr) {
+            const reason = 'Stamp application failed: ' + stampErr.message;
+            stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
+            console.error('[add-record] ❌ Stamp application failed:', stampErr.message);
+          }
+        }
+      }
+    }
 
     const resolvedKind = recordKind || (noticeTiedId ? 'notice' : 'new');
     const noticeTied   = noticeTiedId ? Number(noticeTiedId) : null;
@@ -2010,24 +2072,16 @@ async function handleAddRecord(req, res) {
       // 1. Insert the record with optional stamp metadata
       const recRes = await dbClient.query(
         `INSERT INTO ${table} (
-          project_id, title, description, file_path, attachment_id,
+          project_id, title, description, file_path, attachment_id, 
           uploaded_by, role, record_kind, notice_tied_id,
-          signed_by_id, signed_by_role, signed_at, stamp_type,
-          stamp_page, stamp_x, stamp_y
+          signed_by_id, signed_by_role, signed_at, stamp_type, stamped_doc_url, signature_hash
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                $10, $11, ${stampApplied ? 'NOW()' : 'NULL'}, $12,
-                $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${signedByUserId ? 'NOW()' : 'NULL'}, $12, $13, $14)
         RETURNING id`,
         [
           projectId, title, description || null, filePath, attachmentId,
           userId, role, resolvedKind, noticeTied,
-          stampApplied ? userId : null,
-          stampApplied ? role : null,
-          finalStampType,
-          stampApplied ? stampPage : null,
-          stampApplied ? stampX : null,
-          stampApplied ? stampY : null,
+          signedByUserId, signedByRole, finalStampType || null, stampedDocUrl, signatureHash
         ]
       );
       const recordId = recRes.rows[0].id;
@@ -2064,15 +2118,17 @@ async function handleAddRecord(req, res) {
         console.error('[notifications] ✗ outer error (non-fatal):', notifErr.message);
       }
 
-      res.json({
-        success: true,
-        message: stampApplied ? 'Record saved. Stamp will be applied on download.' : 'Record saved.',
-        recordId,
-        notificationId,
-        attachmentId,
+      res.json({ 
+        success: true, 
+        message: stampWarning
+          ? 'Record saved (stamp could not be applied).'
+          : (stampApplied ? 'Record saved with stamp.' : 'Record saved.'),
+        recordId, 
+        notificationId, 
+        attachmentId, 
         recordKind: resolvedKind,
         stamped: stampApplied,
-        stampWarning: null
+        stampWarning
       });
     } catch (err) {
       await dbClient.query('ROLLBACK');
@@ -2427,7 +2483,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
               r.issued_date, r.role AS uploader_role,
               r.uploaded_by, r.status, r.record_kind, r.notice_tied_id,
               r.signed_by_id, r.signed_by_role, r.signed_at,
-              r.stamp_type, r.stamp_page, r.stamp_x, r.stamp_y
+              r.stamp_type, r.stamped_doc_url, r.signature_hash
        FROM ${table} r WHERE r.project_id = $1 ORDER BY r.issued_date DESC`,
       [projectId]
     );
@@ -2632,10 +2688,13 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
-    const { rows } = await pool.query(`SELECT file_path FROM ${table} WHERE id=$1`, [recordId]);
+    const { rows } = await pool.query(`SELECT file_path, stamped_doc_url FROM ${table} WHERE id=$1`, [recordId]);
     if (!rows.length) return res.status(404).json({ error: 'File not found.' });
-    const filePath = rows[0].file_path;
+    const filePath = rows[0].stamped_doc_url || rows[0].file_path;
     if (!filePath) return res.status(404).json({ error: 'File not found.' });
+    if (rows[0].stamped_doc_url) {
+      console.log('Download proxy using stamped_doc_url for record', recordId);
+    }
     if (filePath.startsWith('http')) {
       const remoteRes = await fetch(filePath);
       if (!remoteRes.ok) {
@@ -2659,145 +2718,6 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Download file error:', err);
     res.status(500).json({ error: 'Failed to download file.' });
-  }
-});
-
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  DOWNLOAD STAMPED  GET /api/download-stamped
-//  Fetches original file from Cloudinary, applies stamp in memory, streams PDF.
-//  Nothing stored — stamp generated fresh on every download.
-// ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/download-stamped', authenticateToken, async (req, res) => {
-  const { recordId, recordType } = req.query;
-  const table = resolveTable(recordType);
-  if (!table) return res.status(400).json({ error: 'Invalid recordType.' });
-
-  try {
-    const { rows } = await pool.query(
-      `SELECT file_path, stamp_type, stamp_page, stamp_x, stamp_y,
-              signed_by_id, signed_by_role, signed_at
-       FROM ${table} WHERE id = $1`,
-      [recordId]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Record not found.' });
-    const rec = rows[0];
-
-    if (!rec.stamp_type || !rec.signed_at) {
-      return res.status(400).json({ error: 'This record has no stamp applied.' });
-    }
-    if (!rec.file_path) {
-      return res.status(404).json({ error: 'No file attached to this record.' });
-    }
-
-    // Fetch stamp profile of the signer
-    const { rows: stampRows } = await pool.query(
-      `SELECT signature_image, stamp_image_url FROM user_stamps
-       WHERE user_id = $1 AND user_role = $2 LIMIT 1`,
-      [rec.signed_by_id, rec.signed_by_role]
-    );
-    const stampProfile = {
-      ...(stampRows[0] || {}),
-      role: rec.signed_by_role,
-    };
-
-    console.log('[download-stamped] Fetching original file:', rec.file_path.substring(0, 60));
-
-    // Fetch original from Cloudinary — file is settled, no race condition
-    const fileResp = await fetch(rec.file_path);
-    if (!fileResp.ok) {
-      return res.status(502).json({ error: 'Could not fetch original file from storage.' });
-    }
-    const fileBuffer = Buffer.from(await fileResp.arrayBuffer());
-    const contentType = fileResp.headers.get('content-type') || '';
-    console.log('[download-stamped] File fetched:', { contentType, bufferSize: fileBuffer.length });
-
-    if (fileBuffer.length === 0) {
-      return res.status(502).json({ error: 'File returned empty from storage.' });
-    }
-
-    // Convert to PDF buffer if needed
-    let pdfBuffer;
-    if (contentType.includes('pdf') || /\.pdf$/i.test(rec.file_path)) {
-      pdfBuffer = fileBuffer;
-    } else if (contentType.startsWith('image/') || /\.(jpe?g|png)$/i.test(rec.file_path)) {
-      const tmpDoc = await PDFDocument.create();
-      const img = contentType.includes('png') || /\.png$/i.test(rec.file_path)
-        ? await tmpDoc.embedPng(fileBuffer)
-        : await tmpDoc.embedJpg(fileBuffer);
-      const pg = tmpDoc.addPage([img.width, img.height]);
-      pg.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
-      pdfBuffer = Buffer.from(await tmpDoc.save());
-    } else {
-      return res.status(400).json({ error: 'File type not supported for stamping. Use PDF, JPG or PNG.' });
-    }
-
-    // Apply stamp in memory
-    const pdfDoc = await PDFDocument.load(pdfBuffer);
-    const pageCount = pdfDoc.getPageCount();
-    const stampPage = Math.min(Math.max((rec.stamp_page || 1) - 1, 0), pageCount - 1);
-    const page = pdfDoc.getPages()[stampPage];
-    const { width, height } = page.getSize();
-    const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-    const xRatio = Math.min(Math.max(Number(rec.stamp_x ?? 0.8), 0), 1);
-    const yRatio = Math.min(Math.max(Number(rec.stamp_y ?? 0.08), 0), 1);
-    const bw = 200, bh = 110;
-    const boxX = Math.round(Math.min(Math.max(xRatio * width, 10), width - bw - 10));
-    const boxY = Math.round(Math.min(Math.max(height - (yRatio * height) - bh, 10), height - bh - 10));
-
-    page.drawRectangle({ x: boxX, y: boxY, width: bw, height: bh,
-      color: rgb(0.98, 0.98, 0.98), borderColor: rgb(0.2, 0.48, 0.53), borderWidth: 1.5 });
-
-    const label = (rec.stamp_type || 'STAMPED').toUpperCase();
-    const lc = label === 'REJECTED' ? rgb(0.6, 0.1, 0.1)
-              : label === 'APPROVED' ? rgb(0.04, 0.37, 0.27)
-              : rgb(0.07, 0.44, 0.52);
-    page.drawText(label, { x: boxX+8, y: boxY+bh-18, size: 13, font, color: lc });
-    page.drawText(rec.signed_by_role || '', { x: boxX+8, y: boxY+bh-34, size: 9, font, color: rgb(0.2,0.2,0.2) });
-    page.drawText(new Date(rec.signed_at).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' }),
-      { x: boxX+8, y: boxY+bh-46, size: 9, font, color: rgb(0.4,0.4,0.4) });
-
-    if (stampProfile.stamp_image_url) {
-      try {
-        const si = await fetch(stampProfile.stamp_image_url);
-        const sb = Buffer.from(await si.arrayBuffer());
-        const sc = si.headers.get('content-type') || '';
-        const se = sc.includes('png') ? await pdfDoc.embedPng(sb) : await pdfDoc.embedJpg(sb);
-        page.drawImage(se, { x: boxX+8, y: boxY+4, width: 48, height: 48 });
-      } catch(e) { console.warn('[download-stamped] stamp image embed failed:', e.message); }
-    }
-    if (stampProfile.signature_image) {
-      try {
-        const sigData = String(stampProfile.signature_image);
-        const sigMatch = sigData.match(/^data:image\/(png|jpeg|jpg);base64,(.+)$/i);
-        let sigImg;
-        if (sigMatch) {
-          const [, sigType, b64] = sigMatch;
-          const sigBuf = Buffer.from(b64, 'base64');
-          sigImg = sigType.toLowerCase() === 'png'
-            ? await pdfDoc.embedPng(sigBuf) : await pdfDoc.embedJpg(sigBuf);
-        } else {
-          sigImg = await pdfDoc.embedPng(Buffer.from(
-            sigData.replace(/^data:image\/\w+;base64,/, ''), 'base64'));
-        }
-        page.drawImage(sigImg, { x: boxX+70, y: boxY+4, width: 120, height: 50 });
-      } catch(e) { console.warn('[download-stamped] signature embed failed:', e.message); }
-    }
-
-    const finalBytes = await pdfDoc.save();
-    const fileName = `stamped-record-${recordId}.pdf`;
-    console.log('[download-stamped] ✅ Streaming stamped PDF:', fileName, finalBytes.length, 'bytes');
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    res.setHeader('Content-Length', finalBytes.length);
-    res.end(Buffer.from(finalBytes));
-
-  } catch (err) {
-    console.error('[download-stamped] ❌ Error:', err.message);
-    res.status(500).json({ error: 'Failed to generate stamped document.' });
   }
 });
 
