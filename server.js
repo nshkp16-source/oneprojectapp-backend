@@ -1953,12 +1953,13 @@ async function handleAddRecord(req, res) {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
     const saveAsPdf = req.body.saveAsPdf === 'true' || req.body.saveAsPdf === true;
-    const stampAction = req.body.stampAction === 'stamp' ? 'stamp' : null;
-    const stampType = (req.body.stampType || 'STAMPED').toUpperCase();
+    const clientStamped = req.body.clientStamped === 'true';
+    const stampAction = clientStamped ? 'stamp' : (req.body.stampAction === 'stamp' ? 'stamp' : null);
+    const stampType = (req.body.stampType || (clientStamped ? 'STAMPED' : 'STAMPED')).toUpperCase();
     const stampPage = Number(req.body.stampPage || 1);
     const stampX = Number(req.body.stampX || 0.8);
     const stampY = Number(req.body.stampY || 0.08);
-    console.log('[add-record] 📝 Request:', { userId, role, stampAction, stampPage, stampX, stampY, saveAsPdf });
+    console.log('[add-record] 📝 Request:', { userId, role, stampAction, clientStamped, stampPage, stampX, stampY, saveAsPdf });
     
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
@@ -2008,7 +2009,16 @@ async function handleAddRecord(req, res) {
     }
     let stampApplied = false;
 
-    if (stampAction === 'stamp' && filePath) {
+    if (clientStamped && filePath) {
+      signedByUserId = userId;
+      signedByRole = role;
+      finalStampType = stampType;
+      stampedDocUrl = filePath;
+      stampApplied = true;
+      console.log('[add-record] 🖋️ Client-side stamp received, skipping server stamp.');
+    }
+
+    if (!clientStamped && stampAction === 'stamp' && filePath) {
       console.log('[add-record] 🖋️ Stamp requested, checking eligibility...');
 
       if (!isDecisionMaker(role)) {
