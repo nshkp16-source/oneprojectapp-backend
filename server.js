@@ -2657,13 +2657,17 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
       console.log('Download proxy using stamped_doc_url for record', recordId);
     }
     if (filePath.startsWith('http')) {
-      // The file is hosted remotely (e.g., Cloudinary). Instead of proxying
-      // the request from the server (which can fail due to outbound network
-      // restrictions or transient errors), redirect the client directly to
-      // the remote URL. Browsers will download the file directly from
-      // Cloudinary which avoids the 502 proxy failure.
-      console.log('Download redirect to remote URL for record', recordId);
-      return res.redirect(filePath);
+      // The file is hosted remotely (e.g., Cloudinary). Return the remote
+      // URL as JSON so the frontend can open it directly in a new tab.
+      // Also perform a quick HEAD check and log the result for diagnostics.
+      console.log('Download returning remote URL for record', recordId, filePath);
+      try {
+        const headResp = await fetch(filePath, { method: 'HEAD', redirect: 'follow' });
+        console.log('Remote HEAD status for', filePath, headResp.status);
+      } catch (headErr) {
+        console.warn('Remote HEAD check failed for', filePath, headErr.message);
+      }
+      return res.json({ url: filePath });
     }
     res.status(404).json({ error: 'File not accessible.' });
   } catch (err) {
@@ -2758,8 +2762,20 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
     
     page.drawText(label, { x: boxX+8, y: boxY+bh-18, size: 13, font, color: lc });
     page.drawText(stampProfile.role || 'User', { x: boxX+8, y: boxY+bh-34, size: 9, font, color: rgb(0.2,0.2,0.2) });
+
+    const signerName = String(stampProfile.signer_name || '').trim();
+    if (signerName) {
+      page.drawText(signerName, { x: boxX+8, y: boxY+bh-50, size: 9, font, color: rgb(0.2,0.2,0.2) });
+    }
+
+    const dateY = boxY + bh - (signerName ? 65 : 50);
     page.drawText(new Date().toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' }),
-      { x: boxX+8, y: boxY+bh-46, size: 9, font, color: rgb(0.4,0.4,0.4) });
+      { x: boxX+8, y: dateY, size: 9, font, color: rgb(0.4,0.4,0.4) });
+
+    const stampSize = Math.min(48, bw - 24);
+    const stampX = boxX + bw - stampSize - 8;
+    const stampY = boxY + 8;
+    const signatureWidth = Math.max(24, Math.min(80, bw - stampSize - 30));
 
     if (stampProfile.stamp_image_url) {
       try {
@@ -2768,7 +2784,7 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
         const sb = Buffer.from(await si.arrayBuffer());
         const sc = si.headers.get('content-type') || '';
         const se = sc.includes('png') ? await pdfDoc.embedPng(sb) : await pdfDoc.embedJpg(sb);
-        page.drawImage(se, { x: boxX + 8, y: boxY + 4, width: 48, height: 48 });
+        page.drawImage(se, { x: stampX, y: stampY, width: stampSize, height: stampSize });
         console.log('[applyStamp] ✅ Company stamp embedded');
       } catch(e) { console.warn('[applyStamp] ⚠️ Failed to embed stamp image:', e.message); }
     }
@@ -2789,7 +2805,7 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
           const rawData = Buffer.from(sigData.replace(/^data:image\/\w+;base64,/, ''), 'base64');
           signatureImage = await pdfDoc.embedPng(rawData);
         }
-        page.drawImage(signatureImage, { x: boxX + 70, y: boxY + 4, width: 120, height: 50 });
+        page.drawImage(signatureImage, { x: boxX + 8, y: boxY + 8, width: signatureWidth, height: 40 });
         console.log('[applyStamp] ✅ Signature embedded');
       } catch(e) {
         console.warn('[applyStamp] ⚠️ Failed to embed signature:', e.message);
@@ -2817,7 +2833,7 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
   const { user_id, role } = req.user;
   try {
     const { rows } = await pool.query(
-      `SELECT id, signature_image, stamp_image_url, updated_at
+      `SELECT id, signer_name, signature_image, stamp_image_url, updated_at
        FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
       [user_id, role]
     );
@@ -2825,26 +2841,51 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
   } catch (err) { console.error('GET my-stamp:', err); res.status(500).json({ error: 'Failed.' }); }
 });
 
+// Open-redirect endpoint: used by frontend fallback to let the browser
+// navigate directly to the remote file URL (so the browser downloads from
+// Cloudinary and avoids server proxy issues).
+app.get('/api/open-remote-file', authenticateToken, async (req, res) => {
+  const { recordId, recordType } = req.query;
+  const table = resolveTable(recordType);
+  if (!table) return res.status(400).send('Invalid recordType');
+  try {
+    const { rows } = await pool.query(`SELECT file_path, stamped_doc_url FROM ${table} WHERE id=$1`, [recordId]);
+    if (!rows.length) return res.status(404).send('Not found');
+    const filePath = rows[0].stamped_doc_url || rows[0].file_path;
+    if (!filePath) return res.status(404).send('No file available');
+    if (!filePath.startsWith('http')) return res.status(400).send('File is not a remote URL');
+    console.log('Open-remote-file redirect for record', recordId, filePath);
+    return res.redirect(filePath);
+  } catch (err) {
+    console.error('Open-remote-file error:', err.message);
+    return res.status(500).send('Server error');
+  }
+});
+
 app.post('/api/my-stamp', authenticateToken, upload.single('stampImage'), async (req, res) => {
   const { user_id, role } = req.user;
   if (!isDecisionMaker(role)) return res.status(403).json({ error: 'Only decision makers can create a stamp.' });
   try {
     const { signatureBase64 } = req.body;
+    const signerName = typeof req.body.signerName === 'string'
+      ? req.body.signerName.trim()
+      : null;
     let stampImageUrl = null;
     if (req.file) {
       const r = await uploadToCloudinary(req.file.buffer, 'oneproject/stamps', 'image');
       stampImageUrl = r.secure_url;
     }
     const { rows } = await pool.query(
-      `INSERT INTO user_stamps (user_id, user_role, signature_image, stamp_image_url, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
+      `INSERT INTO user_stamps (user_id, user_role, signer_name, signature_image, stamp_image_url, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        ON CONFLICT ON CONSTRAINT uniq_user_stamp
        DO UPDATE SET
+         signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
          signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
          stamp_image_url = COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url),
          updated_at      = NOW()
-       RETURNING id, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, signatureBase64 || null, stampImageUrl]
+       RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
+      [user_id, role, signerName, signatureBase64 || null, stampImageUrl]
     );
     res.json({ success: true, stamp: rows[0] });
   } catch (err) { console.error('POST my-stamp:', err); res.status(500).json({ error: 'Failed to save stamp.' }); }
