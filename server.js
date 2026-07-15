@@ -1952,14 +1952,12 @@ async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
-    const saveAsPdf = req.body.saveAsPdf === 'true' || req.body.saveAsPdf === true;
+    // The attachment always arrives pre-converted-to-PDF (and pre-stamped, if the
+    // user chose to stamp) from the client — there is no server-side conversion
+    // or stamping step here anymore. clientStamped is a claim we must verify.
     const clientStamped = req.body.clientStamped === 'true';
-    const stampAction = clientStamped ? 'stamp' : (req.body.stampAction === 'stamp' ? 'stamp' : null);
-    const stampType = (req.body.stampType || (clientStamped ? 'STAMPED' : 'STAMPED')).toUpperCase();
-    const stampPage = Number(req.body.stampPage || 1);
-    const stampX = Number(req.body.stampX || 0.8);
-    const stampY = Number(req.body.stampY || 0.08);
-    console.log('[add-record] 📝 Request:', { userId, role, stampAction, clientStamped, stampPage, stampX, stampY, saveAsPdf });
+    const stampType = (req.body.stampType || 'STAMPED').toUpperCase();
+    console.log('[add-record] 📝 Request:', { userId, role, clientStamped, stampType });
     
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
@@ -1974,8 +1972,29 @@ async function handleAddRecord(req, res) {
     if (!memberCheck.rows.length) return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
     
     let filePath = null, attachmentId = null;
-    let signedByUserId = null, signedByRole = null, stampedDocUrl = null, signatureHash = null;
-    
+    let signedByUserId = null, signedByRole = null;
+    let finalStampType = null;
+    let stampApplied = false;
+
+    // If the client claims the attachment is already stamped, verify that claim
+    // BEFORE trusting it — otherwise any authenticated user could mark a record
+    // as officially signed without being a decision maker or owning a stamp profile.
+    if (clientStamped) {
+      if (!isDecisionMaker(role)) {
+        return res.status(403).json({ success: false, message: 'Only decision makers can stamp documents.' });
+      }
+      const { rows: stampRows } = await pool.query(
+        `SELECT 1 FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
+        [userId, role]
+      );
+      if (!stampRows.length) {
+        return res.status(400).json({ success: false, message: 'No stamp profile found. Set up your stamp first.' });
+      }
+      if (!req.file || !/\.pdf$/i.test(req.file.originalname || '')) {
+        return res.status(400).json({ success: false, message: 'Stamped documents must be submitted as PDF.' });
+      }
+    }
+
     if (req.file) {
       try {
         const r = await new Promise((resolve, reject) => {
@@ -1987,85 +2006,19 @@ async function handleAddRecord(req, res) {
         });
         filePath = r.secure_url;
         attachmentId = r.public_id;
-        console.log('[add-record] ✅ File uploaded to Cloudinary');
+        console.log('[add-record] ✅ File uploaded to Cloudinary (single copy)');
       } catch (uploadErr) {
         console.error('[add-record] ❌ Cloudinary upload error:', uploadErr);
         return res.status(500).json({ success: false, message: 'File upload failed.' });
       }
     }
 
-    let stampWarning = null;
-    let finalStampType = null;
-
-    if ((saveAsPdf || stampAction === 'stamp') && filePath) {
-      try {
-        console.log('[add-record] 🔄 Converting file to PDF before saving...');
-        filePath = await convertFileToPdf(filePath);
-        console.log('[add-record] ✅ File converted to PDF');
-      } catch (convertErr) {
-        stampWarning = `PDF conversion failed: ${convertErr.message}`;
-        console.warn('[add-record] ⚠️ PDF conversion failed, continuing with original file:', convertErr.message);
-      }
-    }
-    let stampApplied = false;
-
     if (clientStamped && filePath) {
       signedByUserId = userId;
       signedByRole = role;
       finalStampType = stampType;
-      stampedDocUrl = filePath;
       stampApplied = true;
-      console.log('[add-record] 🖋️ Client-side stamp received, skipping server stamp.');
-    }
-
-    if (!clientStamped && stampAction === 'stamp' && filePath) {
-      console.log('[add-record] 🖋️ Stamp requested, checking eligibility...');
-
-      if (!isDecisionMaker(role)) {
-        const reason = 'Only decision makers can stamp documents.';
-        stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
-        console.warn('[add-record] ⚠️ Stamp skipped because user is not a decision maker.');
-      } else {
-        const isStampable = /\.(pdf|jpe?g|png)$/i.test(filePath);
-        if (!isStampable) {
-          const ext = filePath.split('.').pop()?.toUpperCase() || 'UNKNOWN';
-          const reason = `Cannot stamp ${ext} files. Supported: PDF, JPG, PNG.`;
-          stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
-          console.warn('[add-record] ⚠️ Stamp skipped because the file type is not supported:', ext);
-        } else {
-          try {
-            const { rows: stampRows } = await pool.query(
-              `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
-              [userId, role]
-            );
-
-            if (!stampRows.length) {
-              const reason = 'No stamp profile found. Set up your stamp first.';
-              stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
-              console.warn('[add-record] ⚠️ Stamp skipped because no stamp profile exists.');
-            } else {
-              const stampProfile = { ...stampRows[0], role };
-              console.log('[add-record] 🖋️ Applying stamp...');
-
-              const stampResult = await applyStampToFile(filePath, 'STAMPED', stampProfile, { page: stampPage, x: stampX, y: stampY });
-              stampedDocUrl = stampResult.stampedDocUrl;
-              signatureHash = stampResult.signatureHash;
-              signedByUserId = userId;
-              signedByRole = role;
-
-              // Use stamped PDF as the file path
-              filePath = stampedDocUrl;
-              finalStampType = 'STAMPED';
-              stampApplied = true;
-              console.log('[add-record] ✅ Stamp applied successfully');
-            }
-          } catch (stampErr) {
-            const reason = 'Stamp application failed: ' + stampErr.message;
-            stampWarning = stampWarning ? `${stampWarning} ${reason}` : reason;
-            console.error('[add-record] ❌ Stamp application failed:', stampErr.message);
-          }
-        }
-      }
+      console.log('[add-record] 🖋️ Verified client-side stamp recorded.');
     }
 
     const resolvedKind = recordKind || (noticeTiedId ? 'notice' : 'new');
@@ -2079,19 +2032,20 @@ async function handleAddRecord(req, res) {
     try {
       await dbClient.query('BEGIN');
 
-      // 1. Insert the record with optional stamp metadata
+      // 1. Insert the record. file_path is the ONLY stored copy of the attachment —
+      // if the user chose to stamp, it already contains the burned-in stamp.
       const recRes = await dbClient.query(
         `INSERT INTO ${table} (
           project_id, title, description, file_path, attachment_id, 
           uploaded_by, role, record_kind, notice_tied_id,
-          signed_by_id, signed_by_role, signed_at, stamp_type, stamped_doc_url, signature_hash
+          signed_by_id, signed_by_role, signed_at, stamp_type
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${signedByUserId ? 'NOW()' : 'NULL'}, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${signedByUserId ? 'NOW()' : 'NULL'}, $12)
         RETURNING id`,
         [
           projectId, title, description || null, filePath, attachmentId,
           userId, role, resolvedKind, noticeTied,
-          signedByUserId, signedByRole, finalStampType || null, stampedDocUrl, signatureHash
+          signedByUserId, signedByRole, finalStampType || null
         ]
       );
       const recordId = recRes.rows[0].id;
@@ -2130,15 +2084,12 @@ async function handleAddRecord(req, res) {
 
       res.json({ 
         success: true, 
-        message: stampWarning
-          ? 'Record saved (stamp could not be applied).'
-          : (stampApplied ? 'Record saved with stamp.' : 'Record saved.'),
+        message: stampApplied ? 'Record saved with stamp.' : 'Record saved.',
         recordId, 
         notificationId, 
         attachmentId, 
         recordKind: resolvedKind,
-        stamped: stampApplied,
-        stampWarning
+        stamped: stampApplied
       });
     } catch (err) {
       await dbClient.query('ROLLBACK');
