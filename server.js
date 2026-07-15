@@ -2657,23 +2657,13 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
       console.log('Download proxy using stamped_doc_url for record', recordId);
     }
     if (filePath.startsWith('http')) {
-      const remoteRes = await fetch(filePath);
-      if (!remoteRes.ok) {
-        console.error('Download proxy failed:', filePath, remoteRes.status, remoteRes.statusText);
-        return res.status(502).json({ error: 'Failed to fetch remote file.' });
-      }
-      const contentType = remoteRes.headers.get('content-type') || 'application/octet-stream';
-      const fileName = filePath.split('/').pop() || 'download';
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-      if (remoteRes.body && typeof remoteRes.body.pipe === 'function') {
-        remoteRes.body.pipe(res);
-      } else if (remoteRes.body) {
-        Readable.fromWeb(remoteRes.body).pipe(res);
-      } else {
-        res.status(502).json({ error: 'No response body from file source.' });
-      }
-      return;
+      // The file is hosted remotely (e.g., Cloudinary). Instead of proxying
+      // the request from the server (which can fail due to outbound network
+      // restrictions or transient errors), redirect the client directly to
+      // the remote URL. Browsers will download the file directly from
+      // Cloudinary which avoids the 502 proxy failure.
+      console.log('Download redirect to remote URL for record', recordId);
+      return res.redirect(filePath);
     }
     res.status(404).json({ error: 'File not accessible.' });
   } catch (err) {
