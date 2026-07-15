@@ -2833,7 +2833,7 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
   const { user_id, role } = req.user;
   try {
     const { rows } = await pool.query(
-      `SELECT id, signer_name, signature_image, stamp_image_url, updated_at
+      `SELECT id, signer_name, company_name, signature_image, stamp_image_url, updated_at
        FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
       [user_id, role]
     );
@@ -2870,22 +2870,26 @@ app.post('/api/my-stamp', authenticateToken, upload.single('stampImage'), async 
     const signerName = typeof req.body.signerName === 'string'
       ? req.body.signerName.trim()
       : null;
+    const companyName = typeof req.body.companyName === 'string'
+      ? req.body.companyName.trim()
+      : null;
     let stampImageUrl = null;
     if (req.file) {
       const r = await uploadToCloudinary(req.file.buffer, 'oneproject/stamps', 'image');
       stampImageUrl = r.secure_url;
     }
     const { rows } = await pool.query(
-      `INSERT INTO user_stamps (user_id, user_role, signer_name, signature_image, stamp_image_url, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO user_stamps (user_id, user_role, signer_name, company_name, signature_image, stamp_image_url, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
        ON CONFLICT ON CONSTRAINT uniq_user_stamp
        DO UPDATE SET
          signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
+         company_name    = COALESCE(EXCLUDED.company_name, user_stamps.company_name),
          signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
          stamp_image_url = COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url),
          updated_at      = NOW()
-       RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, signerName, signatureBase64 || null, stampImageUrl]
+       RETURNING id, signer_name, company_name, signature_image, stamp_image_url, updated_at`,
+      [user_id, role, signerName, companyName, signatureBase64 || null, stampImageUrl]
     );
     res.json({ success: true, stamp: rows[0] });
   } catch (err) { console.error('POST my-stamp:', err); res.status(500).json({ error: 'Failed to save stamp.' }); }
@@ -2944,7 +2948,7 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
     console.log('[sign-record] ✅ File type is stampable');
 
     const { rows: stampRows } = await pool.query(
-      `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
+      `SELECT signer_name, company_name, signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
       [user_id, role]
     );
     console.log('[sign-record] 🖋️ Stamp profile check:', { found: stampRows.length > 0, user_id, role });
@@ -2994,7 +2998,8 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
           const pdfDoc = await PDFDocument.load(pdfBytes);
           const page   = pdfDoc.getPages()[pdfDoc.getPageCount() - 1];
           const { width, height } = page.getSize();
-          const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+          const titleFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+          const bodyFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
 
           const bx = width - 220, by = 20, bw = 200, bh = 110;
           page.drawRectangle({ x: bx, y: by, width: bw, height: bh,
@@ -3004,10 +3009,22 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
           const lc = label === 'REJECTED' ? rgb(0.6,0.1,0.1)
                    : label === 'APPROVED'  ? rgb(0.04,0.37,0.27)
                    : rgb(0.07,0.44,0.52);
-          page.drawText(label, { x: bx+8, y: by+bh-18, size: 13, font, color: lc });
-          page.drawText(role,  { x: bx+8, y: by+bh-34, size: 9,  font, color: rgb(0.2,0.2,0.2) });
+          page.drawText(label, { x: bx+8, y: by+bh-18, size: 13, font: titleFont, color: lc });
+
+          // Draw role, signer name, company and date top-down so bottom area is free for images
+          let textY = by + bh - 34;
+          page.drawText(role,  { x: bx+8, y: textY, size: 9,  font: bodyFont, color: rgb(0.2,0.2,0.2) });
+          if (stampProfile.signer_name) {
+            textY -= 14;
+            page.drawText(String(stampProfile.signer_name), { x: bx+8, y: textY, size: 9, font: bodyFont, color: rgb(0.15,0.15,0.15) });
+          }
+          if (stampProfile.company_name) {
+            textY -= 14;
+            page.drawText(String(stampProfile.company_name), { x: bx+8, y: textY, size: 9, font: bodyFont, color: rgb(0.15,0.15,0.15) });
+          }
+          textY -= 14;
           page.drawText(new Date().toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}),
-            { x: bx+8, y: by+bh-46, size: 9, font, color: rgb(0.4,0.4,0.4) });
+            { x: bx+8, y: textY, size: 9, font: bodyFont, color: rgb(0.4,0.4,0.4) });
 
           if (stampProfile.stamp_image_url) {
             try {
