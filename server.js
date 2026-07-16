@@ -1984,8 +1984,8 @@ async function handleAddRecord(req, res) {
         return res.status(403).json({ success: false, message: 'Only decision makers can stamp documents.' });
       }
       const { rows: stampRows } = await pool.query(
-        `SELECT 1 FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
-        [userId, role]
+        `SELECT 1 FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
+        [userId, role, projectId]
       );
       if (!stampRows.length) {
         return res.status(400).json({ success: false, message: 'No stamp profile found. Set up your stamp first.' });
@@ -2829,15 +2829,57 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: Resolve company_name based on role and project
+async function resolveCompanyNameForStamp(projectId, userId, role) {
+  try {
+    if (role === 'Client') {
+      const { rows } = await pool.query(
+        `SELECT c.company_name FROM projects p
+         JOIN clients c ON p.client_id = c.id
+         WHERE p.id=$1 LIMIT 1`,
+        [projectId]
+      );
+      return rows[0]?.company_name || null;
+    } else if (role === 'Contractor') {
+      const { rows } = await pool.query(
+        `SELECT ca.company_name FROM contractor_assignments ca
+         WHERE ca.project_id=$1 AND ca.contractor_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return rows[0]?.company_name || null;
+    } else if (role === 'Consultant') {
+      const { rows } = await pool.query(
+        `SELECT ca.company_name FROM consultant_assignments ca
+         WHERE ca.project_id=$1 AND ca.consultant_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return rows[0]?.company_name || null;
+    }
+    // PM roles and others don't have company_name in schema
+    return null;
+  } catch (err) {
+    console.warn('resolveCompanyNameForStamp error:', err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/my-stamp', authenticateToken, async (req, res) => {
   const { user_id, role } = req.user;
+  const projectId = parseInt(req.query.projectId, 10);
+  if (!projectId) return res.status(400).json({ error: 'projectId required' });
   try {
     const { rows } = await pool.query(
-      `SELECT id, signer_name, company_name, signature_image, stamp_image_url, updated_at
-       FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
-      [user_id, role]
+      `SELECT id, signer_name, signature_image, stamp_image_url, updated_at
+       FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
+      [user_id, role, projectId]
     );
-    res.json({ stamp: rows[0] || null });
+    const stamp = rows[0] || null;
+    // Resolve company_name on-the-fly for this project
+    if (stamp) {
+      stamp.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
+    }
+    res.json({ stamp });
   } catch (err) { console.error('GET my-stamp:', err); res.status(500).json({ error: 'Failed.' }); }
 });
 
@@ -2862,36 +2904,55 @@ app.get('/api/open-remote-file', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/my-stamp', authenticateToken, upload.single('stampImage'), async (req, res) => {
+app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), async (req, res) => {
   const { user_id, role } = req.user;
+  const projectId = parseInt(req.query.projectId, 10);
+  if (!projectId) return res.status(400).json({ error: 'projectId required' });
   if (!isDecisionMaker(role)) return res.status(403).json({ error: 'Only decision makers can create a stamp.' });
   try {
     const { signatureBase64 } = req.body;
     const signerName = typeof req.body.signerName === 'string'
       ? req.body.signerName.trim()
       : null;
-    const companyName = typeof req.body.companyName === 'string'
-      ? req.body.companyName.trim()
-      : null;
-    let stampImageUrl = null;
-    if (req.file) {
-      const r = await uploadToCloudinary(req.file.buffer, 'oneproject/stamps', 'image');
-      stampImageUrl = r.secure_url;
+    
+    // Handle signature: either base64 from drawing or uploaded image
+    let signatureImage = null;
+    if (signatureBase64) {
+      signatureImage = signatureBase64;
+    } else if (req.files?.signatureImageFile?.[0]) {
+      // Upload signature image to Cloudinary
+      const uploadRes = await uploadToCloudinary(req.files.signatureImageFile[0].buffer, 'oneproject/stamps/signatures', 'image');
+      signatureImage = uploadRes.secure_url;
     }
+    
+    // Handle stamp image upload
+    let stampImageUrl = null;
+    if (req.files?.stampImage?.[0]) {
+      const uploadRes = await uploadToCloudinary(req.files.stampImage[0].buffer, 'oneproject/stamps', 'image');
+      stampImageUrl = uploadRes.secure_url;
+    }
+    
+    // Ensure at least one of signature or stamp is provided
+    if (!signatureImage && !stampImageUrl) {
+      return res.status(400).json({ error: 'Either a signature or stamp image is required' });
+    }
+    
     const { rows } = await pool.query(
-      `INSERT INTO user_stamps (user_id, user_role, signer_name, company_name, signature_image, stamp_image_url, updated_at)
+      `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, NOW())
-       ON CONFLICT ON CONSTRAINT uniq_user_stamp
+       ON CONFLICT ON CONSTRAINT uniq_user_stamp_project
        DO UPDATE SET
          signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
-         company_name    = COALESCE(EXCLUDED.company_name, user_stamps.company_name),
          signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
          stamp_image_url = COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url),
          updated_at      = NOW()
-       RETURNING id, signer_name, company_name, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, signerName, companyName, signatureBase64 || null, stampImageUrl]
+       RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
+      [user_id, role, projectId, signerName, signatureImage || null, stampImageUrl]
     );
-    res.json({ success: true, stamp: rows[0] });
+    const stamp = rows[0];
+    // Resolve company_name for this project
+    stamp.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
+    res.json({ success: true, stamp });
   } catch (err) { console.error('POST my-stamp:', err); res.status(500).json({ error: 'Failed to save stamp.' }); }
 });
 
@@ -2948,20 +3009,23 @@ app.post('/api/sign-record', authenticateToken, async (req, res) => {
     console.log('[sign-record] ✅ File type is stampable');
 
     const { rows: stampRows } = await pool.query(
-      `SELECT signer_name, company_name, signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 LIMIT 1`,
-      [user_id, role]
+      `SELECT signer_name, signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
+      [user_id, role, projectId]
     );
-    console.log('[sign-record] 🖋️ Stamp profile check:', { found: stampRows.length > 0, user_id, role });
+    console.log('[sign-record] 🖋️ Stamp profile check:', { found: stampRows.length > 0, user_id, role, projectId });
     
     if (!stampRows.length) {
-      console.log('[sign-record] ❌ No stamp profile found for user:', user_id, 'role:', role);
+      console.log('[sign-record] ❌ No stamp profile found for user:', user_id, 'role:', role, 'projectId:', projectId);
       return res.status(400).json({ error: 'No stamp profile found. Set up your stamp first.' });
     }
     
     const stampProfile = stampRows[0];
+    // Resolve company_name for this project
+    stampProfile.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
     console.log('[sign-record] ✅ Stamp profile loaded:', { 
       has_signature: !!stampProfile.signature_image,
-      has_stamp_image: !!stampProfile.stamp_image_url
+      has_stamp_image: !!stampProfile.stamp_image_url,
+      company_name: stampProfile.company_name
     });
 
     let stampedDocUrl = null, signatureHash = null;
