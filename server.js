@@ -2758,13 +2758,6 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
     const bw = 200, bh = 110;
     const boxX = Math.round(Math.min(Math.max(xRatio * width, 10), width - bw - 10));
     const boxY = Math.round(Math.min(Math.max(height - (yRatio * height) - bh, 10), height - bh - 10));
-    page.drawRectangle({
-      x: boxX, y: boxY, width: bw, height: bh,
-      color: rgb(0.98, 0.98, 0.98),
-      borderColor: rgb(0.2, 0.48, 0.53),
-      borderWidth: 1.5
-    });
-
     const label = (stampType || 'SIGNED').toUpperCase();
     const lc = label === 'REJECTED' ? rgb(0.6, 0.1, 0.1)
              : label === 'APPROVED'  ? rgb(0.04, 0.37, 0.27)
@@ -2785,7 +2778,7 @@ async function applyStampToFile(fileUrl, stampType, stampProfile, options = {}) 
     const stampSize = Math.min(48, bw - 24);
     const stampX = boxX + bw - stampSize - 8;
     const stampY = boxY + 8;
-    const signatureWidth = Math.max(24, Math.min(80, bw - stampSize - 30));
+    const signatureWidth = Math.max(24, Math.min(5 * 28.3465, bw - stampSize - 30));
 
     if (stampProfile.stamp_image_url) {
       try {
