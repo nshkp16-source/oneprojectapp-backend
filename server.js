@@ -2645,7 +2645,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
 //  DOWNLOAD / DELETE RECORD
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/download-file', authenticateToken, async (req, res) => {
-  const { recordId, recordType } = req.query;
+  const { recordId, recordType, filename } = req.query;
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
@@ -2657,17 +2657,27 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
       console.log('Download proxy using stamped_doc_url for record', recordId);
     }
     if (filePath.startsWith('http')) {
-      // The file is hosted remotely (e.g., Cloudinary). Return the remote
-      // URL as JSON so the frontend can open it directly in a new tab.
-      // Also perform a quick HEAD check and log the result for diagnostics.
-      console.log('Download returning remote URL for record', recordId, filePath);
+      console.log('Download proxy fetching remote file for record', recordId, filePath);
       try {
-        const headResp = await fetch(filePath, { method: 'HEAD', redirect: 'follow' });
-        console.log('Remote HEAD status for', filePath, headResp.status);
+        const remoteResp = await fetch(filePath, { method: 'GET', redirect: 'follow' });
+        if (!remoteResp.ok) {
+          console.warn('Remote file fetch failed with status', remoteResp.status, 'for', filePath);
+          return res.status(remoteResp.status).json({ error: 'File not available.' });
+        }
+        const contentType = remoteResp.headers.get('content-type') || 'application/octet-stream';
+        const contentLength = remoteResp.headers.get('content-length');
+        const safeName = (filename || filePath.split('/').pop().split('?')[0] || `attachment-${recordId}`)
+          .replace(/\\/g, '_')
+          .replace(/"/g, '_');
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+        const buffer = Buffer.from(await remoteResp.arrayBuffer());
+        return res.send(buffer);
       } catch (headErr) {
-        console.warn('Remote HEAD check failed for', filePath, headErr.message);
+        console.warn('Remote file fetch failed for', filePath, headErr.message);
+        return res.status(502).json({ error: 'File not reachable.' });
       }
-      return res.json({ url: filePath });
     }
     res.status(404).json({ error: 'File not accessible.' });
   } catch (err) {
