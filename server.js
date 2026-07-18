@@ -2907,11 +2907,102 @@ async function resolveCompanyNameForStamp(projectId, userId, role) {
         [projectId, userId]
       );
       return rows[0]?.company_name || null;
+    } else if (role === 'ClientPM') {
+      const { rows } = await pool.query(
+        `SELECT c.company_name FROM projects p
+         JOIN clients c ON p.client_id = c.id
+         WHERE p.id=$1 LIMIT 1`,
+        [projectId]
+      );
+      return rows[0]?.company_name || 'Client Project Manager';
+    } else if (role === 'ContractorPM') {
+      const { rows } = await pool.query(
+        `SELECT ca.company_name FROM contractor_assignments ca
+         WHERE ca.project_id=$1 LIMIT 1`,
+        [projectId]
+      );
+      return rows[0]?.company_name || 'Contractor Project Manager';
+    } else if (role === 'ConsultantPM') {
+      const { rows } = await pool.query(
+        `SELECT ca.company_name FROM consultant_assignments ca
+         WHERE ca.project_id=$1 LIMIT 1`,
+        [projectId]
+      );
+      return rows[0]?.company_name || 'Consultant Project Manager';
     }
-    // PM roles and others don't have company_name in schema
+    // Other roles don't have company_name in schema
     return null;
   } catch (err) {
     console.warn('resolveCompanyNameForStamp error:', err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: Resolve signer name from schema fields for stamp rendering
+async function resolveSignerNameForStamp(projectId, userId, role) {
+  try {
+    if (role === 'Client') {
+      const { rows } = await pool.query(`SELECT representative FROM clients WHERE id=$1 LIMIT 1`, [userId]);
+      return rows[0]?.representative || null;
+    }
+    if (role === 'Contractor') {
+      const { rows } = await pool.query(
+        `SELECT representative FROM contractor_assignments
+         WHERE project_id=$1 AND contractor_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      if (rows[0]?.representative) return rows[0].representative;
+      const { rows: userRows } = await pool.query(`SELECT email FROM contractors WHERE id=$1 LIMIT 1`, [userId]);
+      return userRows[0]?.email || null;
+    }
+    if (role === 'Consultant') {
+      const { rows } = await pool.query(
+        `SELECT representative FROM consultant_assignments
+         WHERE project_id=$1 AND consultant_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      if (rows[0]?.representative) return rows[0].representative;
+      const { rows: userRows } = await pool.query(`SELECT email FROM consultants WHERE id=$1 LIMIT 1`, [userId]);
+      return userRows[0]?.email || null;
+    }
+    if (role === 'ClientPM') {
+      const { rows } = await pool.query(
+        `SELECT name FROM client_pm_assignments
+         WHERE project_id=$1 AND client_pm_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return rows[0]?.name || null;
+    }
+    if (role === 'ContractorPM') {
+      const { rows } = await pool.query(
+        `SELECT name FROM contractor_pm_assignments
+         WHERE project_id=$1 AND contractor_pm_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return rows[0]?.name || null;
+    }
+    if (role === 'ConsultantPM') {
+      const { rows } = await pool.query(
+        `SELECT name FROM consultant_pm_assignments
+         WHERE project_id=$1 AND consultant_pm_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return rows[0]?.name || null;
+    }
+    if (role === 'TeamMember') {
+      const { rows } = await pool.query(
+        `SELECT name FROM team_member_assignments
+         WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      if (rows[0]?.name) return rows[0].name;
+      const { rows: userRows } = await pool.query(`SELECT email FROM team_members WHERE id=$1 LIMIT 1`, [userId]);
+      return userRows[0]?.email || null;
+    }
+    return null;
+  } catch (err) {
+    console.warn('resolveSignerNameForStamp error:', err.message);
     return null;
   }
 }
@@ -2928,8 +3019,8 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
       [user_id, role, projectId]
     );
     const stamp = rows[0] || null;
-    // Resolve company_name on-the-fly for this project
     if (stamp) {
+      stamp.signer_name = stamp.signer_name || await resolveSignerNameForStamp(projectId, user_id, role);
       stamp.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
     }
     res.json({ stamp });
