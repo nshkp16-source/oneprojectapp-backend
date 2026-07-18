@@ -92,6 +92,27 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+async function ensureStampStatusColumns() {
+  const recordTables = [
+    'contractual_records',
+    'administrative_records',
+    'safety_records',
+    'operational_records',
+    'financial_records',
+  ];
+
+  for (const table of recordTables) {
+    try {
+      await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS stamp_status TEXT`);
+      console.log(`[schema] ensured stamp_status on ${table}`);
+    } catch (err) {
+      console.warn(`[schema] unable to ensure stamp_status on ${table}:`, err.message);
+    }
+  }
+}
+
+await ensureStampStatusColumns();
+
 // ─── SendGrid ─────────────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport(
   nodemailerSendgrid({ apiKey: process.env.SENDGRID_API_KEY })
@@ -112,6 +133,17 @@ const VALID_RECORD_TABLES = new Set([
 function resolveTable(recordType) {
   if (!recordType || !VALID_RECORD_TABLES.has(recordType)) return null;
   return recordType;
+}
+
+function getStampStatusFromActor(previousStatus, actorRole) {
+  const normalized = (previousStatus || 'none').toLowerCase();
+  if (normalized === 'both') return 'both';
+  const actor = (actorRole || 'approver').toLowerCase();
+  const isRecorder = actor === 'recorder';
+  if (normalized === 'none') return isRecorder ? 'recorder' : 'approver';
+  if (normalized === 'approver' && isRecorder) return 'both';
+  if (normalized === 'recorder' && !isRecorder) return 'both';
+  return normalized;
 }
 
 function getSide(role) {
@@ -2038,14 +2070,14 @@ async function handleAddRecord(req, res) {
         `INSERT INTO ${table} (
           project_id, title, description, file_path, attachment_id, 
           uploaded_by, role, record_kind, notice_tied_id,
-          signed_by_id, signed_by_role, signed_at, stamp_type
+          signed_by_id, signed_by_role, signed_at, stamp_type, stamp_status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${signedByUserId ? 'NOW()' : 'NULL'}, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${signedByUserId ? 'NOW()' : 'NULL'}, $12, $13)
         RETURNING id`,
         [
           projectId, title, description || null, filePath, attachmentId,
           userId, role, resolvedKind, noticeTied,
-          signedByUserId, signedByRole, finalStampType || null
+          signedByUserId, signedByRole, finalStampType || null, stampApplied ? 'recorder' : 'none'
         ]
       );
       const recordId = recRes.rows[0].id;
@@ -2444,7 +2476,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
               r.issued_date, r.role AS uploader_role,
               r.uploaded_by, r.status, r.record_kind, r.notice_tied_id,
               r.signed_by_id, r.signed_by_role, r.signed_at,
-              r.stamp_type, r.stamped_doc_url, r.signature_hash
+              r.stamp_type, r.stamped_doc_url, r.signature_hash, r.stamp_status
        FROM ${table} r WHERE r.project_id = $1 ORDER BY r.issued_date DESC`,
       [projectId]
     );
@@ -2579,8 +2611,8 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  REVIEW RECORD
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/review-record', authenticateToken, async (req, res) => {
-  const { projectId, recordId, recordType, action, comment, actorType } = req.body;
+app.post('/api/review-record', authenticateToken, upload.single('attachment'), async (req, res) => {
+  const { projectId, recordId, recordType, action, comment, actorType, stampDocument } = req.body;
   const reviewerId = req.user.user_id, reviewerRole = req.user.role;
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
@@ -2590,7 +2622,7 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
   if (!isWorkflow && action !== 'no_action') return res.status(400).json({ error: 'Invalid action.' });
   if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
   try {
-    const { rows: recRows } = await pool.query(`SELECT id, role, uploaded_by FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
+    const { rows: recRows } = await pool.query(`SELECT id, role, uploaded_by, file_path, attachment_id, stamp_status, stamp_type FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!recRows.length) return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
     const rec = recRows[0];
     if (String(rec.uploaded_by) === String(reviewerId) && getSide(rec.role) === getSide(reviewerRole)) return res.status(403).json({ error: 'You cannot review your own record.' });
@@ -2617,6 +2649,36 @@ app.post('/api/review-record', authenticateToken, async (req, res) => {
       }
       await pool.query(`INSERT INTO document_reviews (record_type,record_id,record_kind,reviewer_id,reviewer_role,reviewer_email,reviewer_position,reviewer_assigned_part,action,comment) VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8,$9)`, [table, recordId, reviewerId, reviewerRole, reviewerEmail, reviewerPosition, reviewerAssignedPart, action, comment?.trim() || null]);
     }
+
+    let stampedDocUrl = null;
+    let stampedAttachmentId = null;
+    let stampApplied = false;
+    if (isDecisionMakerActor && isWorkflow && stampDocument === 'true' && req.file) {
+      if (!/\.pdf$/i.test(req.file.originalname || '')) {
+        return res.status(400).json({ error: 'Stamped documents must be submitted as PDF.' });
+      }
+      try {
+        const r = await new Promise((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
+            (err, result) => err ? reject(err) : resolve(result)
+          );
+          Readable.from(req.file.buffer).pipe(stream);
+        });
+        stampedDocUrl = r.secure_url;
+        stampedAttachmentId = r.public_id;
+        stampApplied = true;
+        const nextStampStatus = getStampStatusFromActor(rec.stamp_status, 'approver');
+        await pool.query(
+          `UPDATE ${table} SET file_path=$1, attachment_id=$2, stamped_doc_url=$3, signed_by_id=$4, signed_by_role=$5, signed_at=NOW(), stamp_type=$6, stamp_status=$7 WHERE id=$8 AND project_id=$9`,
+          [stampedDocUrl, stampedAttachmentId, stampedDocUrl, reviewerId, reviewerRole, 'STAMPED', nextStampStatus, recordId, projectId]
+        );
+      } catch (uploadErr) {
+        console.error('Review-record stamp upload failed:', uploadErr);
+        return res.status(500).json({ error: 'Failed to stamp and replace the document.' });
+      }
+    }
+
     if (isDecisionMakerActor && isWorkflow) {
       const uploaderSide = getSide(rec.role);
       let newStatus;
