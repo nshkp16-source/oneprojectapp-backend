@@ -1821,8 +1821,23 @@ app.post('/assign', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  /api/me  &  /api/user-assignment
 // ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/me', authenticateToken, (req, res) => {
-  res.json({ id: req.user.user_id, role: req.user.role, email: req.user.email });
+app.get('/api/me', authenticateToken, async (req, res) => {
+  try {
+    const projectId = req.query.projectId ? parseInt(req.query.projectId, 10) : null;
+    let name = null;
+    if (projectId) {
+      name = await resolveDisplayNameForStamp(projectId, req.user.user_id, req.user.role);
+    }
+    res.json({
+      id: req.user.user_id,
+      role: req.user.role,
+      email: req.user.email,
+      name: name || req.user.email || null
+    });
+  } catch (err) {
+    console.error('GET /api/me error:', err);
+    res.status(500).json({ error: 'Failed to load user info.' });
+  }
 });
 
 app.get('/api/user-assignment', authenticateToken, async (req, res) => {
@@ -2796,8 +2811,10 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
       [user_id, role, projectId]
     );
     const stamp = rows[0] || null;
-    // Resolve company_name on-the-fly for this project
     if (stamp) {
+      if (!stamp.signer_name) {
+        stamp.signer_name = await resolveDisplayNameForStamp(projectId, user_id, role);
+      }
       stamp.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
     }
     res.json({ stamp });
@@ -2858,6 +2875,7 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
       return res.status(400).json({ error: 'Either a signature or stamp image is required' });
     }
     
+    const resolvedSignerName = signerName || await resolveDisplayNameForStamp(projectId, user_id, role);
     const { rows } = await pool.query(
       `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -2868,7 +2886,7 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
          stamp_image_url = COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url),
          updated_at      = NOW()
        RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, projectId, signerName, signatureImage || null, stampImageUrl]
+      [user_id, role, projectId, resolvedSignerName, signatureImage || null, stampImageUrl]
     );
     const stamp = rows[0];
     // Resolve company_name for this project
