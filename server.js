@@ -113,6 +113,29 @@ async function ensureStampStatusColumns() {
 
 await ensureStampStatusColumns();
 
+async function ensureDisplayNameColumns() {
+  const userTables = [
+    'clients',
+    'contractors',
+    'consultants',
+    'team_members',
+    'contractor_project_managers',
+    'consultant_project_managers',
+    'client_project_managers',
+  ];
+
+  for (const t of userTables) {
+    try {
+      await pool.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS display_name TEXT`);
+      console.log(`[schema] ensured display_name on ${t}`);
+    } catch (err) {
+      console.warn(`[schema] unable to ensure display_name on ${t}:`, err.message);
+    }
+  }
+}
+
+await ensureDisplayNameColumns();
+
 // ─── SendGrid ─────────────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport(
   nodemailerSendgrid({ apiKey: process.env.SENDGRID_API_KEY })
@@ -172,6 +195,75 @@ function normalizeRole(role) {
     TeamMember: 'TeamMember',
     'Team Member': 'TeamMember',
   }[role] || role;
+}
+
+// Resolve a human-friendly display name for a given role+id within a project context
+async function resolveDisplayNameFor(role, id, projectId = null) {
+  if (!role || !id) return null;
+  const r = normalizeRole(role);
+  try {
+    if (r === 'Client') {
+      const { rows } = await pool.query('SELECT display_name, representative, company_name, company_email FROM clients WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0];
+      return row?.display_name || row?.representative || row?.company_name || row?.company_email || null;
+    }
+    if (r === 'Contractor') {
+      const { rows } = await pool.query('SELECT display_name, email FROM contractors WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0];
+      if (row?.display_name) return row.display_name;
+      // try to find project-specific assignment name/rep
+      if (projectId) {
+        const { rows: arows } = await pool.query('SELECT company_name, representative FROM contractor_assignments WHERE contractor_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
+        const a = arows[0];
+        if (a?.representative) return a.representative;
+        if (a?.company_name) return a.company_name;
+      }
+      return row?.email || null;
+    }
+    if (r === 'Consultant') {
+      const { rows } = await pool.query('SELECT display_name, email FROM consultants WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0];
+      if (row?.display_name) return row.display_name;
+      if (projectId) {
+        const { rows: arows } = await pool.query('SELECT company_name, representative FROM consultant_assignments WHERE consultant_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
+        const a = arows[0];
+        if (a?.representative) return a.representative;
+        if (a?.company_name) return a.company_name;
+      }
+      return row?.email || null;
+    }
+    if (r === 'ClientPM') {
+      const { rows } = await pool.query('SELECT display_name, email FROM client_project_managers WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0];
+      return row?.display_name || row?.email || null;
+    }
+    if (r === 'ContractorPM') {
+      const { rows } = await pool.query('SELECT display_name, email FROM contractor_project_managers WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0];
+      return row?.display_name || row?.email || null;
+    }
+    if (r === 'ConsultantPM') {
+      const { rows } = await pool.query('SELECT display_name, email FROM consultant_project_managers WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0];
+      return row?.display_name || row?.email || null;
+    }
+    if (r === 'TeamMember') {
+      const { rows } = await pool.query('SELECT display_name, email FROM team_members WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0];
+      if (row?.display_name) return row.display_name;
+      if (projectId) {
+        const { rows: arows } = await pool.query('SELECT name, position FROM team_member_assignments WHERE team_member_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
+        const a = arows[0];
+        if (a?.name) return a.name;
+        if (a?.position) return a.position;
+      }
+      return row?.email || null;
+    }
+    return null;
+  } catch (err) {
+    console.warn('[resolveDisplayNameFor] DB lookup failed:', err.message);
+    return null;
+  }
 }
 
 function normalizeProjectId(value) {
@@ -290,6 +382,7 @@ async function getProjectMembers(projectId) {
       c.company_name,
       c.representative,
       c.title,
+      c.display_name         AS display_name,
       NULL::text              AS title_position,
       NULL::text              AS position,
       c.profile_picture,
@@ -308,6 +401,7 @@ async function getProjectMembers(projectId) {
       a.company_name,
       a.representative,
       NULL::text              AS title,
+      c.display_name         AS display_name,
       a.title_position,
       NULL::text              AS position,
       c.profile_picture,
@@ -326,6 +420,7 @@ async function getProjectMembers(projectId) {
       a.company_name,
       a.representative,
       NULL::text              AS title,
+      c.display_name         AS display_name,
       a.title_position,
       NULL::text              AS position,
       c.profile_picture,
@@ -344,6 +439,7 @@ async function getProjectMembers(projectId) {
       NULL::text              AS company_name,
       NULL::text              AS representative,
       a.name                  AS title,
+      c.display_name         AS display_name,
       NULL::text              AS title_position,
       NULL::text              AS position,
       c.profile_picture,
@@ -362,6 +458,7 @@ async function getProjectMembers(projectId) {
       NULL::text              AS company_name,
       NULL::text              AS representative,
       a.name                  AS title,
+      c.display_name         AS display_name,
       NULL::text              AS title_position,
       NULL::text              AS position,
       c.profile_picture,
@@ -380,6 +477,7 @@ async function getProjectMembers(projectId) {
       NULL::text              AS company_name,
       NULL::text              AS representative,
       a.name                  AS title,
+      c.display_name         AS display_name,
       NULL::text              AS title_position,
       NULL::text              AS position,
       c.profile_picture,
@@ -398,6 +496,7 @@ async function getProjectMembers(projectId) {
       NULL::text              AS company_name,
       NULL::text              AS representative,
       a.name                  AS title,
+      c.display_name         AS display_name,
       NULL::text              AS title_position,
       a.position,
       c.profile_picture,
@@ -407,10 +506,10 @@ async function getProjectMembers(projectId) {
     WHERE a.project_id = $1
   `, [projectId]);
 
-  return rows.map(r => ({
+    return rows.map(r => ({
     ...r,
     role_id:      Number(r.role_id),
-    display_name: r.email || 'Unknown',  // raw fallback, overridden by enrichedMembers
+    display_name: r.display_name || r.representative || r.title || r.email || 'Unknown',
   }));
 }
 
@@ -1823,20 +1922,36 @@ app.post('/assign', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/me', authenticateToken, async (req, res) => {
   try {
-    const projectId = req.query.projectId ? parseInt(req.query.projectId, 10) : null;
-    let name = null;
-    if (projectId) {
-      name = await resolveDisplayNameForStamp(projectId, req.user.user_id, req.user.role);
+    const id = req.user.user_id;
+    const role = req.user.role;
+    let name = null, company_name = null;
+    const r = normalizeRole(role);
+    if (r === 'Client') {
+      const { rows } = await pool.query('SELECT display_name, representative, company_name, company_email FROM clients WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0]; name = row?.display_name || row?.representative || row?.company_email || null; company_name = row?.company_name || null;
+    } else if (r === 'Contractor') {
+      const { rows } = await pool.query('SELECT display_name, email FROM contractors WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0]; name = row?.display_name || row?.email || null;
+    } else if (r === 'Consultant') {
+      const { rows } = await pool.query('SELECT display_name, email FROM consultants WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0]; name = row?.display_name || row?.email || null;
+    } else if (r === 'ClientPM') {
+      const { rows } = await pool.query('SELECT display_name, email FROM client_project_managers WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0]; name = row?.display_name || row?.email || null;
+    } else if (r === 'ContractorPM') {
+      const { rows } = await pool.query('SELECT display_name, email FROM contractor_project_managers WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0]; name = row?.display_name || row?.email || null;
+    } else if (r === 'ConsultantPM') {
+      const { rows } = await pool.query('SELECT display_name, email FROM consultant_project_managers WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0]; name = row?.display_name || row?.email || null;
+    } else if (r === 'TeamMember') {
+      const { rows } = await pool.query('SELECT display_name, email FROM team_members WHERE id=$1 LIMIT 1', [id]);
+      const row = rows[0]; name = row?.display_name || row?.email || null;
     }
-    res.json({
-      id: req.user.user_id,
-      role: req.user.role,
-      email: req.user.email,
-      name: name || req.user.email || null
-    });
+    return res.json({ id, role, email: req.user.email, name, company_name });
   } catch (err) {
     console.error('GET /api/me error:', err);
-    res.status(500).json({ error: 'Failed to load user info.' });
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -2577,8 +2692,10 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         const { rows: tied } = await pool.query(`SELECT title FROM ${table} WHERE id = $1`, [rec.notice_tied_id]);
         tiedRecordTitle = tied[0]?.title || null;
       }
+      const signedByDisplayName = rec.signed_by_id ? await resolveDisplayNameFor(rec.signed_by_role, rec.signed_by_id, projectId) : null;
       return {
         ...rec,
+        signed_by_display_name: signedByDisplayName,
         reviews: annotatedReviews,
         is_uploader: isUploader,
         is_viewed: isViewed,
@@ -2811,10 +2928,8 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
       [user_id, role, projectId]
     );
     const stamp = rows[0] || null;
+    // Resolve company_name on-the-fly for this project
     if (stamp) {
-      if (!stamp.signer_name) {
-        stamp.signer_name = await resolveDisplayNameForStamp(projectId, user_id, role);
-      }
       stamp.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
     }
     res.json({ stamp });
@@ -2875,7 +2990,6 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
       return res.status(400).json({ error: 'Either a signature or stamp image is required' });
     }
     
-    const resolvedSignerName = signerName || await resolveDisplayNameForStamp(projectId, user_id, role);
     const { rows } = await pool.query(
       `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -2886,7 +3000,7 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
          stamp_image_url = COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url),
          updated_at      = NOW()
        RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, projectId, resolvedSignerName, signatureImage || null, stampImageUrl]
+      [user_id, role, projectId, signerName, signatureImage || null, stampImageUrl]
     );
     const stamp = rows[0];
     // Resolve company_name for this project
