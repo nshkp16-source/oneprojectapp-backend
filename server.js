@@ -3100,29 +3100,22 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
       signatureImage = uploadRes.secure_url;
     }
     
-    // Handle stamp image upload
-    let stampImageUrl = null;
-    if (req.files?.stampImage?.[0]) {
-      const uploadRes = await uploadToCloudinary(req.files.stampImage[0].buffer, 'oneproject/stamps', 'image');
-      stampImageUrl = uploadRes.secure_url;
-    }
-    
-    // Ensure at least one of signature or stamp is provided
-    if (!signatureImage && !stampImageUrl) {
-      return res.status(400).json({ error: 'Either a signature or stamp image is required' });
+    // Ensure a signature is provided
+    if (!signatureImage) {
+      return res.status(400).json({ error: 'A signature is required' });
     }
     
     const { rows } = await pool.query(
       `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       VALUES ($1, $2, $3, $4, $5, NULL, NOW())
        ON CONFLICT ON CONSTRAINT uniq_user_stamp_project
        DO UPDATE SET
          signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
          signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
-         stamp_image_url = COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url),
+         stamp_image_url = NULL,
          updated_at      = NOW()
        RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, projectId, signerName, signatureImage || null, stampImageUrl]
+      [user_id, role, projectId, signerName, signatureImage || null]
     );
     const stamp = rows[0];
     const [companyName, positionSide] = await Promise.all([
