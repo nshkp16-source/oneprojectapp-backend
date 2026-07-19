@@ -2804,11 +2804,20 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), a
         stampedDocUrl = r.secure_url;
         stampedAttachmentId = r.public_id;
         stampApplied = true;
-        const nextStampStatus = getStampStatusFromActor(rec.stamp_status, 'approver');
-        await pool.query(
-          `UPDATE ${table} SET file_path=$1, attachment_id=$2, stamped_doc_url=$3, signed_by_id=$4, signed_by_role=$5, signed_at=NOW(), stamp_type=$6, stamp_status=$7 WHERE id=$8 AND project_id=$9`,
-          [stampedDocUrl, stampedAttachmentId, stampedDocUrl, reviewerId, reviewerRole, 'STAMPED', nextStampStatus, recordId, projectId]
-        );
+        // Only decision makers should change the overall stamp_status.
+        if (isDecisionMakerActor) {
+          const nextStampStatus = getStampStatusFromActor(rec.stamp_status, 'approver');
+          await pool.query(
+            `UPDATE ${table} SET file_path=$1, attachment_id=$2, stamped_doc_url=$3, signed_by_id=$4, signed_by_role=$5, signed_at=NOW(), stamp_type=$6, stamp_status=$7 WHERE id=$8 AND project_id=$9`,
+            [stampedDocUrl, stampedAttachmentId, stampedDocUrl, reviewerId, reviewerRole, 'STAMPED', nextStampStatus, recordId, projectId]
+          );
+        } else {
+          // Team members can attach a signed PDF, but must not change stamp_status.
+          await pool.query(
+            `UPDATE ${table} SET file_path=$1, attachment_id=$2, stamped_doc_url=$3, signed_by_id=$4, signed_by_role=$5, signed_at=NOW(), stamp_type=$6 WHERE id=$7 AND project_id=$8`,
+            [stampedDocUrl, stampedAttachmentId, stampedDocUrl, reviewerId, reviewerRole, 'STAMPED', recordId, projectId]
+          );
+        }
       } catch (uploadErr) {
         console.error('Review-record stamp upload failed:', uploadErr);
         return res.status(500).json({ error: 'Failed to stamp and replace the document.' });
