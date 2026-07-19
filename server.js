@@ -1924,7 +1924,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   try {
     const id = req.user.user_id;
     const role = req.user.role;
-    let name = null, company_name = null;
+    let name = null, company_name = null, position = null, assigned_part = null;
     const r = normalizeRole(role);
     if (r === 'Client') {
       const { rows } = await pool.query('SELECT display_name, representative, company_name, company_email FROM clients WHERE id=$1 LIMIT 1', [id]);
@@ -1947,8 +1947,11 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     } else if (r === 'TeamMember') {
       const { rows } = await pool.query('SELECT display_name, email FROM team_members WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0]; name = row?.display_name || row?.email || null;
+      const { rows: assignmentRows } = await pool.query('SELECT position, assigned_part FROM team_member_assignments WHERE team_member_id=$1 ORDER BY id DESC LIMIT 1', [id]);
+      position = assignmentRows[0]?.position || null;
+      assigned_part = assignmentRows[0]?.assigned_part || null;
     }
-    return res.json({ id, role, email: req.user.email, name, company_name });
+    return res.json({ id, role, email: req.user.email, name, company_name, position, assigned_part });
   } catch (err) {
     console.error('GET /api/me error:', err);
     return res.status(500).json({ error: 'Server error' });
@@ -2785,7 +2788,8 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), a
     let stampedDocUrl = null;
     let stampedAttachmentId = null;
     let stampApplied = false;
-    if (isDecisionMakerActor && isWorkflow && stampDocument === 'true' && req.file) {
+    const isSignatureActor = actorType === 'team_member' || isDecisionMakerActor;
+    if (isSignatureActor && isWorkflow && stampDocument === 'true' && req.file) {
       if (!/\.pdf$/i.test(req.file.originalname || '')) {
         return res.status(400).json({ error: 'Stamped documents must be submitted as PDF.' });
       }
@@ -2883,6 +2887,26 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Resolve company_name based on role and project
+async function resolvePositionAndSideForStamp(projectId, userId, role) {
+  try {
+    if (role === 'TeamMember') {
+      const { rows } = await pool.query(
+        `SELECT position, assigned_part FROM team_member_assignments
+         WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return {
+        position: rows[0]?.position || null,
+        side: rows[0]?.assigned_part || null,
+      };
+    }
+    return { position: null, side: null };
+  } catch (err) {
+    console.warn('resolvePositionAndSideForStamp error:', err.message);
+    return { position: null, side: null };
+  }
+}
+
 async function resolveCompanyNameForStamp(projectId, userId, role) {
   try {
     if (role === 'Client') {
@@ -3020,8 +3044,15 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
     );
     const stamp = rows[0] || null;
     if (stamp) {
-      stamp.signer_name = stamp.signer_name || await resolveSignerNameForStamp(projectId, user_id, role);
-      stamp.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
+      const [signerName, companyName, positionSide] = await Promise.all([
+        resolveSignerNameForStamp(projectId, user_id, role),
+        resolveCompanyNameForStamp(projectId, user_id, role),
+        resolvePositionAndSideForStamp(projectId, user_id, role),
+      ]);
+      stamp.signer_name = stamp.signer_name || signerName;
+      stamp.company_name = companyName;
+      stamp.position = positionSide.position;
+      stamp.side = positionSide.side;
     }
     res.json({ stamp });
   } catch (err) { console.error('GET my-stamp:', err); res.status(500).json({ error: 'Failed.' }); }
@@ -3052,7 +3083,7 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
   const { user_id, role } = req.user;
   const projectId = parseInt(req.query.projectId, 10);
   if (!projectId) return res.status(400).json({ error: 'projectId required' });
-  if (!isDecisionMaker(role)) return res.status(403).json({ error: 'Only decision makers can create a stamp.' });
+  if (!isDecisionMaker(role) && role !== 'TeamMember') return res.status(403).json({ error: 'Only decision makers and team members can create a signature profile.' });
   try {
     const { signatureBase64 } = req.body;
     const signerName = typeof req.body.signerName === 'string'
@@ -3094,8 +3125,13 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
       [user_id, role, projectId, signerName, signatureImage || null, stampImageUrl]
     );
     const stamp = rows[0];
-    // Resolve company_name for this project
-    stamp.company_name = await resolveCompanyNameForStamp(projectId, user_id, role);
+    const [companyName, positionSide] = await Promise.all([
+      resolveCompanyNameForStamp(projectId, user_id, role),
+      resolvePositionAndSideForStamp(projectId, user_id, role),
+    ]);
+    stamp.company_name = companyName;
+    stamp.position = positionSide.position;
+    stamp.side = positionSide.side;
     res.json({ success: true, stamp });
   } catch (err) { console.error('POST my-stamp:', err); res.status(500).json({ error: 'Failed to save stamp.' }); }
 });
