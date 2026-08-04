@@ -2914,7 +2914,9 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 // Helper: Resolve company_name based on role and project
 async function resolvePositionAndSideForStamp(projectId, userId, role) {
   try {
-    if (role === 'TeamMember') {
+    const normalizedRole = normalizeRole(role);
+
+    if (normalizedRole === 'TeamMember') {
       const { rows } = await pool.query(
         `SELECT position, assigned_part FROM team_member_assignments
          WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`,
@@ -2925,6 +2927,54 @@ async function resolvePositionAndSideForStamp(projectId, userId, role) {
         side: rows[0]?.assigned_part || null,
       };
     }
+
+    if (normalizedRole === 'Client') {
+      const { rows } = await pool.query(
+        `SELECT title, representative FROM clients WHERE id=$1 LIMIT 1`,
+        [userId]
+      );
+      return {
+        position: rows[0]?.title || rows[0]?.representative || null,
+        side: 'Client',
+      };
+    }
+
+    if (normalizedRole === 'Contractor') {
+      const { rows } = await pool.query(
+        `SELECT title_position, representative FROM contractor_assignments
+         WHERE project_id=$1 AND contractor_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return {
+        position: rows[0]?.title_position || rows[0]?.representative || null,
+        side: 'Contractor',
+      };
+    }
+
+    if (normalizedRole === 'Consultant') {
+      const { rows } = await pool.query(
+        `SELECT title_position, representative FROM consultant_assignments
+         WHERE project_id=$1 AND consultant_id=$2 LIMIT 1`,
+        [projectId, userId]
+      );
+      return {
+        position: rows[0]?.title_position || rows[0]?.representative || null,
+        side: 'Consultant',
+      };
+    }
+
+    if (normalizedRole === 'ClientPM') {
+      return { position: null, side: 'Client' };
+    }
+
+    if (normalizedRole === 'ContractorPM') {
+      return { position: null, side: 'Contractor' };
+    }
+
+    if (normalizedRole === 'ConsultantPM') {
+      return { position: null, side: 'Consultant' };
+    }
+
     return { position: null, side: null };
   } catch (err) {
     console.warn('resolvePositionAndSideForStamp error:', err.message);
@@ -3104,43 +3154,52 @@ app.get('/api/open-remote-file', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), async (req, res) => {
+app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'stampImageFile', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), async (req, res) => {
   const { user_id, role } = req.user;
   const projectId = parseInt(req.query.projectId, 10);
+  const isDM = isDecisionMaker(role);
+  const isTM = role === 'TeamMember';
   if (!projectId) return res.status(400).json({ error: 'projectId required' });
-  if (!isDecisionMaker(role) && role !== 'TeamMember') return res.status(403).json({ error: 'Only decision makers and team members can create a signature profile.' });
+  if (!isDM && !isTM) return res.status(403).json({ error: 'Only decision makers and team members can create a signature profile.' });
   try {
     const { signatureBase64 } = req.body;
     const signerName = typeof req.body.signerName === 'string'
       ? req.body.signerName.trim()
       : null;
-    
+
     // Handle signature: either base64 from drawing or uploaded image
     let signatureImage = null;
     if (signatureBase64) {
       signatureImage = signatureBase64;
     } else if (req.files?.signatureImageFile?.[0]) {
-      // Upload signature image to Cloudinary
       const uploadRes = await uploadToCloudinary(req.files.signatureImageFile[0].buffer, 'oneproject/stamps/signatures', 'image');
       signatureImage = uploadRes.secure_url;
     }
-    
+
+    // Company stamp upload is decision-maker only. Team members stay signature-only.
+    let stampImageUrl = null;
+    const stampUploadFile = req.files?.stampImage?.[0] || req.files?.stampImageFile?.[0];
+    if (isDM && stampUploadFile) {
+      const uploadRes = await uploadToCloudinary(stampUploadFile.buffer, 'oneproject/stamps/company', 'image');
+      stampImageUrl = uploadRes.secure_url;
+    }
+
     // Ensure a signature is provided
     if (!signatureImage) {
       return res.status(400).json({ error: 'A signature is required' });
     }
-    
+
     const { rows } = await pool.query(
       `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NULL, NOW())
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
        ON CONFLICT ON CONSTRAINT uniq_user_stamp_project
        DO UPDATE SET
          signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
          signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
-         stamp_image_url = NULL,
+         stamp_image_url = ${isDM ? 'COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url)' : 'NULL'},
          updated_at      = NOW()
        RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, projectId, signerName, signatureImage || null]
+      [user_id, role, projectId, signerName, signatureImage || null, isDM ? (stampImageUrl || null) : null]
     );
     const stamp = rows[0];
     const [companyName, positionSide] = await Promise.all([
