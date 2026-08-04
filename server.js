@@ -2122,7 +2122,11 @@ async function handleAddRecord(req, res) {
     // or stamping step here anymore. clientStamped is a claim we must verify.
     const clientStamped = req.body.clientStamped === 'true';
     const stampType = (req.body.stampType || 'STAMPED').toUpperCase();
-    console.log('[add-record] 📝 Request:', { userId, role, clientStamped, stampType });
+    const stampPageRaw = req.body.stampPage;
+    const stampPage = stampPageRaw === 'append' ? 'append' : Number.parseInt(stampPageRaw, 10);
+    const stampX = Number.parseFloat(req.body.stampX);
+    const stampY = Number.parseFloat(req.body.stampY);
+    console.log('[add-record] 📝 Request:', { userId, role, clientStamped, stampType, stampPage, stampX, stampY });
     
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
@@ -2157,6 +2161,18 @@ async function handleAddRecord(req, res) {
       }
       if (!req.file || !/\.pdf$/i.test(req.file.originalname || '')) {
         return res.status(400).json({ success: false, message: 'Stamped documents must be submitted as PDF.' });
+      }
+      if ((stampPage !== 'append' && (!Number.isInteger(stampPage) || stampPage < 1)) || !Number.isFinite(stampX) || !Number.isFinite(stampY) || stampX < 0 || stampX > 1 || stampY < 0 || stampY > 1) {
+        return res.status(400).json({ success: false, message: 'Invalid stamp placement metadata supplied.' });
+      }
+      try {
+        const pdfDoc = await PDFDocument.load(req.file.buffer);
+        if (!pdfDoc || !pdfDoc.getPageCount()) {
+          return res.status(400).json({ success: false, message: 'The uploaded PDF could not be parsed.' });
+        }
+      } catch (parseErr) {
+        console.error('[add-record] PDF parse verification failed:', parseErr.message);
+        return res.status(400).json({ success: false, message: 'The uploaded PDF could not be verified as a valid PDF.' });
       }
     }
 
