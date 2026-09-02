@@ -3157,8 +3157,9 @@ app.get('/api/open-remote-file', authenticateToken, async (req, res) => {
 app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'stampImageFile', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), async (req, res) => {
   const { user_id, role } = req.user;
   const projectId = parseInt(req.query.projectId, 10);
-  const isDM = isDecisionMaker(role);
-  const isTM = role === 'TeamMember';
+  const normalizedRole = normalizeRole(role);
+  const isDM = isDecisionMaker(normalizedRole);
+  const isTM = normalizedRole === 'TeamMember';
   if (!projectId) return res.status(400).json({ error: 'projectId required' });
   if (!isDM && !isTM) return res.status(403).json({ error: 'Only decision makers and team members can create a signature profile.' });
   try {
@@ -3179,6 +3180,9 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
     // Company stamp upload is decision-maker only. Team members stay signature-only.
     let stampImageUrl = null;
     const stampUploadFile = req.files?.stampImage?.[0] || req.files?.stampImageFile?.[0];
+    if (!isDM && stampUploadFile) {
+      return res.status(403).json({ error: 'Company stamp upload is only available to decision makers. Team members can save a signature only.' });
+    }
     if (isDM && stampUploadFile) {
       const uploadRes = await uploadToCloudinary(stampUploadFile.buffer, 'oneproject/stamps/company', 'image');
       stampImageUrl = uploadRes.secure_url;
@@ -5647,17 +5651,21 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
 });
 
 // Create a new document (draft for team members, auto-approved for side leaders)
-app.post('/api/document-approval/create', authenticateToken, upload.single('file'), async (req, res) => {
+app.post('/api/document-approval/create', authenticateToken, upload.any(), async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   const { doc_type, title, description } = req.body;
   if (!doc_type || !title) return res.status(400).json({ error: 'Missing fields' });
   try {
     let fileUrl = null; let fileName = null; let fileId = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'documents');
+    // multipart: file may be in req.files, stamp_file may also be present
+    const files = req.files || [];
+    const mainFile = files.find(f => f.fieldname === 'file');
+    const stampFile = files.find(f => f.fieldname === 'stamp_file');
+    if (mainFile) {
+      const uploaded = await scheduleCloudinaryUpload(mainFile.buffer, mainFile.originalname, 'documents');
       fileUrl = uploaded.secure_url || uploaded.url || null;
-      fileName = req.file.originalname;
+      fileName = mainFile.originalname;
       fileId = uploaded.public_id || null;
     }
     // Resolve side: for leaders/PMs use role mapping, for TeamMember use assignment for this project
@@ -5685,7 +5693,33 @@ app.post('/api/document-approval/create', authenticateToken, upload.single('file
     console.log('CREATE DOCUMENT SQL:', q, params);
     console.log('CREATE DOCUMENT CONTEXT: user=', { id: req.user.user_id, role: req.user.role, isLeader }, 'file=', req.file ? req.file.originalname : null);
     const insert = await pool.query(q + ` RETURNING id`, params);
-    return res.json({ success: true, id: insert.rows[0].id });
+    const newId = insert.rows[0].id;
+
+    // Handle optional sign or stamp on create
+    try {
+      // sign flag may be in req.body.sign === 'true'
+      if (req.body && req.body.sign === 'true') {
+        await pool.query(`UPDATE documents SET signed_by_id=$1, signed_by_role=$2, signed_at=NOW(), updated_at=NOW() WHERE id=$3`, [req.user.user_id, req.user.role, newId]);
+      }
+      if (stampFile) {
+        // Only leaders allowed to stamp
+        if (!isLeader) {
+          console.warn('Non-leader attempted stamp on create');
+        } else {
+          if (!/\.pdf$/i.test(stampFile.originalname)) throw new Error('Stamped document must be a PDF');
+          const up = await scheduleCloudinaryUpload(stampFile.buffer, stampFile.originalname, 'documents/stamped');
+          const stampedUrl = up.secure_url || up.url || null;
+          const attachmentId = up.public_id || null;
+          await pool.query(`UPDATE documents SET stamped_doc_url=$1, attachment_id=$2, file_url=$1, file_name=$3, stamp_type='STAMPED', stamp_status='approver', approval_status='approved', approved_by_id=$4, approved_by_role=$5, approval_date=NOW(), is_shared=true, shared_at=NOW() WHERE id=$6`, [stampedUrl, attachmentId, stampFile.originalname, req.user.user_id, req.user.role, newId]);
+          // record stamp_event
+          await pool.query(`INSERT INTO stamp_events (project_id, record_type, record_id, actor_id, actor_role, action, stamped_doc_url, attachment_id, stamp_type, created_at) VALUES ($1,$2,$3,$4,$5,'STAMPED',$6,$7,'STAMPED',NOW())`, [projectId, 'documents', newId, req.user.user_id, req.user.role, stampedUrl, attachmentId]);
+        }
+      }
+    } catch (e) {
+      console.error('Post-create sign/stamp handling failed:', e.message);
+    }
+
+    return res.json({ success: true, id: newId });
   } catch (err) {
     console.error('POST /api/document-approval/create:', err);
     return res.status(500).json({ error: 'Failed to create document' });
@@ -5713,7 +5747,7 @@ app.post('/api/_debug/document-approval/create', async (req, res) => {
 });
 
 // Resubmit (update) existing document
-app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single('file'), async (req, res) => {
+app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.any(), async (req, res) => {
   const docId = req.params.id;
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
@@ -5730,10 +5764,13 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
     }
     if (!isCreator && !isAssignedBy) return res.status(403).json({ error: 'Not allowed' });
     let fileUrl = null; let fileName = null; let fileId = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'documents');
+    const files = req.files || [];
+    const mainFile = files.find(f => f.fieldname === 'file');
+    const stampFile = files.find(f => f.fieldname === 'stamp_file');
+    if (mainFile) {
+      const uploaded = await scheduleCloudinaryUpload(mainFile.buffer, mainFile.originalname, 'documents');
       fileUrl = uploaded.secure_url || uploaded.url || null;
-      fileName = req.file.originalname;
+      fileName = mainFile.originalname;
       fileId = uploaded.public_id || null;
     }
     const doc_type = req.body.doc_type || null;
@@ -5750,6 +5787,30 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
     const q = `UPDATE documents SET ${updates.join(', ')} WHERE id=$${idx} AND project_id=$${idx+1}`;
     params.push(docId, projectId);
     await pool.query(q, params);
+
+    // Optional sign or stamp on resubmit
+    try {
+      if (req.body && req.body.sign === 'true') {
+        await pool.query(`UPDATE documents SET signed_by_id=$1, signed_by_role=$2, signed_at=NOW(), updated_at=NOW() WHERE id=$3`, [req.user.user_id, req.user.role, docId]);
+      }
+      if (stampFile) {
+        const resolvedSide = await resolveSide(req.user.role, req.user.user_id, projectId);
+        const isLeader = !!getSide(req.user.role);
+        if (!isLeader) {
+          console.warn('Non-leader attempted stamp on resubmit');
+        } else {
+          if (!/\.pdf$/i.test(stampFile.originalname)) throw new Error('Stamped document must be a PDF');
+          const up = await scheduleCloudinaryUpload(stampFile.buffer, stampFile.originalname, 'documents/stamped');
+          const stampedUrl = up.secure_url || up.url || null;
+          const attachmentId = up.public_id || null;
+          await pool.query(`UPDATE documents SET stamped_doc_url=$1, attachment_id=$2, stamp_type='STAMPED', stamp_status='approver', updated_at=NOW() WHERE id=$3`, [stampedUrl, attachmentId, docId]);
+          await pool.query(`INSERT INTO stamp_events (project_id, record_type, record_id, actor_id, actor_role, action, stamped_doc_url, attachment_id, stamp_type, created_at) VALUES ($1,$2,$3,$4,$5,'STAMPED',$6,$7,'STAMPED',NOW())`, [projectId, 'documents', docId, req.user.user_id, req.user.role, stampedUrl, attachmentId]);
+        }
+      }
+    } catch (e) {
+      console.error('Post-resubmit sign/stamp handling failed:', e.message);
+    }
+
     return res.json({ success: true });
   } catch (err) {
     console.error('PUT /api/document-approval/:id/resubmit:', err);
@@ -5758,13 +5819,13 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
 });
 
 // Review (approve/reject)
-app.post('/api/document-approval/:id/review', authenticateToken, async (req, res) => {
+app.post('/api/document-approval/:id/review', authenticateToken, upload.any(), async (req, res) => {
   const docId = req.params.id;
   const { projectId, action, comment } = req.body || {};
   if (!projectId || !action) return res.status(400).json({ error: 'Missing fields' });
   if (!['approved','rejected'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
   try {
-    const { rows } = await pool.query('SELECT id, approval_status, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT id, approval_status, side, stamp_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
 
     const docSide = (rows[0].side || '').toLowerCase();
@@ -5777,6 +5838,24 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
     } else {
       await pool.query(`UPDATE documents SET approval_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2`, [comment || null, docId]);
     }
+    // Optional stamp upload during review (field: stamp_file)
+    try {
+      const files = req.files || [];
+      const stampFile = files.find(f => f.fieldname === 'stamp_file');
+      if (action === 'approved' && stampFile) {
+        // leader check already done above (userSide)
+        if (!/\.pdf$/i.test(stampFile.originalname)) throw new Error('Stamped document must be a PDF');
+        const up = await scheduleCloudinaryUpload(stampFile.buffer, stampFile.originalname, 'documents/stamped');
+        const stampedUrl = up.secure_url || up.url || null;
+        const attachmentId = up.public_id || null;
+        const prevStampStatus = rows[0].stamp_status || null;
+        const nextStampStatus = getStampStatusFromActor(prevStampStatus, 'approver');
+        await pool.query(`UPDATE documents SET stamped_doc_url=$1, attachment_id=$2, stamp_type='STAMPED', stamp_status=$3, updated_at=NOW() WHERE id=$4`, [stampedUrl, attachmentId, nextStampStatus, docId]);
+        await pool.query(`INSERT INTO stamp_events (project_id, record_type, record_id, actor_id, actor_role, action, stamped_doc_url, attachment_id, stamp_type, created_at) VALUES ($1,$2,$3,$4,$5,'STAMPED',$6,$7,'STAMPED',NOW())`, [projectId, 'documents', docId, req.user.user_id, req.user.role, stampedUrl, attachmentId]);
+      }
+    } catch (e) {
+      console.error('Review stamp handling failed:', e.message);
+    }
     // Insert approval note
     await pool.query(`INSERT INTO document_approval_notes(document_id, note_text, created_by_id, created_by_role, is_visible_to_creator) VALUES($1,$2,$3,$4,$5)`, [docId, comment || (action === 'approved' ? 'Approved' : 'Rejected'), req.user.user_id, req.user.role, true]);
     return res.json({ success: true });
@@ -5787,12 +5866,12 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
 });
 
 // Share to Control & Report
-app.post('/api/document-approval/:id/share', authenticateToken, async (req, res) => {
+app.post('/api/document-approval/:id/share', authenticateToken, upload.any(), async (req, res) => {
   const docId = req.params.id;
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT approval_status, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT approval_status, side, stamp_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Only approved documents can be shared' });
 
@@ -5800,6 +5879,25 @@ app.post('/api/document-approval/:id/share', authenticateToken, async (req, res)
     const userSide = getSide(req.user.role);
     if (!userSide) return res.status(403).json({ error: 'Only side leaders can share documents' });
     if (userSide !== docSide) return res.status(403).json({ error: 'You can only share documents for your side' });
+
+    // Optional stamp on share
+    try {
+      const files = req.files || [];
+      const stampFile = files.find(f => f.fieldname === 'stamp_file');
+      if (stampFile) {
+        if (!/\.pdf$/i.test(stampFile.originalname)) throw new Error('Stamped document must be a PDF');
+        const up = await scheduleCloudinaryUpload(stampFile.buffer, stampFile.originalname, 'documents/stamped');
+        const stampedUrl = up.secure_url || up.url || null;
+        const attachmentId = up.public_id || null;
+        const prevStampStatus = rows[0].stamp_status || null;
+        const nextStampStatus = getStampStatusFromActor(prevStampStatus, 'approver');
+        await pool.query(`UPDATE documents SET stamped_doc_url=$1, attachment_id=$2, stamp_type='STAMPED', stamp_status=$3, is_shared=true, shared_at=NOW(), updated_at=NOW() WHERE id=$4`, [stampedUrl, attachmentId, nextStampStatus, docId]);
+        await pool.query(`INSERT INTO stamp_events (project_id, record_type, record_id, actor_id, actor_role, action, stamped_doc_url, attachment_id, stamp_type, created_at) VALUES ($1,$2,$3,$4,$5,'STAMPED',$6,$7,'STAMPED',NOW())`, [projectId, 'documents', docId, req.user.user_id, req.user.role, stampedUrl, attachmentId]);
+        return res.json({ success: true });
+      }
+    } catch (e) {
+      console.error('Share stamp handling failed:', e.message);
+    }
 
     await pool.query('UPDATE documents SET is_shared=true, shared_at=NOW(), updated_at=NOW() WHERE id=$1', [docId]);
     return res.json({ success: true });
@@ -5923,7 +6021,7 @@ app.post('/api/control-reports', authenticateToken, async (req, res) => {
 });
 
 // CONTROL & REPORT — create (leader direct add)
-app.post('/api/control-reports/create', authenticateToken, upload.single('file'), async (req, res) => {
+app.post('/api/control-reports/create', authenticateToken, upload.any(), async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   const { doc_type, title, description } = req.body;
@@ -5933,10 +6031,13 @@ app.post('/api/control-reports/create', authenticateToken, upload.single('file')
     const userSide = getSide(req.user.role);
     if (!userSide) return res.status(403).json({ error: 'Only side leaders can add control & report records' });
     let fileUrl = null; let fileName = null; let fileId = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'control_reports');
+    const files = req.files || [];
+    const mainFile = files.find(f => f.fieldname === 'file');
+    const stampFile = files.find(f => f.fieldname === 'stamp_file');
+    if (mainFile) {
+      const uploaded = await scheduleCloudinaryUpload(mainFile.buffer, mainFile.originalname, 'control_reports');
       fileUrl = uploaded.secure_url || uploaded.url || null;
-      fileName = req.file.originalname;
+      fileName = mainFile.originalname;
       fileId = uploaded.public_id || null;
     }
     const side = sideLabel(getSide(req.user.role));
@@ -5945,7 +6046,23 @@ app.post('/api/control-reports/create', authenticateToken, upload.single('file')
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'approved',$11,$12,NOW(),true,NOW()) RETURNING id`,
       [projectId, title, description, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, side, req.user.user_id, req.user.role]
     );
-    return res.json({ success: true, id: insert.rows[0].id });
+    const newId = insert.rows[0].id;
+
+    // Optional stamp for control & report add
+    try {
+      if (stampFile) {
+        if (!/\.pdf$/i.test(stampFile.originalname)) throw new Error('Stamped document must be a PDF');
+        const up = await scheduleCloudinaryUpload(stampFile.buffer, stampFile.originalname, 'control_reports/stamped');
+        const stampedUrl = up.secure_url || up.url || null;
+        const attachmentId = up.public_id || null;
+        await pool.query(`UPDATE documents SET stamped_doc_url=$1, attachment_id=$2, stamp_type='STAMPED', stamp_status='approver', updated_at=NOW() WHERE id=$3`, [stampedUrl, attachmentId, newId]);
+        await pool.query(`INSERT INTO stamp_events (project_id, record_type, record_id, actor_id, actor_role, action, stamped_doc_url, attachment_id, stamp_type, created_at) VALUES ($1,$2,$3,$4,$5,'STAMPED',$6,$7,'STAMPED',NOW())`, [projectId, 'documents', newId, req.user.user_id, req.user.role, stampedUrl, attachmentId]);
+      }
+    } catch (e) {
+      console.error('Post-CR create stamp handling failed:', e.message);
+    }
+
+    return res.json({ success: true, id: newId });
   } catch (err) {
     console.error('POST /api/control-reports/create:', err);
     return res.status(500).json({ error: 'Failed to create control report' });
