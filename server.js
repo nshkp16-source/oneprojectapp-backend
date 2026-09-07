@@ -3332,52 +3332,6 @@ app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachment
 //  SCHEDULE MODULE  (unchanged — all routes preserved)
 // =============================================================================
 
-function applyDependencyDates(milestones, additionalMilestones) {
-  const all = [...milestones, ...additionalMilestones];
-  const byId = new Map(all.map(ms => [String(ms.id), ms]));
-  const parseDate = value => new Date(`${value}T00:00:00Z`);
-  const dateText = value => value.toISOString().slice(0, 10);
-  const shift = (value, days) => {
-    const date = parseDate(value);
-    date.setUTCDate(date.getUTCDate() + days);
-    return dateText(date);
-  };
-  const duration = ms => Math.max(1, daysBetween(ms.start, ms.end));
-
-  for (let pass = 0; pass < all.length; pass++) {
-    let changed = false;
-    for (const ms of all) {
-      if (!ms.dep || ms.dep === 'None') continue;
-      const predecessor = byId.get(String(ms.dep));
-      if (!predecessor || !predecessor.start || !predecessor.end) continue;
-      const relation = ['FS', 'SS', 'FF', 'SF'].includes(ms.dependencyType) ? ms.dependencyType : 'FS';
-      const lag = Number.isFinite(Number(ms.dependencyLagDays)) ? Number(ms.dependencyLagDays) : 0;
-      const days = duration(ms);
-      let nextStart = ms.start;
-      let nextEnd = ms.end;
-      if (relation === 'SS') {
-        nextStart = shift(predecessor.start, lag);
-        nextEnd = shift(nextStart, days);
-      } else if (relation === 'FF') {
-        nextEnd = shift(predecessor.end, lag);
-        nextStart = shift(nextEnd, -days);
-      } else if (relation === 'SF') {
-        nextEnd = shift(predecessor.start, lag);
-        nextStart = shift(nextEnd, -days);
-      } else {
-        nextStart = shift(predecessor.end, 1 + lag);
-        nextEnd = shift(nextStart, days);
-      }
-      if (ms.start !== nextStart || ms.end !== nextEnd) {
-        ms.start = nextStart;
-        ms.end = nextEnd;
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
-}
-
 app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
   if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
@@ -3390,7 +3344,7 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     
     const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
     
-    const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',dependencyType:ms.dependency_type||'FS',dependencyLagDays:ms.dependency_lag_days||0,weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt });
+    const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt });
     res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},location:sched.location||null,milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows } });
   } catch (err) { console.error('[GET /api/get-schedule]', err); res.status(500).json({ error: 'Failed to load schedule' }); }
 });
@@ -3416,7 +3370,6 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
   } catch {
     return res.status(400).json({ error: 'Invalid JSON in timeline, milestones, or additional milestone lists' });
   }
-  applyDependencyDates(rawMilestones, addlRawMs);
   const fileMap = {};
   (req.files||[]).forEach(f => { fileMap[f.fieldname.replace(/^file_/,'')] = f; });
   const client = await pool.connect();
@@ -3447,11 +3400,11 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       const w = totalDur > 0 ? (dur / totalDur) * 100 : 0;
       const depId = ms.dep && ms.dep !== 'None' && tempToReal[ms.dep] ? tempToReal[ms.dep] : null;
       if (newIds.has(ms.id)) {
-        const ins = await client.query(`INSERT INTO milestones (schedule_id,project_id,title,description,sort_order,planned_start,planned_end,duration_days,float_days,is_critical,weight_pct,quantity,unit,depends_on,dependency_type,dependency_lag_days,created_by_user_id,created_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`, [schedId,projectId,ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,float===0,w.toFixed(2),parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,ms.dependencyType||'FS',Number(ms.dependencyLagDays)||0,req.user.user_id,req.user.role]);
+        const ins = await client.query(`INSERT INTO milestones (schedule_id,project_id,title,description,sort_order,planned_start,planned_end,duration_days,float_days,is_critical,weight_pct,quantity,unit,depends_on,created_by_user_id,created_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`, [schedId,projectId,ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,float===0,w.toFixed(2),parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,req.user.user_id,req.user.role]);
         const realId = ins.rows[0].id; tempToReal[ms.id] = realId;
         if (fileMap[ms.id]) needsAttachment.push({ realId, tempId: ms.id });
       } else if (editedIds.has(ms.id)) {
-        await client.query(`UPDATE milestones SET title=$1,description=$2,sort_order=$3,planned_start=$4,planned_end=$5,duration_days=$6,float_days=$7,is_critical=$8,weight_pct=$9,quantity=$10,unit=$11,depends_on=$12,dependency_type=$13,dependency_lag_days=$14,updated_at=now() WHERE id=$15 AND schedule_id=$16`, [ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,float===0,w.toFixed(2),parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,ms.dependencyType||'FS',Number(ms.dependencyLagDays)||0,ms.id,schedId]);
+        await client.query(`UPDATE milestones SET title=$1,description=$2,sort_order=$3,planned_start=$4,planned_end=$5,duration_days=$6,float_days=$7,is_critical=$8,weight_pct=$9,quantity=$10,unit=$11,depends_on=$12,updated_at=now() WHERE id=$13 AND schedule_id=$14`, [ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,float===0,w.toFixed(2),parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,ms.id,schedId]);
         if (fileMap[ms.id]) needsAttachment.push({ realId: ms.id, tempId: ms.id });
       } else if (unchangedIds.has(ms.id)) {
         await client.query('UPDATE milestones SET sort_order=$1 WHERE id=$2 AND schedule_id=$3', [i, ms.id, schedId]);
@@ -3470,30 +3423,14 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
       const weight = parseFloat(ms.weight_pct || 0) || 0;
       const isCritical = ms.is_critical ? true : false;
       if (newAddlIds.has(ms.id)) {
-        const ins = await client.query(`INSERT INTO additional_milestones (schedule_id,project_id,title,description,sort_order,planned_start,planned_end,duration_days,float_days,is_critical,weight_pct,quantity,unit,depends_on_baseline,dependency_type,dependency_lag_days,added_by_user_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`, [schedId,projectId,ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,isCritical,weight,parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,ms.dependencyType||'FS',Number(ms.dependencyLagDays)||0,req.user.user_id,req.user.role]);
+        const ins = await client.query(`INSERT INTO additional_milestones (schedule_id,project_id,title,description,sort_order,planned_start,planned_end,duration_days,float_days,is_critical,weight_pct,quantity,unit,depends_on_baseline,added_by_user_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`, [schedId,projectId,ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,isCritical,weight,parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,req.user.user_id,req.user.role]);
         const realId = ins.rows[0].id; addlTempToReal[ms.id] = realId;
         if (fileMap[ms.id]) addlNeedsAttachment.push({ realId, tempId: ms.id });
       } else if (editedAddlIds.has(ms.id)) {
-        await client.query(`UPDATE additional_milestones SET title=$1,description=$2,sort_order=$3,planned_start=$4,planned_end=$5,duration_days=$6,float_days=$7,is_critical=$8,weight_pct=$9,quantity=$10,unit=$11,depends_on_baseline=$12,dependency_type=$13,dependency_lag_days=$14,updated_at=now() WHERE id=$15 AND schedule_id=$16`, [ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,isCritical,weight,parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,ms.dependencyType||'FS',Number(ms.dependencyLagDays)||0,ms.id,schedId]);
+        await client.query(`UPDATE additional_milestones SET title=$1,description=$2,sort_order=$3,planned_start=$4,planned_end=$5,duration_days=$6,float_days=$7,is_critical=$8,weight_pct=$9,quantity=$10,unit=$11,depends_on_baseline=$12,updated_at=now() WHERE id=$13 AND schedule_id=$14`, [ms.title,ms.desc||ms.description||null,i,ms.start,ms.end,dur,float,isCritical,weight,parseFloat(ms.qty||ms.quantity)||0,ms.unit||null,depId,ms.id,schedId]);
         if (fileMap[ms.id]) addlNeedsAttachment.push({ realId: ms.id, tempId: ms.id });
       } else if (unchangedAddlIds.has(ms.id)) {
         await client.query('UPDATE additional_milestones SET sort_order=$1 WHERE id=$2 AND schedule_id=$3', [i, ms.id, schedId]);
-      }
-    }
-
-    // Resolve dependencies that pointed at newly-created temporary IDs.
-    for (const ms of rawMilestones) {
-      if (!ms.dep || ms.dep === 'None') continue;
-      const resolvedId = tempToReal[ms.dep];
-      if (resolvedId && String(resolvedId) !== String(ms.dep)) {
-        await client.query('UPDATE milestones SET depends_on=$1 WHERE id=$2 AND schedule_id=$3', [resolvedId, tempToReal[ms.id] || ms.id, schedId]);
-      }
-    }
-    for (const ms of addlRawMs) {
-      if (!ms.dep || ms.dep === 'None') continue;
-      const resolvedId = addlTempToReal[ms.dep] || tempToReal[ms.dep];
-      if (resolvedId && String(resolvedId) !== String(ms.dep)) {
-        await client.query('UPDATE additional_milestones SET depends_on_baseline=$1 WHERE id=$2 AND schedule_id=$3', [resolvedId, addlTempToReal[ms.id] || ms.id, schedId]);
       }
     }
 
@@ -3541,8 +3478,8 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
     const savedLocation = schedRes.rows[0]?.location || location || null;
     const extRows2 = await pool.query(`SELECT id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [schedId]);
     const amRows2 = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [schedId]);
-    const mapExtMs = ms => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on_baseline||null,dependencyType:ms.dependency_type||'FS',dependencyLagDays:ms.dependency_lag_days||0,weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,added_via_extension:true });
-    res.json({ success:true,schedule:{ id:schedId,timeline:{start:tl.start,finish:tl.finish,duration:tl.duration},location:savedLocation,milestones:freshMs.rows.map(ms=>({id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||'None',dependencyType:ms.dependency_type||'FS',dependencyLagDays:ms.dependency_lag_days||0,weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null})),extension_milestones:amRows2.rows.map(mapExtMs),extensions:extRows2.rows } });
+    const mapExtMs = ms => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on_baseline||null,weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,added_via_extension:true });
+    res.json({ success:true,schedule:{ id:schedId,timeline:{start:tl.start,finish:tl.finish,duration:tl.duration},location:savedLocation,milestones:freshMs.rows.map(ms=>({id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null})),extension_milestones:amRows2.rows.map(mapExtMs),extensions:extRows2.rows } });
   } catch (err) { await client.query('ROLLBACK'); console.error('[POST /api/save-schedule]', err); res.status(500).json({ error: 'Failed to save schedule' }); } finally { client.release(); }
 });
 
