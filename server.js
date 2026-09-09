@@ -3734,7 +3734,7 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/save-extension]',err);res.status(500).json({error:'Failed to save extension'});}finally{client.release();}
 });
 
-app.patch('/api/schedule-extensions/:extensionId', authenticateToken, async (req, res) => {
+app.patch('/api/schedule-extensions/:extensionId', authenticateToken, upload.single('supportingDoc'), async (req, res) => {
   if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const projectId = normalizeProjectId(req.body.projectId);
   const extensionId = req.params.extensionId;
@@ -3742,6 +3742,7 @@ app.patch('/api/schedule-extensions/:extensionId', authenticateToken, async (req
   const newPlannedFinish = String(req.body.newPlannedFinish || '').trim();
   const reason = String(req.body.reason || '').trim();
   const extensionType = String(req.body.extensionType || '').trim();
+  const removeSupportingDoc = req.body.removeSupportingDoc === 'true';
   if (!projectId || !extensionId || !extensionDays || extensionDays < 1 || !newPlannedFinish || !reason || !['delay', 'scope_addition', 'force_majeure', 'design_change'].includes(extensionType)) {
     return res.status(400).json({ error: 'Valid extension details are required' });
   }
@@ -3750,7 +3751,19 @@ app.patch('/api/schedule-extensions/:extensionId', authenticateToken, async (req
     await client.query('BEGIN');
     const current = await client.query('SELECT id,schedule_id FROM schedule_extensions WHERE id=$1 AND project_id=$2 FOR UPDATE', [extensionId, projectId]);
     if (!current.rows.length) return res.status(404).json({ error: 'Extension not found' });
-    await client.query('UPDATE schedule_extensions SET extension_days=$1,new_planned_finish=$2,reason=$3,extension_type=$4,updated_at=now() WHERE id=$5 AND project_id=$6', [extensionDays, newPlannedFinish, reason, extensionType, extensionId, projectId]);
+    let attachmentSql = '';
+    const attachmentValues = [];
+    if (req.file) {
+      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, `oneprojectapp/schedules/${projectId}/extensions`);
+      attachmentSql = ',supporting_file_name=$5,supporting_file_url=$6,supporting_file_public_id=$7,supporting_file_mime=$8,supporting_file_size=$9';
+      attachmentValues.push(req.file.originalname, uploaded.secure_url || uploaded.url || null, uploaded.public_id || null, req.file.mimetype || null, req.file.size || null);
+    } else if (removeSupportingDoc) {
+      attachmentSql = ',supporting_file_name=NULL,supporting_file_url=NULL,supporting_file_public_id=NULL,supporting_file_mime=NULL,supporting_file_size=NULL';
+    }
+    const updateValues = [extensionDays, newPlannedFinish, reason, extensionType, ...attachmentValues, extensionId, projectId];
+    const idPlaceholder = attachmentValues.length ? '$10' : '$5';
+    const projectPlaceholder = attachmentValues.length ? '$11' : '$6';
+    await client.query(`UPDATE schedule_extensions SET extension_days=$1,new_planned_finish=$2,reason=$3,extension_type=$4,updated_at=now()${attachmentSql} WHERE id=${idPlaceholder} AND project_id=${projectPlaceholder}`, updateValues);
     const latest = await client.query('SELECT new_planned_finish FROM schedule_extensions WHERE schedule_id=$1 ORDER BY new_planned_finish DESC,created_at DESC LIMIT 1', [current.rows[0].schedule_id]);
     await client.query('UPDATE project_schedules SET planned_finish=$1,updated_at=now() WHERE id=$2', [latest.rows[0]?.new_planned_finish || newPlannedFinish, current.rows[0].schedule_id]);
     await client.query('COMMIT');
