@@ -3678,8 +3678,8 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
     if (!schedRow.rows.length) return res.json({hasSchedule:false,milestones:[],photos:[],timeline:null});
     const sched=schedRow.rows[0];
     const location=sched.location || null;
-    const msRows=await pool.query(`SELECT m.id,m.title,m.planned_start AS start,m.planned_end AS end,m.quantity,m.unit,m.weight_pct,m.float_days,m.is_critical,m.executed,m.progress_pct,m.activity_status,m.completed_at,m.depends_on AS dep FROM milestones m WHERE m.schedule_id=$1 ORDER BY m.sort_order`,[sched.id]);
-    const amRows=await pool.query(`SELECT am.id,am.title,am.planned_start AS start,am.planned_end AS end,am.quantity,am.unit,am.weight_pct,am.float_days,am.is_critical,am.executed,am.progress_pct,am.activity_status,am.completed_at,am.depends_on_baseline AS dep,true AS is_extension FROM additional_milestones am WHERE am.schedule_id=$1 ORDER BY am.sort_order`,[sched.id]);
+    const msRows=await pool.query(`SELECT m.id,m.title,m.planned_start AS start,m.planned_end AS end,m.quantity,m.unit,m.weight_pct,m.float_days,m.is_critical,m.executed,m.progress_pct,m.activity_status,m.completed_at,(SELECT MAX(e.report_date)::timestamp FROM milestone_progress_entries e WHERE e.milestone_id=m.id) AS last_progress_date,m.depends_on AS dep FROM milestones m WHERE m.schedule_id=$1 ORDER BY m.sort_order`,[sched.id]);
+    const amRows=await pool.query(`SELECT am.id,am.title,am.planned_start AS start,am.planned_end AS end,am.quantity,am.unit,am.weight_pct,am.float_days,am.is_critical,am.executed,am.progress_pct,am.activity_status,am.completed_at,(SELECT MAX(e.report_date)::timestamp FROM additional_milestone_progress_entries e WHERE e.additional_milestone_id=am.id) AS last_progress_date,am.depends_on_baseline AS dep,true AS is_extension FROM additional_milestones am WHERE am.schedule_id=$1 ORDER BY am.sort_order`,[sched.id]);
     const allMilestones=[...msRows.rows.map(m=>({...m,is_extension:false})),...amRows.rows.map(m=>({...m,is_extension:true}))];
     const totalWeight=allMilestones.reduce((s,m)=>s+Number(m.weight_pct||0),0);
     const overallPct=allMilestones.length===0?0:totalWeight>0?allMilestones.reduce((s,m)=>s+Number(m.weight_pct||0)*Number(m.progress_pct||0),0)/totalWeight:allMilestones.reduce((s,m)=>s+Number(m.progress_pct||0),0)/allMilestones.length;
@@ -3690,9 +3690,11 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
     const completed=allMilestones.filter(m=>m.activity_status==='completed');
     const lastCompletedMilestone=completed.reduce((latest,milestone) => {
       if (!latest) return milestone;
-      if (!milestone.completed_at) return latest;
-      if (!latest.completed_at) return milestone;
-      return new Date(milestone.completed_at) > new Date(latest.completed_at) ? milestone : latest;
+      const milestoneDate = milestone.last_progress_date || milestone.completed_at;
+      const latestDate = latest.last_progress_date || latest.completed_at;
+      if (!milestoneDate) return latest;
+      if (!latestDate) return milestone;
+      return new Date(milestoneDate) > new Date(latestDate) ? milestone : latest;
     }, null);
     const lastCompleted=lastCompletedMilestone ? lastCompletedMilestone.title : null;
     const currentMsIndex = allMilestones.findIndex(m => m.activity_status !== 'completed');
@@ -3708,7 +3710,7 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
         if(today > msStart) return Math.min(100, ((today - msStart) / Math.max(1, msEnd - msStart)) * 100);
         return 0;
       })(),
-      actual_pct: currentMsForChart.activity_status === 'completed' ? 100 : parseFloat(Math.min(100, Math.max(0, Number(currentMsForChart.progress_pct || 0))).toFixed(2)),
+      actual_pct: parseFloat(Number(currentMsForChart.progress_pct || 0).toFixed(2)),
       activity_status: currentMsForChart.activity_status,
       completed_at: currentMsForChart.completed_at,
       weight_pct: currentMsForChart.weight_pct,
@@ -3718,7 +3720,7 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
       const msStart = new Date(ms.start), msEnd = new Date(ms.end);
       let msPlanPct = 0;
       if(today >= msEnd) msPlanPct = 100; else if(today > msStart) msPlanPct = Math.min(100, ((today - msStart) / Math.max(1, msEnd - msStart)) * 100);
-      return {id: ms.id, title: ms.title, start: ms.start, end: ms.end, completed_at: ms.completed_at, planned_pct: parseFloat(msPlanPct.toFixed(2)), actual_pct: ms.activity_status === 'completed' ? 100 : parseFloat(Math.min(100, Math.max(0, Number(ms.progress_pct || 0))).toFixed(2)), activity_status: ms.activity_status, weight_pct: ms.weight_pct, is_extension: ms.is_extension, milestone_index: idx};
+      return {id: ms.id, title: ms.title, start: ms.start, end: ms.end, completed_at: ms.completed_at, actual_completed_at: ms.last_progress_date, planned_pct: parseFloat(msPlanPct.toFixed(2)), actual_pct: parseFloat(Number(ms.progress_pct || 0).toFixed(2)), activity_status: ms.activity_status, weight_pct: ms.weight_pct, is_extension: ms.is_extension, milestone_index: idx};
     });
     const msIds=msRows.rows.map(m=>m.id),amIds=amRows.rows.map(m=>m.id);
     let photos=[];
