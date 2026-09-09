@@ -3363,7 +3363,7 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     const schedRow = await pool.query('SELECT * FROM project_schedules WHERE project_id=$1 LIMIT 1', [projectId]);
     if (!schedRow.rows.length) return res.json({ schedule: null });
     const sched = schedRow.rows[0];
-    const msRows = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [sched.id]);
+    const msRows = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('id',e.id,'date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [sched.id]);
     const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('id',e.id,'date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
     
     const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at,supporting_file_name,supporting_file_url,supporting_file_mime,supporting_file_size FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
@@ -3557,12 +3557,13 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/report-additional-progress]',err);res.status(500).json({error:'Failed to save additional progress entry'});}finally{client.release();}
 });
 
-app.patch('/api/schedule-progress/:entryId', authenticateToken, async (req, res) => {
+app.patch('/api/schedule-progress/:entryId', authenticateToken, upload.none(), async (req, res) => {
   if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const projectId = normalizeProjectId(req.body.projectId);
   const qty = Number(req.body.qtyExecuted);
+  const reportDate = String(req.body.reportDate || '').trim();
   const remarks = String(req.body.remarks || '').trim();
-  if (!projectId || !Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: 'Valid projectId and positive qtyExecuted are required' });
+  if (!projectId || !reportDate || !Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: 'Project, report date, and positive quantity are required' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -3576,9 +3577,11 @@ app.patch('/api/schedule-progress/:entryId', authenticateToken, async (req, res)
     const milestoneTable = base.rows.length ? 'milestones' : 'additional_milestones';
     const milestone = await client.query(`SELECT quantity FROM ${milestoneTable} WHERE id=$1 AND project_id=$2`, [milestoneId, projectId]);
     const planned = Number(milestone.rows[0]?.quantity) || 0;
+    const duplicate = await client.query(`SELECT 1 FROM ${table} WHERE ${foreignKey}=$1 AND report_date=$2 AND id<>$3`, [milestoneId, reportDate, req.params.entryId]);
+    if (duplicate.rows.length) return res.status(409).json({ error: 'Another entry already exists for that date' });
     const totals = await client.query(`SELECT COALESCE(SUM(qty_executed),0) AS total FROM ${table} WHERE ${foreignKey}=$1 AND id<>$2`, [milestoneId, req.params.entryId]);
     if (planned > 0 && Number(totals.rows[0].total) + qty > planned) return res.status(422).json({ error: 'Edited quantity would exceed the planned quantity' });
-    await client.query(`UPDATE ${table} SET qty_executed=$1,remarks=$2 WHERE id=$3`, [qty, remarks || null, req.params.entryId]);
+    await client.query(`UPDATE ${table} SET report_date=$1,qty_executed=$2,remarks=$3 WHERE id=$4`, [reportDate, qty, remarks || null, req.params.entryId]);
     const summary = await recalculateScheduleProgress(client, table, foreignKey, milestoneId);
     await client.query('COMMIT');
     res.json({ success: true, milestone: summary });
@@ -3611,6 +3614,7 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
   const { milestoneId, isExtensionMilestone } = req.body;
   if (!projectId||!milestoneId) return res.status(400).json({ error: 'Valid projectId and milestoneId are required' });
   const isExt=isExtensionMilestone===true||isExtensionMilestone==='true';
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const table=isExt?'additional_milestones':'milestones';
   const client=await pool.connect();
   try {
@@ -3635,6 +3639,28 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     await client.query('COMMIT');
     res.json({ success:true,completedAt:new Date().toISOString() });
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/complete-milestone]',err);res.status(500).json({error:'Failed to complete milestone'});}finally{client.release();}
+});
+
+app.post('/api/reopen-milestone', authenticateToken, async (req, res) => {
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
+  const projectId = normalizeProjectId(req.body.projectId);
+  const milestoneId = req.body.milestoneId;
+  const isExt = req.body.isExtensionMilestone === true || req.body.isExtensionMilestone === 'true';
+  if (!projectId || !milestoneId) return res.status(400).json({ error: 'Valid projectId and milestoneId are required' });
+  const table = isExt ? 'additional_milestones' : 'milestones';
+  const entryTable = isExt ? 'additional_milestone_progress_entries' : 'milestone_progress_entries';
+  const foreignKey = isExt ? 'additional_milestone_id' : 'milestone_id';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(`SELECT id FROM ${table} WHERE id=$1 AND project_id=$2 FOR UPDATE`, [milestoneId, projectId]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Milestone not found' });
+    const count = await client.query(`SELECT COUNT(*)::int AS count FROM ${entryTable} WHERE ${foreignKey}=$1`, [milestoneId]);
+    const status = count.rows[0].count > 0 ? 'in_progress' : 'planned';
+    await client.query(`UPDATE ${table} SET activity_status=$1,progress_pct=LEAST(progress_pct,99.99),completed_at=NULL,updated_at=now() WHERE id=$2`, [status, milestoneId]);
+    await client.query('COMMIT');
+    res.json({ success: true, activity_status: status });
+  } catch (err) { await client.query('ROLLBACK'); console.error('[POST /api/reopen-milestone]', err); res.status(500).json({ error: 'Failed to reopen milestone' }); } finally { client.release(); }
 });
 
 app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res) => {
