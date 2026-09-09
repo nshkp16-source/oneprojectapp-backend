@@ -3734,6 +3734,56 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/save-extension]',err);res.status(500).json({error:'Failed to save extension'});}finally{client.release();}
 });
 
+app.patch('/api/schedule-extensions/:extensionId', authenticateToken, async (req, res) => {
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
+  const projectId = normalizeProjectId(req.body.projectId);
+  const extensionId = req.params.extensionId;
+  const extensionDays = parseInt(req.body.extensionDays, 10);
+  const newPlannedFinish = String(req.body.newPlannedFinish || '').trim();
+  const reason = String(req.body.reason || '').trim();
+  const extensionType = String(req.body.extensionType || '').trim();
+  if (!projectId || !extensionId || !extensionDays || extensionDays < 1 || !newPlannedFinish || !reason || !['delay', 'scope_addition', 'force_majeure', 'design_change'].includes(extensionType)) {
+    return res.status(400).json({ error: 'Valid extension details are required' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query('SELECT id,schedule_id FROM schedule_extensions WHERE id=$1 AND project_id=$2 FOR UPDATE', [extensionId, projectId]);
+    if (!current.rows.length) return res.status(404).json({ error: 'Extension not found' });
+    await client.query('UPDATE schedule_extensions SET extension_days=$1,new_planned_finish=$2,reason=$3,extension_type=$4,updated_at=now() WHERE id=$5 AND project_id=$6', [extensionDays, newPlannedFinish, reason, extensionType, extensionId, projectId]);
+    const latest = await client.query('SELECT new_planned_finish FROM schedule_extensions WHERE schedule_id=$1 ORDER BY new_planned_finish DESC,created_at DESC LIMIT 1', [current.rows[0].schedule_id]);
+    await client.query('UPDATE project_schedules SET planned_finish=$1,updated_at=now() WHERE id=$2', [latest.rows[0]?.new_planned_finish || newPlannedFinish, current.rows[0].schedule_id]);
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) { await client.query('ROLLBACK'); console.error('[PATCH /api/schedule-extensions]', err); res.status(500).json({ error: 'Failed to update extension' }); } finally { client.release(); }
+});
+
+app.delete('/api/schedule-extensions/:extensionId', authenticateToken, async (req, res) => {
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
+  const projectId = normalizeProjectId(req.body.projectId);
+  const extensionId = req.params.extensionId;
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const current = await client.query('SELECT id,schedule_id FROM schedule_extensions WHERE id=$1 AND project_id=$2 FOR UPDATE', [extensionId, projectId]);
+    if (!current.rows.length) return res.status(404).json({ error: 'Extension not found' });
+    const milestoneIds = await client.query('SELECT id FROM additional_milestones WHERE schedule_extension_id=$1', [extensionId]);
+    for (const row of milestoneIds.rows) {
+      await client.query('DELETE FROM milestone_photos WHERE additional_milestone_id=$1', [row.id]);
+      await client.query('DELETE FROM additional_milestone_attachments WHERE additional_milestone_id=$1', [row.id]);
+      await client.query('DELETE FROM additional_milestone_progress_entries WHERE additional_milestone_id=$1', [row.id]);
+    }
+    await client.query('DELETE FROM additional_milestones WHERE schedule_extension_id=$1', [extensionId]);
+    await client.query('DELETE FROM schedule_extensions WHERE id=$1 AND project_id=$2', [extensionId, projectId]);
+    const latest = await client.query('SELECT new_planned_finish FROM schedule_extensions WHERE schedule_id=$1 ORDER BY new_planned_finish DESC,created_at DESC LIMIT 1', [current.rows[0].schedule_id]);
+    const baseline = await client.query('SELECT planned_finish FROM project_schedules WHERE id=$1', [current.rows[0].schedule_id]);
+    await client.query('UPDATE project_schedules SET planned_finish=$1,updated_at=now() WHERE id=$2', [latest.rows[0]?.new_planned_finish || baseline.rows[0]?.planned_finish, current.rows[0].schedule_id]);
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) { await client.query('ROLLBACK'); console.error('[DELETE /api/schedule-extensions]', err); res.status(500).json({ error: 'Failed to delete extension' }); } finally { client.release(); }
+});
+
 // ─── Milestone Photos ────────────────────────────────────────────────────────
 app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
   const { milestoneId, additionalMilestoneId } = req.query;
