@@ -3342,9 +3342,9 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     const msRows = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [sched.id]);
     const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
     
-    const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
+    const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at,supporting_file_name,supporting_file_url,supporting_file_mime,supporting_file_size FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
     
-    const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt });
+    const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt,extensionId:ms.schedule_extension_id||null });
     res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},location:sched.location||null,milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows } });
   } catch (err) { console.error('[GET /api/get-schedule]', err); res.status(500).json({ error: 'Failed to load schedule' }); }
 });
@@ -3573,8 +3573,9 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
   if (!extensionDays||extensionDays<1) return res.status(400).json({error:'extensionDays must be a positive integer'});
   if (!newPlannedFinish) return res.status(400).json({error:'newPlannedFinish is required'});
   if (!reason) return res.status(400).json({error:'reason is required'});
-  if (!['delay','scope_addition','force_majeure'].includes(extensionType)) return res.status(400).json({error:'Invalid extensionType'});
+  if (!['delay','scope_addition','force_majeure','design_change'].includes(extensionType)) return res.status(400).json({error:'Invalid extensionType'});
   const fileMap={};(req.files||[]).forEach(f=>{const m=f.fieldname.match(/^extFile_(\d+)$/);if(m)fileMap[parseInt(m[1],10)]=f;});
+  const supportingDoc=(req.files||[]).find(f=>f.fieldname==='supportingDoc');
   const client=await pool.connect();
   try {
     await client.query('BEGIN');
@@ -3585,7 +3586,12 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
     const effectiveFinish=lastExtRes.rows[0]?.new_planned_finish||schedRes.rows[0].planned_finish;
     const newPlannedStart=new Date(effectiveFinish);newPlannedStart.setDate(newPlannedStart.getDate()+1);
     
-    const extRes = await client.query(`INSERT INTO schedule_extensions (schedule_id,project_id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,requested_by_user_id,requested_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,[scheduleId,projectId,extensionDays,newPlannedStart.toISOString().slice(0,10),newPlannedFinish,reason,extensionType,req.user.user_id,req.user.role]);
+    let supportingFile = null;
+    if (supportingDoc) {
+      const uploaded = await scheduleCloudinaryUpload(supportingDoc.buffer, supportingDoc.originalname, `oneprojectapp/schedules/${projectId}/extensions`);
+      supportingFile = { name: supportingDoc.originalname, url: uploaded.secure_url || uploaded.url || null, publicId: uploaded.public_id || null, mime: supportingDoc.mimetype || null, size: supportingDoc.size || null };
+    }
+    const extRes = await client.query(`INSERT INTO schedule_extensions (schedule_id,project_id,extension_days,new_planned_start,new_planned_finish,reason,extension_type,requested_by_user_id,requested_by_role,supporting_file_name,supporting_file_url,supporting_file_public_id,supporting_file_mime,supporting_file_size) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,[scheduleId,projectId,extensionDays,newPlannedStart.toISOString().slice(0,10),newPlannedFinish,reason,extensionType,req.user.user_id,req.user.role,supportingFile?.name||null,supportingFile?.url||null,supportingFile?.publicId||null,supportingFile?.mime||null,supportingFile?.size||null]);
     
     const extensionId=extRes.rows[0].id;
     await client.query('UPDATE project_schedules SET planned_finish=$1,updated_at=now() WHERE id=$2',[newPlannedFinish,scheduleId]);
