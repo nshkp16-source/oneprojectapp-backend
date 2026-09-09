@@ -197,6 +197,30 @@ function normalizeRole(role) {
   }[role] || role;
 }
 
+function canEditSchedule(role) {
+  return ['Contractor', 'Consultant', 'ContractorPM', 'ConsultantPM'].includes(normalizeRole(role));
+}
+
+async function recalculateScheduleProgress(client, table, foreignKey, milestoneId) {
+  const milestoneTable = table === 'milestone_progress_entries' ? 'milestones' : 'additional_milestones';
+  const { rows: milestoneRows } = await client.query(`SELECT quantity FROM ${milestoneTable} WHERE id=$1 FOR UPDATE`, [milestoneId]);
+  if (!milestoneRows.length) return null;
+  const planned = Number(milestoneRows[0].quantity) || 0;
+  const { rows: entries } = await client.query(
+    `SELECT id,qty_executed,report_date FROM ${table} WHERE ${foreignKey}=$1 ORDER BY report_date ASC,id ASC FOR UPDATE`,
+    [milestoneId]
+  );
+  let cumulative = 0;
+  for (const entry of entries) {
+    cumulative += Number(entry.qty_executed) || 0;
+    const pct = planned > 0 ? Math.min(100, cumulative / planned * 100) : 0;
+    await client.query(`UPDATE ${table} SET cumulative_after_entry=$1,progress_pct_after_entry=$2 WHERE id=$3`, [cumulative, pct.toFixed(2), entry.id]);
+  }
+  const status = planned > 0 && cumulative >= planned ? 'completed' : cumulative > 0 ? 'in_progress' : 'planned';
+  await client.query(`UPDATE ${milestoneTable} SET executed=$1,progress_pct=$2,activity_status=$3,completed_at=$4,updated_at=now() WHERE id=$5`, [cumulative, planned > 0 ? Math.min(100, cumulative / planned * 100).toFixed(2) : 0, status, status === 'completed' ? new Date() : null, milestoneId]);
+  return { executed: cumulative, progress_pct: planned > 0 ? Math.min(100, cumulative / planned * 100) : 0, activity_status: status };
+}
+
 // Resolve a human-friendly display name for a given role+id within a project context
 async function resolveDisplayNameFor(role, id, projectId = null) {
   if (!role || !id) return null;
@@ -3340,7 +3364,7 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     if (!schedRow.rows.length) return res.json({ schedule: null });
     const sched = schedRow.rows[0];
     const msRows = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [sched.id]);
-    const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
+    const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('id',e.id,'date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
     
     const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at,supporting_file_name,supporting_file_url,supporting_file_mime,supporting_file_size FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
     
@@ -3533,6 +3557,55 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/report-additional-progress]',err);res.status(500).json({error:'Failed to save additional progress entry'});}finally{client.release();}
 });
 
+app.patch('/api/schedule-progress/:entryId', authenticateToken, async (req, res) => {
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
+  const projectId = normalizeProjectId(req.body.projectId);
+  const qty = Number(req.body.qtyExecuted);
+  const remarks = String(req.body.remarks || '').trim();
+  if (!projectId || !Number.isFinite(qty) || qty <= 0) return res.status(400).json({ error: 'Valid projectId and positive qtyExecuted are required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const base = await client.query('SELECT id,milestone_id FROM milestone_progress_entries WHERE id=$1 AND project_id=$2 FOR UPDATE', [req.params.entryId, projectId]);
+    const ext = base.rows.length ? null : await client.query('SELECT id,additional_milestone_id FROM additional_milestone_progress_entries WHERE id=$1 AND project_id=$2 FOR UPDATE', [req.params.entryId, projectId]);
+    const row = base.rows[0] || ext?.rows[0];
+    if (!row) return res.status(404).json({ error: 'Progress entry not found' });
+    const table = base.rows.length ? 'milestone_progress_entries' : 'additional_milestone_progress_entries';
+    const foreignKey = base.rows.length ? 'milestone_id' : 'additional_milestone_id';
+    const milestoneId = row[foreignKey];
+    const milestoneTable = base.rows.length ? 'milestones' : 'additional_milestones';
+    const milestone = await client.query(`SELECT quantity FROM ${milestoneTable} WHERE id=$1 AND project_id=$2`, [milestoneId, projectId]);
+    const planned = Number(milestone.rows[0]?.quantity) || 0;
+    const totals = await client.query(`SELECT COALESCE(SUM(qty_executed),0) AS total FROM ${table} WHERE ${foreignKey}=$1 AND id<>$2`, [milestoneId, req.params.entryId]);
+    if (planned > 0 && Number(totals.rows[0].total) + qty > planned) return res.status(422).json({ error: 'Edited quantity would exceed the planned quantity' });
+    await client.query(`UPDATE ${table} SET qty_executed=$1,remarks=$2 WHERE id=$3`, [qty, remarks || null, req.params.entryId]);
+    const summary = await recalculateScheduleProgress(client, table, foreignKey, milestoneId);
+    await client.query('COMMIT');
+    res.json({ success: true, milestone: summary });
+  } catch (err) { await client.query('ROLLBACK'); console.error('[PATCH /api/schedule-progress]', err); res.status(500).json({ error: 'Failed to update progress entry' }); } finally { client.release(); }
+});
+
+app.delete('/api/schedule-progress/:entryId', authenticateToken, async (req, res) => {
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
+  const projectId = normalizeProjectId(req.body.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const base = await client.query('SELECT id,milestone_id FROM milestone_progress_entries WHERE id=$1 AND project_id=$2 FOR UPDATE', [req.params.entryId, projectId]);
+    const ext = base.rows.length ? null : await client.query('SELECT id,additional_milestone_id FROM additional_milestone_progress_entries WHERE id=$1 AND project_id=$2 FOR UPDATE', [req.params.entryId, projectId]);
+    const row = base.rows[0] || ext?.rows[0];
+    if (!row) return res.status(404).json({ error: 'Progress entry not found' });
+    const table = base.rows.length ? 'milestone_progress_entries' : 'additional_milestone_progress_entries';
+    const foreignKey = base.rows.length ? 'milestone_id' : 'additional_milestone_id';
+    const milestoneId = row[foreignKey];
+    await client.query(`DELETE FROM ${table} WHERE id=$1`, [req.params.entryId]);
+    const summary = await recalculateScheduleProgress(client, table, foreignKey, milestoneId);
+    await client.query('COMMIT');
+    res.json({ success: true, milestone: summary });
+  } catch (err) { await client.query('ROLLBACK'); console.error('[DELETE /api/schedule-progress]', err); res.status(500).json({ error: 'Failed to delete progress entry' }); } finally { client.release(); }
+});
+
 app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const { milestoneId, isExtensionMilestone } = req.body;
@@ -3647,6 +3720,7 @@ app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',10), async (req, res) => {
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({error:'Schedule edit permission is required'});
   const { milestoneId, additionalMilestoneId } = req.body;
   const projectId = normalizeProjectId(req.body.projectId);
   if (!projectId) return res.status(400).json({error:'projectId is required'});
@@ -3667,9 +3741,9 @@ app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',
 
 app.delete('/api/milestone-photos/:id', authenticateToken, async (req, res) => {
   try {
+    if (!canEditSchedule(req.user.role)) return res.status(403).json({error:'Schedule edit permission is required'});
     const { rows }=await pool.query('SELECT cloudinary_public_id,uploaded_by_user_id FROM milestone_photos WHERE id=$1',[req.params.id]);
     if (!rows.length) return res.status(404).json({error:'Photo not found'});
-    if (rows[0].uploaded_by_user_id!==req.user.user_id) return res.status(403).json({error:'Only the uploader can delete this photo'});
     try{await cloudinary.uploader.destroy(rows[0].cloudinary_public_id,{resource_type:'image'});}catch(cdErr){console.error('[DELETE /api/milestone-photos] Cloudinary destroy error (non-fatal):',cdErr);}
     await pool.query('DELETE FROM milestone_photos WHERE id=$1',[req.params.id]);
     res.json({ success:true });
