@@ -3989,6 +3989,11 @@ app.post('/api/planning-execution', authenticateToken, async (req, res) => {
           FROM   planning_execution_tracking t
           WHERE  t.activity_id = pe.id
         ), 0)                                          AS avg_progress,
+        CASE WHEN pe.planned_quantity > 0 THEN LEAST(100, ROUND((COALESCE((
+          SELECT SUM(t.actual_quantity)
+          FROM   planning_execution_tracking t
+          WHERE  t.activity_id = pe.id
+        ), 0) / pe.planned_quantity * 100)::numeric, 1)) ELSE 0 END AS actual_progress,
         (SELECT COUNT(*)
          FROM   planning_execution_tracking t
          WHERE  t.activity_id = pe.id)                AS tracking_count
@@ -4025,7 +4030,12 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
                WHERE  t.activity_id = pe.id
                ORDER  BY t.report_date DESC, t.created_at DESC
                LIMIT  1
-             ), 0) AS avg_progress
+             ), 0) AS avg_progress,
+             LEAST(100, COALESCE((
+               SELECT SUM(t.actual_quantity)
+               FROM   planning_execution_tracking t
+               WHERE  t.activity_id = pe.id
+             ), 0) / NULLIF(planned_quantity, 0) * 100) AS actual_progress
       FROM   planning_execution pe
       WHERE  project_id = $1
         AND  side       = $2
@@ -4295,11 +4305,15 @@ app.get('/api/planning-execution-tracking', authenticateToken, async (req, res) 
     const result = await pool.query(`
       SELECT
         t.*,
+        CASE WHEN pe.planned_quantity > 0
+          THEN LEAST(100, (t.actual_quantity / pe.planned_quantity) * 100)
+          ELSE 0 END AS daily_progress_pct,
         SUM(t.actual_quantity) OVER (
           ORDER BY t.report_date ASC, t.created_at ASC
           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS cumulative_quantity
       FROM planning_execution_tracking t
+      JOIN planning_execution pe ON pe.id = t.activity_id
       WHERE t.activity_id = $1
       ORDER BY t.report_date ASC, t.created_at ASC
     `, [activityId]);
