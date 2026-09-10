@@ -4360,6 +4360,13 @@ app.post('/api/planning-execution-tracking', authenticateToken,
       return res.status(403).json({
         error: 'Only the creating leader can log execution entries.'
       });
+    const existingEntry = await pool.query(
+      `SELECT id FROM planning_execution_tracking
+       WHERE activity_id=$1 AND report_date=$2 LIMIT 1`,
+      [activity_id, report_date]
+    );
+    if (existingEntry.rows.length)
+      return res.status(409).json({ error: 'An execution entry already exists for this activity and date.' });
 
     let attachmentName = null, attachmentId = null, attachmentUrl = null;
     if (req.file) {
