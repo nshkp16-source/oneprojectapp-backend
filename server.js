@@ -2141,6 +2141,8 @@ async function handleAddRecord(req, res) {
   try {
     const { user_id: userId, role } = req.user;
     const { title, description, projectId, noticeTiedId, recordKind } = req.body;
+    const officialFile = req.files?.officialDocument?.[0] || null;
+    const supportingFiles = req.files?.supportingFiles || [];
     // The attachment always arrives pre-converted-to-PDF (and pre-stamped, if the
     // user chose to stamp) from the client — there is no server-side conversion
     // or stamping step here anymore. clientStamped is a claim we must verify.
@@ -2183,14 +2185,14 @@ async function handleAddRecord(req, res) {
       if (!stampRows.length) {
         return res.status(400).json({ success: false, message: 'No stamp profile found. Set up your stamp first.' });
       }
-      if (!req.file || !/\.pdf$/i.test(req.file.originalname || '')) {
+      if (!officialFile || !/\.pdf$/i.test(officialFile.originalname || '')) {
         return res.status(400).json({ success: false, message: 'Stamped documents must be submitted as PDF.' });
       }
       if ((stampPage !== 'append' && (!Number.isInteger(stampPage) || stampPage < 1)) || !Number.isFinite(stampX) || !Number.isFinite(stampY) || stampX < 0 || stampX > 1 || stampY < 0 || stampY > 1) {
         return res.status(400).json({ success: false, message: 'Invalid stamp placement metadata supplied.' });
       }
       try {
-        const pdfDoc = await PDFDocument.load(req.file.buffer);
+        const pdfDoc = await PDFDocument.load(officialFile.buffer);
         if (!pdfDoc || !pdfDoc.getPageCount()) {
           return res.status(400).json({ success: false, message: 'The uploaded PDF could not be parsed.' });
         }
@@ -2200,22 +2202,56 @@ async function handleAddRecord(req, res) {
       }
     }
 
-    if (req.file) {
-      try {
-        const r = await new Promise((resolve, reject) => {
-          const stream = cloudinary.uploader.upload_stream(
-            { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
-            (err, result) => err ? reject(err) : resolve(result)
-          );
-          Readable.from(req.file.buffer).pipe(stream);
-        });
-        filePath = r.secure_url;
-        attachmentId = r.public_id;
-        console.log('[add-record] ✅ File uploaded to Cloudinary (single copy)');
-      } catch (uploadErr) {
-        console.error('[add-record] ❌ Cloudinary upload error:', uploadErr);
-        return res.status(500).json({ success: false, message: 'File upload failed.' });
+    if (!officialFile) {
+      return res.status(400).json({ success: false, message: 'An official PDF document is required.' });
+    }
+
+    if (!/^application\/pdf$/i.test(officialFile.mimetype || '') || !/\.pdf$/i.test(officialFile.originalname || '')) {
+      return res.status(400).json({ success: false, message: 'The official document must be a PDF.' });
+    }
+
+    let supportingFileRows = [];
+    if (supportingFiles.length > 10) {
+      return res.status(400).json({ success: false, message: 'You can attach up to 10 supporting files.' });
+    }
+
+    try {
+      const pdfDoc = await PDFDocument.load(officialFile.buffer);
+      if (!pdfDoc.getPageCount()) {
+        return res.status(400).json({ success: false, message: 'The official PDF has no pages.' });
       }
+    } catch (parseErr) {
+      return res.status(400).json({ success: false, message: 'The official document is not a valid PDF.' });
+    }
+
+    if (officialFile.size > 10 * 1024 * 1024 || supportingFiles.some(file => file.size > 10 * 1024 * 1024)) {
+      return res.status(400).json({ success: false, message: 'Each document must not exceed 10MB.' });
+    }
+
+    try {
+      const r = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${officialFile.originalname.replace(/\s+/g, '-')}` },
+          (err, result) => err ? reject(err) : resolve(result)
+        );
+        Readable.from(officialFile.buffer).pipe(stream);
+      });
+      filePath = r.secure_url;
+      attachmentId = r.public_id;
+      for (const file of supportingFiles) {
+        const result = await uploadToCloudinary(file.buffer, 'oneproject/record-supporting', 'auto');
+        supportingFileRows.push({
+          name: file.originalname,
+          mime: file.mimetype,
+          size: file.size,
+          url: result.secure_url,
+          public_id: result.public_id
+        });
+      }
+      console.log('[add-record] ✅ Official PDF and supporting files uploaded');
+    } catch (uploadErr) {
+      console.error('[add-record] ❌ Cloudinary upload error:', uploadErr);
+      return res.status(500).json({ success: false, message: 'File upload failed.' });
     }
 
     if (clientStamped && filePath) {
@@ -2244,13 +2280,14 @@ async function handleAddRecord(req, res) {
           project_id, title, description, file_path, attachment_id, 
           uploaded_by, role, record_kind, notice_tied_id,
           signed_by_id, signed_by_role, signed_at, stamp_type, stamp_status
+          , supporting_files
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${signedByUserId ? 'NOW()' : 'NULL'}, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${signedByUserId ? 'NOW()' : 'NULL'}, $12, $13, $14)
         RETURNING id`,
         [
           projectId, title, description || null, filePath, attachmentId,
           userId, role, resolvedKind, noticeTied,
-          signedByUserId, signedByRole, finalStampType || null, stampApplied ? 'recorder' : 'none'
+          signedByUserId, signedByRole, finalStampType || null, stampApplied ? 'recorder' : 'none', JSON.stringify(supportingFileRows)
         ]
       );
       const recordId = recRes.rows[0].id;
@@ -2307,8 +2344,12 @@ async function handleAddRecord(req, res) {
   }
 }
 
-app.post('/api/add-record', authenticateToken, upload.single('attachment'), handleAddRecord);
-app.post('/records',        authenticateToken, upload.single('attachment'), handleAddRecord);
+const recordUpload = upload.fields([
+  { name: 'officialDocument', maxCount: 1 },
+  { name: 'supportingFiles', maxCount: 10 }
+]);
+app.post('/api/add-record', authenticateToken, recordUpload, handleAddRecord);
+app.post('/records',        authenticateToken, recordUpload, handleAddRecord);
 
 app.get('/api/arrets', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
@@ -2645,7 +2686,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const userIsDM = isDecisionMaker(userRole);
   try {
     const { rows: records } = await pool.query(
-      `SELECT r.id, r.title, r.description, r.file_path,
+      `SELECT r.id, r.title, r.description, r.file_path, r.supporting_files,
               r.issued_date, r.role AS uploader_role,
               r.uploaded_by, r.status, r.record_kind, r.notice_tied_id,
               r.signed_by_id, r.signed_by_role, r.signed_at,
