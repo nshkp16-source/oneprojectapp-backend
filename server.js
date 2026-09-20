@@ -2975,6 +2975,53 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/api/download-record-bundle', authenticateToken, async (req, res) => {
+  const { projectId, recordType, noticeId, recordId, mode = 'both' } = req.query;
+  const table = resolveTable(recordType);
+  if (!table || !projectId || !recordId || !['notice', 'record', 'both'].includes(mode)) {
+    return res.status(400).json({ error: 'Invalid record bundle request.' });
+  }
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
+      return res.status(403).json({ error: 'You are not assigned to this project.' });
+    }
+    const ids = mode === 'notice' ? [noticeId] : mode === 'record' ? [recordId] : [noticeId, recordId];
+    if (ids.some(id => !id)) return res.status(400).json({ error: 'Missing document ID.' });
+    if (mode !== 'record') {
+      const { rows: relation } = await pool.query(
+        `SELECT 1 FROM ${table}
+         WHERE id=$1 AND notice_tied_id=$2 AND project_id=$3 LIMIT 1`,
+        [noticeId, recordId, projectId]
+      );
+      if (!relation.length) return res.status(400).json({ error: 'The notice is not tied to this record.' });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, title, file_path, stamped_doc_url
+       FROM ${table} WHERE project_id=$1 AND id = ANY($2::int[])`,
+      [projectId, ids.map(Number)]
+    );
+    const byId = new Map(rows.map(row => [String(row.id), row]));
+    const output = await PDFDocument.create();
+    for (const id of ids) {
+      const row = byId.get(String(id));
+      const filePath = row?.stamped_doc_url || row?.file_path;
+      if (!filePath) return res.status(404).json({ error: 'Official document not found.' });
+      const remote = await fetch(filePath, { redirect: 'follow' });
+      if (!remote.ok) return res.status(502).json({ error: 'Official document is not reachable.' });
+      const source = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
+      const pages = await output.copyPages(source, source.getPageIndices());
+      pages.forEach(page => output.addPage(page));
+    }
+    const merged = await output.save();
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="record-${recordId}-${mode}.pdf"`);
+    return res.send(Buffer.from(merged));
+  } catch (err) {
+    console.error('Bundle download error:', err);
+    return res.status(500).json({ error: 'Failed to create the document bundle.' });
+  }
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: Resolve company_name based on role and project
