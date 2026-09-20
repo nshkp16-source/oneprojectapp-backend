@@ -2267,6 +2267,19 @@ async function handleAddRecord(req, res) {
     if (noticeTied) {
       const parentCheck = await pool.query(`SELECT id FROM ${table} WHERE id = $1 AND project_id = $2`, [noticeTied, projectId]);
       if (!parentCheck.rows.length) return res.status(400).json({ success: false, message: 'The parent record this notice is tied to no longer exists.' });
+      if (!['notice', 'rejection_notice', 'acceptance_notice'].includes(resolvedKind) || !isDecisionMaker(role)) {
+        return res.status(403).json({ success: false, message: 'Only a decision maker who reviewed this record can issue a notice.' });
+      }
+      const { rows: actorReviews } = await pool.query(
+        `SELECT action FROM document_reviews
+         WHERE record_type=$1 AND record_id=$2 AND reviewer_id=$3 AND reviewer_role=$4
+           AND action IN ('approved','accepted','rejected')
+         LIMIT 1`,
+        [table, noticeTied, userId, role]
+      );
+      if (!actorReviews.length) {
+        return res.status(403).json({ success: false, message: 'Review or accept the record before issuing a notice.' });
+      }
     }
 
     const dbClient = await pool.connect();
@@ -2735,6 +2748,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       }) : [];
       let btnState = 'none', pendingRole = null, approveLabel = null;
       if (isUploader) { btnState = 'uploader'; }
+      else if (userIsDM && myReviewRow && ['approved', 'accepted', 'rejected'].includes(myReviewRow.action)) { btnState = 'acted'; }
       else if (isLocked) { btnState = 'locked'; }
       else if (!userIsDM) { btnState = 'team_member'; }
       else if (userSide === uploaderSide) { btnState = 'none'; }
