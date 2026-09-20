@@ -2755,7 +2755,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       }
       // All notices tied to this record — full data, newest first, for card embedding
       const { rows: embeddedNotices } = await pool.query(
-        `SELECT id, title, description, file_path, issued_date,
+        `SELECT id, title, description, file_path, supporting_files, issued_date,
                 role AS uploader_role, record_kind,
                 signed_by_id, signed_by_role, signed_at, stamp_type, stamped_doc_url
          FROM ${table}
@@ -2933,7 +2933,7 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), a
 //  DOWNLOAD / DELETE RECORD
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/download-file', authenticateToken, async (req, res) => {
-  const { recordId, recordType, filename } = req.query;
+  const { recordId, recordType, filename, disposition } = req.query;
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
@@ -2958,7 +2958,8 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
           .replace(/\\/g, '_')
           .replace(/"/g, '_');
         res.setHeader('Content-Type', contentType);
-        res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+        const contentDisposition = disposition === 'inline' ? 'inline' : 'attachment';
+        res.setHeader('Content-Disposition', `${contentDisposition}; filename="${safeName}"`);
         if (contentLength) res.setHeader('Content-Length', contentLength);
         const buffer = Buffer.from(await remoteResp.arrayBuffer());
         return res.send(buffer);
