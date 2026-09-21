@@ -2710,9 +2710,20 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     const enriched = await Promise.all(records.map(async rec => {
       const { rows: reviews } = await pool.query(
         `SELECT dr.reviewer_id, dr.reviewer_role, dr.action, dr.action_date,
-                dr.comment, dr.reviewer_email, dr.reviewer_position, dr.reviewer_assigned_part
+                dr.comment, dr.reviewer_email, dr.reviewer_position,
+                COALESCE(
+                  dr.reviewer_assigned_part,
+                  CASE WHEN dr.reviewer_role = 'TeamMember' THEN (
+                    SELECT tma.assigned_part
+                    FROM team_member_assignments tma
+                    WHERE tma.project_id = $3
+                      AND tma.team_member_id = dr.reviewer_id
+                    ORDER BY tma.id DESC
+                    LIMIT 1
+                  ) END
+                ) AS reviewer_assigned_part
          FROM document_reviews dr WHERE dr.record_type = $1 AND dr.record_id = $2 ORDER BY dr.action_date ASC`,
-        [table, rec.id]
+        [table, rec.id, projectId]
       );
       const annotatedReviews = reviews.map(r => ({ ...r, is_decision_maker: isDecisionMaker(r.reviewer_role) }));
       const isUploader = String(rec.uploaded_by) === String(userId) && getSide(rec.uploader_role) === getSide(userRole);
