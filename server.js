@@ -10,7 +10,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { v2 as cloudinary } from 'cloudinary';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument } from 'pdf-lib';
 import { Readable } from 'stream';
 
 const { v4: uuidv4 } = pkg;
@@ -3021,43 +3021,16 @@ app.get('/api/download-record-bundle', authenticateToken, async (req, res) => {
       if (!relation.length) return res.status(400).json({ error: 'The notice is not tied to this record.' });
     }
     const { rows } = await pool.query(
-      `SELECT id, title, file_path, stamped_doc_url, role AS added_by, issued_date
+      `SELECT id, title, file_path, stamped_doc_url
        FROM ${table} WHERE project_id=$1 AND id = ANY($2::int[])`,
       [projectId, ids.map(Number)]
     );
     const byId = new Map(rows.map(row => [String(row.id), row]));
     const output = await PDFDocument.create();
-    const dividerFont = await output.embedFont(StandardFonts.Helvetica);
-    const dividerBoldFont = await output.embedFont(StandardFonts.HelveticaBold);
-    for (const [index, id] of ids.entries()) {
+    for (const id of ids) {
       const row = byId.get(String(id));
       const filePath = row?.stamped_doc_url || row?.file_path;
       if (!filePath) return res.status(404).json({ error: 'Official document not found.' });
-
-      const isNotice = mode === 'notice' || (mode === 'both' && index === 0);
-      const divider = output.addPage([612, 792]);
-      const dividerColor = isNotice ? rgb(0.57, 0.35, 0.04) : rgb(0.04, 0.32, 0.42);
-      divider.drawRectangle({ x: 0, y: 700, width: 612, height: 92, color: dividerColor });
-      divider.drawText(isNotice ? 'NOTICE' : 'ORIGINAL RECORD', {
-        x: 42, y: 742, size: 22, font: dividerBoldFont, color: rgb(1, 1, 1)
-      });
-      divider.drawText(String(row.title || 'Untitled document'), {
-        x: 42, y: 650, size: 17, font: dividerBoldFont, color: rgb(0.12, 0.16, 0.2), maxWidth: 528
-      });
-      divider.drawText(`Added by: ${row.added_by || 'Unknown'}`, {
-        x: 42, y: 612, size: 11, font: dividerFont, color: rgb(0.35, 0.4, 0.45)
-      });
-      divider.drawText(`Date: ${row.issued_date ? new Date(row.issued_date).toLocaleString() : 'Not recorded'}`, {
-        x: 42, y: 592, size: 11, font: dividerFont, color: rgb(0.35, 0.4, 0.45)
-      });
-      divider.drawLine({
-        start: { x: 42, y: 565 }, end: { x: 570, y: 565 },
-        thickness: 1, color: rgb(0.82, 0.85, 0.88)
-      });
-      divider.drawText('The document pages continue below.', {
-        x: 42, y: 535, size: 10, font: dividerFont, color: rgb(0.45, 0.5, 0.55)
-      });
-
       const remote = await fetch(filePath, { redirect: 'follow' });
       if (!remote.ok) return res.status(502).json({ error: 'Official document is not reachable.' });
       const source = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
