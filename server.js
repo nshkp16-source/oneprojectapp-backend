@@ -10,7 +10,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { v2 as cloudinary } from 'cloudinary';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { Readable } from 'stream';
 
 const { v4: uuidv4 } = pkg;
@@ -3001,7 +3001,7 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/download-record-bundle', authenticateToken, async (req, res) => {
-  const { projectId, recordType, noticeId, recordId, mode = 'both' } = req.query;
+  const { projectId, recordType, noticeId, noticeIds, recordId, mode = 'both' } = req.query;
   const table = resolveTable(recordType);
   if (!table || !projectId || !recordId || !['notice', 'record', 'both'].includes(mode)) {
     return res.status(400).json({ error: 'Invalid record bundle request.' });
@@ -3010,27 +3010,59 @@ app.get('/api/download-record-bundle', authenticateToken, async (req, res) => {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
       return res.status(403).json({ error: 'You are not assigned to this project.' });
     }
-    const ids = mode === 'notice' ? [noticeId] : mode === 'record' ? [recordId] : [noticeId, recordId];
-    if (ids.some(id => !id)) return res.status(400).json({ error: 'Missing document ID.' });
+    const selectedNoticeIds = mode === 'both'
+      ? String(noticeIds || noticeId || '').split(',').map(id => id.trim()).filter(Boolean)
+      : [noticeId].filter(Boolean);
+    const ids = mode === 'notice' ? selectedNoticeIds.slice(0, 1)
+      : mode === 'record' ? [recordId]
+      : [...selectedNoticeIds, recordId];
+    if (ids.some(id => !id) || (mode !== 'record' && !selectedNoticeIds.length)) {
+      return res.status(400).json({ error: 'Missing document ID.' });
+    }
     if (mode !== 'record') {
       const { rows: relation } = await pool.query(
         `SELECT 1 FROM ${table}
-         WHERE id=$1 AND notice_tied_id=$2 AND project_id=$3 LIMIT 1`,
-        [noticeId, recordId, projectId]
+         WHERE id = ANY($1::int[]) AND notice_tied_id=$2 AND project_id=$3
+         LIMIT 1`,
+        [selectedNoticeIds.map(Number), recordId, projectId]
       );
-      if (!relation.length) return res.status(400).json({ error: 'The notice is not tied to this record.' });
+      if (relation.length !== 1 || mode === 'both') {
+        const { rows: matchingNotices } = await pool.query(
+          `SELECT id FROM ${table}
+           WHERE id = ANY($1::int[]) AND notice_tied_id=$2 AND project_id=$3`,
+          [selectedNoticeIds.map(Number), recordId, projectId]
+        );
+        if (matchingNotices.length !== selectedNoticeIds.length) {
+          return res.status(400).json({ error: 'One or more notices are not tied to this record.' });
+        }
+      }
     }
     const { rows } = await pool.query(
-      `SELECT id, title, file_path, stamped_doc_url
+      `SELECT id, title, file_path, stamped_doc_url, role AS added_by, issued_date
        FROM ${table} WHERE project_id=$1 AND id = ANY($2::int[])`,
       [projectId, ids.map(Number)]
     );
     const byId = new Map(rows.map(row => [String(row.id), row]));
     const output = await PDFDocument.create();
-    for (const id of ids) {
+    const labelFont = await output.embedFont(StandardFonts.Helvetica);
+    const labelBoldFont = await output.embedFont(StandardFonts.HelveticaBold);
+    for (const [index, id] of ids.entries()) {
       const row = byId.get(String(id));
       const filePath = row?.stamped_doc_url || row?.file_path;
       if (!filePath) return res.status(404).json({ error: 'Official document not found.' });
+      const isOriginal = mode === 'record' || (mode === 'both' && index === selectedNoticeIds.length);
+      const label = isOriginal ? 'ORIGINAL RECORD' : `NOTICE ${index + 1}`;
+      const strip = output.addPage([612, 72]);
+      const stripColor = isOriginal ? rgb(0.04, 0.32, 0.42) : rgb(0.57, 0.35, 0.04);
+      strip.drawRectangle({ x: 0, y: 0, width: 612, height: 72, color: rgb(0.98, 0.99, 1) });
+      strip.drawRectangle({ x: 0, y: 0, width: 8, height: 72, color: stripColor });
+      strip.drawText(label, { x: 26, y: 43, size: 12, font: labelBoldFont, color: stripColor });
+      strip.drawText(String(row.title || 'Untitled document'), {
+        x: 150, y: 44, size: 10, font: labelBoldFont, color: rgb(0.12, 0.16, 0.2), maxWidth: 420
+      });
+      strip.drawText(`Added by ${row.added_by || 'Unknown'} · ${row.issued_date ? new Date(row.issued_date).toLocaleDateString() : 'Date not recorded'}`, {
+        x: 150, y: 25, size: 9, font: labelFont, color: rgb(0.4, 0.45, 0.5), maxWidth: 420
+      });
       const remote = await fetch(filePath, { redirect: 'follow' });
       if (!remote.ok) return res.status(502).json({ error: 'Official document is not reachable.' });
       const source = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
