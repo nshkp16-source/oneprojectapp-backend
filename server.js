@@ -1239,7 +1239,7 @@ app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'
     console.log('[POST /api/upload-attachment] File received:', {name: req.file.originalname, mime: req.file.mimetype, size: req.file.size});
     const resourceType = req.file.mimetype?.startsWith('image/') ? 'image'
       : req.file.mimetype?.startsWith('video/') ? 'video'
-      : req.file.mimetype?.startsWith('audio/') ? 'raw'
+      : req.file.mimetype?.startsWith('audio/') ? 'video'
       : 'raw';
     console.log('[POST /api/upload-attachment] resourceType:', resourceType);
     const result = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/attachments', resourceType);
