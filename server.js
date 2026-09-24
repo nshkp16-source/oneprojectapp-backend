@@ -655,6 +655,14 @@ const CHAT_SENDER_JOINS = `
 
 const CHAT_SENDER_FIELDS = `
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
+  COALESCE(
+    jsonb_agg(DISTINCT jsonb_build_object(
+      'user_id', r.user_id,
+      'user_role', r.user_role,
+      'read_at', r.read_at
+    )) FILTER (WHERE r.user_id IS NOT NULL),
+    '[]'::jsonb
+  ) AS read_by_details,
 
   CASE m.sender_role
     WHEN 'Client'       THEN COALESCE(c.representative,          c.company_name,         c.company_email)
