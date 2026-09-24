@@ -657,6 +657,14 @@ const CHAT_SENDER_FIELDS = `
   COALESCE(json_agg(DISTINCT r.user_id) FILTER (WHERE r.user_id IS NOT NULL), '[]') AS read_by,
   COALESCE(
     jsonb_agg(DISTINCT jsonb_build_object(
+      'reaction', cr.reaction,
+      'user_id', cr.user_id,
+      'user_role', cr.user_role
+    )) FILTER (WHERE cr.id IS NOT NULL),
+    '[]'::jsonb
+  ) AS reactions,
+  COALESCE(
+    jsonb_agg(DISTINCT jsonb_build_object(
       'user_id', r.user_id,
       'user_role', r.user_role,
       'read_at', r.read_at
@@ -784,6 +792,7 @@ app.get('/chat/conversations', authenticateToken, async (req, res) => {
                 ) AS read_by
          FROM project_chat_messages m
          LEFT JOIN project_chat_read_receipts r ON r.message_id = m.id
+        LEFT JOIN project_chat_reactions cr ON cr.message_id = m.id
          WHERE m.project_id = $1
            AND (
              m.is_group = true
@@ -1138,6 +1147,52 @@ app.post('/chat/mark-read', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('[POST /chat/mark-read]', err);
     res.status(500).json({ success: false, error: 'Failed to mark messages read' });
+  }
+});
+
+app.post('/chat/messages/:messageId/reactions', authenticateToken, async (req, res) => {
+  const messageId = Number(req.params.messageId);
+  const reaction = typeof req.body?.reaction === 'string' ? req.body.reaction.trim() : '';
+  if (!Number.isInteger(messageId) || !reaction || reaction.length > 32) {
+    return res.status(400).json({ success: false, error: 'Valid messageId and reaction are required' });
+  }
+
+  try {
+    const messageResult = await pool.query(
+      'SELECT project_id FROM project_chat_messages WHERE id=$1',
+      [messageId]
+    );
+    if (!messageResult.rows.length) return res.status(404).json({ success: false, error: 'Message not found' });
+    const projectId = messageResult.rows[0].project_id;
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const userRole = normalizeRole(req.user.role);
+    const existing = await pool.query(
+      `SELECT id FROM project_chat_reactions
+       WHERE message_id=$1 AND user_id=$2 AND user_role=$3 AND reaction=$4`,
+      [messageId, req.user.user_id, userRole, reaction]
+    );
+    if (existing.rows.length) {
+      await pool.query('DELETE FROM project_chat_reactions WHERE id=$1', [existing.rows[0].id]);
+    } else {
+      await pool.query(
+        `INSERT INTO project_chat_reactions (message_id,user_id,user_role,reaction)
+         VALUES ($1,$2,$3,$4) ON CONFLICT (message_id,user_id,user_role,reaction) DO NOTHING`,
+        [messageId, req.user.user_id, userRole, reaction]
+      );
+    }
+
+    const reactions = await pool.query(
+      `SELECT reaction, user_id, user_role
+       FROM project_chat_reactions WHERE message_id=$1 ORDER BY created_at ASC`,
+      [messageId]
+    );
+    res.json({ success: true, active: !existing.rows.length, reactions: reactions.rows });
+  } catch (err) {
+    console.error('[POST /chat/messages/:messageId/reactions]', err);
+    res.status(500).json({ success: false, error: 'Failed to update reaction' });
   }
 });
 
