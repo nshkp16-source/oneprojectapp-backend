@@ -2888,6 +2888,9 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), a
       return res.json({ success: true, message: 'Comment saved.' });
     }
     if (existing.length > 0) {
+      if (existing[0].action === 'rejected') {
+        return res.status(409).json({ error: 'This record is already rejected and cannot move to a later approval stage.' });
+      }
       if (isDecisionMakerActor && workflowActions.includes(existing[0].action)) return res.status(409).json({ error: `You already ${existing[0].action} this record.` });
       await pool.query(`UPDATE document_reviews SET action=$1, action_date=NOW(), comment=COALESCE($2,comment) WHERE id=$3`, [action, comment?.trim() || null, existing[0].id]);
     } else {
