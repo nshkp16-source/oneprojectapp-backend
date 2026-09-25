@@ -2903,7 +2903,8 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), a
     let stampedAttachmentId = null;
     let stampApplied = false;
     const isSignatureActor = actorType === 'team_member' || isDecisionMakerActor;
-    if (isSignatureActor && isWorkflow && stampDocument === 'true' && req.file) {
+    const isApprovalStampAction = isWorkflow && action !== 'rejected';
+    if (isSignatureActor && isApprovalStampAction && stampDocument === 'true' && req.file) {
       if (!/\.pdf$/i.test(req.file.originalname || '')) {
         return res.status(400).json({ error: 'Stamped documents must be submitted as PDF.' });
       }
@@ -2941,10 +2942,17 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), a
     if (isDecisionMakerActor && isWorkflow) {
       const uploaderSide = getSide(rec.role);
       let newStatus;
-      if (action === 'rejected') { newStatus = 'rejected'; }
-      else if (action === 'accepted') { newStatus = 'approved_record'; }
-      else { const m = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' }; newStatus = m[uploaderSide] || 'pending_review'; }
-      await pool.query(`UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, recordId, projectId]);
+      if (action === 'rejected') {
+        newStatus = 'rejected';
+        await pool.query(
+          `UPDATE ${table} SET status=$1, stamped_doc_url=NULL, stamp_type=NULL, stamp_status=NULL, signed_by_id=NULL, signed_by_role=NULL, signed_at=NULL WHERE id=$2 AND project_id=$3`,
+          [newStatus, recordId, projectId]
+        );
+      } else {
+        if (action === 'accepted') { newStatus = 'approved_record'; }
+        else { const m = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' }; newStatus = m[uploaderSide] || 'pending_review'; }
+        await pool.query(`UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, recordId, projectId]);
+      }
       const notifMsg = `${reviewerRole} ${action} record #${recordId} (uploaded by ${rec.role})`;
       const dbClient = await pool.connect();
       try {
