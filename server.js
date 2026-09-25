@@ -3304,7 +3304,7 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
   if (!projectId) return res.status(400).json({ error: 'projectId required' });
   try {
     const { rows } = await pool.query(
-      `SELECT id, signer_name, signature_image, stamp_image_url, updated_at
+      `SELECT id, signer_name, signature_image, stamp_image_url, stamp_style, updated_at
        FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
       [user_id, role, projectId]
     );
@@ -3355,6 +3355,7 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
   if (!isDM && !isTM) return res.status(403).json({ error: 'Only decision makers and team members can create a signature profile.' });
   try {
     const { signatureBase64 } = req.body;
+    const stampStyle = req.body.stampStyle === 'three-part' ? 'three-part' : 'compact';
     const signerName = typeof req.body.signerName === 'string'
       ? req.body.signerName.trim()
       : null;
@@ -3385,16 +3386,17 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
     }
 
     const { rows } = await pool.query(
-      `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, stamp_style, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
        ON CONFLICT ON CONSTRAINT uniq_user_stamp_project
        DO UPDATE SET
          signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
          signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
          stamp_image_url = ${isDM ? 'COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url)' : 'NULL'},
+         stamp_style     = EXCLUDED.stamp_style,
          updated_at      = NOW()
-       RETURNING id, signer_name, signature_image, stamp_image_url, updated_at`,
-      [user_id, role, projectId, signerName, signatureImage || null, isDM ? (stampImageUrl || null) : null]
+       RETURNING id, signer_name, signature_image, stamp_image_url, stamp_style, updated_at`,
+      [user_id, role, projectId, signerName, signatureImage || null, isDM ? (stampImageUrl || null) : null, stampStyle]
     );
     const stamp = rows[0];
     const [companyName, positionSide] = await Promise.all([
