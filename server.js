@@ -3355,7 +3355,8 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
   if (!isDM && !isTM) return res.status(403).json({ error: 'Only decision makers and team members can create a signature profile.' });
   try {
     const { signatureBase64 } = req.body;
-    const stampStyle = req.body.stampStyle === 'three-part' ? 'three-part' : 'compact';
+    const stampStyle = ['three-part', 'signature-stamp'].includes(req.body.stampStyle)
+      ? req.body.stampStyle : 'compact';
     const signerName = typeof req.body.signerName === 'string'
       ? req.body.signerName.trim()
       : null;
