@@ -2748,7 +2748,8 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       const uploaderSide  = getSide(rec.uploader_role);
       const step2SideMap  = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
       const step2Side     = step2SideMap[uploaderSide];
-      const isLocked      = rec.status === 'approved_record' || annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
+      const isRejected    = rec.status === 'rejected';
+      const isLocked      = isRejected || rec.status === 'approved_record' || annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
       const stepMap = {
         contractor: [{ side:'consultant',step:1,label:'Consultant Approval',action:'approved'},{side:'client',step:2,label:'Client Acceptance',action:'accepted'}],
         consultant: [{ side:'client',step:1,label:'Client Approval',action:'approved'},{side:'contractor',step:2,label:'Contractor Acceptance',action:'accepted'}],
@@ -2759,7 +2760,8 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         const doneReview     = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
         const rejectedReview = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && r.action === 'rejected');
         let status;
-        if (isLocked) status = 'locked';
+        if (isRejected) status = 'rejected';
+        else if (isLocked) status = 'locked';
         else if (doneReview) status = 'done';
         else if (rejectedReview) status = 'rejected';
         else status = 'pending';
