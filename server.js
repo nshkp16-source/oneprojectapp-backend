@@ -18,11 +18,88 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+async function enforcePendingExitForTargetProject(req, res, next) {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  if (req.path === '/api/project-exit/cancel') return next();
+
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return next();
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET || 'supersecretkey');
+  } catch {
+    return next();
+  }
+
+  const userId = Number.parseInt(decoded.sub, 10);
+  const role = normalizeRole(decoded.role);
+  const body = req.body || {};
+  let projectId = normalizeProjectId(
+    body.projectId ?? body.project_id ?? body.project ?? req.query.projectId ?? req.query.project_id ?? req.params.projectId
+  );
+  if (!projectId) {
+    const resourceId = Number.parseInt(
+      req.params.id ?? req.params.activityId ?? req.params.taskId ?? req.params.entryId ??
+      req.params.extensionId ?? req.params.progressId ?? body.recordId ?? body.id,
+      10
+    );
+    if (Number.isInteger(resourceId)) {
+      const path = req.path;
+      const lookups = [
+        [/^\/api\/arrets\/\d+$/, 'SELECT project_id FROM arrets WHERE id=$1'],
+        [/^\/api\/planning-execution\/\d+$/, 'SELECT project_id FROM planning_execution WHERE id=$1'],
+        [/^\/api\/work-center\/\d+$/, 'SELECT project_id FROM workspace_work_center WHERE id=$1'],
+        [/^\/api\/schedule-progress\/\d+$/, 'SELECT m.project_id FROM milestone_progress_entries e JOIN milestones m ON m.id=e.milestone_id WHERE e.id=$1'],
+        [/^\/api\/schedule-extensions\/\d+$/, 'SELECT project_id::INTEGER FROM project_schedules s JOIN schedule_extensions e ON e.schedule_id=s.id WHERE e.id=$1'],
+        [/^\/api\/milestone-photos\/\d+$/, 'SELECT project_id::INTEGER FROM milestone_photos WHERE id=$1'],
+        [/^\/api\/document-approval\/\d+$/, 'SELECT project_id FROM documents WHERE id=$1'],
+        [/^\/api\/control-reports\/\d+$/, 'SELECT project_id FROM control_and_report_index WHERE id=$1'],
+        [/^\/api\/meetings\/\d+\/minute$/, 'SELECT project_id FROM meetings WHERE id=$1'],
+      ];
+      const lookup = lookups.find(([pattern]) => pattern.test(path));
+      if (lookup) {
+        const target = await pool.query(lookup[1], [resourceId]);
+        projectId = normalizeProjectId(target.rows[0]?.project_id);
+      } else if (body.recordType && body.recordId) {
+        const recordTable = resolveTable(body.recordType);
+        if (recordTable) {
+          const target = await pool.query(`SELECT project_id FROM ${recordTable} WHERE id=$1`, [resourceId]);
+          projectId = normalizeProjectId(target.rows[0]?.project_id);
+        }
+      }
+    }
+  }
+  if (!Number.isInteger(userId) || !projectId || !role) return next();
+
+  try {
+    const pendingExit = await pool.query(
+      `SELECT 1 FROM project_exit_requests
+       WHERE project_id = $1 AND user_id = $2 AND user_role = $3
+         AND status = 'pending' AND effective_at > NOW()
+       LIMIT 1`,
+      [projectId, userId, role]
+    );
+    if (pendingExit.rowCount) {
+      return res.status(423).json({
+        error: 'You requested to leave this project. You can review or download existing files, or cancel your exit request; changes are disabled for you.',
+        code: 'PROJECT_EXIT_READ_ONLY',
+      });
+    }
+    return next();
+  } catch (err) {
+    console.error('[project-exit] Write permission check failed:', err.message);
+    return res.status(500).json({ error: 'Unable to verify project write access.' });
+  }
+}
+
+app.use(enforcePendingExitForTargetProject);
+
 // Simple request logger for API routes
 app.use((req, _res, next) => {
   if (req.originalUrl && req.originalUrl.startsWith('/api')) {
     console.log(`[API] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   }
+  void processProjectLifecycleTasks();
   next();
 });
 
@@ -995,7 +1072,7 @@ app.get('/chat/messages', authenticateToken, async (req, res) => {
 app.post('/chat/messages', authenticateToken, async (req, res) => {
   const {
     projectId, recipientRole, recipientId, content, isGroup,
-    replyToMessageId, attachmentUrl, attachmentName, attachmentMime,
+    replyToMessageId, attachmentUrl, attachmentName, attachmentMime, attachmentPublicId,
   } = req.body;
 
   const contentText = typeof content === 'string' ? content.trim() : '';
@@ -1054,9 +1131,9 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
           recipient_role, recipient_id, recipient_email,
           reply_to_message_id,
           is_group, content,
-          attachment_url, attachment_name, attachment_mime,
+           attachment_url, attachment_name, attachment_mime, attachment_public_id,
           delivered)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, false)
        RETURNING *`,
       [
         projectId,
@@ -1069,6 +1146,7 @@ app.post('/chat/messages', authenticateToken, async (req, res) => {
         attachmentUrl  || null,
         attachmentName || null,
         attachmentMime || null,
+        attachmentPublicId || null,
       ]
     );
 
@@ -1230,8 +1308,17 @@ app.post('/api/profile-picture', authenticateToken, upload.single('picture'), as
   }
 });
 
-app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'), async (req, res) => {
+app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'), enforcePendingExitForTargetProject, async (req, res) => {
   try {
+    const projectId = normalizeProjectId(req.body.projectId);
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
+      return res.status(403).json({ error: 'Access denied to this project' });
+    }
+    const projectState = await pool.query('SELECT lifecycle_status FROM projects WHERE id = $1', [projectId]);
+    if (projectState.rows[0]?.lifecycle_status !== 'active') {
+      return res.status(423).json({ error: 'This project is read-only during its scheduled deletion period.' });
+    }
     if (!req.file) {
       console.error('[POST /api/upload-attachment] No file in request');
       return res.status(400).json({ error: 'No file uploaded' });
@@ -1244,7 +1331,7 @@ app.post('/api/upload-attachment', authenticateToken, upload.single('attachment'
     console.log('[POST /api/upload-attachment] resourceType:', resourceType);
     const result = await uploadToCloudinary(req.file.buffer, 'oneprojectapp/attachments', resourceType);
     console.log('[POST /api/upload-attachment] Cloudinary response:', {url: result.secure_url});
-    res.json({ success: true, url: result.secure_url, name: req.file.originalname, mime: req.file.mimetype });
+    res.json({ success: true, url: result.secure_url, publicId: result.public_id, name: req.file.originalname, mime: req.file.mimetype });
   } catch (err) {
     console.error('Attachment upload error:', err);
     res.status(500).json({ error: 'Failed to upload attachment' });
@@ -2014,6 +2101,521 @@ app.get('/api/user-assignment', authenticateToken, async (req, res) => {
   }
 });
 
+const PROJECT_EXIT_ASSIGNMENTS = {
+  Contractor:   { table: 'contractor_assignments', column: 'contractor_id' },
+  Consultant:   { table: 'consultant_assignments', column: 'consultant_id' },
+  ClientPM:     { table: 'client_pm_assignments', column: 'client_pm_id' },
+  ContractorPM: { table: 'contractor_pm_assignments', column: 'contractor_pm_id' },
+  ConsultantPM: { table: 'consultant_pm_assignments', column: 'consultant_pm_id' },
+  TeamMember:   { table: 'team_member_assignments', column: 'team_member_id' },
+};
+
+async function createProjectLifecycleNotification(dbClient, projectId, message, actorId, actorRole, excludedMember = null) {
+  const { rows } = await dbClient.query(
+    `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+     VALUES ($1, $1, 'project_lifecycle', $2, $3, $4) RETURNING id`,
+    [projectId, message, actorId, actorRole]
+  );
+  const members = await getProjectMembers(projectId);
+  const recipients = members
+    .filter(member => !excludedMember ||
+      Number(member.role_id) !== Number(excludedMember.userId) ||
+      normalizeRole(member.role) !== normalizeRole(excludedMember.role))
+    .map(member => ({
+      recipient_role: normalizeRole(member.role),
+      recipient_role_id: Number(member.role_id),
+    }));
+  await insertNotificationRecipients(dbClient, rows[0].id, recipients);
+  return rows[0].id;
+}
+
+async function emailProjectMembers(projectId, subject, text) {
+  try {
+    const members = await getProjectMembers(projectId);
+    const emails = [...new Set(members.map(member => member.email).filter(Boolean))];
+    await Promise.allSettled(emails.map(to => transporter.sendMail({
+      from: 'skyprincenkp16@gmail.com',
+      to,
+      subject,
+      text,
+    })));
+  } catch (err) {
+    console.error('[project-lifecycle] Member email notice failed:', err.message);
+  }
+}
+
+function cloudinaryPublicIdFromUrl(value) {
+  try {
+    const parsed = new URL(value);
+    if (!parsed.hostname.endsWith('.cloudinary.com')) return null;
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    const uploadIndex = parts.indexOf('upload');
+    if (uploadIndex < 0) return null;
+    const versionIndex = parts.findIndex((part, index) => index > uploadIndex && /^v\d+$/.test(part));
+    const publicParts = parts.slice(versionIndex >= 0 ? versionIndex + 1 : uploadIndex + 1);
+    if (!publicParts.length) return null;
+    publicParts[publicParts.length - 1] = publicParts[publicParts.length - 1].replace(/\.[^/.]+$/, '');
+    return publicParts.join('/') || null;
+  } catch {
+    return null;
+  }
+}
+
+async function queueProjectCloudinaryAssets(dbClient, projectId) {
+  const { rows } = await dbClient.query(
+    `SELECT DISTINCT public_id FROM (
+       SELECT attachment_id AS public_id FROM contractual_records WHERE project_id = $1
+       UNION ALL SELECT attachment_id FROM administrative_records WHERE project_id = $1
+       UNION ALL SELECT attachment_id FROM safety_records WHERE project_id = $1
+       UNION ALL SELECT attachment_id FROM operational_records WHERE project_id = $1
+       UNION ALL SELECT attachment_id FROM financial_records WHERE project_id = $1
+       UNION ALL SELECT supporting_file_public_id FROM schedule_extensions WHERE project_id = $1::TEXT
+       UNION ALL SELECT file_id FROM documents WHERE project_id = $1
+       UNION ALL SELECT file_id FROM workspace_documents WHERE project_id = $1
+       UNION ALL SELECT linked_file_id FROM planning_execution WHERE project_id = $1
+       UNION ALL SELECT linked_file_id FROM workspace_work_center WHERE project_id = $1
+       UNION ALL SELECT public_id FROM meeting_attachments WHERE meeting_id IN (SELECT id FROM meetings WHERE project_id = $1)
+       UNION ALL SELECT public_id FROM meeting_attachments WHERE minute_id IN (SELECT id FROM meeting_minutes WHERE project_id = $1)
+       UNION ALL SELECT attachment_public_id FROM arrets WHERE project_id = $1
+       UNION ALL SELECT public_id FROM arret_attachments WHERE arret_id IN (SELECT id FROM arrets WHERE project_id = $1)
+      UNION ALL SELECT attachment_public_id FROM project_chat_messages WHERE project_id = $1
+       UNION ALL SELECT cloudinary_public_id FROM milestone_attachments WHERE milestone_id IN
+         (SELECT m.id FROM milestones m JOIN project_schedules s ON s.id = m.schedule_id WHERE s.project_id = $1::TEXT)
+       UNION ALL SELECT cloudinary_public_id FROM additional_milestone_attachments WHERE additional_milestone_id IN
+         (SELECT m.id FROM additional_milestones m JOIN project_schedules s ON s.id = m.schedule_id WHERE s.project_id = $1::TEXT)
+       UNION ALL SELECT cloudinary_public_id FROM progress_entry_attachments WHERE progress_entry_id IN
+         (SELECT e.id FROM milestone_progress_entries e JOIN milestones m ON m.id = e.milestone_id
+          JOIN project_schedules s ON s.id = m.schedule_id WHERE s.project_id = $1::TEXT)
+       UNION ALL SELECT cloudinary_public_id FROM milestone_photos WHERE project_id = $1::TEXT
+       UNION ALL SELECT supporting.item->>'public_id' FROM contractual_records r
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.supporting_files, '[]'::JSONB)) AS supporting(item) WHERE r.project_id = $1
+       UNION ALL SELECT supporting.item->>'publicId' FROM contractual_records r
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.supporting_files, '[]'::JSONB)) AS supporting(item) WHERE r.project_id = $1
+       UNION ALL SELECT supporting.item->>'public_id' FROM administrative_records r
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.supporting_files, '[]'::JSONB)) AS supporting(item) WHERE r.project_id = $1
+       UNION ALL SELECT supporting.item->>'public_id' FROM safety_records r
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.supporting_files, '[]'::JSONB)) AS supporting(item) WHERE r.project_id = $1
+       UNION ALL SELECT supporting.item->>'public_id' FROM operational_records r
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.supporting_files, '[]'::JSONB)) AS supporting(item) WHERE r.project_id = $1
+       UNION ALL SELECT supporting.item->>'public_id' FROM financial_records r
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.supporting_files, '[]'::JSONB)) AS supporting(item) WHERE r.project_id = $1
+     ) assets
+     WHERE public_id IS NOT NULL AND BTRIM(public_id) <> ''`,
+    [projectId]
+  );
+
+  for (const asset of rows) {
+    await dbClient.query(
+      `INSERT INTO project_deletion_asset_cleanup (project_id, public_id)
+       VALUES ($1, $2) ON CONFLICT (project_id, public_id) DO NOTHING`,
+      [projectId, asset.public_id]
+    );
+  }
+
+  const legacyChatFiles = await dbClient.query(
+    `SELECT attachment_url FROM project_chat_messages
+     WHERE project_id = $1 AND attachment_public_id IS NULL AND attachment_url IS NOT NULL`,
+    [projectId]
+  );
+  for (const message of legacyChatFiles.rows) {
+    const publicId = cloudinaryPublicIdFromUrl(message.attachment_url);
+    if (!publicId) continue;
+    await dbClient.query(
+      `INSERT INTO project_deletion_asset_cleanup (project_id, public_id)
+       VALUES ($1, $2) ON CONFLICT (project_id, public_id) DO NOTHING`,
+      [projectId, publicId]
+    );
+  }
+}
+
+let projectAssetCleanupRunning = false;
+
+async function processProjectAssetCleanup() {
+  if (projectAssetCleanupRunning) return;
+  projectAssetCleanupRunning = true;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, public_id FROM project_deletion_asset_cleanup
+       WHERE status = 'pending' ORDER BY id LIMIT 25`
+    );
+    for (const asset of rows) {
+      let removed = false;
+      let missingForEveryType = true;
+      for (const resourceType of ['image', 'video', 'raw']) {
+        try {
+          const result = await cloudinary.uploader.destroy(asset.public_id, { resource_type: resourceType });
+          if (result.result === 'ok') {
+            removed = true;
+            break;
+          }
+          if (result.result !== 'not found') missingForEveryType = false;
+        } catch (err) {
+          missingForEveryType = false;
+          console.warn(`[project-lifecycle] Cloudinary cleanup retry for ${asset.public_id} (${resourceType}):`, err.message);
+        }
+      }
+      removed = removed || missingForEveryType;
+      await pool.query(
+        `UPDATE project_deletion_asset_cleanup
+         SET attempts = attempts + 1,
+             status = CASE WHEN $2 THEN 'deleted' ELSE 'pending' END,
+             deleted_at = CASE WHEN $2 THEN NOW() ELSE deleted_at END
+         WHERE id = $1`,
+        [asset.id, removed]
+      );
+    }
+  } catch (err) {
+    console.error('[project-lifecycle] Cloudinary cleanup worker failed:', err.message);
+  } finally {
+    projectAssetCleanupRunning = false;
+  }
+}
+
+app.get('/api/project-lifecycle', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.query.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required.' });
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { rows } = await pool.query(
+      `SELECT id, name, lifecycle_status, deletion_requested_at, deletion_scheduled_at
+       FROM projects WHERE id = $1`,
+      [projectId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Project not found.' });
+    const exitRequest = req.user.role === 'Client' ? null : (await pool.query(
+      `SELECT requested_at, effective_at, status
+       FROM project_exit_requests
+       WHERE project_id = $1 AND user_id = $2 AND user_role = $3
+       ORDER BY id DESC LIMIT 1`,
+      [projectId, req.user.user_id, req.user.role]
+    )).rows[0] || null;
+    return res.json({
+      project: rows[0],
+      exitRequest,
+      isClientOwner: req.user.role === 'Client' && await userHasProjectAccess(req.user.user_id, req.user.role, projectId),
+    });
+  } catch (err) {
+    console.error('GET /api/project-lifecycle:', err);
+    return res.status(500).json({ error: 'Unable to load project status.' });
+  }
+});
+
+app.post('/api/project-exit/request', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.body.projectId);
+  const assignment = PROJECT_EXIT_ASSIGNMENTS[req.user.role];
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required.' });
+  if (!assignment) return res.status(403).json({ error: 'Project owners must use Delete Project instead.' });
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
+      return res.status(403).json({ error: 'You are not a member of this project.' });
+    }
+    const project = await pool.query(
+      `SELECT lifecycle_status FROM projects WHERE id = $1`, [projectId]
+    );
+    if (project.rows[0]?.lifecycle_status !== 'active') {
+      return res.status(423).json({ error: 'This project is read-only or scheduled for deletion.' });
+    }
+    const result = await pool.query(
+      `INSERT INTO project_exit_requests (project_id, user_id, user_role, effective_at)
+       VALUES ($1, $2, $3, NOW() + INTERVAL '15 days')
+       RETURNING requested_at, effective_at, status`,
+      [projectId, req.user.user_id, req.user.role]
+    );
+    return res.status(201).json({ success: true, exitRequest: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      const { rows } = await pool.query(
+        `SELECT requested_at, effective_at, status FROM project_exit_requests
+         WHERE project_id = $1 AND user_id = $2 AND user_role = $3 AND status = 'pending'`,
+        [projectId, req.user.user_id, req.user.role]
+      );
+      return res.json({ success: true, exitRequest: rows[0] });
+    }
+    console.error('POST /api/project-exit/request:', err);
+    return res.status(500).json({ error: 'Unable to schedule project exit.' });
+  }
+});
+
+app.post('/api/project-exit/cancel', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.body.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required.' });
+  try {
+    const result = await pool.query(
+      `UPDATE project_exit_requests
+       SET status = 'cancelled'
+       WHERE project_id = $1 AND user_id = $2 AND user_role = $3
+         AND status = 'pending' AND effective_at > NOW()
+       RETURNING id`,
+      [projectId, req.user.user_id, req.user.role]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'No cancellable exit request was found.' });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/project-exit/cancel:', err);
+    return res.status(500).json({ error: 'Unable to cancel project exit.' });
+  }
+});
+
+app.post('/api/project-deletion/request', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.body.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required.' });
+  if (req.user.role !== 'Client') return res.status(403).json({ error: 'Only the client owner can delete a project.' });
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query('BEGIN');
+    const project = await dbClient.query(
+      `SELECT name, lifecycle_status FROM projects WHERE id = $1 AND client_id = $2 FOR UPDATE`,
+      [projectId, req.user.user_id]
+    );
+    if (!project.rows.length) {
+      await dbClient.query('ROLLBACK');
+      return res.status(404).json({ error: 'Owned project not found.' });
+    }
+    if (project.rows[0].lifecycle_status !== 'active') {
+      await dbClient.query('ROLLBACK');
+      return res.status(409).json({ error: 'Project deletion is already scheduled.' });
+    }
+    const scheduledAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
+    await createProjectLifecycleNotification(
+      dbClient, projectId,
+      `Project deletion requested by the client. This project is read-only and scheduled for deletion in 60 days.`,
+      req.user.user_id, req.user.role
+    );
+    await dbClient.query(
+      `UPDATE projects SET lifecycle_status = 'pending_deletion',
+         deletion_requested_at = NOW(), deletion_scheduled_at = $1, deletion_requested_by = $2
+       WHERE id = $3`,
+      [scheduledAt, req.user.user_id, projectId]
+    );
+    await dbClient.query('COMMIT');
+    const dateLabel = scheduledAt.toISOString();
+    await emailProjectMembers(
+      projectId,
+      `Project scheduled for deletion: ${project.rows[0].name}`,
+      `The client requested deletion of "${project.rows[0].name}". The project is now read-only. It will be permanently deleted on ${dateLabel} unless the client cancels the request. You may view or export existing records during this period.`
+    );
+    return res.json({ success: true, scheduledAt });
+  } catch (err) {
+    await dbClient.query('ROLLBACK').catch(() => {});
+    console.error('POST /api/project-deletion/request:', err);
+    return res.status(500).json({ error: 'Unable to schedule project deletion.' });
+  } finally {
+    dbClient.release();
+  }
+});
+
+app.post('/api/project-deletion/cancel', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.body.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Valid projectId is required.' });
+  if (req.user.role !== 'Client') return res.status(403).json({ error: 'Only the client owner can cancel project deletion.' });
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query('BEGIN');
+    const result = await dbClient.query(
+      `UPDATE projects SET lifecycle_status = 'active', deletion_requested_at = NULL,
+         deletion_scheduled_at = NULL, deletion_requested_by = NULL
+       WHERE id = $1 AND client_id = $2 AND lifecycle_status = 'pending_deletion'
+         AND deletion_scheduled_at > NOW()
+       RETURNING name`,
+      [projectId, req.user.user_id]
+    );
+    if (!result.rowCount) {
+      await dbClient.query('ROLLBACK');
+      return res.status(404).json({ error: 'No cancellable project deletion was found.' });
+    }
+    await createProjectLifecycleNotification(
+      dbClient, projectId, 'The client cancelled the scheduled project deletion. The project is active again.',
+      req.user.user_id, req.user.role
+    );
+    await dbClient.query('COMMIT');
+    await emailProjectMembers(
+      projectId,
+      `Project deletion cancelled: ${result.rows[0].name}`,
+      `The client cancelled deletion of "${result.rows[0].name}". The project is active again.`
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    await dbClient.query('ROLLBACK').catch(() => {});
+    console.error('POST /api/project-deletion/cancel:', err);
+    return res.status(500).json({ error: 'Unable to cancel project deletion.' });
+  } finally {
+    dbClient.release();
+  }
+});
+
+let projectLifecycleWorkerRunning = false;
+
+async function processDueProjectExits() {
+  const dueRequests = await pool.query(
+    `SELECT id FROM project_exit_requests
+     WHERE status = 'pending' AND effective_at <= NOW()
+     ORDER BY effective_at LIMIT 25`
+  );
+
+  for (const due of dueRequests.rows) {
+    const dbClient = await pool.connect();
+    try {
+      await dbClient.query('BEGIN');
+      const locked = await dbClient.query(
+        `SELECT e.id, e.project_id, e.user_id, e.user_role, p.lifecycle_status
+         FROM project_exit_requests e
+         JOIN projects p ON p.id = e.project_id
+         WHERE e.id = $1 AND e.status = 'pending' AND e.effective_at <= NOW()
+         FOR UPDATE OF e, p`,
+        [due.id]
+      );
+      const request = locked.rows[0];
+      const assignment = request && PROJECT_EXIT_ASSIGNMENTS[request.user_role];
+      if (!request || request.lifecycle_status !== 'active' || !assignment) {
+        await dbClient.query('ROLLBACK');
+        continue;
+      }
+
+      const removed = await dbClient.query(
+        `DELETE FROM ${assignment.table} WHERE project_id = $1 AND ${assignment.column} = $2`,
+        [request.project_id, request.user_id]
+      );
+      await dbClient.query(
+        `UPDATE project_exit_requests SET status = 'completed', completed_at = NOW() WHERE id = $1`,
+        [request.id]
+      );
+
+      if (removed.rowCount > 0) {
+        const notification = await dbClient.query(
+          `INSERT INTO notifications (project_id, entity_id, entity_type, message, added_by_id, added_by_role)
+           VALUES ($1, $1, 'project_member_exit', $2, $3, $4) RETURNING id`,
+          [request.project_id, `${request.user_role} left the project after a scheduled exit. Their existing contributions remain in the project.`, request.user_id, request.user_role]
+        );
+        await dbClient.query(
+          `WITH project_members AS (
+             SELECT 'Client'::TEXT AS role, client_id::INTEGER AS role_id
+             FROM projects WHERE id = $2
+             UNION ALL
+             SELECT role, role_id FROM assignments_view WHERE project_id = $2
+           )
+           INSERT INTO notification_recipients (notification_id, recipient_role, recipient_role_id)
+           SELECT $1, role, role_id FROM project_members
+           WHERE NOT (role = $3 AND role_id = $4)
+           ON CONFLICT DO NOTHING`,
+          [notification.rows[0].id, request.project_id, request.user_role, request.user_id]
+        );
+      }
+      await dbClient.query('COMMIT');
+      if (removed.rowCount > 0) {
+        await emailProjectMembers(
+          request.project_id,
+          'A member has left a project',
+          `${request.user_role} left the project after a scheduled exit. Their existing contributions remain in the project.`
+        );
+      }
+    } catch (err) {
+      await dbClient.query('ROLLBACK').catch(() => {});
+      console.error(`[project-lifecycle] Failed to process exit request ${due.id}:`, err.message);
+    } finally {
+      dbClient.release();
+    }
+  }
+}
+
+async function finalizeDueProjectDeletions() {
+  const dueProjects = await pool.query(
+    `SELECT id FROM projects
+     WHERE lifecycle_status = 'pending_deletion' AND deletion_scheduled_at <= NOW()
+     ORDER BY deletion_scheduled_at LIMIT 10`
+  );
+
+  for (const candidate of dueProjects.rows) {
+    const dbClient = await pool.connect();
+    try {
+      const projectMembers = await getProjectMembers(candidate.id);
+      const project = await pool.query('SELECT name FROM projects WHERE id = $1', [candidate.id]);
+
+      await dbClient.query('BEGIN');
+      const locked = await dbClient.query(
+        `SELECT id FROM projects
+         WHERE id = $1 AND lifecycle_status = 'pending_deletion' AND deletion_scheduled_at <= NOW()
+         FOR UPDATE`,
+        [candidate.id]
+      );
+      if (!locked.rowCount) {
+        await dbClient.query('ROLLBACK');
+        continue;
+      }
+
+      await dbClient.query(`SELECT set_config('app.project_deletion_purge', 'on', true)`);
+      await dbClient.query(
+        `DELETE FROM document_reviews review
+         USING (
+           SELECT 'contractual_records'::TEXT AS record_type, id FROM contractual_records WHERE project_id = $1
+           UNION ALL SELECT 'administrative_records', id FROM administrative_records WHERE project_id = $1
+           UNION ALL SELECT 'safety_records', id FROM safety_records WHERE project_id = $1
+           UNION ALL SELECT 'operational_records', id FROM operational_records WHERE project_id = $1
+           UNION ALL SELECT 'financial_records', id FROM financial_records WHERE project_id = $1
+         ) project_records
+         WHERE LOWER(review.record_type) = project_records.record_type
+           AND review.record_id = project_records.id`,
+        [candidate.id]
+      );
+      await dbClient.query(
+        `DELETE FROM reply_relationships relation
+         USING (
+           SELECT 'contractual_records'::TEXT AS record_type, id FROM contractual_records WHERE project_id = $1
+           UNION ALL SELECT 'administrative_records', id FROM administrative_records WHERE project_id = $1
+           UNION ALL SELECT 'safety_records', id FROM safety_records WHERE project_id = $1
+           UNION ALL SELECT 'operational_records', id FROM operational_records WHERE project_id = $1
+           UNION ALL SELECT 'financial_records', id FROM financial_records WHERE project_id = $1
+         ) project_records
+         WHERE LOWER(relation.record_type) = project_records.record_type
+           AND (relation.record_id = project_records.id OR relation.notice_id = project_records.id)`,
+        [candidate.id]
+      );
+
+      await queueProjectCloudinaryAssets(dbClient, candidate.id);
+
+      // These tables use project IDs without a foreign key to projects.
+      await dbClient.query('DELETE FROM project_schedules WHERE project_id = $1::TEXT', [candidate.id]);
+      await dbClient.query('DELETE FROM milestone_photos WHERE project_id = $1::TEXT', [candidate.id]);
+      await dbClient.query('DELETE FROM project_chat_mutes WHERE project_id = $1', [candidate.id]);
+      await dbClient.query('DELETE FROM project_chat_blocks WHERE project_id = $1', [candidate.id]);
+      await dbClient.query('DELETE FROM project_chat_reports WHERE project_id = $1', [candidate.id]);
+      await dbClient.query('DELETE FROM project_chat_group_members WHERE project_id = $1', [candidate.id]);
+      await dbClient.query('DELETE FROM project_chat_calls WHERE project_id = $1', [candidate.id]);
+      await dbClient.query('DELETE FROM projects WHERE id = $1', [candidate.id]);
+      await dbClient.query('COMMIT');
+      if (project.rows[0]) {
+        const emails = [...new Set(projectMembers.map(member => member.email).filter(Boolean))];
+        await Promise.allSettled(emails.map(to => transporter.sendMail({
+          from: 'skyprincenkp16@gmail.com',
+          to,
+          subject: `Project deleted: ${project.rows[0].name}`,
+          text: `The scheduled 60-day deletion period has ended. Project "${project.rows[0].name}" and its database records have been permanently deleted. Uploaded files are being removed from storage.`,
+        })));
+      }
+    } catch (err) {
+      await dbClient.query('ROLLBACK').catch(() => {});
+      console.error(`[project-lifecycle] Failed to finalize project ${candidate.id}:`, err.message);
+    } finally {
+      dbClient.release();
+    }
+  }
+}
+
+async function processProjectLifecycleTasks() {
+  if (projectLifecycleWorkerRunning) return;
+  projectLifecycleWorkerRunning = true;
+  try {
+    await processDueProjectExits();
+    await finalizeDueProjectDeletions();
+    await processProjectAssetCleanup();
+  } catch (err) {
+    console.error('[project-lifecycle] Worker error:', err.message);
+  } finally {
+    projectLifecycleWorkerRunning = false;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIFICATIONS  (both /notifications/* and /api/notifications/*)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2165,6 +2767,11 @@ async function handleAddRecord(req, res) {
     const table = resolveTable(req.body.recordType);
     if (!table) return res.status(400).json({ success: false, message: 'Invalid or missing recordType.' });
     if (!projectId || !title) return res.status(400).json({ success: false, message: 'projectId and title are required.' });
+
+    const projectState = await pool.query('SELECT lifecycle_status FROM projects WHERE id = $1', [projectId]);
+    if (projectState.rows[0]?.lifecycle_status !== 'active') {
+      return res.status(423).json({ success: false, message: 'This project is read-only during its scheduled deletion period.' });
+    }
     
     const memberCheck = await pool.query(
       `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3
@@ -2369,8 +2976,8 @@ const recordUpload = upload.fields([
   { name: 'officialDocument', maxCount: 1 },
   { name: 'supportingFiles', maxCount: 10 }
 ]);
-app.post('/api/add-record', authenticateToken, recordUpload, handleAddRecord);
-app.post('/records',        authenticateToken, recordUpload, handleAddRecord);
+app.post('/api/add-record', authenticateToken, recordUpload, enforcePendingExitForTargetProject, handleAddRecord);
+app.post('/records',        authenticateToken, recordUpload, enforcePendingExitForTargetProject, handleAddRecord);
 
 app.get('/api/arrets', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
@@ -2429,7 +3036,7 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/arrets', authenticateToken, upload.array('attachments'), async (req, res) => {
+app.post('/api/arrets', authenticateToken, upload.array('attachments'), enforcePendingExitForTargetProject, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const title = (req.body.title || '').trim();
   const description = (req.body.description || '').trim();
@@ -2862,7 +3469,7 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  REVIEW RECORD
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/review-record', authenticateToken, upload.single('attachment'), async (req, res) => {
+app.post('/api/review-record', authenticateToken, upload.single('attachment'), enforcePendingExitForTargetProject, async (req, res) => {
   const { projectId, recordId, recordType, action, comment, actorType, stampDocument } = req.body;
   const reviewerId = req.user.user_id, reviewerRole = req.user.role;
   const table = resolveTable(recordType);
@@ -3345,7 +3952,7 @@ app.get('/api/open-remote-file', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'stampImageFile', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), async (req, res) => {
+app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'stampImageFile', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), enforcePendingExitForTargetProject, async (req, res) => {
   const { user_id, role } = req.user;
   const projectId = parseInt(req.query.projectId, 10);
   const normalizedRole = normalizeRole(role);
@@ -3452,7 +4059,7 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
   } catch (err) { console.error('GET /api/meetings:', err); res.status(500).json({ error: 'Failed to load meetings' }); }
 });
 
-app.post('/api/meetings', authenticateToken, upload.array('attachments'), async (req, res) => {
+app.post('/api/meetings', authenticateToken, upload.array('attachments'), enforcePendingExitForTargetProject, async (req, res) => {
   const { project_id, meeting_type, title, date_time, location, participants, agenda, scope, scope_value } = req.body;
   if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
   if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
@@ -3484,7 +4091,7 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), async 
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings:', err); res.status(500).json({ error: 'Failed to create meeting' }); } finally { client.release(); }
 });
 
-app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachments'), async (req, res) => {
+app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachments'), enforcePendingExitForTargetProject, async (req, res) => {
   const meetingId = req.params.id;
   const { project_id, attendees, agenda_discussed, decisions, action_items, scope, scope_value, next_meeting_date } = req.body;
   if (!project_id||!attendees||!agenda_discussed||!decisions||!action_items||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
@@ -3543,7 +4150,7 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   } catch (err) { console.error('[GET /api/get-schedule]', err); res.status(500).json({ error: 'Failed to load schedule' }); }
 });
 
-app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res) => {
+app.post('/api/save-schedule', authenticateToken, upload.any(), enforcePendingExitForTargetProject, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
   let tl, rawMilestones, newIds, editedIds, unchangedIds, deletedIds;
@@ -3677,7 +4284,7 @@ app.post('/api/save-schedule', authenticateToken, upload.any(), async (req, res)
   } catch (err) { await client.query('ROLLBACK'); console.error('[POST /api/save-schedule]', err); res.status(500).json({ error: 'Failed to save schedule' }); } finally { client.release(); }
 });
 
-app.post('/api/report-progress', authenticateToken, upload.single('attachment'), async (req, res) => {
+app.post('/api/report-progress', authenticateToken, upload.single('attachment'), enforcePendingExitForTargetProject, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
@@ -3703,7 +4310,7 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
   } catch (err) { await client.query('ROLLBACK'); console.error('[POST /api/report-progress]', err); res.status(500).json({ error: 'Failed to save progress entry' }); } finally { client.release(); }
 });
 
-app.post('/api/report-additional-progress', authenticateToken, upload.single('attachment'), async (req, res) => {
+app.post('/api/report-additional-progress', authenticateToken, upload.single('attachment'), enforcePendingExitForTargetProject, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
@@ -3727,7 +4334,7 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/report-additional-progress]',err);res.status(500).json({error:'Failed to save additional progress entry'});}finally{client.release();}
 });
 
-app.patch('/api/schedule-progress/:entryId', authenticateToken, upload.none(), async (req, res) => {
+app.patch('/api/schedule-progress/:entryId', authenticateToken, upload.none(), enforcePendingExitForTargetProject, async (req, res) => {
   if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const projectId = normalizeProjectId(req.body.projectId);
   const qty = Number(req.body.qtyExecuted);
@@ -3833,7 +4440,7 @@ app.post('/api/reopen-milestone', authenticateToken, async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); console.error('[POST /api/reopen-milestone]', err); res.status(500).json({ error: 'Failed to reopen milestone' }); } finally { client.release(); }
 });
 
-app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res) => {
+app.post('/api/save-extension', authenticateToken, upload.any(), enforcePendingExitForTargetProject, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
   const extensionDays=parseInt(req.body.extensionDays,10),newPlannedFinish=req.body.newPlannedFinish,reason=(req.body.reason||'').trim(),extensionType=req.body.extensionType,scopeType=req.body.scopeType;
@@ -3904,7 +4511,7 @@ app.post('/api/save-extension', authenticateToken, upload.any(), async (req, res
   } catch(err){await client.query('ROLLBACK');console.error('[POST /api/save-extension]',err);res.status(500).json({error:'Failed to save extension'});}finally{client.release();}
 });
 
-app.patch('/api/schedule-extensions/:extensionId', authenticateToken, upload.single('supportingDoc'), async (req, res) => {
+app.patch('/api/schedule-extensions/:extensionId', authenticateToken, upload.single('supportingDoc'), enforcePendingExitForTargetProject, async (req, res) => {
   if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const projectId = normalizeProjectId(req.body.projectId);
   const extensionId = req.params.extensionId;
@@ -3978,7 +4585,7 @@ app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
   } catch(err){console.error('[GET /api/milestone-photos]',err);res.status(500).json({error:'Failed to fetch photos'});}
 });
 
-app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',10), async (req, res) => {
+app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',10), enforcePendingExitForTargetProject, async (req, res) => {
   if (!canEditSchedule(req.user.role)) return res.status(403).json({error:'Schedule edit permission is required'});
   const { milestoneId, additionalMilestoneId } = req.body;
   const projectId = normalizeProjectId(req.body.projectId);
@@ -4221,7 +4828,7 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
 
 // ── Create activity (leaders/PMs only) ───────────────────────────────────────
 app.post('/api/planning-execution/create', authenticateToken,
-  upload.single('linked_file'), async (req, res) => {
+  upload.single('linked_file'), enforcePendingExitForTargetProject, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     if (!isWCLeader(role))
@@ -4299,7 +4906,7 @@ app.post('/api/planning-execution/create', authenticateToken,
 
 // ── Update activity plan fields (creating leader only) ───────────────────────
 app.put('/api/planning-execution', authenticateToken,
-  upload.single('linked_file'), async (req, res) => {
+  upload.single('linked_file'), enforcePendingExitForTargetProject, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     if (!isWCLeader(role))
@@ -4497,7 +5104,7 @@ app.get('/api/planning-execution-tracking', authenticateToken, async (req, res) 
 
 // ── Log execution entry (creating leader only) ────────────────────────────────
 app.post('/api/planning-execution-tracking', authenticateToken,
-  upload.single('attachment'), async (req, res) => {
+  upload.single('attachment'), enforcePendingExitForTargetProject, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     if (!isWCLeader(role))
@@ -4796,7 +5403,7 @@ app.get('/api/work-center/team-members', authenticateToken, async (req, res) => 
 
 // ── Create task (leaders/PMs only) ────────────────────────────────────────────
 app.post('/api/work-center', authenticateToken,
-  upload.single('linked_file'), async (req, res) => {
+  upload.single('linked_file'), enforcePendingExitForTargetProject, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     if (!isWCLeader(role))
@@ -4889,7 +5496,7 @@ app.post('/api/work-center', authenticateToken,
 
 // ── Update task (same-side leader only) ──────────────────────────────────────
 app.put('/api/work-center/:taskId', authenticateToken,
-  upload.single('linked_file'), async (req, res) => {
+  upload.single('linked_file'), enforcePendingExitForTargetProject, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     const { taskId }        = req.params;
@@ -5131,7 +5738,7 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
 
 // ── Submit progress (TeamMember only) ─────────────────────────────────────────
 app.post('/api/work-center-progress', authenticateToken,
-  upload.single('attachment'), async (req, res) => {
+  upload.single('attachment'), enforcePendingExitForTargetProject, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     if (role !== 'TeamMember')
@@ -6021,7 +6628,7 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
 });
 
 // Create a new document (draft for team members, auto-approved for side leaders)
-app.post('/api/document-approval/create', authenticateToken, upload.single('file'), async (req, res) => {
+app.post('/api/document-approval/create', authenticateToken, upload.single('file'), enforcePendingExitForTargetProject, async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   const { doc_type, title, description } = req.body;
@@ -6087,7 +6694,7 @@ app.post('/api/_debug/document-approval/create', async (req, res) => {
 });
 
 // Resubmit (update) existing document
-app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single('file'), async (req, res) => {
+app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single('file'), enforcePendingExitForTargetProject, async (req, res) => {
   const docId = req.params.id;
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
@@ -6297,7 +6904,7 @@ app.post('/api/control-reports', authenticateToken, async (req, res) => {
 });
 
 // CONTROL & REPORT — create (leader direct add)
-app.post('/api/control-reports/create', authenticateToken, upload.single('file'), async (req, res) => {
+app.post('/api/control-reports/create', authenticateToken, upload.single('file'), enforcePendingExitForTargetProject, async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   const { doc_type, title, description } = req.body;
@@ -6354,6 +6961,9 @@ app.use((err, _req, res, _next) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+
+void processProjectLifecycleTasks();
+setInterval(() => { void processProjectLifecycleTasks(); }, 60 * 1000);
 
 setInterval(() => {
   fetch('https://oneprojectapp-backend.onrender.com/')
