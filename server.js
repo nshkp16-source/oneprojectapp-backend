@@ -669,6 +669,24 @@ function lifecycleProjectId(req) {
   return /^\d+$/.test(String(value || '')) ? Number(value) : null;
 }
 
+async function getProjectScheduleClock(projectId, db = pool) {
+  const { rows } = await db.query(
+    `SELECT lifecycle_status,deletion_requested_at,
+            TO_CHAR((
+              (CASE WHEN lifecycle_status='pending_deletion' THEN deletion_requested_at ELSE NOW() END)
+              - lifecycle_paused_seconds * INTERVAL '1 second'
+            )::DATE,'YYYY-MM-DD') AS effective_today
+     FROM projects WHERE id=$1`,
+    [projectId]
+  );
+  if (!rows.length) return null;
+  return {
+    effective_today: rows[0].effective_today,
+    paused: rows[0].lifecycle_status === 'pending_deletion',
+    pause_started_at: rows[0].deletion_requested_at,
+  };
+}
+
 async function resolveLifecycleProjectId(req) {
   const explicitId = lifecycleProjectId(req);
   if (explicitId) return explicitId;
@@ -770,12 +788,13 @@ app.get('/api/project-lifecycle', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Access denied to this project.' });
     }
     const result = await pool.query(
-      `SELECT id,name,client_id,lifecycle_status,deletion_requested_at,deletion_scheduled_at
+      `SELECT id,name,client_id,lifecycle_status,deletion_requested_at,deletion_scheduled_at,lifecycle_paused_seconds
        FROM projects WHERE id=$1`,
       [projectId]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Project not found.' });
     const project = result.rows[0];
+    const scheduleClock = await getProjectScheduleClock(projectId);
     const exit = await pool.query(
       `SELECT id,effective_at,status FROM project_exit_requests
        WHERE project_id=$1 AND user_id=$2 AND user_role=$3 AND status='pending'
@@ -790,6 +809,8 @@ app.get('/api/project-lifecycle', authenticateToken, async (req, res) => {
       isClientOwner,
       exitRequest,
       writeAllowed: !readOnly,
+      effective_schedule_today: scheduleClock?.effective_today || null,
+      schedule_clock_paused: scheduleClock?.paused || false,
       readOnlyReason: project.lifecycle_status === 'pending_deletion'
         ? 'Project deletion is scheduled.'
         : exitRequest ? 'Your project exit is scheduled.' : null,
@@ -860,7 +881,9 @@ app.post('/api/project-deletion/cancel', authenticateToken, async (req, res) => 
     if (!projectCheck.rows.length) return res.status(404).json({ error: 'Project not found.' });
     const result = await pool.query(
       `UPDATE projects
-       SET lifecycle_status='active',deletion_requested_at=NULL,deletion_scheduled_at=NULL,deletion_requested_by=NULL
+         SET lifecycle_status='active',
+           lifecycle_paused_seconds=lifecycle_paused_seconds + GREATEST(0,FLOOR(EXTRACT(EPOCH FROM (NOW()-deletion_requested_at)))::BIGINT),
+           deletion_requested_at=NULL,deletion_scheduled_at=NULL,deletion_requested_by=NULL
        WHERE id=$1 AND client_id=$2 AND lifecycle_status='pending_deletion'
        RETURNING id`,
       [projectId, req.user.user_id]
@@ -4097,8 +4120,9 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
   if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
   try {
+    const scheduleClock = await getProjectScheduleClock(projectId);
     const schedRow = await pool.query('SELECT * FROM project_schedules WHERE project_id=$1 LIMIT 1', [projectId]);
-    if (!schedRow.rows.length) return res.json({ schedule: null });
+    if (!schedRow.rows.length) return res.json({ schedule: null, effective_today: scheduleClock?.effective_today || null, schedule_paused: scheduleClock?.paused || false, pause_started_at: scheduleClock?.pause_started_at || null });
     const sched = schedRow.rows[0];
     const msRows = await pool.query(`SELECT m.*,COALESCE(json_agg(json_build_object('id',e.id,'date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url,'publicId',a.cloudinary_public_id)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM milestones m LEFT JOIN milestone_progress_entries e ON e.milestone_id=m.id LEFT JOIN milestone_attachments a ON a.milestone_id=m.id WHERE m.schedule_id=$1 GROUP BY m.id ORDER BY m.sort_order`, [sched.id]);
     const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('id',e.id,'date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
@@ -4106,7 +4130,7 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at,supporting_file_name,supporting_file_url,supporting_file_mime,supporting_file_size FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
     
     const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt,extensionId:ms.schedule_extension_id||null });
-    res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},location:sched.location||null,milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows } });
+    res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},location:sched.location||null,milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows,effective_today:scheduleClock?.effective_today||null,schedule_paused:scheduleClock?.paused||false,pause_started_at:scheduleClock?.pause_started_at||null } });
   } catch (err) { console.error('[GET /api/get-schedule]', err); res.status(500).json({ error: 'Failed to load schedule' }); }
 });
 
@@ -4580,8 +4604,9 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
   if (!projectId) return res.status(400).json({error:'Valid projectId is required'});
   try {
+    const scheduleClock=await getProjectScheduleClock(projectId);
     const schedRow=await pool.query('SELECT id,planned_start,planned_finish,total_duration,location FROM project_schedules WHERE project_id=$1 LIMIT 1',[projectId]);
-    if (!schedRow.rows.length) return res.json({hasSchedule:false,milestones:[],photos:[],timeline:null});
+    if (!schedRow.rows.length) return res.json({hasSchedule:false,milestones:[],photos:[],timeline:null,effective_today:scheduleClock?.effective_today||null,schedule_paused:scheduleClock?.paused||false,pause_started_at:scheduleClock?.pause_started_at||null});
     const sched=schedRow.rows[0];
     const location=sched.location || null;
     const msRows=await pool.query(`SELECT m.id,m.title,m.planned_start AS start,m.planned_end AS end,m.quantity,m.unit,m.weight_pct,m.float_days,m.is_critical,m.executed,m.progress_pct,m.activity_status,m.completed_at,(SELECT MAX(e.report_date)::timestamp FROM milestone_progress_entries e WHERE e.milestone_id=m.id) AS last_progress_date,m.depends_on AS dep FROM milestones m WHERE m.schedule_id=$1 ORDER BY m.sort_order`,[sched.id]);
@@ -4589,7 +4614,8 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
     const allMilestones=[...msRows.rows.map(m=>({...m,is_extension:false})),...amRows.rows.map(m=>({...m,is_extension:true}))];
     const totalWeight=allMilestones.reduce((s,m)=>s+Number(m.weight_pct||0),0);
     const overallPct=allMilestones.length===0?0:totalWeight>0?allMilestones.reduce((s,m)=>s+Number(m.weight_pct||0)*Number(m.progress_pct||0),0)/totalWeight:allMilestones.reduce((s,m)=>s+Number(m.progress_pct||0),0)/allMilestones.length;
-    const today=new Date();today.setHours(0,0,0,0);
+    const [clockYear,clockMonth,clockDay]=(scheduleClock?.effective_today||new Date().toISOString().slice(0,10)).split('-').map(Number);
+    const today=new Date(clockYear,clockMonth-1,clockDay);today.setHours(0,0,0,0);
     const projStart=new Date(sched.planned_start),projFinish=new Date(sched.planned_finish);
     const elapsed=Math.max(0,(today-projStart)/86400000),totalDays=Math.max(1,(projFinish-projStart)/86400000);
     const plannedPct=Math.min(100,(elapsed/totalDays)*100),variance=parseFloat((overallPct-plannedPct).toFixed(2));
@@ -4647,6 +4673,9 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
     } : null;
     res.json({
       hasSchedule:true,
+      effective_today:scheduleClock?.effective_today||null,
+      schedule_paused:scheduleClock?.paused||false,
+      pause_started_at:scheduleClock?.pause_started_at||null,
       location,
       timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration,current_finish:latestExtension?latestExtension.new_planned_finish:sched.planned_finish},
       progress:{overall_pct:parseFloat(overallPct.toFixed(2)),planned_pct:parseFloat(plannedPct.toFixed(2)),variance_pct:variance,last_completed:lastCompleted,total_milestones:allMilestones.length,completed_count:completed.length,in_progress_count:allMilestones.filter(m=>m.activity_status==='in_progress').length},
