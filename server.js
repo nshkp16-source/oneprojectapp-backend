@@ -574,6 +574,77 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
     }));
 }
 
+function escapeEmailHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[char]);
+}
+
+async function verifyClientPassword(clientId, password) {
+  if (typeof password !== 'string' || !password) return false;
+  const result = await pool.query('SELECT password_hash FROM clients WHERE id=$1', [clientId]);
+  const passwordHash = result.rows[0]?.password_hash;
+  return Boolean(passwordHash && await bcrypt.compare(password, passwordHash));
+}
+
+async function notifyProjectLifecycleChange(projectId, actorUserId, actorRole, { subject, message, emailBody }) {
+  const result = { inAppSent: false, emailSent: 0, emailFailed: 0 };
+  let projectName = `Project ${projectId}`;
+  let members = [];
+  let recipients = [];
+  try {
+    const projectResult = await pool.query('SELECT name FROM projects WHERE id=$1', [projectId]);
+    projectName = projectResult.rows[0]?.name || projectName;
+    members = await getProjectMembers(projectId);
+    recipients = members
+      .filter(member => !(Number(member.role_id) === Number(actorUserId) && normalizeRole(member.role) === normalizeRole(actorRole)))
+      .map(member => ({
+        recipient_role: normalizeRole(member.role),
+        recipient_role_id: Number(member.role_id),
+        user_id: Number(member.role_id),
+      }));
+  } catch (err) {
+    console.error('[project lifecycle] failed to load notification recipients:', err.message);
+    return result;
+  }
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SELECT set_config('app.project_deletion_purge','on',true)`);
+      const notification = await client.query(
+        `INSERT INTO notifications (project_id,entity_type,entity_id,message,added_by_id,added_by_role)
+         VALUES ($1,'project_lifecycle',$2,$3,$4,$5) RETURNING id`,
+        [projectId, projectId, message, actorUserId, normalizeRole(actorRole)]
+      );
+      await insertNotificationRecipients(client, notification.rows[0].id, recipients);
+      await client.query('COMMIT');
+      result.inAppSent = recipients.length > 0;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('[project lifecycle] in-app notification failed:', err.message);
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('[project lifecycle] notification transaction failed:', err.message);
+  }
+
+  const uniqueEmails = [...new Set(members.map(member => String(member.email || '').trim()).filter(Boolean).map(email => email.toLowerCase()))];
+  const displayEmails = new Map(members.map(member => [String(member.email || '').trim().toLowerCase(), String(member.email || '').trim()]));
+  const deliveries = await Promise.allSettled(uniqueEmails.map(email => transporter.sendMail({
+    from: 'skyprincenkp16@gmail.com',
+    to: displayEmails.get(email),
+    subject,
+    html: `<p>Project <strong>${escapeEmailHtml(projectName)}</strong></p>${emailBody}`,
+  })));
+  result.emailSent = deliveries.filter(delivery => delivery.status === 'fulfilled').length;
+  result.emailFailed = deliveries.length - result.emailSent;
+  if (result.emailFailed) console.error(`[project lifecycle] ${result.emailFailed} member email(s) failed for project ${projectId}`);
+  return result;
+}
+
 async function userHasProjectAccess(userId, role, projectId) {
   const projectCheck = {
     Client:       { table: 'projects',                  idCol: 'client_id' },
@@ -735,10 +806,19 @@ app.post('/api/project-deletion/request', authenticateToken, async (req, res) =>
   if (normalizeRole(req.user.role) !== 'Client') {
     return res.status(403).json({ error: 'Only the client project owner can schedule deletion.' });
   }
+  const projectName = String(req.body.projectName || '').trim();
+  const password = req.body.password;
+  if (!projectName || typeof password !== 'string' || !password) {
+    return res.status(400).json({ error: 'Project name and password are required.' });
+  }
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
       return res.status(403).json({ error: 'Only the client project owner can schedule deletion.' });
     }
+    const projectCheck = await pool.query('SELECT name FROM projects WHERE id=$1 AND client_id=$2', [projectId, req.user.user_id]);
+    if (!projectCheck.rows.length) return res.status(404).json({ error: 'Project not found.' });
+    if (projectName !== projectCheck.rows[0].name) return res.status(400).json({ error: 'Project name does not match.' });
+    if (!await verifyClientPassword(req.user.user_id, password)) return res.status(401).json({ error: 'Incorrect password.' });
     const result = await pool.query(
       `UPDATE projects
        SET lifecycle_status='pending_deletion',deletion_requested_at=NOW(),
@@ -748,7 +828,13 @@ app.post('/api/project-deletion/request', authenticateToken, async (req, res) =>
       [projectId, req.user.user_id]
     );
     if (!result.rows.length) return res.status(409).json({ error: 'Project is already scheduled for deletion or unavailable.' });
-    return res.json({ success: true, deletion_scheduled_at: result.rows[0].deletion_scheduled_at });
+    const notice = `Project deletion scheduled. The project is read-only until ${new Date(result.rows[0].deletion_scheduled_at).toLocaleDateString()}.`;
+    const notifications = await notifyProjectLifecycleChange(projectId, req.user.user_id, req.user.role, {
+      subject: `Project deletion scheduled: ${projectCheck.rows[0].name}`,
+      message: notice,
+      emailBody: `<p>${escapeEmailHtml(notice)}</p><p>Project members can view existing records during the recovery period, but cannot make project changes.</p>`,
+    });
+    return res.json({ success: true, deletion_scheduled_at: result.rows[0].deletion_scheduled_at, notifications });
   } catch (err) {
     console.error('[POST /api/project-deletion/request]', err);
     return res.status(500).json({ error: 'Unable to schedule project deletion.' });
@@ -761,10 +847,17 @@ app.post('/api/project-deletion/cancel', authenticateToken, async (req, res) => 
   if (normalizeRole(req.user.role) !== 'Client') {
     return res.status(403).json({ error: 'Only the client project owner can cancel deletion.' });
   }
+  const password = req.body.password;
+  if (typeof password !== 'string' || !password) {
+    return res.status(400).json({ error: 'Password is required to cancel deletion.' });
+  }
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
       return res.status(403).json({ error: 'Only the client project owner can cancel deletion.' });
     }
+    if (!await verifyClientPassword(req.user.user_id, password)) return res.status(401).json({ error: 'Incorrect password.' });
+    const projectCheck = await pool.query('SELECT name FROM projects WHERE id=$1 AND client_id=$2', [projectId, req.user.user_id]);
+    if (!projectCheck.rows.length) return res.status(404).json({ error: 'Project not found.' });
     const result = await pool.query(
       `UPDATE projects
        SET lifecycle_status='active',deletion_requested_at=NULL,deletion_scheduled_at=NULL,deletion_requested_by=NULL
@@ -773,7 +866,13 @@ app.post('/api/project-deletion/cancel', authenticateToken, async (req, res) => 
       [projectId, req.user.user_id]
     );
     if (!result.rows.length) return res.status(409).json({ error: 'No scheduled project deletion was found.' });
-    return res.json({ success: true });
+    const notice = `Project deletion was cancelled. Project "${projectCheck.rows[0].name}" is active again.`;
+    const notifications = await notifyProjectLifecycleChange(projectId, req.user.user_id, req.user.role, {
+      subject: `Project deletion cancelled: ${projectCheck.rows[0].name}`,
+      message: notice,
+      emailBody: `<p>${escapeEmailHtml(notice)}</p><p>Project members can edit and add project information again.</p>`,
+    });
+    return res.json({ success: true, notifications });
   } catch (err) {
     console.error('[POST /api/project-deletion/cancel]', err);
     return res.status(500).json({ error: 'Unable to cancel project deletion.' });
@@ -3813,7 +3912,7 @@ app.get('/api/open-remote-file', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'stampImageFile', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), async (req, res) => {
+app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampImage', maxCount: 1 }, { name: 'stampImageFile', maxCount: 1 }, { name: 'signatureImageFile', maxCount: 1 }]), requireProjectLifecycleWrite, async (req, res) => {
   const { user_id, role } = req.user;
   const projectId = parseInt(req.query.projectId, 10);
   const normalizedRole = normalizeRole(role);
