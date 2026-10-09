@@ -4021,6 +4021,18 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  MEETINGS
 // ─────────────────────────────────────────────────────────────────────────────
+function meetingProjectMemberName(member) {
+  const role = member.role || '';
+  if (role === 'Client') return [member.representative, member.title, 'Client'].filter(Boolean).join(' - ');
+  if (role === 'Contractor' || role === 'Consultant') return [member.representative, member.title_position, role].filter(Boolean).join(' - ');
+  if (role === 'ContractorPM' || role === 'ConsultantPM' || role === 'ClientPM') {
+    const label = { ContractorPM: 'Contractor PM', ConsultantPM: 'Consultant PM', ClientPM: 'Client PM' }[role];
+    return [member.title, label].filter(Boolean).join(' - ');
+  }
+  if (role === 'TeamMember') return [member.title, member.position, member.assigned_part, 'Team Member'].filter(Boolean).join(' - ');
+  return member.display_name || member.representative || member.email || role || 'Project participant';
+}
+
 app.get('/api/meetings', authenticateToken, async (req, res) => {
   const { view, scope, scope_value, project_id } = req.query;
   if (!project_id || !view || !scope) return res.status(400).json({ error: 'project_id, view and scope are required' });
@@ -4034,22 +4046,68 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
         (SELECT json_build_object('id',mm.id,'attendees',mm.attendees,'agenda_discussed',mm.agenda_discussed,'decisions',mm.decisions,'action_items',mm.action_items,'next_meeting_date',mm.next_meeting_date,'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
         (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments
       FROM meetings m
-      WHERE m.project_id=$1 AND m.scope=$2 AND m.date_time ${view==='scheduled'?'>=':'<'} $3
+      WHERE m.project_id=$1 AND m.scope=$2 AND COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'>=':'<'} $3
       ${scopeFilter}
-      ORDER BY m.date_time ${view==='scheduled'?'ASC':'DESC'}
+      ORDER BY COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
     `, params);
     res.json(rows);
   } catch (err) { console.error('GET /api/meetings:', err); res.status(500).json({ error: 'Failed to load meetings' }); }
 });
 
 app.post('/api/meetings', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
-  const { project_id, meeting_type, title, date_time, location, participants, agenda, scope, scope_value } = req.body;
+  const { project_id, meeting_type, title, date_time, location, participants, participant_details, purpose, duration_minutes, timezone, invitation_text, agenda, scope, scope_value } = req.body;
   if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
   if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
+  let participantDetails = [];
+  try {
+    participantDetails = participant_details ? JSON.parse(participant_details) : [];
+  } catch {
+    return res.status(400).json({ error: 'Participant details must be valid JSON' });
+  }
+  if (!Array.isArray(participantDetails)) return res.status(400).json({ error: 'Participant details must be a list' });
+  const durationMinutes = duration_minutes ? Number(duration_minutes) : null;
+  if (durationMinutes !== null && (!Number.isInteger(durationMinutes) || durationMinutes < 1)) {
+    return res.status(400).json({ error: 'Duration must be a positive number of minutes' });
+  }
+  if (timezone?.trim()) {
+    try { new Intl.DateTimeFormat('en-US', { timeZone: timezone.trim() }).format(new Date()); }
+    catch { return res.status(400).json({ error: 'A valid time zone is required' }); }
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,location,participants,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [project_id,meeting_type,title,date_time,location,participants,agenda,scope,scope_value||null,req.user.user_id,req.user.role]);
+    const projectMembers = await getProjectMembers(project_id);
+    const membersByKey = new Map(projectMembers.map(member => [`${member.role}:${member.role_id}`, member]));
+    const verifiedParticipants = [];
+    for (const participant of participantDetails) {
+      if (participant?.source === 'manual') {
+        const name = String(participant.name || '').trim();
+        if (!name || name.length > 160) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'Manual participant names must be between 1 and 160 characters' });
+        }
+        verifiedParticipants.push({ source: 'manual', name });
+        continue;
+      }
+      const member = membersByKey.get(`${participant?.role}:${participant?.role_id}`);
+      if (!member) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'A selected participant is not a member of this project' });
+      }
+      verifiedParticipants.push({
+        source: 'project',
+        role: member.role,
+        role_id: member.role_id,
+        name: meetingProjectMemberName(member),
+        email: member.email || '',
+        company_name: member.company_name || '',
+        profile_picture: member.profile_picture || null,
+      });
+    }
+    const storedParticipants = verifiedParticipants.length
+      ? verifiedParticipants.map(participant => participant.name).join('\n')
+      : participants;
+    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,scheduled_at,location,participants,participant_details,purpose,duration_minutes,timezone,invitation_text,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,CASE WHEN $10::text IS NOT NULL AND $10::text <> '' THEN ($4::timestamp AT TIME ZONE $10::text) ELSE NULL END,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`, [project_id,meeting_type,title,date_time,location,storedParticipants,JSON.stringify(verifiedParticipants),purpose?.trim()||null,durationMinutes,timezone?.trim()||null,invitation_text?.trim()||null,agenda,scope,scope_value||null,req.user.user_id,req.user.role]);
     const meeting = rows[0];
     if (req.files?.length) {
       for (const file of req.files) {
