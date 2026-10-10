@@ -4148,9 +4148,9 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
         (SELECT json_build_object('id',mm.id,'attendees',mm.attendees,'agenda_discussed',mm.agenda_discussed,'decisions',mm.decisions,'action_items',mm.action_items,'next_meeting_date',mm.next_meeting_date,'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
         (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments
       FROM meetings m
-      WHERE m.project_id=$1 AND m.scope=$2 AND m.date_time ${view==='scheduled'?'>=':'<'} $3
+      WHERE m.project_id=$1 AND m.scope=$2 AND COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'>=':'<'} $3
       ${scopeFilter}
-      ORDER BY m.date_time ${view==='scheduled'?'ASC':'DESC'}
+      ORDER BY COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
     `, params);
     res.json(rows);
   } catch (err) { console.error('GET /api/meetings:', err); res.status(500).json({ error: 'Failed to load meetings' }); }
@@ -4178,10 +4178,14 @@ app.get('/api/meetings/:id/pdf', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/meetings', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
-  const { project_id, meeting_type, title, date_time, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
+  const { project_id, meeting_type, title, date_time, scheduled_at, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
   if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!purpose||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
   if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
   if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+  const scheduledInstant = new Date(scheduled_at);
+  if (!scheduled_at || Number.isNaN(scheduledInstant.getTime()) || scheduledInstant.getTime() <= Date.now()) {
+    return res.status(400).json({ error: 'Meeting date and time must be in the future.' });
+  }
   let participantDetails;
   try { participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants); }
   catch (err) { return res.status(400).json({ error: err.message }); }
@@ -4190,7 +4194,7 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), requir
   try {
     await client.query('BEGIN');
     const participantNames = participantDetails.map(person => person.name).join('\n');
-    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,location,participants,participant_details,purpose,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13) RETURNING *`, [project_id,meeting_type,title,date_time,location,participantNames,JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.user.user_id,req.user.role]);
+    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,scheduled_at,location,participants,participant_details,purpose,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14) RETURNING *`, [project_id,meeting_type,title,date_time,scheduledInstant,location,participantNames,JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.user.user_id,req.user.role]);
     const meeting = rows[0];
     if (req.files?.length) {
       for (const file of req.files) {
@@ -4216,10 +4220,14 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), requir
 });
 
 app.put('/api/meetings/:id', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
-  const { project_id, meeting_type, title, date_time, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
+  const { project_id, meeting_type, title, date_time, scheduled_at, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
   if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!purpose||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+    const scheduledInstant = new Date(scheduled_at);
+    if (!scheduled_at || Number.isNaN(scheduledInstant.getTime()) || scheduledInstant.getTime() <= Date.now()) {
+      return res.status(400).json({ error: 'Meeting date and time must be in the future.' });
+    }
     const { rows: existingRows } = await pool.query('SELECT * FROM meetings WHERE id=$1 AND project_id=$2', [req.params.id, project_id]);
     const existing = existingRows[0];
     if (!existing) return res.status(404).json({ error: 'Meeting not found' });
@@ -4228,7 +4236,7 @@ app.put('/api/meetings/:id', authenticateToken, upload.array('attachments'), req
     }
     const participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants);
     if (!participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
-    const { rows } = await pool.query(`UPDATE meetings SET meeting_type=$1,title=$2,date_time=$3,location=$4,participants=$5,participant_details=$6::jsonb,purpose=$7,agenda=$8,scope=$9,scope_value=$10 WHERE id=$11 AND project_id=$12 RETURNING *`, [meeting_type,title,date_time,location,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.params.id,project_id]);
+    const { rows } = await pool.query(`UPDATE meetings SET meeting_type=$1,title=$2,date_time=$3,scheduled_at=$4,location=$5,participants=$6,participant_details=$7::jsonb,purpose=$8,agenda=$9,scope=$10,scope_value=$11 WHERE id=$12 AND project_id=$13 RETURNING *`, [meeting_type,title,date_time,scheduledInstant,location,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.params.id,project_id]);
     if (req.files?.length) {
       for (const file of req.files) {
         const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
