@@ -49,6 +49,15 @@ const photoUpload = multer({
   },
 });
 
+const meetingMinutePdfUpload = multer({
+  limits: { fileSize: 50 * 1024 * 1024, files: 1 },
+  storage: multer.memoryStorage(),
+  fileFilter: (_req, file, cb) => {
+    const isPdf = file.mimetype === 'application/pdf' || /\.pdf$/i.test(file.originalname || '');
+    cb(isPdf ? null : new Error('Meeting report must be a PDF'), isPdf);
+  },
+});
+
 // ─── Cloudinary helpers ───────────────────────────────────────────────────────
 function uploadToCloudinary(buffer, folder, resourceType = 'auto') {
   return new Promise((resolve, reject) => {
@@ -4021,93 +4030,167 @@ app.delete('/api/delete-record', authenticateToken, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 //  MEETINGS
 // ─────────────────────────────────────────────────────────────────────────────
-function meetingProjectMemberName(member) {
+function meetingParticipantLabel(member) {
   const role = member.role || '';
-  if (role === 'Client') return [member.representative, member.title, 'Client'].filter(Boolean).join(' - ');
-  if (role === 'Contractor' || role === 'Consultant') return [member.representative, member.title_position, role].filter(Boolean).join(' - ');
-  if (role === 'ContractorPM' || role === 'ConsultantPM' || role === 'ClientPM') {
-    const label = { ContractorPM: 'Contractor PM', ConsultantPM: 'Consultant PM', ClientPM: 'Client PM' }[role];
-    return [member.title, label].filter(Boolean).join(' - ');
-  }
-  if (role === 'TeamMember') return [member.title, member.position, member.assigned_part, 'Team Member'].filter(Boolean).join(' - ');
+  if (role === 'Client') return [member.representative, member.title, role].filter(Boolean).join(' · ');
+  if (role === 'Contractor' || role === 'Consultant') return [member.representative, member.title_position, role].filter(Boolean).join(' · ');
+  if (role.endsWith('PM')) return [member.title, role.replace(/([A-Z])/g, ' $1').trim()].filter(Boolean).join(' · ');
+  if (role === 'TeamMember') return [member.title, member.position, member.assigned_part, 'Team Member'].filter(Boolean).join(' · ');
   return member.display_name || member.representative || member.email || role || 'Project participant';
+}
+
+async function normalizeMeetingParticipants(projectId, rawParticipants, legacyParticipants = '') {
+  let submitted;
+  try { submitted = rawParticipants ? JSON.parse(rawParticipants) : []; }
+  catch { throw new Error('Participant data is invalid.'); }
+  if (!Array.isArray(submitted)) throw new Error('Participants must be a list.');
+  if (!submitted.length && legacyParticipants) {
+    submitted = String(legacyParticipants).split(/\r?\n/).map(name => ({ source: 'manual', name }));
+  }
+  const members = await getProjectMembers(projectId);
+  const memberMap = new Map(members.map(member => [`${member.role}:${member.role_id}`, member]));
+  return submitted.map(person => {
+    if (person?.source === 'manual') {
+      const name = String(person.name || '').trim();
+      if (!name || name.length > 160) throw new Error('Manual participant names must be between 1 and 160 characters.');
+      return { source: 'manual', name };
+    }
+    const member = memberMap.get(`${person?.role}:${person?.role_id}`);
+    if (!member) throw new Error('A selected participant is not a member of this project.');
+    return {
+      source: 'project', role: member.role, role_id: member.role_id,
+      name: meetingParticipantLabel(member), email: member.email || '', company_name: member.company_name || '',
+    };
+  });
+}
+
+function pdfPlainText(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^\x20-\x7E\n]/g, '?');
+}
+
+async function buildMeetingBriefPdf(meeting, references = []) {
+  const pdf = await PDFDocument.create();
+  const regular = await pdf.embedFont(StandardFonts.Helvetica);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const pageSize = [612, 792];
+  let page = pdf.addPage(pageSize);
+  let y = 744;
+  const addPage = () => { page = pdf.addPage(pageSize); y = 744; };
+  const drawLines = (value, font, size, color, indent = 0) => {
+    const maxWidth = 516 - indent;
+    const paragraphs = pdfPlainText(value).split('\n');
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/).filter(Boolean);
+      let line = '';
+      const lines = [];
+      for (const word of words) {
+        const candidate = line ? `${line} ${word}` : word;
+        if (line && font.widthOfTextAtSize(candidate, size) > maxWidth) {
+          lines.push(line);
+          line = word;
+        } else line = candidate;
+      }
+      if (line || !words.length) lines.push(line);
+      for (const text of lines) {
+        if (y < 48) addPage();
+        if (text) page.drawText(text, { x: 48 + indent, y, size, font, color, maxWidth });
+        y -= size + 5;
+      }
+    }
+  };
+  const section = (label, value) => {
+    drawLines(label.toUpperCase(), bold, 9, rgb(0.04, 0.39, 0.43));
+    drawLines(value || 'Not provided', regular, 11, rgb(0.12, 0.16, 0.2), 8);
+    y -= 7;
+  };
+
+  page.drawRectangle({ x: 0, y: 766, width: 612, height: 26, color: rgb(0.02, 0.34, 0.39) });
+  page.drawText('MEETING PLAN', { x: 48, y: 775, size: 10, font: bold, color: rgb(1, 1, 1) });
+  y = 724;
+  drawLines(meeting.title || 'Meeting', bold, 20, rgb(0.1, 0.17, 0.21));
+  y -= 8;
+  section('Meeting type', meeting.meeting_type);
+  section('Date and time', meeting.date_time_local || (meeting.date_time ? new Date(meeting.date_time).toLocaleString() : 'Not provided'));
+  section('Location / access details', meeting.location);
+  section('Purpose', meeting.purpose);
+  const selected = Array.isArray(meeting.participant_details) && meeting.participant_details.length
+    ? meeting.participant_details.map(person => `${person.name || 'Project participant'}${person.role ? ` (${person.role})` : person.source === 'manual' ? ' (External participant)' : ''}`).join('\n')
+    : meeting.participants;
+  section('Required participants', selected);
+  section('Agenda', meeting.agenda);
+  if (references.length) section('Attachments / references', references.map(file => file.name).join('\n'));
+  return Buffer.from(await pdf.save());
+}
+
+async function buildMergedMeetingReportPdf(meeting, references, uploadedReport) {
+  const coverBytes = await buildMeetingBriefPdf(meeting, references);
+  const cover = await PDFDocument.load(coverBytes);
+  const source = await PDFDocument.load(uploadedReport);
+  const merged = await PDFDocument.create();
+  for (const document of [cover, source]) {
+    const pages = await merged.copyPages(document, document.getPageIndices());
+    pages.forEach(page => merged.addPage(page));
+  }
+  return Buffer.from(await merged.save());
 }
 
 app.get('/api/meetings', authenticateToken, async (req, res) => {
   const { view, scope, scope_value, project_id } = req.query;
   if (!project_id || !view || !scope) return res.status(400).json({ error: 'project_id, view and scope are required' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
     const params = [project_id, scope, new Date()];
     let scopeFilter = '';
     if (scope === 'side' && scope_value) { scopeFilter = ` AND m.scope_value = $4`; params.push(scope_value); }
     const { rows } = await pool.query(`
-      SELECT m.*,
+      SELECT m.*, to_char(m.date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local,
         EXISTS (SELECT 1 FROM meeting_minutes mm WHERE mm.meeting_id = m.id) AS has_minute,
         (SELECT json_build_object('id',mm.id,'attendees',mm.attendees,'agenda_discussed',mm.agenda_discussed,'decisions',mm.decisions,'action_items',mm.action_items,'next_meeting_date',mm.next_meeting_date,'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
         (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments
       FROM meetings m
-      WHERE m.project_id=$1 AND m.scope=$2 AND COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'>=':'<'} $3
+      WHERE m.project_id=$1 AND m.scope=$2 AND m.date_time ${view==='scheduled'?'>=':'<'} $3
       ${scopeFilter}
-      ORDER BY COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
+      ORDER BY m.date_time ${view==='scheduled'?'ASC':'DESC'}
     `, params);
     res.json(rows);
   } catch (err) { console.error('GET /api/meetings:', err); res.status(500).json({ error: 'Failed to load meetings' }); }
 });
 
-app.post('/api/meetings', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
-  const { project_id, meeting_type, title, date_time, location, participants, participant_details, purpose, duration_minutes, timezone, invitation_text, agenda, scope, scope_value } = req.body;
-  if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
-  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
-  let participantDetails = [];
+app.get('/api/meetings/:id/pdf', authenticateToken, async (req, res) => {
   try {
-    participantDetails = participant_details ? JSON.parse(participant_details) : [];
-  } catch {
-    return res.status(400).json({ error: 'Participant details must be valid JSON' });
+    const { rows } = await pool.query(`
+      SELECT m.*, to_char(m.date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local,
+        (SELECT COALESCE(json_agg(json_build_object('name',a.name)), '[]'::json)
+         FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS meeting_references
+      FROM meetings m WHERE m.id=$1
+    `, [req.params.id]);
+    const meeting = rows[0];
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, meeting.project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+    const pdf = await buildMeetingBriefPdf(meeting, meeting.meeting_references || []);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="meeting-${meeting.id}-plan.pdf"`);
+    return res.send(pdf);
+  } catch (err) {
+    console.error('Meeting plan PDF error:', err);
+    return res.status(500).json({ error: 'Could not generate the meeting plan PDF' });
   }
-  if (!Array.isArray(participantDetails)) return res.status(400).json({ error: 'Participant details must be a list' });
-  const durationMinutes = duration_minutes ? Number(duration_minutes) : null;
-  if (durationMinutes !== null && (!Number.isInteger(durationMinutes) || durationMinutes < 1)) {
-    return res.status(400).json({ error: 'Duration must be a positive number of minutes' });
-  }
-  if (timezone?.trim()) {
-    try { new Intl.DateTimeFormat('en-US', { timeZone: timezone.trim() }).format(new Date()); }
-    catch { return res.status(400).json({ error: 'A valid time zone is required' }); }
-  }
+});
+
+app.post('/api/meetings', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
+  const { project_id, meeting_type, title, date_time, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
+  if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!purpose||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
+  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
+  if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+  let participantDetails;
+  try { participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
+  if (!participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const projectMembers = await getProjectMembers(project_id);
-    const membersByKey = new Map(projectMembers.map(member => [`${member.role}:${member.role_id}`, member]));
-    const verifiedParticipants = [];
-    for (const participant of participantDetails) {
-      if (participant?.source === 'manual') {
-        const name = String(participant.name || '').trim();
-        if (!name || name.length > 160) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: 'Manual participant names must be between 1 and 160 characters' });
-        }
-        verifiedParticipants.push({ source: 'manual', name });
-        continue;
-      }
-      const member = membersByKey.get(`${participant?.role}:${participant?.role_id}`);
-      if (!member) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'A selected participant is not a member of this project' });
-      }
-      verifiedParticipants.push({
-        source: 'project',
-        role: member.role,
-        role_id: member.role_id,
-        name: meetingProjectMemberName(member),
-        email: member.email || '',
-        company_name: member.company_name || '',
-        profile_picture: member.profile_picture || null,
-      });
-    }
-    const storedParticipants = verifiedParticipants.length
-      ? verifiedParticipants.map(participant => participant.name).join('\n')
-      : participants;
-    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,scheduled_at,location,participants,participant_details,purpose,duration_minutes,timezone,invitation_text,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,CASE WHEN $10::text IS NOT NULL AND $10::text <> '' THEN ($4::timestamp AT TIME ZONE $10::text) ELSE NULL END,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`, [project_id,meeting_type,title,date_time,location,storedParticipants,JSON.stringify(verifiedParticipants),purpose?.trim()||null,durationMinutes,timezone?.trim()||null,invitation_text?.trim()||null,agenda,scope,scope_value||null,req.user.user_id,req.user.role]);
+    const participantNames = participantDetails.map(person => person.name).join('\n');
+    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,location,participants,participant_details,purpose,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13) RETURNING *`, [project_id,meeting_type,title,date_time,location,participantNames,JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.user.user_id,req.user.role]);
     const meeting = rows[0];
     if (req.files?.length) {
       for (const file of req.files) {
@@ -4132,42 +4215,128 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), requir
   } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings:', err); res.status(500).json({ error: 'Failed to create meeting' }); } finally { client.release(); }
 });
 
-app.post('/api/meetings/:id/minute', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
-  const meetingId = req.params.id;
-  const { project_id, attendees, agenda_discussed, decisions, action_items, scope, scope_value, next_meeting_date } = req.body;
-  if (!project_id||!attendees||!agenda_discussed||!decisions||!action_items||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
-  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot add meeting minutes.' });
-  const client = await pool.connect();
+app.put('/api/meetings/:id', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
+  const { project_id, meeting_type, title, date_time, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
+  if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!purpose||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
   try {
-    await client.query('BEGIN');
-    const { rows: meeting } = await client.query(`SELECT id, title FROM meetings WHERE id=$1 AND project_id=$2`, [meetingId, project_id]);
-    if (!meeting.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Meeting not found' }); }
-    const { rows: existing } = await client.query(`SELECT id FROM meeting_minutes WHERE meeting_id=$1`, [meetingId]);
-    if (existing.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Minute already recorded for this meeting' }); }
-    const { rows } = await client.query(`INSERT INTO meeting_minutes (meeting_id,project_id,attendees,agenda_discussed,decisions,action_items,next_meeting_date,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [meetingId,project_id,attendees,agenda_discussed,decisions,action_items,next_meeting_date||null,scope,scope_value||null,req.user.user_id,req.user.role]);
-    const minute = rows[0];
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+    const { rows: existingRows } = await pool.query('SELECT * FROM meetings WHERE id=$1 AND project_id=$2', [req.params.id, project_id]);
+    const existing = existingRows[0];
+    if (!existing) return res.status(404).json({ error: 'Meeting not found' });
+    if (Number(existing.created_by) !== Number(req.user.user_id) || normalizeRole(existing.created_role) !== normalizeRole(req.user.role)) {
+      return res.status(403).json({ error: 'Only the meeting planner can edit this meeting' });
+    }
+    const participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants);
+    if (!participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
+    const { rows } = await pool.query(`UPDATE meetings SET meeting_type=$1,title=$2,date_time=$3,location=$4,participants=$5,participant_details=$6::jsonb,purpose=$7,agenda=$8,scope=$9,scope_value=$10 WHERE id=$11 AND project_id=$12 RETURNING *`, [meeting_type,title,date_time,location,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.params.id,project_id]);
     if (req.files?.length) {
       for (const file of req.files) {
         const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
-        await client.query(`INSERT INTO meeting_attachments (minute_id,name,url,public_id) VALUES ($1,$2,$3,$4)`, [minute.id,file.originalname,result.secure_url,result.public_id]);
+        await pool.query('INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)', [req.params.id,file.originalname,result.secure_url,result.public_id]);
       }
     }
-    const { rows: attachments } = await client.query(`SELECT name, url FROM meeting_attachments WHERE minute_id=$1`, [minute.id]);
-    minute.attachments = attachments;
-    const meetingTitle = meeting[0]?.title || `#${meetingId}`;
-    const notifMsg = scope === 'side'
-      ? `Meeting minutes recorded by ${req.user.role} for ${scope_value || 'your'} side: "${meetingTitle}"`
-      : `Meeting minutes recorded by ${req.user.role}: "${meetingTitle}"`;
-    const notifRes = await client.query(
-      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [project_id, minute.id, 'meeting_minutes', notifMsg, req.user.user_id, req.user.role]
-    );
-    const notificationId = notifRes.rows[0].id;
-    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-    await insertNotificationRecipients(client, notificationId, recipients);
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error('PUT /api/meetings/:id:', err);
+    return res.status(500).json({ error: err.message || 'Failed to update meeting' });
+  }
+});
+
+async function saveMeetingMinutePdf(req, res, replaceExisting) {
+  const meetingId = req.params.id;
+  const projectId = req.body.project_id;
+  if (!projectId) return res.status(400).json({ error: 'project_id is required' });
+  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot edit meeting minutes.' });
+  if (!req.file || !req.file.buffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
+    return res.status(400).json({ error: 'Attach one valid PDF meeting report.' });
+  }
+  if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) return res.status(403).json({ error: 'Access denied to this project' });
+
+  let client;
+  let uploadedPdf;
+  try {
+    const { rows: meetingRows } = await pool.query('SELECT * FROM meetings WHERE id=$1 AND project_id=$2', [meetingId, projectId]);
+    const meeting = meetingRows[0];
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+    if (Number(meeting.created_by) !== Number(req.user.user_id) || normalizeRole(meeting.created_role) !== normalizeRole(req.user.role)) {
+      return res.status(403).json({ error: 'Only the meeting planner can edit its meeting report' });
+    }
+    const { rows: minuteRows } = await pool.query('SELECT * FROM meeting_minutes WHERE meeting_id=$1 LIMIT 1', [meetingId]);
+    const existingMinute = minuteRows[0];
+    if (replaceExisting && !existingMinute) return res.status(404).json({ error: 'Meeting report not found' });
+    if (!replaceExisting && existingMinute) return res.status(409).json({ error: 'A meeting report already exists; use edit to replace it' });
+
+    const { rows: referenceRows } = await pool.query('SELECT name FROM meeting_attachments WHERE meeting_id=$1 AND minute_id IS NULL ORDER BY id', [meetingId]);
+    const mergedPdf = await buildMergedMeetingReportPdf(meeting, referenceRows, req.file.buffer);
+    uploadedPdf = await uploadToCloudinary(mergedPdf, 'meeting_attachments', 'raw');
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    let minute;
+    let oldAttachment = null;
+    if (existingMinute) {
+      const { rows: oldRows } = await client.query('SELECT id,public_id FROM meeting_attachments WHERE minute_id=$1 ORDER BY id DESC LIMIT 1', [existingMinute.id]);
+      oldAttachment = oldRows[0] || null;
+      const { rows } = await client.query(
+        `UPDATE meeting_minutes SET attendees='',agenda_discussed='',decisions='',action_items='',created_by=$1,created_role=$2 WHERE id=$3 RETURNING *`,
+        [req.user.user_id,req.user.role,existingMinute.id]
+      );
+      minute = rows[0];
+      await client.query('DELETE FROM meeting_attachments WHERE minute_id=$1', [minute.id]);
+    } else {
+      const { rows } = await client.query(
+        `INSERT INTO meeting_minutes (meeting_id,project_id,attendees,agenda_discussed,decisions,action_items,next_meeting_date,scope,scope_value,created_by,created_role) VALUES ($1,$2,'','','','',NULL,$3,$4,$5,$6) RETURNING *`,
+        [meetingId,projectId,meeting.scope,meeting.scope_value||null,req.user.user_id,req.user.role]
+      );
+      minute = rows[0];
+    }
+    const reportName = `meeting-${meetingId}-report.pdf`;
+    await client.query('INSERT INTO meeting_attachments (minute_id,name,url,public_id) VALUES ($1,$2,$3,$4)', [minute.id,reportName,uploadedPdf.secure_url,uploadedPdf.public_id]);
+    if (!existingMinute) {
+      const message = `Meeting report recorded by ${req.user.role}: "${meeting.title}"`;
+      const { rows: notificationRows } = await client.query(
+        `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,'meeting_minutes',$3,$4,$5) RETURNING id`,
+        [projectId,minute.id,message,req.user.user_id,req.user.role]
+      );
+      const recipients = await getProjectRecipientKeys(projectId, req.user.user_id, req.user.role, meeting.scope, meeting.scope_value);
+      await insertNotificationRecipients(client, notificationRows[0].id, recipients);
+    }
     await client.query('COMMIT');
-    res.status(201).json({ minute });
-  } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings/:id/minute:', err); res.status(500).json({ error: 'Failed to save minute' }); } finally { client.release(); }
+    if (oldAttachment?.public_id) await cloudinary.uploader.destroy(oldAttachment.public_id, { resource_type: 'raw' }).catch(() => {});
+    minute.attachments = [{ id: minute.id, name: reportName, url: uploadedPdf.secure_url }];
+    return res.status(existingMinute ? 200 : 201).json({ minute });
+  } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    if (uploadedPdf?.public_id) await cloudinary.uploader.destroy(uploadedPdf.public_id, { resource_type: 'raw' }).catch(() => {});
+    console.error('Meeting report save error:', err);
+    return res.status(500).json({ error: 'Failed to save the meeting report PDF' });
+  } finally {
+    client?.release();
+  }
+}
+
+app.post('/api/meetings/:id/minute', authenticateToken, meetingMinutePdfUpload.single('report'), requireProjectLifecycleWrite, (req, res) => saveMeetingMinutePdf(req, res, false));
+app.put('/api/meetings/:id/minute', authenticateToken, meetingMinutePdfUpload.single('report'), requireProjectLifecycleWrite, (req, res) => saveMeetingMinutePdf(req, res, true));
+
+app.get('/api/meetings/:id/minute/pdf', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT m.project_id, a.url FROM meetings m
+      JOIN meeting_minutes mm ON mm.meeting_id=m.id
+      JOIN meeting_attachments a ON a.minute_id=mm.id
+      WHERE m.id=$1 ORDER BY a.id DESC LIMIT 1
+    `, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Meeting report not found' });
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, rows[0].project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+    const fileResponse = await fetch(rows[0].url);
+    if (!fileResponse.ok) return res.status(502).json({ error: 'Saved meeting report is unavailable' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="meeting-${req.params.id}-report.pdf"`);
+    return res.send(Buffer.from(await fileResponse.arrayBuffer()));
+  } catch (err) {
+    console.error('Meeting report download error:', err);
+    return res.status(500).json({ error: 'Could not download the meeting report PDF' });
+  }
 });
 
 // =============================================================================
