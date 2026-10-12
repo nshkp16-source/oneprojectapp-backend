@@ -4065,7 +4065,144 @@ async function normalizeMeetingParticipants(projectId, rawParticipants, legacyPa
 }
 
 function pdfPlainText(value) {
-  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^\x20-\x7E\n]/g, '?');
+  return String(value || '')
+    .replace(/[\u00b7\u2022]/g, '-').replace(/[\u2013\u2014]/g, '-')
+    .replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"')
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^\x20-\x7E\n]/g, '?');
+}
+
+// ── Meeting rules, helpers and PDF builders ─────────────────────────────────
+const MEETING_TYPES = ['site', 'office', 'virtual'];
+const MEETING_TYPE_LABELS = { site: 'Site meeting', office: 'Office meeting', virtual: 'Virtual meeting' };
+const MEETING_SCOPES = ['global', 'side'];
+const MEETING_LIMITS = { title: 200, location: 300, purpose: 5000, agenda: 8000 };
+const MEETING_FIELD_LABELS = { title: 'Title', location: 'Location', purpose: 'Purpose', agenda: 'Agenda' };
+const MEETING_MIGRATION = 'backend/migrations/2026-10-12-meeting-cancel-and-report-audit.sql';
+
+const meetingAttachmentUpload = multer({
+  limits: { fileSize: 25 * 1024 * 1024, files: 10 },
+  storage: multer.memoryStorage(),
+});
+function meetingAttachmentsMiddleware(req, res, next) {
+  meetingAttachmentUpload.array('attachments', 10)(req, res, err => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'Each attachment must be 25 MB or smaller.'
+      : (err.code === 'LIMIT_UNEXPECTED_FILE' || err.code === 'LIMIT_FILE_COUNT') ? 'You can attach up to 10 files.'
+      : 'Could not read the uploaded files.';
+    return res.status(400).json({ error: message });
+  });
+}
+function meetingReportMiddleware(req, res, next) {
+  meetingMinutePdfUpload.single('report')(req, res, err => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'The meeting report must be 50 MB or smaller.'
+      : err.message === 'Meeting report must be a PDF' ? 'Attach one valid PDF meeting report.'
+      : 'Could not read the uploaded report.';
+    return res.status(400).json({ error: message });
+  });
+}
+
+// The optional columns arrive with the 2026-10-12 migration; the API works before and after it.
+let meetingColumnsCache = { at: 0, value: null };
+async function getMeetingColumns() {
+  if (meetingColumnsCache.value && Date.now() - meetingColumnsCache.at < 60000) return meetingColumnsCache.value;
+  const { rows } = await pool.query(
+    `SELECT table_name, column_name FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name IN ('meetings','meeting_minutes')`);
+  const has = (table, column) => rows.some(row => row.table_name === table && row.column_name === column);
+  const value = {
+    cancel: ['status', 'cancelled_at', 'cancelled_by', 'cancelled_by_role', 'cancel_reason'].every(column => has('meetings', column)),
+    reportAudit: has('meeting_minutes', 'report_uploaded_at') && has('meeting_minutes', 'report_version'),
+  };
+  meetingColumnsCache = { at: Date.now(), value };
+  return value;
+}
+
+function isMeetingCancelled(meeting) {
+  return meeting?.status === 'cancelled' || Boolean(meeting?.cancelled_at);
+}
+
+function isMeetingPlannerRow(meeting, user) {
+  return Number(meeting.created_by) === Number(user.user_id)
+    && normalizeRole(meeting.created_role) === normalizeRole(user.role);
+}
+
+// Side (contractor / consultant / client) that a user belongs to on a project.
+// Team members take the side of their assigned part, like the notification logic does.
+async function getMeetingUserSide(userId, role, projectId) {
+  const side = getSide(role);
+  if (side) return side;
+  if (normalizeRole(role) === 'TeamMember') {
+    const { rows } = await pool.query(
+      'SELECT assigned_part FROM team_member_assignments WHERE project_id=$1 AND team_member_id=$2 ORDER BY id DESC LIMIT 1',
+      [projectId, userId]);
+    const part = String(rows[0]?.assigned_part || '').trim().toLowerCase();
+    return part || null;
+  }
+  return null;
+}
+const meetingSideKeys = side => [side, `${side}pm`, `${side}projectmanager`];
+
+// Global meetings are visible to the whole project; side meetings only to that side.
+async function canViewMeeting(user, meeting) {
+  if (!await userHasProjectAccess(user.user_id, user.role, meeting.project_id)) return false;
+  if (meeting.scope !== 'side') return true;
+  const userSide = await getMeetingUserSide(user.user_id, user.role, meeting.project_id);
+  return Boolean(userSide) && userSide === getSide(meeting.scope_value);
+}
+
+async function getMeetingLabels(projectId) {
+  const members = await getProjectMembers(projectId);
+  return new Map(members.map(member => [`${normalizeRole(member.role)}:${Number(member.role_id)}`, meetingParticipantLabel(member)]));
+}
+const meetingActorKey = (role, id) => `${normalizeRole(role)}:${Number(id)}`;
+
+const MEETING_DATE_FORMAT = { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' };
+function formatMeetingWhen(meeting) {
+  let date = null, timeZone;
+  const local = meeting?.date_time_local;
+  if (typeof local === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(local)) { date = new Date(`${local.slice(0, 16)}:00Z`); timeZone = 'UTC'; }
+  else if (meeting?.date_time) date = new Date(meeting.date_time);
+  if (!date || Number.isNaN(date.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-GB', timeZone ? { ...MEETING_DATE_FORMAT, timeZone } : MEETING_DATE_FORMAT)
+    .formatToParts(date).reduce((out, part) => (out[part.type] = part.value, out), {});
+  return `${parts.weekday} ${parts.day} ${parts.month} ${parts.year}, ${parts.hour}:${parts.minute}`;
+}
+
+function parseMeetingBody(body) {
+  const clean = value => String(value ?? '').trim();
+  const meeting = {
+    meeting_type: clean(body.meeting_type).toLowerCase(), title: clean(body.title), location: clean(body.location),
+    purpose: clean(body.purpose), agenda: clean(body.agenda), date_time: clean(body.date_time),
+    scheduled_at: clean(body.scheduled_at), scope: clean(body.scope),
+  };
+  if (!meeting.meeting_type || !meeting.title || !meeting.date_time || !meeting.location || !meeting.purpose || !meeting.agenda || !meeting.scope) {
+    return { error: 'All required fields must be provided' };
+  }
+  if (!MEETING_TYPES.includes(meeting.meeting_type)) return { error: 'Meeting type must be site, office or virtual.' };
+  if (!MEETING_SCOPES.includes(meeting.scope)) return { error: 'Invalid meeting scope.' };
+  for (const [field, max] of Object.entries(MEETING_LIMITS)) {
+    if (meeting[field].length > max) return { error: `${MEETING_FIELD_LABELS[field]} must not exceed ${max} characters.` };
+  }
+  const instant = new Date(meeting.scheduled_at);
+  if (!meeting.scheduled_at || Number.isNaN(instant.getTime()) || instant.getTime() <= Date.now()) {
+    return { error: 'Meeting date and time must be in the future.' };
+  }
+  meeting.scheduledInstant = instant;
+  return { value: meeting };
+}
+
+async function notifyMeetingChange(client, meeting, actor, message) {
+  const { rows } = await client.query(
+    `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,'meetings',$3,$4,$5) RETURNING id`,
+    [meeting.project_id, meeting.id, message, actor.user_id, actor.role]);
+  const recipients = await getProjectRecipientKeys(meeting.project_id, actor.user_id, actor.role, meeting.scope, meeting.scope_value);
+  await insertNotificationRecipients(client, rows[0].id, recipients);
+}
+
+async function destroyUploadedMeetingFiles(files) {
+  await Promise.all(files.map(file =>
+    cloudinary.uploader.destroy(file.public_id, { resource_type: file.resource_type || 'image' }).catch(() => {})));
 }
 
 async function buildMeetingBriefPdf(meeting, references = []) {
@@ -4092,7 +4229,7 @@ async function buildMeetingBriefPdf(meeting, references = []) {
       }
       if (line || !words.length) lines.push(line);
       for (const text of lines) {
-        if (y < 48) addPage();
+        if (y < 56) addPage();
         if (text) page.drawText(text, { x: 48 + indent, y, size, font, color, maxWidth });
         y -= size + 5;
       }
@@ -4104,14 +4241,23 @@ async function buildMeetingBriefPdf(meeting, references = []) {
     y -= 7;
   };
 
+  const cancelled = isMeetingCancelled(meeting);
   page.drawRectangle({ x: 0, y: 766, width: 612, height: 26, color: rgb(0.02, 0.34, 0.39) });
   page.drawText('MEETING PLAN', { x: 48, y: 775, size: 10, font: bold, color: rgb(1, 1, 1) });
+  if (cancelled) {
+    page.drawRectangle({ x: 470, y: 766, width: 142, height: 26, color: rgb(0.7, 0.13, 0.13) });
+    page.drawText('CANCELLED', { x: 502, y: 775, size: 10, font: bold, color: rgb(1, 1, 1) });
+  }
   y = 724;
   drawLines(meeting.title || 'Meeting', bold, 20, rgb(0.1, 0.17, 0.21));
   y -= 8;
-  section('Meeting type', meeting.meeting_type);
-  section('Date and time', meeting.date_time_local || (meeting.date_time ? new Date(meeting.date_time).toLocaleString() : 'Not provided'));
+  section('Meeting type', MEETING_TYPE_LABELS[meeting.meeting_type] || meeting.meeting_type);
+  section('Date and time', formatMeetingWhen(meeting));
   section('Location / access details', meeting.location);
+  section('Visibility', meeting.scope === 'side'
+    ? `${String(getSide(meeting.scope_value) || 'Team').replace(/^./, c => c.toUpperCase())} side only`
+    : 'All project participants');
+  if (meeting.planned_by_name) section('Planned by', meeting.planned_by_name);
   section('Purpose', meeting.purpose);
   const selected = Array.isArray(meeting.participant_details) && meeting.participant_details.length
     ? meeting.participant_details.map(person => `${person.name || 'Project participant'}${person.role ? ` (${person.role})` : person.source === 'manual' ? ' (External participant)' : ''}`).join('\n')
@@ -4119,6 +4265,12 @@ async function buildMeetingBriefPdf(meeting, references = []) {
   section('Required participants', selected);
   section('Agenda', meeting.agenda);
   if (references.length) section('Attachments / references', references.map(file => file.name).join('\n'));
+
+  const generated = new Date().toISOString().slice(0, 10);
+  pdf.getPages().forEach(pg => {
+    pg.drawLine({ start: { x: 48, y: 40 }, end: { x: 564, y: 40 }, thickness: 0.5, color: rgb(0.8, 0.84, 0.87) });
+    pg.drawText(pdfPlainText(`OneProjectApp  |  Meeting plan #${meeting.id}  |  Generated ${generated}`), { x: 48, y: 26, size: 8, font: regular, color: rgb(0.45, 0.5, 0.54) });
+  });
   return Buffer.from(await pdf.save());
 }
 
@@ -4135,23 +4287,46 @@ async function buildMergedMeetingReportPdf(meeting, references, uploadedReport) 
 }
 
 app.get('/api/meetings', authenticateToken, async (req, res) => {
-  const { view, scope, scope_value, project_id } = req.query;
+  const { view, scope, project_id } = req.query;
   if (!project_id || !view || !scope) return res.status(400).json({ error: 'project_id, view and scope are required' });
+  if (!['scheduled', 'minutes'].includes(view)) return res.status(400).json({ error: 'view must be scheduled or minutes' });
+  if (!MEETING_SCOPES.includes(scope)) return res.status(400).json({ error: 'Invalid meeting scope.' });
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
     const params = [project_id, scope, new Date()];
     let scopeFilter = '';
-    if (scope === 'side' && scope_value) { scopeFilter = ` AND m.scope_value = $4`; params.push(scope_value); }
+    if (scope === 'side') {
+      // The side always comes from the signed-in user, never from the query string.
+      const side = await getMeetingUserSide(req.user.user_id, req.user.role, project_id);
+      if (!side) return res.status(403).json({ error: 'Your role does not belong to a project side.' });
+      params.push(meetingSideKeys(side));
+      scopeFilter = ` AND LOWER(REGEXP_REPLACE(COALESCE(m.scope_value,''), '[\\s_-]+', '', 'g')) = ANY($4)`;
+    }
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 500, 1), 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    params.push(limit, offset);
     const { rows } = await pool.query(`
       SELECT m.*, to_char(m.date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local,
         EXISTS (SELECT 1 FROM meeting_minutes mm WHERE mm.meeting_id = m.id) AS has_minute,
-        (SELECT json_build_object('id',mm.id,'attendees',mm.attendees,'agenda_discussed',mm.agenda_discussed,'decisions',mm.decisions,'action_items',mm.action_items,'next_meeting_date',mm.next_meeting_date,'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
+        (SELECT json_build_object('id',mm.id,'attendees',mm.attendees,'agenda_discussed',mm.agenda_discussed,'decisions',mm.decisions,'action_items',mm.action_items,'next_meeting_date',mm.next_meeting_date,
+          'created_by',mm.created_by,'created_role',mm.created_role,
+          'uploaded_at',COALESCE(to_jsonb(mm)->>'report_uploaded_at', to_jsonb(mm)->>'created_at'),
+          'version',to_jsonb(mm)->>'report_version',
+          'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
         (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments
       FROM meetings m
       WHERE m.project_id=$1 AND m.scope=$2 AND COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'>=':'<'} $3
       ${scopeFilter}
       ORDER BY COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
+      LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
+    if (rows.length) {
+      const labels = await getMeetingLabels(project_id);
+      rows.forEach(row => {
+        row.planned_by_name = labels.get(meetingActorKey(row.created_role, row.created_by)) || null;
+        if (row.minute) row.minute.uploaded_by_name = labels.get(meetingActorKey(row.minute.created_role, row.minute.created_by)) || null;
+      });
+    }
     res.json(rows);
   } catch (err) { console.error('GET /api/meetings:', err); res.status(500).json({ error: 'Failed to load meetings' }); }
 });
@@ -4166,7 +4341,8 @@ app.get('/api/meetings/:id/pdf', authenticateToken, async (req, res) => {
     `, [req.params.id]);
     const meeting = rows[0];
     if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
-    if (!await userHasProjectAccess(req.user.user_id, req.user.role, meeting.project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+    if (!await canViewMeeting(req.user, meeting)) return res.status(403).json({ error: 'Access denied to this meeting' });
+    meeting.planned_by_name = (await getMeetingLabels(meeting.project_id)).get(meetingActorKey(meeting.created_role, meeting.created_by)) || null;
     const pdf = await buildMeetingBriefPdf(meeting, meeting.meeting_references || []);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="meeting-${meeting.id}-plan.pdf"`);
@@ -4177,47 +4353,43 @@ app.get('/api/meetings/:id/pdf', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/meetings', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
-  const { project_id, meeting_type, title, date_time, scheduled_at, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
-  if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!purpose||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
+app.post('/api/meetings', authenticateToken, meetingAttachmentsMiddleware, requireProjectLifecycleWrite, async (req, res) => {
+  const { project_id, participants, participant_details } = req.body;
+  if (!project_id) return res.status(400).json({ error: 'All required fields must be provided' });
   if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
+  const parsed = parseMeetingBody(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+  const m = parsed.value;
   if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
-  const scheduledInstant = new Date(scheduled_at);
-  if (!scheduled_at || Number.isNaN(scheduledInstant.getTime()) || scheduledInstant.getTime() <= Date.now()) {
-    return res.status(400).json({ error: 'Meeting date and time must be in the future.' });
-  }
+  // Who can see a side meeting is decided by the planner's own role, not by the request body.
+  if (m.scope === 'side' && !getSide(req.user.role)) return res.status(403).json({ error: 'Only a project side can plan side meetings.' });
+  const scopeValue = m.scope === 'side' ? req.user.role : null;
   let participantDetails;
   try { participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants); }
   catch (err) { return res.status(400).json({ error: err.message }); }
   if (!participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
   const client = await pool.connect();
+  const uploaded = [];
   try {
     await client.query('BEGIN');
     const participantNames = participantDetails.map(person => person.name).join('\n');
-    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,scheduled_at,location,participants,participant_details,purpose,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14) RETURNING *`, [project_id,meeting_type,title,date_time,scheduledInstant,location,participantNames,JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.user.user_id,req.user.role]);
+    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,scheduled_at,location,participants,participant_details,purpose,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14) RETURNING *`, [project_id,m.meeting_type,m.title,m.date_time,m.scheduledInstant,m.location,participantNames,JSON.stringify(participantDetails),m.purpose,m.agenda,m.scope,scopeValue,req.user.user_id,req.user.role]);
     const meeting = rows[0];
-    if (req.files?.length) {
-      for (const file of req.files) {
-        const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
-        await client.query(`INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)`, [meeting.id,file.originalname,result.secure_url,result.public_id]);
-      }
+    for (const file of req.files || []) {
+      const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
+      uploaded.push({ public_id: result.public_id, resource_type: result.resource_type });
+      await client.query(`INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)`, [meeting.id,file.originalname,result.secure_url,result.public_id]);
     }
-    const notifMsg = scope === 'side'
-      ? `New ${meeting_type} meeting scheduled by ${req.user.role} for ${scope_value || 'your'} side: "${title}" on ${date_time}`
-      : `New ${meeting_type} meeting scheduled by ${req.user.role}: "${title}" on ${date_time}`;
-    console.log('[notifications] creating notification', { projectId: project_id, entity_id: meeting.id, entity_type: 'meetings', message: notifMsg, added_by_id: req.user.user_id, added_by_role: req.user.role, scope, scope_value });
-    const notifRes = await client.query(
-      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [project_id, meeting.id, 'meetings', notifMsg, req.user.user_id, req.user.role]
-    );
-    const notificationId = notifRes.rows[0].id;
-    console.log('[notifications] created', { notificationId, projectId: project_id, entity_id: meeting.id });
-    const recipients = await getProjectRecipientKeys(project_id, req.user.user_id, req.user.role, scope, scope_value);
-    await insertNotificationRecipients(client, notificationId, recipients);
+    const when = formatMeetingWhen({ date_time_local: m.date_time }) || m.date_time;
+    const notifMsg = m.scope === 'side'
+      ? `New ${m.meeting_type} meeting scheduled by ${req.user.role} for ${getSide(req.user.role)} side: "${m.title}" on ${when}`
+      : `New ${m.meeting_type} meeting scheduled by ${req.user.role}: "${m.title}" on ${when}`;
+    await notifyMeetingChange(client, meeting, req.user, notifMsg);
     await client.query('COMMIT');
     res.status(201).json(meeting);
   } catch (err) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
+    await destroyUploadedMeetingFiles(uploaded);
     console.error('POST /api/meetings:', err);
     const schemaOutOfDate = err.code === '42703' && /scheduled_at|participant_details|purpose/.test(err.message || '');
     res.status(500).json({ error: schemaOutOfDate
@@ -4226,38 +4398,83 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), requir
   } finally { client.release(); }
 });
 
-app.put('/api/meetings/:id', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
-  const { project_id, meeting_type, title, date_time, scheduled_at, location, participants, participant_details, purpose, agenda, scope, scope_value } = req.body;
-  if (!project_id||!meeting_type||!title||!date_time||!location||!participants||!purpose||!agenda||!scope) return res.status(400).json({ error: 'All required fields must be provided' });
+app.put('/api/meetings/:id', authenticateToken, meetingAttachmentsMiddleware, requireProjectLifecycleWrite, async (req, res) => {
+  const { project_id, participants, participant_details } = req.body;
+  if (!project_id) return res.status(400).json({ error: 'All required fields must be provided' });
+  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot edit meetings.' });
+  const parsed = parseMeetingBody(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+  const m = parsed.value;
+  const client = await pool.connect();
+  const uploaded = [];
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
-    const scheduledInstant = new Date(scheduled_at);
-    if (!scheduled_at || Number.isNaN(scheduledInstant.getTime()) || scheduledInstant.getTime() <= Date.now()) {
-      return res.status(400).json({ error: 'Meeting date and time must be in the future.' });
-    }
-    const { rows: existingRows } = await pool.query('SELECT * FROM meetings WHERE id=$1 AND project_id=$2', [req.params.id, project_id]);
+    const { rows: existingRows } = await client.query('SELECT * FROM meetings WHERE id=$1 AND project_id=$2', [req.params.id, project_id]);
     const existing = existingRows[0];
     if (!existing) return res.status(404).json({ error: 'Meeting not found' });
-    if (Number(existing.created_by) !== Number(req.user.user_id) || normalizeRole(existing.created_role) !== normalizeRole(req.user.role)) {
-      return res.status(403).json({ error: 'Only the meeting planner can edit this meeting' });
-    }
-    const participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants);
+    if (!isMeetingPlannerRow(existing, req.user)) return res.status(403).json({ error: 'Only the meeting planner can edit this meeting' });
+    if (isMeetingCancelled(existing)) return res.status(409).json({ error: 'A cancelled meeting cannot be edited.' });
+    let participantDetails;
+    try { participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants); }
+    catch (err) { return res.status(400).json({ error: err.message }); }
     if (!participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
-    const { rows } = await pool.query(`UPDATE meetings SET meeting_type=$1,title=$2,date_time=$3,scheduled_at=$4,location=$5,participants=$6,participant_details=$7::jsonb,purpose=$8,agenda=$9,scope=$10,scope_value=$11 WHERE id=$12 AND project_id=$13 RETURNING *`, [meeting_type,title,date_time,scheduledInstant,location,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),purpose,agenda,scope,scope_value||null,req.params.id,project_id]);
-    if (req.files?.length) {
-      for (const file of req.files) {
-        const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
-        await pool.query('INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)', [req.params.id,file.originalname,result.secure_url,result.public_id]);
-      }
+
+    await client.query('BEGIN');
+    // Scope and side stay as they were planned; they cannot be changed from the request body.
+    const { rows } = await client.query(`UPDATE meetings SET meeting_type=$1,title=$2,date_time=$3,scheduled_at=$4,location=$5,participants=$6,participant_details=$7::jsonb,purpose=$8,agenda=$9 WHERE id=$10 AND project_id=$11 RETURNING *`, [m.meeting_type,m.title,m.date_time,m.scheduledInstant,m.location,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),m.purpose,m.agenda,req.params.id,project_id]);
+    for (const file of req.files || []) {
+      const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
+      uploaded.push({ public_id: result.public_id, resource_type: result.resource_type });
+      await client.query('INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)', [req.params.id,file.originalname,result.secure_url,result.public_id]);
     }
+    const when = formatMeetingWhen({ date_time_local: m.date_time }) || m.date_time;
+    await notifyMeetingChange(client, rows[0], req.user, `Meeting updated by ${req.user.role}: "${m.title}" is now on ${when}`);
+    await client.query('COMMIT');
     return res.json(rows[0]);
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    await destroyUploadedMeetingFiles(uploaded);
     console.error('PUT /api/meetings/:id:', err);
     const schemaOutOfDate = err.code === '42703' && /scheduled_at|participant_details|purpose/.test(err.message || '');
     return res.status(500).json({ error: schemaOutOfDate
       ? 'Meeting database schema is out of date. Run backend/migrations/2026-10-09-meeting-invitation-details.sql and retry.'
       : 'Failed to update meeting' });
-  }
+  } finally { client.release(); }
+});
+
+app.patch('/api/meetings/:id/cancel', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+  const projectId = req.body?.project_id;
+  if (!projectId) return res.status(400).json({ error: 'project_id is required' });
+  if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot cancel meetings.' });
+  const reason = String(req.body?.reason || '').trim().slice(0, 500) || null;
+  let client;
+  try {
+    if (!(await getMeetingColumns()).cancel) {
+      return res.status(503).json({ error: `Cancelling meetings needs a database update. Run ${MEETING_MIGRATION} and retry.` });
+    }
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) return res.status(403).json({ error: 'Access denied to this project' });
+    const { rows: found } = await pool.query(`SELECT *, to_char(date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local FROM meetings WHERE id=$1 AND project_id=$2`, [req.params.id, projectId]);
+    const meeting = found[0];
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+    if (!isMeetingPlannerRow(meeting, req.user)) return res.status(403).json({ error: 'Only the meeting planner can cancel this meeting' });
+    if (isMeetingCancelled(meeting)) return res.status(409).json({ error: 'This meeting is already cancelled.' });
+    const when = new Date(meeting.scheduled_at || meeting.date_time);
+    if (Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) return res.status(400).json({ error: 'Only upcoming meetings can be cancelled.' });
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `UPDATE meetings SET status='cancelled', cancelled_at=NOW(), cancelled_by=$1, cancelled_by_role=$2, cancel_reason=$3 WHERE id=$4 AND project_id=$5 RETURNING *`,
+      [req.user.user_id, req.user.role, reason, req.params.id, projectId]);
+    await notifyMeetingChange(client, rows[0], req.user,
+      `Meeting cancelled by ${req.user.role}: "${meeting.title}" (was ${formatMeetingWhen(meeting) || 'scheduled'})${reason ? `. Reason: ${reason}` : ''}`);
+    await client.query('COMMIT');
+    return res.json(rows[0]);
+  } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    console.error('PATCH /api/meetings/:id/cancel:', err);
+    return res.status(500).json({ error: 'Failed to cancel the meeting' });
+  } finally { client?.release(); }
 });
 
 async function saveMeetingMinutePdf(req, res, replaceExisting) {
@@ -4273,21 +4490,29 @@ async function saveMeetingMinutePdf(req, res, replaceExisting) {
   let client;
   let uploadedPdf;
   try {
-    const { rows: meetingRows } = await pool.query('SELECT * FROM meetings WHERE id=$1 AND project_id=$2', [meetingId, projectId]);
+    const { rows: meetingRows } = await pool.query(`SELECT *, to_char(date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local FROM meetings WHERE id=$1 AND project_id=$2`, [meetingId, projectId]);
     const meeting = meetingRows[0];
     if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
-    if (Number(meeting.created_by) !== Number(req.user.user_id) || normalizeRole(meeting.created_role) !== normalizeRole(req.user.role)) {
+    if (!isMeetingPlannerRow(meeting, req.user)) {
       return res.status(403).json({ error: 'Only the meeting planner can edit its meeting report' });
+    }
+    if (isMeetingCancelled(meeting)) return res.status(409).json({ error: 'A cancelled meeting cannot have a report.' });
+    const heldAt = new Date(meeting.scheduled_at || meeting.date_time);
+    if (!Number.isNaN(heldAt.getTime()) && heldAt.getTime() > Date.now()) {
+      return res.status(400).json({ error: 'A report can only be added after the meeting has taken place.' });
     }
     const { rows: minuteRows } = await pool.query('SELECT * FROM meeting_minutes WHERE meeting_id=$1 LIMIT 1', [meetingId]);
     const existingMinute = minuteRows[0];
     if (replaceExisting && !existingMinute) return res.status(404).json({ error: 'Meeting report not found' });
     if (!replaceExisting && existingMinute) return res.status(409).json({ error: 'A meeting report already exists; use edit to replace it' });
 
+    const labels = await getMeetingLabels(projectId);
+    meeting.planned_by_name = labels.get(meetingActorKey(meeting.created_role, meeting.created_by)) || null;
     const { rows: referenceRows } = await pool.query('SELECT name FROM meeting_attachments WHERE meeting_id=$1 AND minute_id IS NULL ORDER BY id', [meetingId]);
     const mergedPdf = await buildMergedMeetingReportPdf(meeting, referenceRows, req.file.buffer);
     uploadedPdf = await uploadToCloudinary(mergedPdf, 'meeting_attachments', 'raw');
 
+    const audit = (await getMeetingColumns()).reportAudit;
     client = await pool.connect();
     await client.query('BEGIN');
     let minute;
@@ -4296,14 +4521,14 @@ async function saveMeetingMinutePdf(req, res, replaceExisting) {
       const { rows: oldRows } = await client.query('SELECT id,public_id FROM meeting_attachments WHERE minute_id=$1 ORDER BY id DESC LIMIT 1', [existingMinute.id]);
       oldAttachment = oldRows[0] || null;
       const { rows } = await client.query(
-        `UPDATE meeting_minutes SET attendees='',agenda_discussed='',decisions='',action_items='',created_by=$1,created_role=$2 WHERE id=$3 RETURNING *`,
+        `UPDATE meeting_minutes SET attendees='',agenda_discussed='',decisions='',action_items='',created_by=$1,created_role=$2${audit ? ',report_uploaded_at=NOW(),report_version=COALESCE(report_version,1)+1' : ''} WHERE id=$3 RETURNING *`,
         [req.user.user_id,req.user.role,existingMinute.id]
       );
       minute = rows[0];
       await client.query('DELETE FROM meeting_attachments WHERE minute_id=$1', [minute.id]);
     } else {
       const { rows } = await client.query(
-        `INSERT INTO meeting_minutes (meeting_id,project_id,attendees,agenda_discussed,decisions,action_items,next_meeting_date,scope,scope_value,created_by,created_role) VALUES ($1,$2,'','','','',NULL,$3,$4,$5,$6) RETURNING *`,
+        `INSERT INTO meeting_minutes (meeting_id,project_id,attendees,agenda_discussed,decisions,action_items,next_meeting_date,scope,scope_value,created_by,created_role${audit ? ',report_uploaded_at,report_version' : ''}) VALUES ($1,$2,'','','','',NULL,$3,$4,$5,$6${audit ? ',NOW(),1' : ''}) RETURNING *`,
         [meetingId,projectId,meeting.scope,meeting.scope_value||null,req.user.user_id,req.user.role]
       );
       minute = rows[0];
@@ -4322,6 +4547,9 @@ async function saveMeetingMinutePdf(req, res, replaceExisting) {
     await client.query('COMMIT');
     if (oldAttachment?.public_id) await cloudinary.uploader.destroy(oldAttachment.public_id, { resource_type: 'raw' }).catch(() => {});
     minute.attachments = [{ id: minute.id, name: reportName, url: uploadedPdf.secure_url }];
+    minute.uploaded_at = minute.report_uploaded_at || new Date().toISOString();
+    minute.uploaded_by_name = labels.get(meetingActorKey(req.user.role, req.user.user_id)) || null;
+    minute.version = minute.report_version || null;
     return res.status(existingMinute ? 200 : 201).json({ minute });
   } catch (err) {
     if (client) await client.query('ROLLBACK').catch(() => {});
@@ -4333,19 +4561,19 @@ async function saveMeetingMinutePdf(req, res, replaceExisting) {
   }
 }
 
-app.post('/api/meetings/:id/minute', authenticateToken, meetingMinutePdfUpload.single('report'), requireProjectLifecycleWrite, (req, res) => saveMeetingMinutePdf(req, res, false));
-app.put('/api/meetings/:id/minute', authenticateToken, meetingMinutePdfUpload.single('report'), requireProjectLifecycleWrite, (req, res) => saveMeetingMinutePdf(req, res, true));
+app.post('/api/meetings/:id/minute', authenticateToken, meetingReportMiddleware, requireProjectLifecycleWrite, (req, res) => saveMeetingMinutePdf(req, res, false));
+app.put('/api/meetings/:id/minute', authenticateToken, meetingReportMiddleware, requireProjectLifecycleWrite, (req, res) => saveMeetingMinutePdf(req, res, true));
 
 app.get('/api/meetings/:id/minute/pdf', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT m.project_id, a.url FROM meetings m
+      SELECT m.id, m.project_id, m.scope, m.scope_value, a.url FROM meetings m
       JOIN meeting_minutes mm ON mm.meeting_id=m.id
       JOIN meeting_attachments a ON a.minute_id=mm.id
       WHERE m.id=$1 ORDER BY a.id DESC LIMIT 1
     `, [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Meeting report not found' });
-    if (!await userHasProjectAccess(req.user.user_id, req.user.role, rows[0].project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+    if (!await canViewMeeting(req.user, rows[0])) return res.status(403).json({ error: 'Access denied to this meeting' });
     const fileResponse = await fetch(rows[0].url);
     if (!fileResponse.ok) return res.status(502).json({ error: 'Saved meeting report is unavailable' });
     res.setHeader('Content-Type', 'application/pdf');
