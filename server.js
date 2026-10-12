@@ -4216,7 +4216,14 @@ app.post('/api/meetings', authenticateToken, upload.array('attachments'), requir
     await insertNotificationRecipients(client, notificationId, recipients);
     await client.query('COMMIT');
     res.status(201).json(meeting);
-  } catch (err) { await client.query('ROLLBACK'); console.error('POST /api/meetings:', err); res.status(500).json({ error: 'Failed to create meeting' }); } finally { client.release(); }
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /api/meetings:', err);
+    const schemaOutOfDate = err.code === '42703' && /scheduled_at|participant_details|purpose/.test(err.message || '');
+    res.status(500).json({ error: schemaOutOfDate
+      ? 'Meeting database schema is out of date. Run backend/migrations/2026-10-09-meeting-invitation-details.sql and retry.'
+      : 'Failed to create meeting' });
+  } finally { client.release(); }
 });
 
 app.put('/api/meetings/:id', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
@@ -4246,7 +4253,10 @@ app.put('/api/meetings/:id', authenticateToken, upload.array('attachments'), req
     return res.json(rows[0]);
   } catch (err) {
     console.error('PUT /api/meetings/:id:', err);
-    return res.status(500).json({ error: err.message || 'Failed to update meeting' });
+    const schemaOutOfDate = err.code === '42703' && /scheduled_at|participant_details|purpose/.test(err.message || '');
+    return res.status(500).json({ error: schemaOutOfDate
+      ? 'Meeting database schema is out of date. Run backend/migrations/2026-10-09-meeting-invitation-details.sql and retry.'
+      : 'Failed to update meeting' });
   }
 });
 
