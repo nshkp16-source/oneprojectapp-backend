@@ -4050,18 +4050,87 @@ async function normalizeMeetingParticipants(projectId, rawParticipants, legacyPa
   const members = await getProjectMembers(projectId);
   const memberMap = new Map(members.map(member => [`${member.role}:${member.role_id}`, member]));
   return submitted.map(person => {
+    const attendanceType = ['required', 'optional', 'information'].includes(person?.attendance_type)
+      ? person.attendance_type
+      : 'required';
     if (person?.source === 'manual') {
       const name = String(person.name || '').trim();
       if (!name || name.length > 160) throw new Error('Manual participant names must be between 1 and 160 characters.');
-      return { source: 'manual', name };
+      const email = String(person.email || '').trim().toLowerCase();
+      if (email && (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254)) {
+        throw new Error(`Enter a valid email address for external participant ${name}.`);
+      }
+      return { source: 'manual', name, email, attendance_type: attendanceType };
     }
     const member = memberMap.get(`${person?.role}:${person?.role_id}`);
     if (!member) throw new Error('A selected participant is not a member of this project.');
     return {
       source: 'project', role: member.role, role_id: member.role_id,
       name: meetingParticipantLabel(member), email: member.email || '', company_name: member.company_name || '',
+      attendance_type: attendanceType,
     };
   });
+}
+
+function isValidMeetingTimeZone(value) {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function meetingLocalTimeToUtc(value, timeZone) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
+  if (!match || !isValidMeetingTimeZone(timeZone)) return null;
+  const [, year, month, day, hour, minute] = match;
+  const desired = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute));
+  let candidate = desired;
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  });
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = formatter.formatToParts(new Date(candidate))
+      .reduce((result, part) => (result[part.type] = part.value, result), {});
+    const asUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute));
+    const adjustment = desired - asUtc;
+    if (!adjustment) break;
+    candidate += adjustment;
+  }
+  const finalParts = formatter.formatToParts(new Date(candidate))
+    .reduce((result, part) => (result[part.type] = part.value, result), {});
+  if (finalParts.year !== year || finalParts.month !== month || finalParts.day !== day
+    || finalParts.hour !== hour || finalParts.minute !== minute) return null;
+  return new Date(candidate);
+}
+
+function sanitizeMeetingHtml(value) {
+  return String(value ?? '')
+    .replace(/<(script|style|iframe|object|svg|math)[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<\/?([a-z][a-z0-9]*)\b[^>]*>/gi, (tag, name) => {
+      const allowed = new Set(['p', 'br', 'strong', 'b', 'em', 'i', 'u', 'ul', 'ol', 'li', 'h2', 'h3', 'blockquote']);
+      const normalized = name.toLowerCase();
+      if (!allowed.has(normalized)) return '';
+      return /^<\//.test(tag) ? `</${normalized}>` : `<${normalized}>`;
+    });
+}
+
+function meetingHtmlToPlainText(value) {
+  return sanitizeMeetingHtml(value)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|li|h2|h3|blockquote)>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
 }
 
 function pdfPlainText(value) {
@@ -4075,9 +4144,10 @@ function pdfPlainText(value) {
 const MEETING_TYPES = ['site', 'office', 'virtual'];
 const MEETING_TYPE_LABELS = { site: 'Site meeting', office: 'Office meeting', virtual: 'Virtual meeting' };
 const MEETING_SCOPES = ['global', 'side'];
-const MEETING_LIMITS = { title: 200, location: 300, purpose: 5000, agenda: 8000 };
+const MEETING_LIMITS = { title: 200, location: 300, purpose: 5000, agenda: 8000, virtual_link: 500, safety_notes: 2000, chairperson: 160, minute_taker: 160, meeting_number: 80 };
 const MEETING_FIELD_LABELS = { title: 'Title', location: 'Location', purpose: 'Purpose', agenda: 'Agenda' };
 const MEETING_MIGRATION = 'backend/migrations/2026-10-12-meeting-cancel-and-report-audit.sql';
+const MEETING_PROFESSIONAL_MIGRATION = 'backend/migrations/2026-10-13-professional-meetings.sql';
 
 const meetingAttachmentUpload = multer({
   limits: { fileSize: 25 * 1024 * 1024, files: 10 },
@@ -4159,36 +4229,89 @@ const meetingActorKey = (role, id) => `${normalizeRole(role)}:${Number(id)}`;
 
 const MEETING_DATE_FORMAT = { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' };
 function formatMeetingWhen(meeting) {
-  let date = null, timeZone;
-  const local = meeting?.date_time_local;
-  if (typeof local === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(local)) { date = new Date(`${local.slice(0, 16)}:00Z`); timeZone = 'UTC'; }
-  else if (meeting?.date_time) date = new Date(meeting.date_time);
+  const date = meeting?.scheduled_at ? new Date(meeting.scheduled_at)
+    : meeting?.date_time ? new Date(meeting.date_time) : null;
   if (!date || Number.isNaN(date.getTime())) return null;
-  const parts = new Intl.DateTimeFormat('en-GB', timeZone ? { ...MEETING_DATE_FORMAT, timeZone } : MEETING_DATE_FORMAT)
+  const options = meeting.time_zone ? { ...MEETING_DATE_FORMAT, timeZone: meeting.time_zone } : MEETING_DATE_FORMAT;
+  const parts = new Intl.DateTimeFormat('en-GB', options)
     .formatToParts(date).reduce((out, part) => (out[part.type] = part.value, out), {});
-  return `${parts.weekday} ${parts.day} ${parts.month} ${parts.year}, ${parts.hour}:${parts.minute}`;
+  return `${parts.weekday} ${parts.day} ${parts.month} ${parts.year}, ${parts.hour}:${parts.minute}${meeting.time_zone ? ` ${meeting.time_zone}` : ''}`;
 }
 
-function parseMeetingBody(body) {
+function parseMeetingBody(body, projectTimeZone = '') {
   const clean = value => String(value ?? '').trim();
   const meeting = {
-    meeting_type: clean(body.meeting_type).toLowerCase(), title: clean(body.title), location: clean(body.location),
-    purpose: clean(body.purpose), agenda: clean(body.agenda), date_time: clean(body.date_time),
-    scheduled_at: clean(body.scheduled_at), scope: clean(body.scope),
+    meeting_type: clean(body.meeting_type).toLowerCase() || (String(body.is_draft).toLowerCase() === 'true' ? 'site' : ''), title: clean(body.title), location: clean(body.location),
+    purpose: sanitizeMeetingHtml(body.purpose), date_time: clean(body.date_time),
+    end_time: clean(body.end_time), time_zone: clean(body.time_zone || projectTimeZone),
+    virtual_link: clean(body.virtual_link), safety_notes: clean(body.safety_notes),
+    chairperson: clean(body.chairperson), minute_taker: clean(body.minute_taker),
+    meeting_number: clean(body.meeting_number), scope: clean(body.scope),
+    agenda_items: body.agenda_items,
+    is_draft: String(body.is_draft).toLowerCase() === 'true',
+    recurrence_frequency: clean(body.recurrence_frequency),
+    recurrence_until: clean(body.recurrence_until),
   };
-  if (!meeting.meeting_type || !meeting.title || !meeting.date_time || !meeting.location || !meeting.purpose || !meeting.agenda || !meeting.scope) {
+  if (!meeting.is_draft && (!meeting.meeting_type || !meeting.title || !meeting.date_time || !meeting.end_time
+    || !meeting.purpose || !meeting.scope)) {
     return { error: 'All required fields must be provided' };
   }
   if (!MEETING_TYPES.includes(meeting.meeting_type)) return { error: 'Meeting type must be site, office or virtual.' };
-  if (!MEETING_SCOPES.includes(meeting.scope)) return { error: 'Invalid meeting scope.' };
-  for (const [field, max] of Object.entries(MEETING_LIMITS)) {
-    if (meeting[field].length > max) return { error: `${MEETING_FIELD_LABELS[field]} must not exceed ${max} characters.` };
+  if (!meeting.is_draft && !MEETING_SCOPES.includes(meeting.scope)) return { error: 'Invalid meeting scope.' };
+  if (meeting.is_draft && !meeting.scope) meeting.scope = 'global';
+  if (!meeting.is_draft && !isValidMeetingTimeZone(meeting.time_zone)) return { error: 'Choose a valid project time zone.' };
+  if (meeting.is_draft && !meeting.time_zone) meeting.time_zone = 'UTC';
+  if (!isValidMeetingTimeZone(meeting.time_zone)) return { error: 'Choose a valid project time zone.' };
+  if (!meeting.is_draft && meeting.meeting_type === 'virtual') {
+    try {
+      const parsedLink = new URL(meeting.virtual_link);
+      if (!['https:', 'http:'].includes(parsedLink.protocol)) throw new Error('invalid protocol');
+    } catch {
+      return { error: 'Enter a valid virtual meeting link.' };
+    }
+  } else if (!meeting.is_draft && !meeting.location) return { error: 'Enter the meeting location.' };
+  let agendaItems;
+  try { agendaItems = meeting.agenda_items ? typeof meeting.agenda_items === 'string' ? JSON.parse(meeting.agenda_items) : meeting.agenda_items : []; }
+  catch { return { error: 'Agenda data is invalid.' }; }
+  if (!Array.isArray(agendaItems) || (!meeting.is_draft && !agendaItems.length)) return { error: 'Add at least one agenda item.' };
+  if (agendaItems.length > 100) return { error: 'A meeting cannot have more than 100 agenda items.' };
+  if (agendaItems.some(item => clean(item?.title).length > 300 || clean(item?.presenter).length > 160)) {
+    return { error: 'Agenda topics must be 300 characters or fewer and presenter names 160 characters or fewer.' };
   }
-  const instant = new Date(meeting.scheduled_at);
-  if (!meeting.scheduled_at || Number.isNaN(instant.getTime()) || instant.getTime() <= Date.now()) {
+  meeting.agenda_items = agendaItems.map((item, index) => ({
+    title: clean(item?.title),
+    presenter: clean(item?.presenter),
+    duration_minutes: Number(item?.duration_minutes),
+    details: sanitizeMeetingHtml(item?.details),
+    position: index + 1,
+  }));
+  if (!meeting.is_draft && meeting.agenda_items.some(item =>
+    !item.title || !Number.isInteger(item.duration_minutes) || item.duration_minutes < 1 || item.duration_minutes > 480)) {
+    return { error: 'Each agenda item needs a topic and a duration from 1 to 480 minutes.' };
+  }
+  meeting.agenda = meeting.agenda_items.map(item => `${item.title}: ${meetingHtmlToPlainText(item.details)}`).join('\n');
+  if (!meeting.is_draft && meeting.agenda.length > MEETING_LIMITS.agenda) return { error: `Agenda must not exceed ${MEETING_LIMITS.agenda} characters.` };
+  for (const [field, max] of Object.entries(MEETING_LIMITS)) {
+    const length = field === 'purpose' ? meetingHtmlToPlainText(meeting[field]).length : String(meeting[field] || '').length;
+    if (length > max) return { error: `${MEETING_FIELD_LABELS[field] || field.replaceAll('_', ' ')} must not exceed ${max} characters.` };
+  }
+  const instant = meeting.date_time ? meetingLocalTimeToUtc(meeting.date_time, meeting.time_zone) : null;
+  const endInstant = meeting.end_time ? meetingLocalTimeToUtc(meeting.end_time, meeting.time_zone) : null;
+  if (!meeting.is_draft && (!instant || !endInstant || instant.getTime() <= Date.now())) {
     return { error: 'Meeting date and time must be in the future.' };
   }
+  if (!meeting.is_draft && (endInstant <= instant || endInstant - instant > 12 * 60 * 60 * 1000)) return { error: 'End time must be after the start time and no more than 12 hours later.' };
+  if (!meeting.is_draft && meeting.recurrence_frequency && !['weekly', 'biweekly', 'monthly'].includes(meeting.recurrence_frequency)) return { error: 'Choose a supported recurrence frequency.' };
+  if (!meeting.is_draft && meeting.recurrence_frequency) {
+    const until = new Date(`${meeting.recurrence_until}T00:00:00Z`);
+    if (!meeting.recurrence_until || Number.isNaN(until.getTime()) || until <= instant || until > new Date(instant.getTime() + 366 * 24 * 60 * 60 * 1000)) {
+      return { error: 'Choose a recurrence end date within one year of the first meeting.' };
+    }
+  }
+  if (meeting.is_draft && !meeting.date_time) meeting.date_time = '2000-01-01T00:00';
+  if (meeting.is_draft && !meeting.title) meeting.title = 'Untitled draft';
   meeting.scheduledInstant = instant;
+  meeting.endInstant = endInstant;
   return { value: meeting };
 }
 
@@ -4198,6 +4321,132 @@ async function notifyMeetingChange(client, meeting, actor, message) {
     [meeting.project_id, meeting.id, message, actor.user_id, actor.role]);
   const recipients = await getProjectRecipientKeys(meeting.project_id, actor.user_id, actor.role, meeting.scope, meeting.scope_value);
   await insertNotificationRecipients(client, rows[0].id, recipients);
+}
+
+function addMeetingRecurrence(localValue, frequency, count) {
+  const [datePart, timePart] = localValue.split('T');
+  const [year, month, day] = datePart.split('-').map(Number);
+  const [hour, minute] = timePart.split(':').map(Number);
+  if (frequency === 'monthly') {
+    const monthIndex = month - 1 + count;
+    const targetYear = year + Math.floor(monthIndex / 12);
+    const targetMonth = monthIndex % 12;
+    const targetDay = Math.min(day, new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate());
+    return `${targetYear}-${String(targetMonth + 1).padStart(2, '0')}-${String(targetDay).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  }
+  const date = new Date(Date.UTC(year, month - 1, day + count * (frequency === 'biweekly' ? 14 : 7), hour, minute));
+  return `${date.toISOString().slice(0, 10)}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function getMeetingOccurrences(meeting) {
+  if (!meeting.recurrence_frequency || meeting.is_draft) return [{ start: meeting.date_time, end: meeting.end_time, time_zone: meeting.time_zone }];
+  const until = meeting.recurrence_until;
+  const duration = meetingLocalTimeToUtc(meeting.end_time, meeting.time_zone)
+    .getTime() - meetingLocalTimeToUtc(meeting.date_time, meeting.time_zone).getTime();
+  const occurrences = [];
+  for (let index = 0; index < 52; index += 1) {
+    const start = addMeetingRecurrence(meeting.date_time, meeting.recurrence_frequency, index);
+    if (start.slice(0, 10) > until) break;
+    const startInstant = meetingLocalTimeToUtc(start, meeting.time_zone);
+    if (!startInstant) throw new Error(`The recurring meeting time does not exist in ${meeting.time_zone} on ${start.slice(0, 10)} because of a daylight-saving transition.`);
+    if (index && startInstant.getTime() > Date.now()) {
+      const endDate = new Date(startInstant.getTime() + duration);
+      const endParts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: meeting.time_zone, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+      }).formatToParts(endDate).reduce((result, part) => (result[part.type] = part.value, result), {});
+      const end = `${endParts.year}-${endParts.month}-${endParts.day}T${endParts.hour}:${endParts.minute}`;
+      occurrences.push({ start, end, time_zone: meeting.time_zone });
+    }
+    if (!index) occurrences.push({ start, end: meeting.end_time, time_zone: meeting.time_zone });
+    if (occurrences.length >= 52) break;
+  }
+  return occurrences;
+}
+
+function participantKey(person) {
+  return person.source === 'project'
+    ? `project:${person.role}:${person.role_id}`
+    : `manual:${String(person.email || '').toLowerCase()}`;
+}
+
+async function createMeetingRsvps(client, meeting, participants) {
+  const invitations = [];
+  for (const person of participants) {
+    const key = participantKey(person);
+    const token = person.source === 'manual' ? crypto.randomBytes(32).toString('hex') : null;
+    await client.query(
+      `INSERT INTO meeting_rsvps
+        (meeting_id,participant_key,participant_name,participant_email,participant_role,participant_role_id,participant_source,token_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (meeting_id,participant_key) DO UPDATE SET
+         participant_name=EXCLUDED.participant_name, participant_email=EXCLUDED.participant_email,
+         participant_role=EXCLUDED.participant_role, participant_role_id=EXCLUDED.participant_role_id,
+         participant_source=EXCLUDED.participant_source, token_hash=COALESCE(EXCLUDED.token_hash,meeting_rsvps.token_hash),
+         reminder_sent_at=NULL`,
+      [meeting.id, key, person.name, person.email || null, person.role || null, person.role_id || null, person.source, token ? crypto.createHash('sha256').update(token).digest('hex') : null]
+    );
+    if (person.source === 'manual' && person.email) invitations.push({ ...person, token });
+  }
+  return invitations;
+}
+
+async function findMeetingConflicts(projectId, occurrences, participants, actor, excludeMeetingId = null) {
+  if (!participants.length) return [];
+  const starts = occurrences.map(occurrence => meetingLocalTimeToUtc(occurrence.start, occurrence.time_zone));
+  const ends = occurrences.map(occurrence => meetingLocalTimeToUtc(occurrence.end, occurrence.time_zone));
+  const minStart = new Date(Math.min(...starts.map(date => date.getTime())));
+  const maxEnd = new Date(Math.max(...ends.map(date => date.getTime())));
+  const { rows } = await pool.query(
+    `SELECT id,project_id,scope,scope_value,title,scheduled_at,end_at,time_zone,participant_details
+       FROM meetings
+      WHERE project_id=$1 AND is_draft=false AND status='scheduled'
+        AND scheduled_at < $2 AND end_at > $3 AND ($4::integer IS NULL OR id<>$4)`,
+    [projectId, maxEnd, minStart, excludeMeetingId]
+  );
+  const inviteeKeys = new Set(participants.map(participantKey));
+  const conflicts = rows.filter(row => {
+    const rowKeys = new Set((row.participant_details || []).map(participantKey));
+    return [...inviteeKeys].some(key => rowKeys.has(key));
+  });
+  const visible = [];
+  let hiddenCount = 0;
+  for (const row of conflicts) {
+    if (await canViewMeeting(actor, row)) visible.push({
+      id: row.id,
+      title: row.title,
+      when: formatMeetingWhen(row),
+    });
+    else hiddenCount += 1;
+  }
+  if (hiddenCount) visible.push({ title: 'Another project meeting (details hidden)', when: '' });
+  return visible;
+}
+
+function escapeMeetingEmail(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[character]);
+}
+
+async function sendMeetingInvitations(meeting, invitees, baseUrl) {
+  const when = formatMeetingWhen(meeting);
+  const results = await Promise.allSettled(invitees.map(person => {
+    const rsvpUrl = person.token
+      ? `${baseUrl}/api/meetings/rsvp?token=${encodeURIComponent(person.token)}`
+      : `${baseUrl}/dashboard.html`;
+    return transporter.sendMail({
+      from: 'skyprincenkp16@gmail.com',
+      to: person.email,
+      subject: `${meeting.is_draft ? 'Draft: ' : ''}Meeting invitation — ${meeting.title}`,
+      text: `${meeting.title}\n${when}\n${meeting.location || meeting.virtual_link}\n${meeting.purpose ? meetingHtmlToPlainText(meeting.purpose) : ''}\nRSVP: ${rsvpUrl}`,
+      html: `<p>You are invited to <strong>${escapeMeetingEmail(meeting.title)}</strong>.</p><p>${escapeMeetingEmail(when || '')}</p><p>${escapeMeetingEmail(meeting.location || meeting.virtual_link || '')}</p><p><a href="${escapeMeetingEmail(rsvpUrl)}">Respond to this invitation</a></p>`,
+    });
+  }));
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') console.error('Meeting invitation email failed:', invitees[index].email, result.reason);
+  });
+  return results.flatMap((result, index) => result.status === 'rejected' ? [invitees[index].email] : []);
 }
 
 async function destroyUploadedMeetingFiles(files) {
@@ -4243,7 +4492,7 @@ async function buildMeetingBriefPdf(meeting, references = []) {
 
   const cancelled = isMeetingCancelled(meeting);
   page.drawRectangle({ x: 0, y: 766, width: 612, height: 26, color: rgb(0.02, 0.34, 0.39) });
-  page.drawText('MEETING PLAN', { x: 48, y: 775, size: 10, font: bold, color: rgb(1, 1, 1) });
+  page.drawText(pdfPlainText(`MEETING PLAN${meeting.project_name ? `  |  ${meeting.project_name}` : ''}`), { x: 48, y: 775, size: 10, font: bold, color: rgb(1, 1, 1), maxWidth: 410 });
   if (cancelled) {
     page.drawRectangle({ x: 470, y: 766, width: 142, height: 26, color: rgb(0.7, 0.13, 0.13) });
     page.drawText('CANCELLED', { x: 502, y: 775, size: 10, font: bold, color: rgb(1, 1, 1) });
@@ -4251,19 +4500,29 @@ async function buildMeetingBriefPdf(meeting, references = []) {
   y = 724;
   drawLines(meeting.title || 'Meeting', bold, 20, rgb(0.1, 0.17, 0.21));
   y -= 8;
+  if (meeting.project_reference) section('Project reference', meeting.project_reference);
+  if (meeting.meeting_number) section('Meeting number', meeting.meeting_number);
   section('Meeting type', MEETING_TYPE_LABELS[meeting.meeting_type] || meeting.meeting_type);
-  section('Date and time', formatMeetingWhen(meeting));
-  section('Location / access details', meeting.location);
+  section('Date and time', meeting.is_draft ? 'Not scheduled (draft)' : formatMeetingWhen(meeting));
+  if (meeting.end_at) section('End time', formatMeetingWhen({ scheduled_at: meeting.end_at, time_zone: meeting.time_zone }));
+  section('Location / access details', meeting.location || '—');
+  if (meeting.virtual_link) section('Virtual meeting link', meeting.virtual_link);
+  if (meeting.safety_notes) section('Site access / safety notes', meeting.safety_notes);
   section('Visibility', meeting.scope === 'side'
     ? `${String(getSide(meeting.scope_value) || 'Team').replace(/^./, c => c.toUpperCase())} side only`
     : 'All project participants');
   if (meeting.planned_by_name) section('Planned by', meeting.planned_by_name);
-  section('Purpose', meeting.purpose);
+  if (meeting.chairperson) section('Chairperson', meeting.chairperson);
+  if (meeting.minute_taker) section('Minute-taker', meeting.minute_taker);
+  section('Purpose', meetingHtmlToPlainText(meeting.purpose));
   const selected = Array.isArray(meeting.participant_details) && meeting.participant_details.length
-    ? meeting.participant_details.map(person => `${person.name || 'Project participant'}${person.role ? ` (${person.role})` : person.source === 'manual' ? ' (External participant)' : ''}`).join('\n')
+    ? meeting.participant_details.map(person => `${person.name || 'Project participant'}${person.email ? ` <${person.email}>` : ''} (${person.attendance_type || 'required'})`).join('\n')
     : meeting.participants;
-  section('Required participants', selected);
-  section('Agenda', meeting.agenda);
+  section('Participants', selected);
+  const agendaText = Array.isArray(meeting.agenda_items) && meeting.agenda_items.length
+    ? meeting.agenda_items.map((item, index) => `${index + 1}. ${item.title} — ${item.duration_minutes} min${item.presenter ? ` · ${item.presenter}` : ''}\n${meetingHtmlToPlainText(item.details)}`).join('\n')
+    : meetingHtmlToPlainText(meeting.agenda);
+  section('Agenda', agendaText);
   if (references.length) section('Attachments / references', references.map(file => file.name).join('\n'));
 
   const generated = new Date().toISOString().slice(0, 10);
@@ -4293,31 +4552,40 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
   if (!MEETING_SCOPES.includes(scope)) return res.status(400).json({ error: 'Invalid meeting scope.' });
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
-    const params = [project_id, scope, new Date()];
+    const params = [project_id, scope, new Date(), req.user.user_id, req.user.role];
     let scopeFilter = '';
     if (scope === 'side') {
       // The side always comes from the signed-in user, never from the query string.
       const side = await getMeetingUserSide(req.user.user_id, req.user.role, project_id);
       if (!side) return res.status(403).json({ error: 'Your role does not belong to a project side.' });
       params.push(meetingSideKeys(side));
-      scopeFilter = ` AND LOWER(REGEXP_REPLACE(COALESCE(m.scope_value,''), '[\\s_-]+', '', 'g')) = ANY($4)`;
+      scopeFilter = ` AND LOWER(REGEXP_REPLACE(COALESCE(m.scope_value,''), '[\\s_-]+', '', 'g')) = ANY($6)`;
     }
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 500, 1), 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     params.push(limit, offset);
     const { rows } = await pool.query(`
-      SELECT m.*, to_char(m.date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local,
+      SELECT m.*, p.name AS project_name, p.contract_reference AS project_reference,
+        to_char(m.date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local,
+        to_char(m.scheduled_at AT TIME ZONE COALESCE(m.time_zone, p.time_zone, 'UTC'), 'YYYY-MM-DD"T"HH24:MI') AS start_time_local,
+        to_char(m.end_at AT TIME ZONE COALESCE(m.time_zone, p.time_zone, 'UTC'), 'YYYY-MM-DD"T"HH24:MI') AS end_time_local,
         EXISTS (SELECT 1 FROM meeting_minutes mm WHERE mm.meeting_id = m.id) AS has_minute,
         (SELECT json_build_object('id',mm.id,'attendees',mm.attendees,'agenda_discussed',mm.agenda_discussed,'decisions',mm.decisions,'action_items',mm.action_items,'next_meeting_date',mm.next_meeting_date,
           'created_by',mm.created_by,'created_role',mm.created_role,
           'uploaded_at',COALESCE(to_jsonb(mm)->>'report_uploaded_at', to_jsonb(mm)->>'created_at'),
           'version',to_jsonb(mm)->>'report_version',
           'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
-        (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments
-      FROM meetings m
-      WHERE m.project_id=$1 AND m.scope=$2 AND COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'>=':'<'} $3
+        (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments,
+        (SELECT COALESCE(json_agg(json_build_object('participant_key',r.participant_key,'participant_name',r.participant_name,'response',r.response,'participant_source',r.participant_source)),'[]')
+         FROM meeting_rsvps r WHERE r.meeting_id=m.id) AS rsvps,
+        (SELECT COUNT(*) + 1 FROM meetings recurring WHERE recurring.recurrence_group=m.recurrence_group
+           AND recurring.scheduled_at < m.scheduled_at) AS series_index
+      FROM meetings m JOIN projects p ON p.id=m.project_id
+      WHERE m.project_id=$1 AND m.scope=$2 AND (m.is_draft = false OR (m.is_draft = true AND m.created_by=$4 AND m.created_role=$5))
+        AND (m.is_draft = false OR '${view}' = 'scheduled')
+        AND (m.is_draft = true OR COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'>=':'<'} $3)
       ${scopeFilter}
-      ORDER BY COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
+      ORDER BY m.is_draft DESC, COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
     if (rows.length) {
@@ -4334,14 +4602,16 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
 app.get('/api/meetings/:id/pdf', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT m.*, to_char(m.date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local,
+      SELECT m.*, p.name AS project_name, p.contract_reference AS project_reference,
+        to_char(m.date_time, 'YYYY-MM-DD"T"HH24:MI') AS date_time_local,
         (SELECT COALESCE(json_agg(json_build_object('name',a.name)), '[]'::json)
          FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS meeting_references
-      FROM meetings m WHERE m.id=$1
+      FROM meetings m JOIN projects p ON p.id=m.project_id WHERE m.id=$1
     `, [req.params.id]);
     const meeting = rows[0];
     if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
     if (!await canViewMeeting(req.user, meeting)) return res.status(403).json({ error: 'Access denied to this meeting' });
+    if (meeting.is_draft && !isMeetingPlannerRow(meeting, req.user)) return res.status(404).json({ error: 'Meeting not found' });
     meeting.planned_by_name = (await getMeetingLabels(meeting.project_id)).get(meetingActorKey(meeting.created_role, meeting.created_by)) || null;
     const pdf = await buildMeetingBriefPdf(meeting, meeting.meeting_references || []);
     res.setHeader('Content-Type', 'application/pdf');
@@ -4353,47 +4623,213 @@ app.get('/api/meetings/:id/pdf', authenticateToken, async (req, res) => {
   }
 });
 
+app.get('/api/meetings/:id/ics', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.*, p.name AS project_name FROM meetings m JOIN projects p ON p.id=m.project_id WHERE m.id=$1`,
+      [req.params.id]
+    );
+    const meeting = rows[0];
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
+    if (!await canViewMeeting(req.user, meeting)) return res.status(403).json({ error: 'Access denied to this meeting.' });
+    if (meeting.is_draft) return res.status(409).json({ error: 'Draft meetings cannot be added to a calendar.' });
+    const icsEscape = value => String(value || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
+    const icsDate = value => new Date(value).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+    const contents = [
+      'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//OneProjectApp//Meeting Plan//EN',
+      'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'BEGIN:VEVENT',
+      `UID:meeting-${meeting.id}@oneprojectapp`,
+      `DTSTAMP:${icsDate(new Date())}`,
+      `DTSTART:${icsDate(meeting.scheduled_at)}`,
+      `DTEND:${icsDate(meeting.end_at)}`,
+      `SUMMARY:${icsEscape(meeting.title)}`,
+      `LOCATION:${icsEscape(meeting.location || meeting.virtual_link)}`,
+      `DESCRIPTION:${icsEscape(`${meeting.project_name}\n${meetingHtmlToPlainText(meeting.purpose)}\n${meeting.virtual_link || ''}`)}`,
+      'END:VEVENT', 'END:VCALENDAR',
+    ].join('\r\n');
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="meeting-${meeting.id}.ics"`);
+    return res.send(contents);
+  } catch (err) {
+    console.error('Meeting calendar download error:', err);
+    return res.status(500).json({ error: 'Could not create the calendar file.' });
+  }
+});
+
+app.get('/api/meetings/rsvp', async (req, res) => {
+  const token = String(req.query.token || '');
+  if (!/^[a-f0-9]{64}$/i.test(token)) return res.status(400).send('This invitation link is invalid.');
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const { rows } = await pool.query(
+      `SELECT r.participant_name,m.title,m.scheduled_at,m.time_zone,m.location,m.virtual_link,m.id AS meeting_id
+         FROM meeting_rsvps r JOIN meetings m ON m.id=r.meeting_id
+        WHERE r.token_hash=$1 AND m.is_draft=false AND m.status='scheduled'`,
+      [tokenHash]
+    );
+    if (!rows.length) return res.status(404).send('This invitation has expired or is no longer available.');
+    const meeting = rows[0];
+    const heading = `RSVP for ${escapeMeetingEmail(meeting.title)}`;
+    const form = `<p>Hello ${escapeMeetingEmail(meeting.participant_name)}, please respond to this invitation.</p>
+      <p>${escapeMeetingEmail(formatMeetingWhen(meeting) || '')}<br>${escapeMeetingEmail(meeting.location || meeting.virtual_link || '')}</p>
+      <form method="post" action="/api/meetings/${meeting.meeting_id}/rsvp">
+      <input type="hidden" name="token" value="${escapeMeetingEmail(token)}">
+      <button name="response" value="accepted">Accept</button>
+      <button name="response" value="declined">Decline</button></form>`;
+    return res.type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${heading}</title><main style="font:16px system-ui;max-width:600px;margin:4rem auto;padding:1rem"><h1>${heading}</h1>${form}</main>`);
+  } catch (err) {
+    console.error('External meeting RSVP lookup failed:', err);
+    return res.status(500).send('Could not load this invitation.');
+  }
+});
+
+app.post('/api/meetings/:id/rsvp', express.urlencoded({ extended: false }), async (req, res, next) => {
+  if (req.body?.token) {
+    const token = String(req.body.token);
+    const response = String(req.body.response || '');
+    if (!/^[a-f0-9]{64}$/i.test(token) || !['accepted', 'declined'].includes(response)) {
+      return res.status(400).send('The invitation response is invalid.');
+    }
+    try {
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const { rowCount } = await pool.query(
+        `UPDATE meeting_rsvps r SET response=$1,responded_at=NOW()
+          FROM meetings m
+         WHERE r.meeting_id=m.id AND m.id=$2 AND r.token_hash=$3 AND m.is_draft=false AND m.status='scheduled'`,
+        [response, req.params.id, tokenHash]
+      );
+      if (!rowCount) return res.status(404).send('This invitation has expired or is no longer available.');
+      return res.type('html').send(`<!doctype html><meta charset="utf-8"><title>RSVP saved</title><main style="font:16px system-ui;max-width:600px;margin:4rem auto;padding:1rem"><h1>Response saved</h1><p>Thank you. Your response was recorded as ${response}.</p></main>`);
+    } catch (err) {
+      console.error('External meeting RSVP update failed:', err);
+      return res.status(500).send('Could not save your response.');
+    }
+  }
+  return authenticateToken(req, res, async () => {
+    const response = String(req.body?.response || '');
+    if (!['accepted', 'declined'].includes(response)) return res.status(400).json({ error: 'RSVP must be accepted or declined.' });
+    try {
+      const { rows } = await pool.query('SELECT * FROM meetings WHERE id=$1 AND is_draft=false AND status=$2', [req.params.id, 'scheduled']);
+      const meeting = rows[0];
+      if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
+      const userKey = `project:${req.user.role}:${req.user.user_id}`;
+      const person = (meeting.participant_details || []).find(entry => entry.source === 'project'
+        && String(entry.role).toLowerCase() === String(req.user.role).toLowerCase()
+        && String(entry.role_id) === String(req.user.user_id));
+      if (!person) return res.status(403).json({ error: 'You are not an invitee for this meeting.' });
+      const { rowCount } = await pool.query(
+        'UPDATE meeting_rsvps SET response=$1,responded_at=NOW() WHERE meeting_id=$2 AND participant_key=$3',
+        [response, req.params.id, userKey]
+      );
+      if (!rowCount) return res.status(404).json({ error: 'RSVP record not found.' });
+      return res.json({ success: true, response });
+    } catch (err) {
+      console.error('Internal meeting RSVP failed:', err);
+      return res.status(500).json({ error: 'Could not save your response.' });
+    }
+  });
+});
+
 app.post('/api/meetings', authenticateToken, meetingAttachmentsMiddleware, requireProjectLifecycleWrite, async (req, res) => {
   const { project_id, participants, participant_details } = req.body;
   if (!project_id) return res.status(400).json({ error: 'All required fields must be provided' });
   if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot schedule meetings.' });
-  const parsed = parseMeetingBody(req.body);
+  if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+  const { rows: projectRows } = await pool.query('SELECT name,contract_reference,time_zone FROM projects WHERE id=$1', [project_id]);
+  const project = projectRows[0];
+  if (!project) return res.status(404).json({ error: 'Project not found.' });
+  const parsed = parseMeetingBody(req.body, project.time_zone);
   if (parsed.error) return res.status(400).json({ error: parsed.error });
   const m = parsed.value;
-  if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
   // Who can see a side meeting is decided by the planner's own role, not by the request body.
   if (m.scope === 'side' && !getSide(req.user.role)) return res.status(403).json({ error: 'Only a project side can plan side meetings.' });
   const scopeValue = m.scope === 'side' ? req.user.role : null;
   let participantDetails;
   try { participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants); }
   catch (err) { return res.status(400).json({ error: err.message }); }
-  if (!participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
+  if (!m.is_draft && !participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
+  if (!m.is_draft && participantDetails.some(person => person.source === 'manual' && !person.email)) {
+    return res.status(400).json({ error: 'Add an email address for each external participant before scheduling.' });
+  }
+  let occurrences;
+  try { occurrences = getMeetingOccurrences(m); }
+  catch (err) { return res.status(400).json({ error: err.message }); }
+  if (!m.is_draft && req.body.confirm_conflicts !== 'true') {
+    const conflicts = await findMeetingConflicts(project_id, occurrences, participantDetails, req.user);
+    if (conflicts.length) return res.status(409).json({ error: 'One or more participants have another meeting during this time.', conflicts });
+  }
   const client = await pool.connect();
   const uploaded = [];
+  const createdMeetings = [];
+  const inviteesByMeeting = [];
+  const seriesId = occurrences.length > 1 ? uuidv4() : null;
   try {
     await client.query('BEGIN');
     const participantNames = participantDetails.map(person => person.name).join('\n');
-    const { rows } = await client.query(`INSERT INTO meetings (project_id,meeting_type,title,date_time,scheduled_at,location,participants,participant_details,purpose,agenda,scope,scope_value,created_by,created_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14) RETURNING *`, [project_id,m.meeting_type,m.title,m.date_time,m.scheduledInstant,m.location,participantNames,JSON.stringify(participantDetails),m.purpose,m.agenda,m.scope,scopeValue,req.user.user_id,req.user.role]);
-    const meeting = rows[0];
+    const attachmentRecords = [];
     for (const file of req.files || []) {
       const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
       uploaded.push({ public_id: result.public_id, resource_type: result.resource_type });
-      await client.query(`INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)`, [meeting.id,file.originalname,result.secure_url,result.public_id]);
+      attachmentRecords.push({ name: file.originalname, url: result.secure_url, public_id: result.public_id });
     }
-    const when = formatMeetingWhen({ date_time_local: m.date_time }) || m.date_time;
-    const notifMsg = m.scope === 'side'
-      ? `New ${m.meeting_type} meeting scheduled by ${req.user.role} for ${getSide(req.user.role)} side: "${m.title}" on ${when}`
-      : `New ${m.meeting_type} meeting scheduled by ${req.user.role}: "${m.title}" on ${when}`;
-    await notifyMeetingChange(client, meeting, req.user, notifMsg);
+    for (let index = 0; index < occurrences.length; index += 1) {
+      const occurrence = occurrences[index];
+      const startInstant = m.is_draft ? null : meetingLocalTimeToUtc(occurrence.start, m.time_zone);
+      const endInstant = m.is_draft ? null : meetingLocalTimeToUtc(occurrence.end, m.time_zone);
+      const recurrenceRule = m.recurrence_frequency
+        ? { frequency: m.recurrence_frequency, until: m.recurrence_until }
+        : null;
+      const { rows } = await client.query(
+        `INSERT INTO meetings
+          (project_id,meeting_type,title,meeting_number,date_time,scheduled_at,end_at,time_zone,location,virtual_link,safety_notes,
+           participants,participant_details,purpose,agenda,agenda_items,chairperson,minute_taker,scope,scope_value,created_by,created_role,is_draft,
+           recurrence_group,recurrence_rule)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16::jsonb,$17,$18,$19,$20,$21,$22,$23,$24,$25::jsonb)
+         RETURNING *`,
+        [project_id,m.meeting_type,m.title,m.meeting_number || null,occurrence.start,startInstant,endInstant,m.time_zone,
+          m.location || '',m.virtual_link || null,m.safety_notes || null,participantNames,JSON.stringify(participantDetails),
+          m.purpose,m.agenda,JSON.stringify(m.agenda_items),m.chairperson || null,m.minute_taker || null,m.scope,scopeValue,
+          req.user.user_id,req.user.role,m.is_draft,seriesId,recurrenceRule ? JSON.stringify(recurrenceRule) : null]
+      );
+      const meeting = { ...rows[0], project_name: project.name, project_reference: project.contract_reference };
+      createdMeetings.push(meeting);
+      const invitees = m.is_draft ? [] : await createMeetingRsvps(client, meeting, participantDetails);
+      inviteesByMeeting.push(invitees);
+      for (const file of attachmentRecords) {
+        await client.query(
+          'INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)',
+          [meeting.id,file.name,file.url,file.public_id]
+        );
+      }
+      if (!m.is_draft) {
+        const when = formatMeetingWhen(meeting) || occurrence.start;
+        const notifMsg = m.scope === 'side'
+          ? `New ${m.meeting_type} meeting scheduled by ${req.user.role} for ${getSide(req.user.role)} side: "${m.title}" on ${when}`
+          : `New ${m.meeting_type} meeting scheduled by ${req.user.role}: "${m.title}" on ${when}`;
+        await notifyMeetingChange(client, meeting, req.user, notifMsg);
+      }
+    }
     await client.query('COMMIT');
-    res.status(201).json(meeting);
+    const apiBase = String(process.env.PUBLIC_API_URL || 'https://oneprojectapp-backend.onrender.com').replace(/\/$/, '');
+    const failedInvitations = [];
+    for (let index = 0; index < createdMeetings.length; index += 1) {
+      if (inviteesByMeeting[index].length) {
+        failedInvitations.push(...await sendMeetingInvitations(createdMeetings[index], inviteesByMeeting[index], apiBase));
+      }
+    }
+    res.status(201).json({
+      meeting: createdMeetings[0],
+      occurrences: createdMeetings.length,
+      notification_warnings: failedInvitations.length ? [`Could not email these external invitees: ${failedInvitations.join(', ')}`] : [],
+    });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     await destroyUploadedMeetingFiles(uploaded);
     console.error('POST /api/meetings:', err);
-    const schemaOutOfDate = err.code === '42703' && /scheduled_at|participant_details|purpose/.test(err.message || '');
+    const schemaOutOfDate = ['42703', '42P01'].includes(err.code)
+      && /scheduled_at|participant_details|purpose|time_zone|end_at|agenda_items|meeting_rsvps|is_draft|meeting_number|virtual_link|safety_notes|chairperson|minute_taker|recurrence_group|recurrence_rule/.test(err.message || '');
     res.status(500).json({ error: schemaOutOfDate
-      ? 'Meeting database schema is out of date. Run backend/migrations/2026-10-09-meeting-invitation-details.sql and retry.'
+      ? `Meeting database schema is out of date. Run ${MEETING_PROFESSIONAL_MIGRATION} and retry.`
       : 'Failed to create meeting' });
   } finally { client.release(); }
 });
@@ -4402,13 +4838,16 @@ app.put('/api/meetings/:id', authenticateToken, meetingAttachmentsMiddleware, re
   const { project_id, participants, participant_details } = req.body;
   if (!project_id) return res.status(400).json({ error: 'All required fields must be provided' });
   if (normalizeRole(req.user.role) === 'TeamMember') return res.status(403).json({ error: 'Team members cannot edit meetings.' });
-  const parsed = parseMeetingBody(req.body);
-  if (parsed.error) return res.status(400).json({ error: parsed.error });
-  const m = parsed.value;
   const client = await pool.connect();
   const uploaded = [];
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, project_id)) return res.status(403).json({ error: 'Access denied to this project' });
+    const { rows: projectRows } = await client.query('SELECT name,contract_reference,time_zone FROM projects WHERE id=$1', [project_id]);
+    const project = projectRows[0];
+    if (!project) return res.status(404).json({ error: 'Project not found.' });
+    const parsed = parseMeetingBody(req.body, project.time_zone);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const m = parsed.value;
     const { rows: existingRows } = await client.query('SELECT * FROM meetings WHERE id=$1 AND project_id=$2', [req.params.id, project_id]);
     const existing = existingRows[0];
     if (!existing) return res.status(404).json({ error: 'Meeting not found' });
@@ -4417,27 +4856,57 @@ app.put('/api/meetings/:id', authenticateToken, meetingAttachmentsMiddleware, re
     let participantDetails;
     try { participantDetails = await normalizeMeetingParticipants(project_id, participant_details, participants); }
     catch (err) { return res.status(400).json({ error: err.message }); }
-    if (!participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
+    if (!m.is_draft && !participantDetails.length) return res.status(400).json({ error: 'Select or add at least one participant' });
+    if (!m.is_draft && participantDetails.some(person => person.source === 'manual' && !person.email)) {
+      return res.status(400).json({ error: 'Add an email address for each external participant before scheduling.' });
+    }
+    if (!m.is_draft && req.body.confirm_conflicts !== 'true') {
+      const conflicts = await findMeetingConflicts(project_id, [{ start: m.date_time, end: m.end_time, time_zone: m.time_zone }], participantDetails, req.user, existing.id);
+      if (conflicts.length) return res.status(409).json({ error: 'One or more participants have another meeting during this time.', conflicts });
+    }
 
     await client.query('BEGIN');
     // Scope and side stay as they were planned; they cannot be changed from the request body.
-    const { rows } = await client.query(`UPDATE meetings SET meeting_type=$1,title=$2,date_time=$3,scheduled_at=$4,location=$5,participants=$6,participant_details=$7::jsonb,purpose=$8,agenda=$9 WHERE id=$10 AND project_id=$11 RETURNING *`, [m.meeting_type,m.title,m.date_time,m.scheduledInstant,m.location,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),m.purpose,m.agenda,req.params.id,project_id]);
+    const { rows } = await client.query(
+      `UPDATE meetings SET meeting_type=$1,title=$2,meeting_number=$3,date_time=$4,scheduled_at=$5,end_at=$6,time_zone=$7,
+        location=$8,virtual_link=$9,safety_notes=$10,participants=$11,participant_details=$12::jsonb,purpose=$13,agenda=$14,
+        agenda_items=$15::jsonb,chairperson=$16,minute_taker=$17,is_draft=$18
+       WHERE id=$19 AND project_id=$20 RETURNING *`,
+      [m.meeting_type,m.title,m.meeting_number || null,m.date_time,m.scheduledInstant,m.endInstant,m.time_zone,m.location || '',
+        m.virtual_link || null,m.safety_notes || null,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),
+        m.purpose,m.agenda,JSON.stringify(m.agenda_items),m.chairperson || null,m.minute_taker || null,m.is_draft,req.params.id,project_id]
+    );
+    await client.query('DELETE FROM meeting_rsvps WHERE meeting_id=$1 AND NOT (participant_key = ANY($2::text[]))',
+      [req.params.id, participantDetails.map(participantKey)]);
+    const meeting = { ...rows[0], project_name: project.name, project_reference: project.contract_reference };
+    const invitees = m.is_draft ? [] : await createMeetingRsvps(client, meeting, participantDetails);
     for (const file of req.files || []) {
       const result = await uploadToCloudinary(file.buffer, 'meeting_attachments');
       uploaded.push({ public_id: result.public_id, resource_type: result.resource_type });
       await client.query('INSERT INTO meeting_attachments (meeting_id,name,url,public_id) VALUES ($1,$2,$3,$4)', [req.params.id,file.originalname,result.secure_url,result.public_id]);
     }
-    const when = formatMeetingWhen({ date_time_local: m.date_time }) || m.date_time;
-    await notifyMeetingChange(client, rows[0], req.user, `Meeting updated by ${req.user.role}: "${m.title}" is now on ${when}`);
+    if (!m.is_draft) {
+      const when = formatMeetingWhen(meeting) || m.date_time;
+      await notifyMeetingChange(client, meeting, req.user, `Meeting updated by ${req.user.role}: "${m.title}" is now on ${when}`);
+    }
     await client.query('COMMIT');
-    return res.json(rows[0]);
+    let failedInvitations = [];
+    if (invitees.length) {
+      const apiBase = String(process.env.PUBLIC_API_URL || 'https://oneprojectapp-backend.onrender.com').replace(/\/$/, '');
+      failedInvitations = await sendMeetingInvitations(meeting, invitees, apiBase);
+    }
+    return res.json({
+      ...meeting,
+      notification_warnings: failedInvitations.length ? [`Could not email these external invitees: ${failedInvitations.join(', ')}`] : [],
+    });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     await destroyUploadedMeetingFiles(uploaded);
     console.error('PUT /api/meetings/:id:', err);
-    const schemaOutOfDate = err.code === '42703' && /scheduled_at|participant_details|purpose/.test(err.message || '');
+    const schemaOutOfDate = ['42703', '42P01'].includes(err.code)
+      && /scheduled_at|participant_details|purpose|time_zone|end_at|agenda_items|meeting_rsvps|is_draft|meeting_number|virtual_link|safety_notes|chairperson|minute_taker|recurrence_group|recurrence_rule/.test(err.message || '');
     return res.status(500).json({ error: schemaOutOfDate
-      ? 'Meeting database schema is out of date. Run backend/migrations/2026-10-09-meeting-invitation-details.sql and retry.'
+      ? `Meeting database schema is out of date. Run ${MEETING_PROFESSIONAL_MIGRATION} and retry.`
       : 'Failed to update meeting' });
   } finally { client.release(); }
 });
@@ -6406,7 +6875,7 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
 
     // ── Project base fields ──────────────────────────────────────────────────
     const projRes = await pool.query(
-      `SELECT id, name, location, contract_reference, created_at
+      `SELECT id, name, location, contract_reference, time_zone, created_at
        FROM projects WHERE id = $1`,
       [projectId]
     );
@@ -6526,11 +6995,13 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
 // Edit project base fields (name, location, contract_reference).
 // Only Client / ClientPM can call this (enforced in frontend + here).
 app.post('/api/project-edit', authenticateToken, async (req, res) => {
-  const { projectId, name, location, contract_reference } = req.body;
+  const { projectId, name, location, contract_reference, time_zone } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid) return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
   if (!name || !location || !contract_reference)
     return res.status(400).json({ success: false, error: 'name, location and contract_reference are required.' });
+  if (time_zone && !isValidMeetingTimeZone(String(time_zone).trim()))
+    return res.status(400).json({ success: false, error: 'Enter a valid IANA time zone, such as Europe/London.' });
 
   // Only client-side roles may edit project base fields
   const userSide = getSide(req.user.role);
@@ -6555,9 +7026,9 @@ app.post('/api/project-edit', authenticateToken, async (req, res) => {
       return res.status(409).json({ success: false, error: 'Another project with this name already exists.' });
 
     await pool.query(
-      `UPDATE projects SET name = $1, location = $2, contract_reference = $3
-       WHERE id = $4`,
-      [name, location, contract_reference, pid]
+      `UPDATE projects SET name = $1, location = $2, contract_reference = $3, time_zone = $4
+       WHERE id = $5`,
+      [name, location, contract_reference, String(time_zone || '').trim() || null, pid]
     );
 
     return res.json({ success: true, message: 'Project info updated.' });
@@ -7421,11 +7892,57 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+async function sendDueMeetingReminders() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT r.id AS rsvp_id,r.participant_name,r.participant_email,r.participant_source,r.token_hash,
+              m.id,m.title,m.scheduled_at,m.time_zone,m.location,m.virtual_link
+         FROM meeting_rsvps r JOIN meetings m ON m.id=r.meeting_id
+        WHERE m.is_draft=false AND m.status='scheduled' AND r.response='pending'
+          AND r.reminder_sent_at IS NULL AND r.participant_email IS NOT NULL
+          AND m.scheduled_at > NOW() + INTERVAL '23 hours'
+          AND m.scheduled_at <= NOW() + INTERVAL '25 hours'
+        ORDER BY m.scheduled_at LIMIT 100`
+    );
+    const apiBase = String(process.env.PUBLIC_API_URL || 'https://oneprojectapp-backend.onrender.com').replace(/\/$/, '');
+    const frontendBase = String(process.env.FRONTEND_URL || 'https://oneprojectapp.onrender.com').replace(/\/$/, '');
+    for (const invitee of rows) {
+      const token = invitee.participant_source === 'manual' ? crypto.randomBytes(32).toString('hex') : null;
+      if (token) {
+        await pool.query('UPDATE meeting_rsvps SET token_hash=$1 WHERE id=$2',
+          [crypto.createHash('sha256').update(token).digest('hex'), invitee.rsvp_id]);
+      }
+      const rsvpUrl = token
+        ? `${apiBase}/api/meetings/rsvp?token=${encodeURIComponent(token)}`
+        : `${frontendBase}/dashboard.html`;
+      try {
+        await transporter.sendMail({
+          from: 'skyprincenkp16@gmail.com',
+          to: invitee.participant_email,
+          subject: `Reminder: ${invitee.title}`,
+          text: `${invitee.title}\n${formatMeetingWhen(invitee)}\n${invitee.location || invitee.virtual_link || ''}\nRSVP: ${rsvpUrl}`,
+          html: `<p>Reminder: <strong>${escapeMeetingEmail(invitee.title)}</strong></p><p>${escapeMeetingEmail(formatMeetingWhen(invitee) || '')}</p><p><a href="${escapeMeetingEmail(rsvpUrl)}">Respond to this invitation</a></p>`,
+        });
+        await pool.query('UPDATE meeting_rsvps SET reminder_sent_at=NOW() WHERE id=$1', [invitee.rsvp_id]);
+      } catch (error) {
+        console.error('Meeting reminder email failed:', invitee.participant_email, error);
+      }
+    }
+  } catch (error) {
+    console.error('Meeting reminder job failed:', error);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  START
 // ─────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+
+setTimeout(() => {
+  sendDueMeetingReminders();
+  setInterval(sendDueMeetingReminders, 15 * 60 * 1000);
+}, 30 * 1000);
 
 setInterval(() => {
   fetch('https://oneprojectapp-backend.onrender.com/')
