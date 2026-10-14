@@ -3774,52 +3774,49 @@ async function resolvePositionAndSideForStamp(projectId, userId, role) {
 
 async function resolveCompanyNameForStamp(projectId, userId, role) {
   try {
-    if (role === 'Client') {
+    const normalizedRole = normalizeRole(role);
+    let companyRole = normalizedRole;
+
+    if (normalizedRole === 'TeamMember') {
       const { rows } = await pool.query(
-        `SELECT c.company_name FROM projects p
-         JOIN clients c ON p.client_id = c.id
-         WHERE p.id=$1 LIMIT 1`,
-        [projectId]
-      );
-      return rows[0]?.company_name || null;
-    } else if (role === 'Contractor') {
-      const { rows } = await pool.query(
-        `SELECT ca.company_name FROM contractor_assignments ca
-         WHERE ca.project_id=$1 AND ca.contractor_id=$2 LIMIT 1`,
+        `SELECT assigned_part FROM team_member_assignments
+         WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`,
         [projectId, userId]
       );
-      return rows[0]?.company_name || null;
-    } else if (role === 'Consultant') {
-      const { rows } = await pool.query(
-        `SELECT ca.company_name FROM consultant_assignments ca
-         WHERE ca.project_id=$1 AND ca.consultant_id=$2 LIMIT 1`,
-        [projectId, userId]
-      );
-      return rows[0]?.company_name || null;
-    } else if (role === 'ClientPM') {
-      const { rows } = await pool.query(
-        `SELECT c.company_name FROM projects p
-         JOIN clients c ON p.client_id = c.id
-         WHERE p.id=$1 LIMIT 1`,
-        [projectId]
-      );
-      return rows[0]?.company_name || 'Client Project Manager';
-    } else if (role === 'ContractorPM') {
-      const { rows } = await pool.query(
-        `SELECT ca.company_name FROM contractor_assignments ca
-         WHERE ca.project_id=$1 LIMIT 1`,
-        [projectId]
-      );
-      return rows[0]?.company_name || 'Contractor Project Manager';
-    } else if (role === 'ConsultantPM') {
-      const { rows } = await pool.query(
-        `SELECT ca.company_name FROM consultant_assignments ca
-         WHERE ca.project_id=$1 LIMIT 1`,
-        [projectId]
-      );
-      return rows[0]?.company_name || 'Consultant Project Manager';
+      const side = rows[0]?.assigned_part;
+      const normalizedSide = getSide(side);
+      companyRole = normalizedSide
+        ? `${normalizedSide[0].toUpperCase()}${normalizedSide.slice(1)}`
+        : null;
     }
-    // Other roles don't have company_name in schema
+
+    if (companyRole === 'Client' || companyRole === 'ClientPM') {
+      const { rows } = await pool.query(
+        `SELECT c.company_name FROM projects p
+         JOIN clients c ON p.client_id = c.id
+         WHERE p.id=$1 LIMIT 1`,
+        [projectId]
+      );
+      return rows[0]?.company_name || null;
+    } else if (companyRole === 'Contractor' || companyRole === 'ContractorPM') {
+      const { rows } = await pool.query(
+        `SELECT ca.company_name FROM contractor_assignments ca
+         WHERE ca.project_id=$1
+           AND ($2::boolean OR ca.contractor_id=$3)
+         LIMIT 1`,
+        [projectId, companyRole === 'ContractorPM', userId]
+      );
+      return rows[0]?.company_name || null;
+    } else if (companyRole === 'Consultant' || companyRole === 'ConsultantPM') {
+      const { rows } = await pool.query(
+        `SELECT ca.company_name FROM consultant_assignments ca
+         WHERE ca.project_id=$1
+           AND ($2::boolean OR ca.consultant_id=$3)
+         LIMIT 1`,
+        [projectId, companyRole === 'ConsultantPM', userId]
+      );
+      return rows[0]?.company_name || null;
+    }
     return null;
   } catch (err) {
     console.warn('resolveCompanyNameForStamp error:', err.message);
