@@ -4250,7 +4250,7 @@ function parseMeetingBody(body, projectTimeZone = '') {
     recurrence_until: clean(body.recurrence_until),
   };
   if (!meeting.is_draft && (!meeting.meeting_type || !meeting.title || !meeting.date_time || !meeting.end_time
-    || !meeting.purpose || !meeting.scope)) {
+    || !meeting.purpose || !meeting.scope || !meeting.chairperson || !meeting.minute_taker)) {
     return { error: 'All required fields must be provided' };
   }
   if (!MEETING_TYPES.includes(meeting.meeting_type)) return { error: 'Meeting type must be site, office or virtual.' };
@@ -4259,14 +4259,20 @@ function parseMeetingBody(body, projectTimeZone = '') {
   if (!meeting.is_draft && !isValidMeetingTimeZone(meeting.time_zone)) return { error: 'Choose a valid project time zone.' };
   if (meeting.is_draft && !meeting.time_zone) meeting.time_zone = 'UTC';
   if (!isValidMeetingTimeZone(meeting.time_zone)) return { error: 'Choose a valid project time zone.' };
-  if (!meeting.is_draft && meeting.meeting_type === 'virtual') {
+  if (meeting.virtual_link) {
     try {
       const parsedLink = new URL(meeting.virtual_link);
       if (!['https:', 'http:'].includes(parsedLink.protocol)) throw new Error('invalid protocol');
     } catch {
       return { error: 'Enter a valid virtual meeting link.' };
     }
-  } else if (!meeting.is_draft && !meeting.location) return { error: 'Enter the meeting location.' };
+  }
+  if (!meeting.is_draft && meeting.meeting_type === 'virtual' && !meeting.virtual_link) {
+    return { error: 'Enter a valid virtual meeting link.' };
+  }
+  if (!meeting.is_draft && meeting.meeting_type !== 'virtual' && !meeting.location) {
+    return { error: 'Enter the meeting location.' };
+  }
   let agendaItems;
   try { agendaItems = meeting.agenda_items ? typeof meeting.agenda_items === 'string' ? JSON.parse(meeting.agenda_items) : meeting.agenda_items : []; }
   catch { return { error: 'Agenda data is invalid.' }; }
@@ -4463,7 +4469,20 @@ async function buildMeetingBriefPdf(meeting, references = []) {
     const maxWidth = 516 - indent;
     const paragraphs = pdfPlainText(value).split('\n');
     for (const paragraph of paragraphs) {
-      const words = paragraph.split(/\s+/).filter(Boolean);
+      const words = paragraph.split(/\s+/).filter(Boolean).flatMap(word => {
+        if (font.widthOfTextAtSize(word, size) <= maxWidth) return [word];
+        const chunks = [];
+        let chunk = '';
+        for (const character of word) {
+          const candidate = chunk + character;
+          if (chunk && font.widthOfTextAtSize(candidate, size) > maxWidth) {
+            chunks.push(chunk);
+            chunk = character;
+          } else chunk = candidate;
+        }
+        if (chunk) chunks.push(chunk);
+        return chunks;
+      });
       let line = '';
       const lines = [];
       for (const word of words) {
@@ -4573,7 +4592,7 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
           'version',to_jsonb(mm)->>'report_version',
           'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
         (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments,
-        (SELECT COALESCE(json_agg(json_build_object('participant_key',r.participant_key,'participant_name',r.participant_name,'response',r.response,'participant_source',r.participant_source)),'[]')
+        (SELECT COALESCE(json_agg(json_build_object('participant_key',r.participant_key,'participant_name',r.participant_name,'response',r.response,'participant_source',r.participant_source,'participant_role',r.participant_role,'participant_role_id',r.participant_role_id)),'[]')
          FROM meeting_rsvps r WHERE r.meeting_id=m.id) AS rsvps,
         (SELECT COUNT(*) + 1 FROM meetings recurring WHERE recurring.recurrence_group=m.recurrence_group
            AND recurring.scheduled_at < m.scheduled_at) AS series_index
@@ -4630,20 +4649,40 @@ app.get('/api/meetings/:id/ics', authenticateToken, async (req, res) => {
     if (!meeting) return res.status(404).json({ error: 'Meeting not found.' });
     if (!await canViewMeeting(req.user, meeting)) return res.status(403).json({ error: 'Access denied to this meeting.' });
     if (meeting.is_draft) return res.status(409).json({ error: 'Draft meetings cannot be added to a calendar.' });
-    const icsEscape = value => String(value || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
+    const icsEscape = value => String(value || '').replace(/\\/g, '\\\\').replace(/\r\n|\r|\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
     const icsDate = value => new Date(value).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+    const foldIcsLine = line => {
+      const chunks = [];
+      let chunk = '';
+      let bytes = 0;
+      for (const character of line) {
+        const characterBytes = Buffer.byteLength(character, 'utf8');
+        if (bytes + characterBytes > 75) {
+          chunks.push(chunk);
+          chunk = ` ${character}`;
+          bytes = 1 + characterBytes;
+        } else {
+          chunk += character;
+          bytes += characterBytes;
+        }
+      }
+      chunks.push(chunk);
+      return chunks.join('\r\n');
+    };
+    const cancelled = isMeetingCancelled(meeting);
     const contents = [
       'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//OneProjectApp//Meeting Plan//EN',
-      'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', 'BEGIN:VEVENT',
+      'CALSCALE:GREGORIAN', `METHOD:${cancelled ? 'CANCEL' : 'PUBLISH'}`, 'BEGIN:VEVENT',
       `UID:meeting-${meeting.id}@oneprojectapp`,
       `DTSTAMP:${icsDate(new Date())}`,
       `DTSTART:${icsDate(meeting.scheduled_at)}`,
       `DTEND:${icsDate(meeting.end_at)}`,
+      ...(cancelled ? ['STATUS:CANCELLED'] : []),
       `SUMMARY:${icsEscape(meeting.title)}`,
       `LOCATION:${icsEscape(meeting.location || meeting.virtual_link)}`,
       `DESCRIPTION:${icsEscape(`${meeting.project_name}\n${meetingHtmlToPlainText(meeting.purpose)}\n${meeting.virtual_link || ''}`)}`,
       'END:VEVENT', 'END:VCALENDAR',
-    ].join('\r\n');
+    ].map(foldIcsLine).join('\r\n');
     res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="meeting-${meeting.id}.ics"`);
     return res.send(contents);
@@ -4873,6 +4912,15 @@ app.put('/api/meetings/:id', authenticateToken, meetingAttachmentsMiddleware, re
         m.virtual_link || null,m.safety_notes || null,participantDetails.map(person => person.name).join('\n'),JSON.stringify(participantDetails),
         m.purpose,m.agenda,JSON.stringify(m.agenda_items),m.chairperson || null,m.minute_taker || null,m.is_draft,req.params.id,project_id]
     );
+    const meetingTimeChanged = !existing.is_draft && !m.is_draft
+      && (new Date(existing.scheduled_at).getTime() !== m.scheduledInstant.getTime()
+        || new Date(existing.end_at).getTime() !== m.endInstant.getTime());
+    if (meetingTimeChanged) {
+      await client.query(
+        `UPDATE meeting_rsvps SET response='pending',responded_at=NULL,reminder_sent_at=NULL WHERE meeting_id=$1`,
+        [req.params.id]
+      );
+    }
     await client.query('DELETE FROM meeting_rsvps WHERE meeting_id=$1 AND NOT (participant_key = ANY($2::text[]))',
       [req.params.id, participantDetails.map(participantKey)]);
     const meeting = { ...rows[0], project_name: project.name, project_reference: project.contract_reference };
@@ -4926,6 +4974,11 @@ app.patch('/api/meetings/:id/cancel', authenticateToken, requireProjectLifecycle
     if (isMeetingCancelled(meeting)) return res.status(409).json({ error: 'This meeting is already cancelled.' });
     const when = new Date(meeting.scheduled_at || meeting.date_time);
     if (Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) return res.status(400).json({ error: 'Only upcoming meetings can be cancelled.' });
+    const { rows: externalInvitees } = await pool.query(
+      `SELECT participant_name,participant_email FROM meeting_rsvps
+        WHERE meeting_id=$1 AND participant_source='manual' AND participant_email IS NOT NULL`,
+      [req.params.id]
+    );
 
     client = await pool.connect();
     await client.query('BEGIN');
@@ -4935,7 +4988,26 @@ app.patch('/api/meetings/:id/cancel', authenticateToken, requireProjectLifecycle
     await notifyMeetingChange(client, rows[0], req.user,
       `Meeting cancelled by ${req.user.role}: "${meeting.title}" (was ${formatMeetingWhen(meeting) || 'scheduled'})${reason ? `. Reason: ${reason}` : ''}`);
     await client.query('COMMIT');
-    return res.json(rows[0]);
+    const cancellationResults = await Promise.allSettled(externalInvitees.map(invitee =>
+      Promise.resolve().then(() => transporter.sendMail({
+        from: 'skyprincenkp16@gmail.com',
+        to: invitee.participant_email,
+        subject: `Cancelled: ${meeting.title}`,
+        text: `The meeting "${meeting.title}" has been cancelled.${reason ? `\nReason: ${reason}` : ''}`,
+        html: `<p>The meeting <strong>${escapeMeetingEmail(meeting.title)}</strong> has been cancelled.</p>${reason ? `<p>Reason: ${escapeMeetingEmail(reason)}</p>` : ''}`,
+      }))
+    ));
+    const notificationWarnings = cancellationResults.flatMap((result, index) => {
+      if (result.status === 'fulfilled') return [];
+      console.error('Meeting cancellation email failed:', externalInvitees[index].participant_email, result.reason);
+      return [externalInvitees[index].participant_email];
+    });
+    return res.json({
+      ...rows[0],
+      notification_warnings: notificationWarnings.length
+        ? [`Could not email these external invitees: ${notificationWarnings.join(', ')}`]
+        : [],
+    });
   } catch (err) {
     if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('PATCH /api/meetings/:id/cancel:', err);
@@ -4962,6 +5034,7 @@ async function saveMeetingMinutePdf(req, res, replaceExisting) {
     if (!isMeetingPlannerRow(meeting, req.user)) {
       return res.status(403).json({ error: 'Only the meeting planner can edit its meeting report' });
     }
+    if (meeting.is_draft) return res.status(409).json({ error: 'A draft meeting cannot have a report.' });
     if (isMeetingCancelled(meeting)) return res.status(409).json({ error: 'A cancelled meeting cannot have a report.' });
     const heldAt = new Date(meeting.scheduled_at || meeting.date_time);
     if (!Number.isNaN(heldAt.getTime()) && heldAt.getTime() > Date.now()) {
