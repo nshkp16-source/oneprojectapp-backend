@@ -4259,6 +4259,7 @@ function parseMeetingBody(body, projectTimeZone = '') {
   if (!meeting.is_draft && !isValidMeetingTimeZone(meeting.time_zone)) return { error: 'Choose a valid project time zone.' };
   if (meeting.is_draft && !meeting.time_zone) meeting.time_zone = 'UTC';
   if (!isValidMeetingTimeZone(meeting.time_zone)) return { error: 'Choose a valid project time zone.' };
+  if (meeting.meeting_type !== 'virtual') meeting.virtual_link = '';
   if (meeting.virtual_link) {
     try {
       const parsedLink = new URL(meeting.virtual_link);
@@ -4521,7 +4522,7 @@ async function buildMeetingBriefPdf(meeting, references = []) {
   section('Meeting type', MEETING_TYPE_LABELS[meeting.meeting_type] || meeting.meeting_type);
   section('Date and time', meeting.is_draft ? 'Not scheduled (draft)' : formatMeetingWhen(meeting));
   if (meeting.end_at) section('End time', formatMeetingWhen({ scheduled_at: meeting.end_at, time_zone: meeting.time_zone }));
-  section('Location / access details', meeting.location || '—');
+  if (meeting.location || meeting.meeting_type !== 'virtual') section('Location / access details', meeting.location || '—');
   if (meeting.virtual_link) section('Virtual meeting link', meeting.virtual_link);
   if (meeting.safety_notes) section('Site access / safety notes', meeting.safety_notes);
   section('Visibility', meeting.scope === 'side'
@@ -4532,7 +4533,7 @@ async function buildMeetingBriefPdf(meeting, references = []) {
   if (meeting.minute_taker) section('Minute-taker', meeting.minute_taker);
   section('Purpose', meetingHtmlToPlainText(meeting.purpose));
   const selected = Array.isArray(meeting.participant_details) && meeting.participant_details.length
-    ? meeting.participant_details.map(person => `${person.name || 'Project participant'}${person.email ? ` <${person.email}>` : ''} (${person.attendance_type || 'required'})`).join('\n')
+    ? meeting.participant_details.map(person => `${person.name || 'Project participant'}${person.email ? ` <${person.email}>` : ''} (${{ required: 'required', optional: 'optional', information: 'for information' }[person.attendance_type] || 'required'})`).join('\n')
     : meeting.participants;
   section('Participants', selected);
   const agendaText = Array.isArray(meeting.agenda_items) && meeting.agenda_items.length
@@ -4755,7 +4756,7 @@ app.post('/api/meetings/:id/rsvp', express.urlencoded({ extended: false }), asyn
       if (!person) return res.status(403).json({ error: 'You are not an invitee for this meeting.' });
       const { rowCount } = await pool.query(
         'UPDATE meeting_rsvps SET response=$1,responded_at=NOW() WHERE meeting_id=$2 AND participant_key=$3',
-        [response, req.params.id, userKey]
+        [response, req.params.id, `project:${person.role}:${person.role_id}`]
       );
       if (!rowCount) return res.status(404).json({ error: 'RSVP record not found.' });
       return res.json({ success: true, response });
@@ -4988,13 +4989,14 @@ app.patch('/api/meetings/:id/cancel', authenticateToken, requireProjectLifecycle
     await notifyMeetingChange(client, rows[0], req.user,
       `Meeting cancelled by ${req.user.role}: "${meeting.title}" (was ${formatMeetingWhen(meeting) || 'scheduled'})${reason ? `. Reason: ${reason}` : ''}`);
     await client.query('COMMIT');
+    const cancelWhen = formatMeetingWhen(meeting) || '';
     const cancellationResults = await Promise.allSettled(externalInvitees.map(invitee =>
       Promise.resolve().then(() => transporter.sendMail({
         from: 'skyprincenkp16@gmail.com',
         to: invitee.participant_email,
         subject: `Cancelled: ${meeting.title}`,
-        text: `The meeting "${meeting.title}" has been cancelled.${reason ? `\nReason: ${reason}` : ''}`,
-        html: `<p>The meeting <strong>${escapeMeetingEmail(meeting.title)}</strong> has been cancelled.</p>${reason ? `<p>Reason: ${escapeMeetingEmail(reason)}</p>` : ''}`,
+        text: `The meeting "${meeting.title}"${cancelWhen ? ` on ${cancelWhen}` : ''} has been cancelled.${reason ? `\nReason: ${reason}` : ''}`,
+        html: `<p>The meeting <strong>${escapeMeetingEmail(meeting.title)}</strong>${cancelWhen ? ` on ${escapeMeetingEmail(cancelWhen)}` : ''} has been cancelled.</p>${reason ? `<p>Reason: ${escapeMeetingEmail(reason)}</p>` : ''}`,
       }))
     ));
     const notificationWarnings = cancellationResults.flatMap((result, index) => {
@@ -5048,6 +5050,9 @@ async function saveMeetingMinutePdf(req, res, replaceExisting) {
     const labels = await getMeetingLabels(projectId);
     meeting.planned_by_name = labels.get(meetingActorKey(meeting.created_role, meeting.created_by)) || null;
     const { rows: referenceRows } = await pool.query('SELECT name FROM meeting_attachments WHERE meeting_id=$1 AND minute_id IS NULL ORDER BY id', [meetingId]);
+    const { rows: projectRows } = await pool.query('SELECT name, contract_reference FROM projects WHERE id=$1', [projectId]);
+    meeting.project_name = projectRows[0]?.name || null;
+    meeting.project_reference = projectRows[0]?.contract_reference || null;
     const mergedPdf = await buildMergedMeetingReportPdf(meeting, referenceRows, req.file.buffer);
     uploadedPdf = await uploadToCloudinary(mergedPdf, 'meeting_attachments', 'raw');
 
