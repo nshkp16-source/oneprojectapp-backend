@@ -430,20 +430,25 @@ async function loadSignerProfile(projectId, role, userId) {
 }
 
 // Plain-language reason a signer cannot sign yet (null when their setup is complete).
+// A company stamp IMAGE is required only for the styles that print one (three-part, signature-stamp);
+// the compact style needs just the signature.
+const STAMP_STYLES_WITH_IMAGE = ['three-part', 'signature-stamp'];
 async function explainMissingSignerSetup(projectId, role, userId, needStamp) {
   const { rows } = await pool.query(
-    `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
+    `SELECT signature_image, stamp_image_url, stamp_style FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
     [userId, role, projectId]
   );
   const st = rows[0];
-  const how = ' Open your Signature & Stamp setup for this project, add it, save, then try again.';
-  if (!st || (!st.signature_image && !(needStamp && st.stamp_image_url))) {
-    return needStamp
-      ? 'You have not set up your signature and company stamp for this project, so the decision cannot be signed.' + how
-      : 'You have not set up your signature for this project, so your review cannot be signed.' + how;
+  const how = ' Open your Signature & Stamp setup for this project, save it, then try again.';
+  if (!st) {
+    return (needStamp
+      ? 'You have not set up your signature for this project, so the decision cannot be signed.'
+      : 'You have not set up your signature for this project, so your review cannot be signed.') + how;
   }
   if (!st.signature_image) return 'Your signature image is missing for this project, so it cannot be signed.' + how;
-  if (needStamp && !st.stamp_image_url) return 'Your company stamp is missing for this project. A decision must carry your signature and company stamp.' + how;
+  if (needStamp && STAMP_STYLES_WITH_IMAGE.includes(st.stamp_style) && !st.stamp_image_url) {
+    return 'Your stamp style includes a company stamp, but no company stamp image is saved for this project. Upload it in your Signature & Stamp setup, or switch to the compact style.' + how;
+  }
   return null;
 }
 
@@ -648,11 +653,12 @@ async function drawNoticeAnnex(pdfDoc, ctx, queries) {
   drawFingerprint(L, ctx);
 }
 
-async function appendSignaturePage(pdfDoc, ctx, slots) {
+async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
   const L = await createLayout(pdfDoc);
-  L.text('Signatures', { size: 15, font: L.bold, gap: 2 });
+  L.text(opts.heading || 'Signatures', { size: 15, font: L.bold, gap: 2 });
   L.text(`${ctx.kindTitle}. Record #${ctx.rec.id}: ${ctx.rec.title}`, { size: 9.5, color: MUTED, gap: 8 });
   L.rule(10);
+  if (opts.decisionLine) L.text(opts.decisionLine, { size: 11, font: L.bold, gap: 8 });
   const boxW = 235, boxH = 122, gapX = 17, gapY = 26;
   let col = 0;
   for (const slot of slots) {
@@ -720,8 +726,19 @@ async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots }) 
   return Buffer.from(await out.save());
 }
 
+// The record itself carries the approvals: its latest file plus a sign-off page for this stage.
+// Built only for approvals. A rejected record is never signed or stamped.
+async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine }) {
+  const recUrl = rec.stamped_doc_url || rec.file_path;
+  const remote = await fetch(recUrl, { redirect: 'follow' });
+  if (!remote.ok) throw new Error('The record file is not reachable.');
+  const doc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()), { ignoreEncryption: true });
+  await appendSignaturePage(doc, { ...ctx, kindTitle: `Record sign-off, ${stageLabel}` }, slots, { heading: 'Record sign-off', decisionLine });
+  return Buffer.from(await doc.save());
+}
+
 // Original record + the new notice, with divider strips (same look as the bundle)
-async function buildDecisionBundle({ rec, noticeBytes, noticeLabel }) {
+async function buildDecisionBundle({ rec, noticeBytes, noticeLabel, recordBytes }) {
   const out = await PDFDocument.create();
   const labelFont = await out.embedFont(StandardFonts.Helvetica);
   const labelBold = await out.embedFont(StandardFonts.HelveticaBold);
@@ -734,10 +751,15 @@ async function buildDecisionBundle({ rec, noticeBytes, noticeLabel }) {
     page.drawText(makePdfSafe(labelFont)(meta), { x: 150, y: 25, size: 9, font: labelFont, color: MUTED, maxWidth: 420 });
   };
   const recUrl = rec.stamped_doc_url || rec.file_path;
-  const remote = await fetch(recUrl, { redirect: 'follow' });
-  if (!remote.ok) throw new Error('The original record file is not reachable.');
-  const recDoc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
-  strip('ORIGINAL RECORD', String(rec.title || 'Untitled'), `Added by ${flowRoleLabel(rec.role) || 'Unknown'}, ${flowFormatDate(rec.issued_date)}`);
+  let recDoc;
+  if (recordBytes) {
+    recDoc = await PDFDocument.load(recordBytes);
+  } else {
+    const remote = await fetch(recUrl, { redirect: 'follow' });
+    if (!remote.ok) throw new Error('The original record file is not reachable.');
+    recDoc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
+  }
+  strip(recordBytes ? 'RECORD + SIGN-OFF' : 'ORIGINAL RECORD', String(rec.title || 'Untitled'), `Added by ${flowRoleLabel(rec.role) || 'Unknown'}, ${flowFormatDate(rec.issued_date)}`);
   (await out.copyPages(recDoc, recDoc.getPageIndices())).forEach(p => out.addPage(p));
   const noticeDoc = await PDFDocument.load(noticeBytes);
   strip(noticeLabel, 'Preview, not yet issued', 'Shown exactly as it will be issued');
@@ -3725,6 +3747,10 @@ async function prepareDecision(req, { preview }) {
     }
     const waiting = planRows.filter(r => !r.is_decider && r.status !== 'signed');
     if (waiting.length) return fail(409, `Waiting for ${waiting.map(w => w.signer_position || flowRoleLabel(w.signer_role)).join(', ')} to sign first.`);
+    const objecting = planRows.filter(r => !r.is_decider && r.status === 'signed' && r.outcome === 'queries');
+    if (decision !== 'rejected' && objecting.length) {
+      return fail(409, `You cannot ${decision === 'accepted' ? 'accept' : 'approve'} while queries from ${objecting.map(o => o.signer_position || flowRoleLabel(o.signer_role)).join(', ')} are open. They must clear them by signing again with "No queries", or you can reject this record. If they have left the project, replace them.`);
+    }
   }
 
   const setupProblem = await explainMissingSignerSetup(projectId, role, userId, true);
@@ -3760,6 +3786,7 @@ async function prepareDecision(req, { preview }) {
     const isMe = Boolean(r.is_decider);
     const p = isMe ? profile : (r.status === 'signed' ? await loadSignerProfile(projectId, r.signer_role, r.signer_user_id) : null);
     slots.push({
+      isDecider: Boolean(r.is_decider),
       caption: r.is_decider ? 'Decision by' : (r.is_team_member ? 'Checked by (team)' : 'Co-signed by'),
       position: r.signer_position, side: r.side,
       status: isMe ? (preview ? 'pending' : 'signed') : (r.status === 'signed' && p ? 'signed' : 'pending'),
@@ -3776,8 +3803,21 @@ async function prepareDecision(req, { preview }) {
     issuerRole: role, issuerSide: step.side, issuedAt, respondBy, title, body,
     kindTitle: FLOW_NOTICE_TITLE[kind], decisionWord: FLOW_DECISION_WORD[decision], fingerprint,
   };
-  const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots });
-  return { data: { table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
+  const noticeSlots = slots.filter(sl => sl.isDecider);   // the notice carries the leader's signature and stamp only
+  const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots: noticeSlots });
+  let recordBytes = null;
+  if (decision !== 'rejected') {
+    try {
+      recordBytes = await buildRecordWithSignoff({
+        rec: state.rec, ctx, slots, stageLabel: step.label,
+        decisionLine: `Decision: ${ctx.decisionWord}, ${flowFormatDate(issuedAt)}. The signed notice is attached to this record.`,
+      });
+    } catch (stampErr) {
+      console.error('[prepareDecision] record sign-off failed:', stampErr);
+      return fail(502, 'The record file could not be opened to add the sign-off page, so nothing was issued. Check that the record PDF is readable and try again.');
+    }
+  }
+  return { data: { recordBytes, table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
 }
 
 app.post('/api/decision-preview', authenticateToken, decisionUpload, async (req, res) => {
@@ -3785,7 +3825,7 @@ app.post('/api/decision-preview', authenticateToken, decisionUpload, async (req,
     const r = await prepareDecision(req, { preview: true });
     if (r.fail) return res.status(r.fail.status).json({ success: false, message: r.fail.message });
     const d = r.data;
-    const bundle = await buildDecisionBundle({ rec: d.state.rec, noticeBytes: d.noticeBytes, noticeLabel: FLOW_NOTICE_TITLE[d.kind].split(' (')[0] });
+    const bundle = await buildDecisionBundle({ rec: d.state.rec, noticeBytes: d.noticeBytes, noticeLabel: FLOW_NOTICE_TITLE[d.kind].split(' (')[0], recordBytes: d.recordBytes });
     res.set('Content-Type', 'application/pdf');
     res.set('Content-Disposition', 'inline; filename="decision-preview.pdf"');
     return res.send(bundle);
@@ -3807,12 +3847,17 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
 
     // Upload the signed notice (permanent step, tracked for cleanup)
     const noticeHash = crypto.createHash('sha256').update(d.noticeBytes).digest('hex');
-    let noticeUrl, noticeAttachmentId;
+    let noticeUrl, noticeAttachmentId, stampedRecordUrl = null;
     const supportingRows = [];
     try {
       const up = await uploadRecordFile({ buffer: d.noticeBytes }, 'oneproject/records', `${Date.now()}-notice-${d.recordId}.pdf`);
       uploaded.push({ public_id: up.public_id, resource_type: up.resource_type });
       noticeUrl = up.secure_url; noticeAttachmentId = up.public_id;
+      if (d.recordBytes) {
+        const upRec = await uploadRecordFile({ buffer: d.recordBytes }, 'oneproject/records', `${Date.now()}-signed-record-${d.recordId}.pdf`);
+        uploaded.push({ public_id: upRec.public_id, resource_type: upRec.resource_type });
+        stampedRecordUrl = upRec.secure_url;
+      }
       const settled = await Promise.allSettled(d.supportingFiles.map(f => uploadRecordFile(f, 'oneproject/record-supporting')));
       settled.forEach((s, i) => {
         if (s.status !== 'fulfilled') return;
@@ -3869,6 +3914,14 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
       else if (d.decision === 'accepted') newStatus = 'approved_record';
       else newStatus = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' }[d.state.uploaderSide] || 'pending_review';
       await client.query(`UPDATE ${d.table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, d.recordId, d.projectId]);
+      if (stampedRecordUrl) {
+        // Approval only: the record's latest copy now carries the sign-off page. The original upload (file_path) is kept.
+        const cur = await client.query(`SELECT stamp_status FROM ${d.table} WHERE id=$1`, [d.recordId]);
+        await client.query(
+          `UPDATE ${d.table} SET stamped_doc_url=$1, signed_by_id=$2, signed_by_role=$3, signed_at=NOW(), stamp_type='STAMPED', stamp_status=$4 WHERE id=$5 AND project_id=$6`,
+          [stampedRecordUrl, userId, role, getStampStatusFromActor(cur.rows[0]?.stamp_status, 'approver'), d.recordId, d.projectId]
+        );
+      }
 
       // Signers of this stage: tie them to the notice; record the decider's signature
       if (d.deciderRow) {
@@ -3940,16 +3993,18 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
     const state = await getRecordFlowState(table, projectId, recordId);
     if (!state || state.isLocked || !state.stage) return fail(409, 'This record is not waiting for signatures.');
     const { rows } = await pool.query(
-      `SELECT * FROM record_signers WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND signer_role=$4 AND signer_user_id=$5 AND status='pending' AND is_decider=FALSE`,
+      `SELECT * FROM record_signers WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND signer_role=$4 AND signer_user_id=$5 AND is_decider=FALSE AND (status='pending' OR (status='signed' AND outcome='queries' AND notice_id IS NULL))`,
       [table, recordId, state.stage, role, userId]
     );
     const mine = rows[0];
-    if (!mine) return fail(403, 'You are not a named signer for this stage, or you already signed.');
+    if (!mine) return fail(403, 'You are not a named signer for this stage, or your review is already final.');
     const setupProblem = await explainMissingSignerSetup(projectId, role, userId, false);
     if (setupProblem) return fail(400, setupProblem);
     const profile = await loadSignerProfile(projectId, role, userId);
     if (!profile) return fail(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
-    const findings = { note, queries: outcome === 'queries' ? parsed.queries : [] };
+    // Signing again after raising queries keeps the earlier review in the history
+    const earlier = mine.status === 'signed' ? [{ outcome: mine.outcome, note: mine.findings?.note || '', queries: mine.findings?.queries || [], signed_at: mine.signed_at }] : [];
+    const findings = { note, queries: outcome === 'queries' ? parsed.queries : [], history: [...(mine.findings?.history || []), ...earlier] };
     await pool.query(
       `UPDATE record_signers SET status='signed', outcome=$1, findings=$2, signed_at=NOW(), first_viewed_at=COALESCE(first_viewed_at, NOW()) WHERE id=$3`,
       [outcome, JSON.stringify(findings), mine.id]
@@ -4064,7 +4119,13 @@ app.post('/api/record-signer-replace', authenticateToken, requireProjectLifecycl
     const { rows } = await pool.query(`SELECT * FROM record_signers WHERE id=$1 AND project_id=$2`, [signerId, projectId]);
     const row = rows[0];
     if (!row) return fail(404, 'Signer not found.');
-    if (row.status !== 'pending') return fail(409, 'Only a pending signer can be replaced.');
+    let replaceable = row.status === 'pending';
+    if (!replaceable && row.status === 'signed' && row.outcome === 'queries' && !row.notice_id && !row.is_decider) {
+      // A checker whose queries block approval can be replaced only if they left the project
+      replaceable = !(await userHasProjectAccess(row.signer_user_id, row.signer_role, projectId));
+      if (!replaceable) return fail(409, 'This team member is still on the project. They can clear their queries by signing again, or you can reject the record.');
+    }
+    if (!replaceable) return fail(409, 'Only a pending signer, or a team member who has left the project, can be replaced.');
     if (!isDecisionMaker(role) || getSide(role) !== row.side) return fail(403, 'Only a leader of the same side can replace a signer.');
     const state = await getRecordFlowState(row.record_table, projectId, row.record_id);
     if (!state || state.isLocked || state.stage !== row.stage) return fail(409, 'This signer can no longer be replaced.');
@@ -4147,7 +4208,15 @@ async function buildRecordFlowView(c) {
   const stage = !isNoticeRecord && !isLocked && pendingIdx >= 0 ? pendingIdx + 1 : null;
   const isMe = (r) => r.signer_role === userRole && Number(r.signer_user_id) === Number(userId);
 
-  const publicSigner = async (r) => ({
+  const publicSigner = async (r) => {
+  const openQueries = r.status === 'signed' && r.outcome === 'queries' && !r.notice_id && !r.is_decider;
+  const sameSideLeader = Boolean(stage) && r.stage === stage && userIsDM && userSide === r.side;
+  // Only leaders of the signer's own side are told that someone is no longer on the project
+  const leftProject = sameSideLeader && (r.status === 'pending' || openQueries)
+    ? !(await userHasProjectAccess(r.signer_user_id, r.signer_role, projectId).catch(() => true)) : false;
+  return {
+    open_queries: openQueries, left_project: leftProject,
+    can_resign: Boolean(stage) && r.stage === stage && openQueries && isMe(r),
     id: r.id, position: r.signer_position || flowRoleLabel(r.signer_role), side: r.side, role: r.signer_role,
     is_team_member: r.is_team_member, is_decider: r.is_decider, order_no: r.order_no, status: r.status,
     outcome: r.outcome, signed_at: r.signed_at, first_viewed_at: r.first_viewed_at, last_viewed_at: r.last_viewed_at,
@@ -4158,8 +4227,9 @@ async function buildRecordFlowView(c) {
     user_id: r.signer_user_id,
     findings: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? { note: r.findings?.note || '', queries: Array.isArray(r.findings?.queries) ? r.findings.queries : [] } : null,
     is_me: isMe(r),
-    can_replace: Boolean(stage) && r.status === 'pending' && r.stage === stage && userIsDM && userSide === r.side,
-  });
+    can_replace: sameSideLeader && (r.status === 'pending' || (openQueries && leftProject)),
+  };
+  };
 
   const stages = [];
   for (const st of [1, 2]) {
@@ -4184,10 +4254,13 @@ async function buildRecordFlowView(c) {
     if (me && me.status === 'pending') {
       if (me.is_decider) {
         const waiting = stageRows.filter(r => !r.is_decider && r.status !== 'signed');
+        const objecting = stageRows.filter(r => !r.is_decider && r.status === 'signed' && r.outcome === 'queries' && !r.notice_id);
         if (waiting.length) { btn = 'awaiting_signers'; pend = waiting.map(w => w.signer_position || flowRoleLabel(w.signer_role)).join(', '); }
+        else if (objecting.length) { btn = 'queries_open'; pend = objecting.map(o => o.signer_position || flowRoleLabel(o.signer_role)).join(', '); }
         else { btn = 'can_approve'; label = steps[stage - 1].action === 'accepted' ? 'Accept' : 'Approve'; }
       } else btn = 'sign_review';
-    } else if (me && me.status === 'signed') btn = 'signed_waiting';
+    } else if (me && me.status === 'signed' && me.outcome === 'queries' && !me.notice_id && !me.is_decider) btn = 'sign_review_again';
+    else if (me && me.status === 'signed') btn = 'signed_waiting';
     else if (userIsDM && userSide === steps[stage - 1].side) btn = 'not_named';
   }
 
