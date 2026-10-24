@@ -429,6 +429,24 @@ async function loadSignerProfile(projectId, role, userId) {
   };
 }
 
+// Plain-language reason a signer cannot sign yet (null when their setup is complete).
+async function explainMissingSignerSetup(projectId, role, userId, needStamp) {
+  const { rows } = await pool.query(
+    `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
+    [userId, role, projectId]
+  );
+  const st = rows[0];
+  const how = ' Open your Signature & Stamp setup for this project, add it, save, then try again.';
+  if (!st || (!st.signature_image && !(needStamp && st.stamp_image_url))) {
+    return needStamp
+      ? 'You have not set up your signature and company stamp for this project, so the decision cannot be signed.' + how
+      : 'You have not set up your signature for this project, so your review cannot be signed.' + how;
+  }
+  if (!st.signature_image) return 'Your signature image is missing for this project, so it cannot be signed.' + how;
+  if (needStamp && !st.stamp_image_url) return 'Your company stamp is missing for this project. A decision must carry your signature and company stamp.' + how;
+  return null;
+}
+
 async function embedImageFromSource(pdfDoc, source) {
   if (!source) return null;
   try {
@@ -3709,8 +3727,10 @@ async function prepareDecision(req, { preview }) {
     if (waiting.length) return fail(409, `Waiting for ${waiting.map(w => w.signer_position || flowRoleLabel(w.signer_role)).join(', ')} to sign first.`);
   }
 
+  const setupProblem = await explainMissingSignerSetup(projectId, role, userId, true);
+  if (setupProblem) return fail(400, setupProblem);
   const profile = await loadSignerProfile(projectId, role, userId);
-  if (!profile) return fail(400, 'Set up your signature first, then issue the decision.');
+  if (!profile) return fail(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
 
   let nextPlan = null;
   if (decision === 'approved' && state.steps[stage]) {
@@ -3925,8 +3945,10 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
     );
     const mine = rows[0];
     if (!mine) return fail(403, 'You are not a named signer for this stage, or you already signed.');
+    const setupProblem = await explainMissingSignerSetup(projectId, role, userId, false);
+    if (setupProblem) return fail(400, setupProblem);
     const profile = await loadSignerProfile(projectId, role, userId);
-    if (!profile) return fail(400, 'Set up your signature first, then sign.');
+    if (!profile) return fail(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
     const findings = { note, queries: outcome === 'queries' ? parsed.queries : [] };
     await pool.query(
       `UPDATE record_signers SET status='signed', outcome=$1, findings=$2, signed_at=NOW(), first_viewed_at=COALESCE(first_viewed_at, NOW()) WHERE id=$3`,
