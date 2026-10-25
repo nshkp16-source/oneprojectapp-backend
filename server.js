@@ -4582,7 +4582,7 @@ async function buildRecordFlowView(c) {
 
   const qOut = (q) => ({
     id: q.id, notice_id: q.notice_id, seq: q.seq, ref: q.ref, query: q.query, required_action: q.required_action,
-    status: q.status, response: q.response, responded_at: q.responded_at, resolved_at: q.resolved_at, issuer_side: q.issuer_side, raised_by: q.raised_by || null,
+    status: q.status, response: q.response, responded_at: q.responded_at, resolved_at: q.resolved_at, issuer_side: q.issuer_side, raised_by: q.raised_by || null, created_at: q.created_at,
     can_review: userIsDM && userSide === q.issuer_side && ['answered', 'resolved'].includes(q.status),
   });
   const ownQueries = (queriesByRecord.get(rec.id) || []).map(qOut);
@@ -4954,6 +4954,10 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
   const userSide = getSide(userRole);
   const userIsDM = isDecisionMaker(userRole);
   try {
+    // Everyone assigned to the project can read its records. Nobody else can.
+    if (!await userHasProjectAccess(userId, userRole, projectId)) {
+      return res.status(403).json({ error: 'You are not assigned to this project.' });
+    }
     const { rows: records } = await pool.query(
       `SELECT r.id, r.title, r.description, r.file_path, r.supporting_files,
               r.issued_date, r.role AS uploader_role,
@@ -5134,6 +5138,7 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
+    if (!await userHasProjectAccess(reviewerId, reviewerRole, projectId)) return res.status(403).json({ error: 'You are not assigned to this project.' });
     const { rows: rec } = await pool.query(`SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
     if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) return res.json({ success: true, skipped: true });
@@ -5161,7 +5166,10 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), r
   if (!isWorkflow && action !== 'no_action') return res.status(400).json({ error: 'Invalid action.' });
   if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
   if (isWorkflow && isDecisionMakerActor) return res.status(400).json({ error: 'A decision is issued together with a signed notice. Use the review and sign form.' });
+  // Only a real team member can act as one. The role comes from the login token, never from the request.
+  if (actorType === 'team_member' && normalizeRole(reviewerRole) !== 'TeamMember') return res.status(403).json({ error: 'Only team members can act as team members.' });
   try {
+    if (!await userHasProjectAccess(reviewerId, reviewerRole, projectId)) return res.status(403).json({ error: 'You are not assigned to this project.' });
     const { rows: recRows } = await pool.query(`SELECT id, role, uploaded_by, file_path, attachment_id, stamp_status, stamp_type FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!recRows.length) return res.status(400).json({ error: 'Record not found. It may have been deleted.' });
     const rec = recRows[0];
@@ -5268,13 +5276,23 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), r
 //  DOWNLOAD / DELETE RECORD
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/download-file', authenticateToken, async (req, res) => {
-  const { recordId, recordType, filename, disposition } = req.query;
+  const { recordId, recordType, filename, disposition, supportingIndex } = req.query;
   const table = resolveTable(recordType);
   if (!table) return res.status(400).json({ error: 'Invalid or missing recordType.' });
   try {
-    const { rows } = await pool.query(`SELECT file_path, stamped_doc_url FROM ${table} WHERE id=$1`, [recordId]);
+    const { rows } = await pool.query(`SELECT project_id, file_path, stamped_doc_url, supporting_files FROM ${table} WHERE id=$1`, [recordId]);
     if (!rows.length) return res.status(404).json({ error: 'File not found.' });
-    const filePath = rows[0].stamped_doc_url || rows[0].file_path;
+    // The record decides which project the file belongs to, so a user cannot reach another project's files.
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, rows[0].project_id)) {
+      return res.status(403).json({ error: 'You are not assigned to this project.' });
+    }
+    let filePath = rows[0].stamped_doc_url || rows[0].file_path;
+    if (supportingIndex !== undefined && supportingIndex !== '') {
+      let list = rows[0].supporting_files;
+      if (typeof list === 'string') { try { list = JSON.parse(list); } catch (_) { list = []; } }
+      const idx = Number(supportingIndex);
+      filePath = Array.isArray(list) && Number.isInteger(idx) && idx >= 0 ? (list[idx]?.url || null) : null;
+    }
     if (!filePath) return res.status(404).json({ error: 'File not found.' });
     if (rows[0].stamped_doc_url) {
       console.log('Download proxy using stamped_doc_url for record', recordId);
