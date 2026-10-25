@@ -217,6 +217,7 @@ async function ensureRecordFlowSchema() {
     'superseded_by_id INTEGER',
     'notice_source TEXT',
     'respond_by DATE',
+    'stamped_doc_public_id TEXT',
   ];
   for (const table of VALID_RECORD_TABLES) {
     for (const column of columns) {
@@ -229,7 +230,7 @@ async function ensureRecordFlowSchema() {
        id SERIAL PRIMARY KEY,
        record_table TEXT NOT NULL,
        record_id INTEGER NOT NULL,
-       project_id INTEGER NOT NULL,
+       project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
        stage INTEGER NOT NULL,
        side TEXT NOT NULL,
        signer_role TEXT NOT NULL,
@@ -259,7 +260,7 @@ async function ensureRecordFlowSchema() {
        record_table TEXT NOT NULL,
        record_id INTEGER NOT NULL,
        notice_id INTEGER NOT NULL,
-       project_id INTEGER NOT NULL,
+       project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
        seq INTEGER NOT NULL,
        ref TEXT,
        query TEXT NOT NULL,
@@ -278,6 +279,9 @@ async function ensureRecordFlowSchema() {
        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
      )`,
     `CREATE INDEX IF NOT EXISTS record_queries_record_idx ON record_queries (record_table, record_id)`,
+    `ALTER TABLE record_queries ADD COLUMN IF NOT EXISTS raised_by TEXT`,
+    // One live row per person per stage: stops duplicates and double-clicks racing each other
+    `CREATE UNIQUE INDEX IF NOT EXISTS record_signers_one_active ON record_signers (record_table, record_id, stage, signer_role, signer_user_id) WHERE status <> 'replaced'`,
   ];
   for (const sql of statements) {
     try { await pool.query(sql); }
@@ -383,7 +387,35 @@ async function getRecordFlowState(table, projectId, recordId) {
 }
 
 // ── Notifications to named people or the whole project ──────────────────────
-async function notifyRecordUsers({ projectId, recordId, table, message, actorId, actorRole, recipients }) {
+// Email for the few events people must not miss. In-app notifications still happen for everything.
+const FLOW_EMAIL_TABLE = {
+  Client: 'clients', Contractor: 'contractors', Consultant: 'consultants',
+  ClientPM: 'client_project_managers', ContractorPM: 'contractor_project_managers',
+  ConsultantPM: 'consultant_project_managers', TeamMember: 'team_members',
+};
+async function emailFlowRecipients(recipients, subject, message, projectId) {
+  try {
+    const { rows: pr } = await pool.query('SELECT name FROM projects WHERE id=$1', [projectId]);
+    const project = pr[0]?.name || 'your project';
+    const from = process.env.MAIL_FROM || 'skyprincenkp16@gmail.com';
+    const link = process.env.APP_BASE_URL ? `<p><a href="${flowEscape(process.env.APP_BASE_URL)}">Open OneProjectApp</a></p>` : '';
+    const seen = new Set();
+    for (const r of recipients || []) {
+      const role = normalizeRole(r.recipient_role); const id = Number(r.recipient_role_id ?? r.user_id);
+      const table = FLOW_EMAIL_TABLE[role];
+      if (!table || !Number.isInteger(id) || seen.has(`${role}:${id}`)) continue;
+      seen.add(`${role}:${id}`);
+      const { rows } = await pool.query(`SELECT email FROM ${table} WHERE id=$1 LIMIT 1`, [id]).catch(() => ({ rows: [] }));
+      const to = rows[0]?.email;
+      if (!to) continue;
+      await transporter.sendMail({
+        from, to, subject: `${subject} - ${project}`,
+        html: `<p>${flowEscape(message)}</p><p style="color:#64748b;font-size:12px;">Project: ${flowEscape(project)}</p>${link}`,
+      }).catch(err => console.error('[record-flow] email failed (non-fatal):', err.message));
+    }
+  } catch (err) { console.error('[record-flow] email error (non-fatal):', err.message); }
+}
+async function notifyRecordUsers({ projectId, recordId, table, message, actorId, actorRole, recipients, email = false, emailSubject = '' }) {
   if (!recipients || !recipients.length) return null;
   let client;
   try {
@@ -396,6 +428,7 @@ async function notifyRecordUsers({ projectId, recordId, table, message, actorId,
     );
     await insertNotificationRecipients(client, n.rows[0].id, recipients);
     await client.query('COMMIT');
+    if (email) emailFlowRecipients(recipients, emailSubject || 'OneProjectApp update', message, projectId);   // not awaited
     return n.rows[0].id;
   } catch (err) {
     if (client) await client.query('ROLLBACK').catch(() => {});
@@ -577,23 +610,46 @@ async function createLayout(pdfDoc, { startNewPage = true } = {}) {
   return L;
 }
 
-function flowFormatDateTime(value) {
+const FLOW_REF_PREFIX = { contractual_records: 'CON', administrative_records: 'ADM', safety_records: 'SAF', operational_records: 'OPS', financial_records: 'FIN' };
+const flowRecordRef = (table, rec) => `${FLOW_REF_PREFIX[table] || 'REC'}-${String(rec.id).padStart(3, '0')}${rec.revision_no ? ` Rev ${rec.revision_no}` : ''}`;
+const DEFAULT_FLOW_TZ = 'Africa/Kigali';
+const flowValidTz = (tz) => { try { new Intl.DateTimeFormat('en-GB', { timeZone: tz }); return tz; } catch (_) { return DEFAULT_FLOW_TZ; } };
+function flowFormatDateTime(value, tz) {
   if (!value) return '';
-  return new Date(value).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC';
+  return new Date(value).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short', timeZone: flowValidTz(tz || DEFAULT_FLOW_TZ) });
 }
-function flowFormatDate(value) {
+function flowFormatDate(value, tz) {
   if (!value) return '';
-  return new Date(value).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
+  return new Date(value).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: flowValidTz(tz || DEFAULT_FLOW_TZ) });
+}
+async function loadProjectMemberKeys(projectId) {
+  const { rows } = await pool.query(
+    `SELECT 'Client' AS role, client_id AS id FROM projects WHERE id=$1 AND client_id IS NOT NULL
+     UNION ALL SELECT 'Contractor', contractor_id FROM contractor_assignments WHERE project_id=$1
+     UNION ALL SELECT 'Consultant', consultant_id FROM consultant_assignments WHERE project_id=$1
+     UNION ALL SELECT 'ClientPM', client_pm_id FROM client_pm_assignments WHERE project_id=$1
+     UNION ALL SELECT 'ContractorPM', contractor_pm_id FROM contractor_pm_assignments WHERE project_id=$1
+     UNION ALL SELECT 'ConsultantPM', consultant_pm_id FROM consultant_pm_assignments WHERE project_id=$1
+     UNION ALL SELECT 'TeamMember', team_member_id FROM team_member_assignments WHERE project_id=$1`,
+    [projectId]
+  );
+  return new Set(rows.map(r => `${r.role}:${r.id}`));
+}
+async function loadProjectTz(projectId) {
+  const { rows } = await pool.query('SELECT time_zone FROM projects WHERE id=$1', [projectId]).catch(() => ({ rows: [] }));
+  return flowValidTz(rows[0]?.time_zone || DEFAULT_FLOW_TZ);
 }
 
 function drawMetaBlock(L, ctx) {
+  L.metaRow('To', ctx.toLine);
+  L.metaRow('From', ctx.fromLine);
+  L.metaRow('Cc', ctx.ccLine);
   L.metaRow('Project', ctx.projectName);
-  L.metaRow('Record', `#${ctx.rec.id}  ${ctx.rec.title}${ctx.rec.revision_no ? `  (Revision ${ctx.rec.revision_no})` : ''}`);
-  L.metaRow('Category', ctx.categoryLabel);
-  L.metaRow('Record added by', `${flowRoleLabel(ctx.rec.role)}, ${flowFormatDate(ctx.rec.issued_date)}`);
-  L.metaRow('Issued by', `${flowRoleLabel(ctx.issuerRole)} (${flowSideLabel(ctx.issuerSide)} side)`);
-  L.metaRow('Date issued', flowFormatDate(ctx.issuedAt));
-  L.metaRow('Respond by', ctx.respondBy ? flowFormatDate(ctx.respondBy) : '');
+  L.metaRow('Contract ref.', ctx.contractRef);
+  L.metaRow('Reference', ctx.recordRef);
+  L.metaRow('Subject', `${ctx.decisionWord}: ${ctx.rec.title}`);
+  L.metaRow('Date', flowFormatDate(ctx.issuedAt, ctx.tz));
+  L.metaRow('Respond by', ctx.respondBy ? flowFormatDate(ctx.respondBy, ctx.tz) : '');
 }
 
 function drawQuerySchedule(L, queries) {
@@ -601,9 +657,9 @@ function drawQuerySchedule(L, queries) {
   L.ensure(60);
   L.text('Query schedule', { size: 11, font: L.bold, gap: 4 });
   L.table(
-    ['No.', 'Reference', 'Query', 'Required action'],
-    [30, 82, 195, 180],
-    queries.map((q, i) => [String(i + 1), q.ref || '', q.query, q.required_action || ''])
+    ['No.', 'Reference', 'Query', 'Required action', 'Raised by'],
+    [26, 68, 160, 142, 100],
+    queries.map((q, i) => [String(i + 1), q.ref || '', q.query, q.required_action || '', q.by || ''])
   );
 }
 
@@ -826,7 +882,7 @@ async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
         { t: p.name, f: L.bold, s: 9.5, c: INK },
         { t: `${slot.position || p.position || ''}${slot.side ? ', ' + flowSideLabel(slot.side) + ' side' : ''}`, f: L.regular, s: 8, c: INK },
         { t: p.company ? `Company: ${p.company}` : '', f: L.regular, s: 8, c: INK },
-        { t: flowFormatDateTime(slot.signed_at), f: L.regular, s: 7.5, c: MUTED },
+        { t: flowFormatDateTime(slot.signed_at, ctx.tz), f: L.regular, s: 7.5, c: MUTED },
       ];
       for (const r of rows) {
         if (!r.t) continue;
@@ -845,46 +901,68 @@ async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
 }
 
 // Notice PDF = (system letter | the user's own PDF + annex) + signature page
+async function addFlowFooters(doc, { left, fromIndex = 0 }) {
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const safe = makePdfSafe(font);
+  const total = doc.getPageCount();
+  for (let i = fromIndex; i < total; i++) {
+    const page = doc.getPage(i); const { width } = page.getSize();
+    const right = `Page ${i + 1} of ${total}`;
+    page.drawLine({ start: { x: PDF_M, y: 34 }, end: { x: width - PDF_M, y: 34 }, thickness: 0.5, color: RULE });
+    page.drawText(safe(String(left)).slice(0, 95), { x: PDF_M, y: 22, size: 8, font, color: MUTED });
+    page.drawText(right, { x: width - PDF_M - font.widthOfTextAtSize(right, 8), y: 22, size: 8, font, color: MUTED });
+  }
+}
+
 async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots }) {
   const out = await PDFDocument.create();
+  let ownPages = 0;
   if (source === 'uploaded') {
     const up = await PDFDocument.load(uploadedBytes);
     const pages = await out.copyPages(up, up.getPageIndices());
     pages.forEach(p => out.addPage(p));
+    ownPages = pages.length;
     if (queries.length || ctx.body) await drawNoticeAnnex(out, ctx, queries);
   } else {
     await drawGeneratedLetter(out, ctx, queries);
   }
   await appendSignaturePage(out, ctx, slots);
+  await addFlowFooters(out, { left: `${ctx.projectName}  |  ${ctx.recordRef}  |  ${ctx.kindTitle}`, fromIndex: ownPages });   // never over the leader's own pages
   return Buffer.from(await out.save());
 }
 
 // The record itself carries the approvals: its latest file plus a sign-off page for this stage.
 // Built only for approvals. A rejected record is never signed or stamped.
-async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine, stage }) {
+async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine, stage, placementIn }) {
   const recUrl = rec.stamped_doc_url || rec.file_path;
   const remote = await fetch(recUrl, { redirect: 'follow' });
   if (!remote.ok) throw new Error('The record file is not reachable.');
   const doc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()), { ignoreEncryption: true });
 
-  // 1) The decision is signed and stamped ON the record's first page (stacked above earlier stages)
-  const decider = slots.find(sl => sl.isDecider);
-  const placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, profile: decider?.profile, signedAt: decider?.signed_at, stage: stage || 1 });
-  // 2) ...and the full sign-off page (every named signer) is added at the end
+  // 1) Only if the approver chose a spot: the decision block goes exactly there (never over content by default)
+  let placement = null;
+  if (placementIn) {
+    const decider = slots.find(sl => sl.isDecider);
+    placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, profile: decider?.profile, signedAt: decider?.signed_at, at: placementIn, tz: ctx.tz });
+  }
+  // 2) The sign-off page (every named signer) is always added at the end of the record
+  const originalPages = doc.getPageCount();
   await appendSignaturePage(doc, { ...ctx, kindTitle: `Record sign-off, ${stageLabel}` }, slots, { heading: 'Record sign-off', decisionLine });
+  await addFlowFooters(doc, { left: `${ctx.projectName}  |  ${ctx.recordRef}  |  Record sign-off`, fromIndex: originalPages });
   return { bytes: Buffer.from(await doc.save()), placement };
 }
 
-// Decision block on page 1 of the record: word, signature, company stamp, name/position, date.
-async function drawRecordDecisionStamp(doc, { word, profile, signedAt, stage }) {
-  const page = doc.getPage(0);
+// Decision block at the position the approver picked: word, signature, company stamp, name/position, date.
+async function drawRecordDecisionStamp(doc, { word, profile, signedAt, at, tz }) {
+  const pageIdx = Math.min(Math.max((at.page || 1) - 1, 0), doc.getPageCount() - 1);
+  const page = doc.getPage(pageIdx);
   const { width, height } = page.getSize();
   const regular = await doc.embedFont(StandardFonts.Helvetica);
   const bold = await doc.embedFont(StandardFonts.HelveticaBold);
   const safe = makePdfSafe(regular);
-  const w = 176, h = 86, margin = 18, gapY = 6;
-  const x = Math.max(margin, width - w - margin);
-  const y = Math.min(margin + (Math.max(stage, 1) - 1) * (h + gapY), Math.max(margin, height - h - margin));
+  const w = 176, h = 86, margin = 12;
+  const x = Math.min(Math.max(at.x * width - w / 2, margin), Math.max(margin, width - w - margin));
+  const y = Math.min(Math.max(at.y * height - h / 2, margin), Math.max(margin, height - h - margin));
   const green = rgb(0.09, 0.45, 0.24);
   page.drawRectangle({ x, y, width: w, height: h, color: rgb(1, 1, 1), opacity: 0.92, borderColor: green, borderWidth: 1.2 });
   page.drawText(safe(word || 'APPROVED'), { x: x + 8, y: y + h - 16, size: 12, font: bold, color: green });
@@ -899,12 +977,12 @@ async function drawRecordDecisionStamp(doc, { word, profile, signedAt, stage }) 
   const line = (t, dy, f = regular, sz = 7) => page.drawText(safe(String(t).slice(0, 46)), { x: x + 8, y: y + dy, size: sz, font: f, color: rgb(0.1, 0.1, 0.1) });
   line(profile?.name || '', 26, bold, 7.5);
   line([profile?.position, profile?.side].filter(Boolean).join(', '), 17);
-  line(`${profile?.company ? profile.company + ', ' : ''}${flowFormatDate(signedAt)}`, 8);
-  return { page: 1, x: x / width, y: y / height };
+  line(`${profile?.company ? profile.company + ', ' : ''}${flowFormatDate(signedAt, tz)}`, 8);
+  return { page: pageIdx + 1, x: x / width, y: y / height };
 }
 
 // Original record + the new notice, with divider strips (same look as the bundle)
-async function buildDecisionBundle({ rec, noticeBytes, noticeLabel, recordBytes }) {
+async function buildDecisionBundle({ rec, noticeBytes, noticeLabel, recordBytes, tz }) {
   const out = await PDFDocument.create();
   const labelFont = await out.embedFont(StandardFonts.Helvetica);
   const labelBold = await out.embedFont(StandardFonts.HelveticaBold);
@@ -925,7 +1003,7 @@ async function buildDecisionBundle({ rec, noticeBytes, noticeLabel, recordBytes 
     if (!remote.ok) throw new Error('The original record file is not reachable.');
     recDoc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
   }
-  strip(recordBytes ? 'RECORD + SIGN-OFF' : 'ORIGINAL RECORD', String(rec.title || 'Untitled'), `Added by ${flowRoleLabel(rec.role) || 'Unknown'}, ${flowFormatDate(rec.issued_date)}`);
+  strip(recordBytes ? 'RECORD + SIGN-OFF' : 'ORIGINAL RECORD', String(rec.title || 'Untitled'), `Added by ${flowRoleLabel(rec.role) || 'Unknown'}, ${flowFormatDate(rec.issued_date, tz)}`);
   (await out.copyPages(recDoc, recDoc.getPageIndices())).forEach(p => out.addPage(p));
   const noticeDoc = await PDFDocument.load(noticeBytes);
   strip(noticeLabel, 'Preview, not yet issued', 'Shown exactly as it will be issued');
@@ -1744,7 +1822,7 @@ function quoteSqlIdentifier(value) {
 }
 
 async function queueProjectDeletionAssets(client, projectId) {
-  const assetColumns = ['cloudinary_public_id', 'attachment_public_id', 'public_id', 'file_id', 'attachment_id', 'linked_file_id', 'supporting_file_public_id'];
+  const assetColumns = ['cloudinary_public_id', 'attachment_public_id', 'public_id', 'file_id', 'attachment_id', 'linked_file_id', 'supporting_file_public_id', 'stamped_doc_public_id'];
   const directColumns = await client.query(
     `SELECT c.table_name,c.column_name
      FROM information_schema.columns c
@@ -3771,8 +3849,8 @@ async function handleAddRecord(req, res) {
       ? `Revision ${revisionNo} of record #${parent.id} added by ${role}: "${title}" (${openQueries.length} ${openQueries.length === 1 ? 'query' : 'queries'} answered)`
       : `New record added by ${role}: "${title}"`;
     const projectRecipients = await getProjectRecipientKeys(projectId, userId, role).catch(() => []);
-    const notificationId = await notifyRecordUsers({ projectId, recordId, table, message: whole, actorId: userId, actorRole: role, recipients: projectRecipients });
-    await notifyRecordUsers({
+    const notificationId = await notifyRecordUsers({ email: Boolean(parent), emailSubject: 'Revision submitted', projectId, recordId, table, message: whole, actorId: userId, actorRole: role, recipients: projectRecipients });
+    await notifyRecordUsers({ email: true, emailSubject: 'Action needed: review and sign',
       projectId, recordId, table, actorId: userId, actorRole: role,
       message: `You are named to review and sign "${title}" (${stage1.label}).`,
       recipients: plan.signers.map(s => flowKey(s.role, s.user_id)),
@@ -3833,6 +3911,7 @@ function parseQueryList(raw) {
       ref: String(item?.ref || '').trim().slice(0, 120),
       query: query.slice(0, 1500),
       required_action: String(item?.required_action || '').trim().slice(0, 1000),
+      by: String(item?.by || '').trim().slice(0, 120),
     });
   }
   if (out.length > FLOW_MAX_QUERIES) return { error: `At most ${FLOW_MAX_QUERIES} queries per notice.` };
@@ -3916,6 +3995,15 @@ async function prepareDecision(req, { preview }) {
     const waiting = planRows.filter(r => !r.is_decider && r.status !== 'signed');
     if (waiting.length) return fail(409, `Waiting for ${waiting.map(w => w.signer_position || flowRoleLabel(w.signer_role)).join(', ')} to sign first.`);
     const objecting = planRows.filter(r => !r.is_decider && r.status === 'signed' && r.outcome === 'queries');
+    if (decision !== 'rejected') {
+      const { rows: unresolved } = await pool.query(
+        `SELECT seq FROM record_queries WHERE record_table=$1 AND responded_in_record_id=$2 AND issuer_side=$3 AND status <> 'resolved' ORDER BY seq`,
+        [table, recordId, step.side]
+      );
+      if (unresolved.length) {
+        return fail(409, `You cannot ${decision === 'accepted' ? 'accept' : 'approve'} while ${unresolved.length === 1 ? 'an answered query is' : unresolved.length + ' answered queries are'} still unresolved (${unresolved.map(u => 'no. ' + u.seq).join(', ')}). Mark each as Resolved, or Reopen it, then decide.`);
+      }
+    }
     if (decision !== 'rejected' && objecting.length) {
       return fail(409, `You cannot ${decision === 'accepted' ? 'accept' : 'approve'} while queries from ${objecting.map(o => o.signer_position || flowRoleLabel(o.signer_role)).join(', ')} are open. They must clear them by signing again with "No queries", or you can reject this record. If they have left the project, replace them.`);
     }
@@ -3964,21 +4052,43 @@ async function prepareDecision(req, { preview }) {
   }
 
   const fingerprint = state.rec.signature_hash || await hashRemoteFile(state.rec.file_path);
-  const { rows: pr } = await pool.query('SELECT name FROM projects WHERE id=$1', [projectId]);
+  const { rows: pr } = await pool.query('SELECT name, contract_reference FROM projects WHERE id=$1', [projectId]);
   const kind = FLOW_NOTICE_KIND[decision];
+  const deciderSlot = slots.find(sl => sl.isDecider);
+  const issuerLabel = `${deciderSlot?.profile?.position || flowRoleLabel(role)}, ${flowSideLabel(step.side)} side`;
+  for (const q of queries) if (!q.by) q.by = issuerLabel;   // every query says who raised it
+  const [toName, toCompany] = await Promise.all([
+    resolveDisplayNameFor(state.rec.role, state.rec.uploaded_by, projectId).catch(() => null),
+    resolveCompanyNameForStamp(projectId, state.rec.uploaded_by, state.rec.role).catch(() => null),
+  ]);
+  const joinParts = (...a) => a.filter(Boolean).join(', ');
+  const ccList = slots.filter(sl => !sl.isDecider).map(sl => sl.position || sl.profile?.position).filter(Boolean);
   const ctx = {
-    projectName: pr[0]?.name || '', rec: state.rec, categoryLabel: FLOW_TABLE_LABELS[table],
+    tz: await loadProjectTz(projectId), projectName: pr[0]?.name || '', contractRef: pr[0]?.contract_reference || '',
+    recordRef: flowRecordRef(table, state.rec),
+    toLine: joinParts(toName, flowRoleLabel(state.rec.role), toCompany),
+    fromLine: joinParts(deciderSlot?.profile?.name, issuerLabel, deciderSlot?.profile?.company),
+    ccLine: ccList.join('; '),
+    rec: state.rec, categoryLabel: FLOW_TABLE_LABELS[table],
     issuerRole: role, issuerSide: step.side, issuedAt, respondBy, title, body,
     kindTitle: FLOW_NOTICE_TITLE[kind], decisionWord: FLOW_DECISION_WORD[decision], fingerprint,
   };
   const noticeSlots = slots.filter(sl => sl.isDecider);   // the notice carries the leader's signature and stamp only
   const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots: noticeSlots });
   let recordBytes = null, recordStampPlacement = null;
+  let placementIn = null;   // where the approver chose to stamp the record (optional)
+  if (decision !== 'rejected' && req.body.stampPlacement) {
+    try {
+      const sp = JSON.parse(String(req.body.stampPlacement));
+      const pg = parseInt(sp.page, 10), px = Number(sp.x), py = Number(sp.y);
+      if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) placementIn = { page: pg, x: px, y: py };
+    } catch (_) { /* ignore a malformed placement: the sign-off page still carries the signatures */ }
+  }
   if (decision !== 'rejected') {
     try {
       const built = await buildRecordWithSignoff({
-        stage, rec: state.rec, ctx, slots, stageLabel: step.label,
-        decisionLine: `Decision: ${ctx.decisionWord}, ${flowFormatDate(issuedAt)}. The signed notice is attached to this record.`,
+        stage, placementIn, rec: state.rec, ctx, slots, stageLabel: step.label,
+        decisionLine: `Decision: ${ctx.decisionWord}, ${flowFormatDate(issuedAt, ctx.tz)}. The signed notice is attached to this record.`,
       });
       recordBytes = built.bytes; recordStampPlacement = built.placement;
     } catch (stampErr) {
@@ -3986,7 +4096,7 @@ async function prepareDecision(req, { preview }) {
       return fail(502, 'The record file could not be opened to add the sign-off page, so nothing was issued. Check that the record PDF is readable and try again.');
     }
   }
-  return { data: { recordBytes, recordStampPlacement, table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
+  return { data: { tz: ctx.tz, recordBytes, recordStampPlacement, table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
 }
 
 // Does this user have a signature or stamp saved for the record's project? The database answers, using the
@@ -4017,7 +4127,7 @@ app.post('/api/decision-preview', authenticateToken, decisionUpload, async (req,
     const r = await prepareDecision(req, { preview: true });
     if (r.fail) return res.status(r.fail.status).json({ success: false, message: r.fail.message });
     const d = r.data;
-    const bundle = await buildDecisionBundle({ rec: d.state.rec, noticeBytes: d.noticeBytes, noticeLabel: FLOW_NOTICE_TITLE[d.kind].split(' (')[0], recordBytes: d.recordBytes });
+    const bundle = await buildDecisionBundle({ rec: d.state.rec, noticeBytes: d.noticeBytes, noticeLabel: FLOW_NOTICE_TITLE[d.kind].split(' (')[0], recordBytes: d.recordBytes, tz: d.tz });
     res.set('Content-Type', 'application/pdf');
     res.set('Content-Disposition', 'inline; filename="decision-preview.pdf"');
     return res.send(bundle);
@@ -4039,7 +4149,7 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
 
     // Upload the signed notice (permanent step, tracked for cleanup)
     const noticeHash = crypto.createHash('sha256').update(d.noticeBytes).digest('hex');
-    let noticeUrl, noticeAttachmentId, stampedRecordUrl = null;
+    let noticeUrl, noticeAttachmentId, stampedRecordUrl = null, stampedRecordPublicId = null, stampedRecordType = 'raw', previousSignedCopy = null;
     const supportingRows = [];
     try {
       const up = await uploadRecordFile({ buffer: d.noticeBytes }, 'oneproject/records', `${Date.now()}-notice-${d.recordId}.pdf`);
@@ -4048,7 +4158,7 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
       if (d.recordBytes) {
         const upRec = await uploadRecordFile({ buffer: d.recordBytes }, 'oneproject/records', `${Date.now()}-signed-record-${d.recordId}.pdf`);
         uploaded.push({ public_id: upRec.public_id, resource_type: upRec.resource_type });
-        stampedRecordUrl = upRec.secure_url;
+        stampedRecordUrl = upRec.secure_url; stampedRecordPublicId = upRec.public_id; stampedRecordType = upRec.resource_type;
       }
       const settled = await Promise.allSettled(d.supportingFiles.map(f => uploadRecordFile(f, 'oneproject/record-supporting')));
       settled.forEach((s, i) => {
@@ -4108,12 +4218,13 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
       await client.query(`UPDATE ${d.table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, d.recordId, d.projectId]);
       if (stampedRecordUrl) {
         // Approval only: the record's latest copy now carries the sign-off page. The original upload (file_path) is kept.
-        const cur = await client.query(`SELECT stamp_status FROM ${d.table} WHERE id=$1`, [d.recordId]);
+        const cur = await client.query(`SELECT stamp_status, stamped_doc_public_id FROM ${d.table} WHERE id=$1`, [d.recordId]);
+        previousSignedCopy = cur.rows[0]?.stamped_doc_public_id || null;
         await client.query(
           `UPDATE ${d.table} SET stamped_doc_url=$1, signed_by_id=$2, signed_by_role=$3, signed_at=NOW(), stamp_type='STAMPED', stamp_status=$4,
-                stamp_page=$5, stamp_x=$6, stamp_y=$7 WHERE id=$8 AND project_id=$9`,
+                stamp_page=$5, stamp_x=$6, stamp_y=$7, stamped_doc_public_id=$10 WHERE id=$8 AND project_id=$9`,
           [stampedRecordUrl, userId, role, getStampStatusFromActor(cur.rows[0]?.stamp_status, 'approver'),
-           d.recordStampPlacement?.page ?? 1, d.recordStampPlacement?.x ?? null, d.recordStampPlacement?.y ?? null, d.recordId, d.projectId]
+           d.recordStampPlacement?.page ?? null, d.recordStampPlacement?.x ?? null, d.recordStampPlacement?.y ?? null, d.recordId, d.projectId, stampedRecordPublicId]
         );
       }
 
@@ -4131,9 +4242,9 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
       for (let i = 0; i < d.queries.length; i++) {
         const q = d.queries[i];
         await client.query(
-          `INSERT INTO record_queries (record_table, record_id, notice_id, project_id, seq, ref, query, required_action, issuer_role, issuer_side)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [d.table, d.recordId, noticeId, d.projectId, i + 1, q.ref, q.query, q.required_action, role, d.step.side]
+          `INSERT INTO record_queries (record_table, record_id, notice_id, project_id, seq, ref, query, required_action, issuer_role, issuer_side, raised_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [d.table, d.recordId, noticeId, d.projectId, i + 1, q.ref, q.query, q.required_action, role, d.step.side, q.by || null]
         );
       }
       if (d.nextPlan) await insertSignerRows(client, { table: d.table, recordId: d.recordId, projectId: d.projectId, stage: d.nextPlan.stage, side: d.nextPlan.side, signers: d.nextPlan.signers });
@@ -4146,6 +4257,11 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
       return fail(500, 'The decision could not be saved. Nothing was changed.');
     } finally { if (client) { client.release(); client = null; } }
 
+    // The earlier signed copy of this record is superseded: remove it from storage (non-fatal)
+    if (previousSignedCopy && previousSignedCopy !== stampedRecordPublicId) {
+      await removeUploadedRecordFiles([{ public_id: previousSignedCopy, resource_type: stampedRecordType }]).catch(() => {});
+    }
+
     // Notifications (non-fatal)
     const q = d.queries.length;
     const message = d.decision === 'rejected'
@@ -4153,8 +4269,11 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
       : `${role} ${d.decision} record #${d.recordId} "${d.state.rec.title}" with notice #${noticeId}`;
     const recipients = await getProjectRecipientKeys(d.projectId, userId, role).catch(() => []);
     await notifyRecordUsers({ projectId: d.projectId, recordId: d.recordId, table: d.table, message, actorId: userId, actorRole: role, recipients });
+    if (d.state.rec.uploaded_by && !(Number(d.state.rec.uploaded_by) === Number(userId) && normalizeRole(d.state.rec.role) === normalizeRole(role))) {
+      emailFlowRecipients([flowKey(d.state.rec.role, d.state.rec.uploaded_by)], `Decision issued: ${FLOW_DECISION_WORD[d.decision]}`, message, d.projectId);   // not awaited
+    }
     if (d.nextPlan) {
-      await notifyRecordUsers({
+      await notifyRecordUsers({ email: true, emailSubject: 'Action needed: review and sign',
         projectId: d.projectId, recordId: d.recordId, table: d.table, actorId: userId, actorRole: role,
         message: `You are named to review and sign "${d.state.rec.title}" (${d.state.steps[d.stage].label}).`,
         recipients: d.nextPlan.signers.map(s => flowKey(s.role, s.user_id)),
@@ -4198,7 +4317,8 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
     if (!profile) return fail(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
     // Signing again after raising queries keeps the earlier review in the history
     const earlier = mine.status === 'signed' ? [{ outcome: mine.outcome, note: mine.findings?.note || '', queries: mine.findings?.queries || [], signed_at: mine.signed_at }] : [];
-    const findings = { note, queries: outcome === 'queries' ? parsed.queries : [], history: [...(mine.findings?.history || []), ...earlier] };
+    const raisedBy = `${mine.signer_position || flowRoleLabel(role)}, ${flowSideLabel(mine.side)} side`;
+    const findings = { note, queries: outcome === 'queries' ? parsed.queries.map(q => ({ ...q, by: raisedBy })) : [], history: [...(mine.findings?.history || []), ...earlier] };
     await pool.query(
       `UPDATE record_signers SET status='signed', outcome=$1, findings=$2, signed_at=NOW(), first_viewed_at=COALESCE(first_viewed_at, NOW()) WHERE id=$3`,
       [outcome, JSON.stringify(findings), mine.id]
@@ -4260,6 +4380,7 @@ app.post('/api/record-view', authenticateToken, async (req, res) => {
     }
     res.json({ success: true, first_viewed_at: upd.rows[0].first_viewed_at });
   } catch (err) {
+    if (err && err.code === '55000') return res.status(204).end();   // read-only project: nothing to record
     console.error('[record-view]', err);
     res.status(500).json({ error: 'Failed to record the view.' });
   }
@@ -4287,7 +4408,7 @@ app.post('/api/record-remind', authenticateToken, requireProjectLifecycleWrite, 
     );
     if (!rows.length) return fail(409, `A reminder was already sent in the last ${FLOW_REMIND_COOLDOWN_HOURS} hours, or nobody is waiting.`);
     await pool.query(`UPDATE record_signers SET reminder_sent_at=NOW() WHERE id = ANY($1::int[])`, [rows.map(r => r.id)]);
-    await notifyRecordUsers({
+    await notifyRecordUsers({ email: true, emailSubject: 'Reminder: waiting for your signature',
       projectId, recordId, table, actorId: userId, actorRole: role,
       message: `Reminder: "${state.rec.title}" is waiting for your signature.`,
       recipients: rows.map(r => flowKey(r.signer_role, r.signer_user_id)),
@@ -4341,7 +4462,7 @@ app.post('/api/record-signer-replace', authenticateToken, requireProjectLifecycl
     );
     await client.query(`UPDATE record_signers SET status='replaced', replaced_at=NOW(), replaced_by_user_id=$1, replaced_by_role=$2, replaced_by_signer_id=$3 WHERE id=$4`, [userId, role, ins.rows[0].id, row.id]);
     await client.query('COMMIT');
-    await notifyRecordUsers({
+    await notifyRecordUsers({ email: true, emailSubject: 'Action needed: review and sign',
       projectId, recordId: row.record_id, table: row.record_table, actorId: userId, actorRole: role,
       message: `You are named to review and sign "${state.rec.title}" in place of ${row.signer_position || flowRoleLabel(row.signer_role)}.`,
       recipients: [flowKey(cand.role, cand.user_id)],
@@ -4379,7 +4500,7 @@ app.post('/api/query-status', authenticateToken, requireProjectLifecycleWrite, a
       [status, role, userId, queryId]
     );
     if (q.responded_by_id) {
-      await notifyRecordUsers({
+      await notifyRecordUsers({ email: status === 'reopened', emailSubject: 'Query reopened',
         projectId, recordId: q.responded_in_record_id || q.record_id, table: q.record_table, actorId: userId, actorRole: role,
         message: `Query ${q.seq} was ${status === 'resolved' ? 'resolved' : 'reopened'} by ${role}.`,
         recipients: [flowKey(q.responded_by_role, q.responded_by_id)],
@@ -4395,7 +4516,7 @@ app.post('/api/query-status', authenticateToken, requireProjectLifecycleWrite, a
 // ── Card data: signing plan, queries, revisions, buttons ────────────────────
 async function buildRecordFlowView(c) {
   const { rec, projectId, userId, userRole, userSide, userIsDM, isUploader, isLocked, isRejected, steps,
-          btnState, pendingRole, approveLabel, workflowSteps, embeddedNotices, signersByRecord, queriesByRecord, allQueries, nameOf } = c;
+          btnState, pendingRole, approveLabel, workflowSteps, embeddedNotices, signersByRecord, queriesByRecord, allQueries, nameOf, projectTz, memberKeys, table } = c;
   const isNoticeRecord = Boolean(rec.notice_tied_id);
   const planRows = signersByRecord.get(rec.id) || [];
   const pendingIdx = workflowSteps.findIndex(s => s.status === 'pending');
@@ -4407,7 +4528,7 @@ async function buildRecordFlowView(c) {
   const sameSideLeader = Boolean(stage) && r.stage === stage && userIsDM && userSide === r.side;
   // Only leaders of the signer's own side are told that someone is no longer on the project
   const leftProject = sameSideLeader && (r.status === 'pending' || openQueries)
-    ? !(await userHasProjectAccess(r.signer_user_id, r.signer_role, projectId).catch(() => true)) : false;
+    ? !memberKeys.has(`${normalizeRole(r.signer_role)}:${r.signer_user_id}`) : false;
   return {
     open_queries: openQueries, left_project: leftProject,
     can_resign: Boolean(stage) && r.stage === stage && openQueries && isMe(r),
@@ -4456,11 +4577,12 @@ async function buildRecordFlowView(c) {
     } else if (me && me.status === 'signed' && me.outcome === 'queries' && !me.notice_id && !me.is_decider) btn = 'sign_review_again';
     else if (me && me.status === 'signed') btn = 'signed_waiting';
     else if (userIsDM && userSide === steps[stage - 1].side) btn = 'not_named';
+    else if (!userIsDM && userSide === steps[stage - 1].side) btn = 'not_named_comment';   // unnamed team members can only comment
   }
 
   const qOut = (q) => ({
     id: q.id, notice_id: q.notice_id, seq: q.seq, ref: q.ref, query: q.query, required_action: q.required_action,
-    status: q.status, response: q.response, responded_at: q.responded_at, resolved_at: q.resolved_at, issuer_side: q.issuer_side,
+    status: q.status, response: q.response, responded_at: q.responded_at, resolved_at: q.resolved_at, issuer_side: q.issuer_side, raised_by: q.raised_by || null,
     can_review: userIsDM && userSide === q.issuer_side && ['answered', 'resolved'].includes(q.status),
   });
   const ownQueries = (queriesByRecord.get(rec.id) || []).map(qOut);
@@ -4486,7 +4608,7 @@ async function buildRecordFlowView(c) {
     btn_state: btn, pending_role: pend, approve_label: label,
     revision_of_id: rec.revision_of_id || null, revision_no: rec.revision_no || 0, superseded_by_id: rec.superseded_by_id || null,
     notice_source: rec.notice_source || null, respond_by: rec.respond_by || null,
-    current_stage: stage,
+    current_stage: stage, time_zone: projectTz, reference: flowRecordRef(table, rec),
     signing_plan: stages,
     my_signer: stage ? (() => { const me = stageRows.find(r => isMe(r) && r.status === 'pending'); return me ? { id: me.id, stage, is_decider: me.is_decider, first_viewed_at: me.first_viewed_at } : null; })() : null,
     can_remind: Boolean(stage) && (isUploader || (userIsDM && userSide === getSide(rec.role))),
@@ -4852,6 +4974,8 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
     const queriesByRecord = new Map();
     for (const qr of allQueries) { if (!queriesByRecord.has(qr.record_id)) queriesByRecord.set(qr.record_id, []); queriesByRecord.get(qr.record_id).push(qr); }
     const nameCache = new Map();
+    const projectTz = await loadProjectTz(projectId);
+    const memberKeys = await loadProjectMemberKeys(projectId);
     const nameOf = async (r, id) => {
       const k = `${r}:${id}`;
       if (!nameCache.has(k)) nameCache.set(k, await resolveDisplayNameFor(r, id, projectId).catch(() => null));
@@ -4973,7 +5097,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       const flowView = await buildRecordFlowView({
         rec, projectId, userId, userRole, userSide, userIsDM, isUploader, isLocked, isRejected, steps,
         btnState, pendingRole, approveLabel, workflowSteps, embeddedNotices,
-        signersByRecord, queriesByRecord, allQueries, nameOf,
+        signersByRecord, queriesByRecord, allQueries, nameOf, projectTz, memberKeys, table,
       });
       return {
         ...rec,
