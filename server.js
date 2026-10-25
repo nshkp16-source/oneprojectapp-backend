@@ -413,7 +413,7 @@ async function loadSignerProfile(projectId, role, userId) {
     [userId, role, projectId]
   );
   const st = rows[0];
-  if (!st || !st.signature_image) return null;
+  if (!st || (!st.signature_image && !st.stamp_image_url)) return null;   // nothing saved at all
   const [name, company, ps] = await Promise.all([
     resolveSignerNameForStamp(projectId, userId, role),
     resolveCompanyNameForStamp(projectId, userId, role),
@@ -429,27 +429,17 @@ async function loadSignerProfile(projectId, role, userId) {
   };
 }
 
-// Plain-language reason a signer cannot sign yet (null when their setup is complete).
-// A company stamp IMAGE is required only for the styles that print one (three-part, signature-stamp);
-// the compact style needs just the signature.
-const STAMP_STYLES_WITH_IMAGE = ['three-part', 'signature-stamp'];
+// Reason a signer cannot sign yet. Only one case counts: the user has saved neither a signature nor a stamp
+// for this project. Anything saved (signature and/or stamp image) is accepted.
 async function explainMissingSignerSetup(projectId, role, userId, needStamp) {
   const { rows } = await pool.query(
-    `SELECT signature_image, stamp_image_url, stamp_style FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
+    `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
     [userId, role, projectId]
   );
   const st = rows[0];
-  const how = ' Open your Signature & Stamp setup for this project, save it, then try again.';
-  if (!st) {
-    return (needStamp
-      ? 'You have not set up your signature for this project, so the decision cannot be signed.'
-      : 'You have not set up your signature for this project, so your review cannot be signed.') + how;
-  }
-  if (!st.signature_image) return 'Your signature image is missing for this project, so it cannot be signed.' + how;
-  if (needStamp && STAMP_STYLES_WITH_IMAGE.includes(st.stamp_style) && !st.stamp_image_url) {
-    return 'Your stamp style includes a company stamp, but no company stamp image is saved for this project. Upload it in your Signature & Stamp setup, or switch to the compact style.' + how;
-  }
-  return null;
+  if (st && (st.signature_image || st.stamp_image_url)) return null;
+  return 'You have not set up a signature or stamp for this project, so ' +
+    (needStamp ? 'the decision' : 'your review') + ' cannot be signed. Open your Signature & Stamp setup, save it, then try again.';
 }
 
 async function embedImageFromSource(pdfDoc, source) {
@@ -3819,6 +3809,29 @@ async function prepareDecision(req, { preview }) {
   }
   return { data: { recordBytes, table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
 }
+
+// Does this user have a signature or stamp saved for the record's project? The database answers, using the
+// project of the record itself (not whatever project the browser thinks is active).
+app.get('/api/signing-readiness', authenticateToken, async (req, res) => {
+  const { user_id: userId, role } = req.user;
+  try {
+    let projectId = parseInt(req.query.projectId, 10);
+    const recordId = parseInt(req.query.recordId, 10);
+    const table = req.query.recordType ? resolveTable(req.query.recordType) : null;
+    if (table && recordId) {
+      const { rows } = await pool.query(`SELECT project_id FROM ${table} WHERE id=$1`, [recordId]);
+      if (!rows[0]) return res.status(404).json({ error: 'Record not found.' });
+      projectId = rows[0].project_id;
+    }
+    if (!projectId) return res.status(400).json({ error: 'projectId or recordId required' });
+    if (!await userHasProjectAccess(userId, role, projectId)) return res.status(403).json({ error: 'You are not a member of this project.' });
+    const problem = await explainMissingSignerSetup(projectId, role, userId, String(req.query.mode) !== 'review');
+    res.json({ ready: !problem, message: problem });
+  } catch (err) {
+    console.error('GET signing-readiness:', err);
+    res.status(500).json({ error: 'Could not check your signature setup.' });
+  }
+});
 
 app.post('/api/decision-preview', authenticateToken, decisionUpload, async (req, res) => {
   try {
