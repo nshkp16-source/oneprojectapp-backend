@@ -616,6 +616,149 @@ function drawFingerprint(L, ctx) {
 }
 
 // The system letter (a full notice built from the form)
+// ---- Formatted notice text (rich letter) ----------------------------------------------------
+// The notice text is written in a small editor (bold, italic, underline, headings, lists, alignment).
+// The server keeps only a safe subset of tags and draws it into the letter PDF.
+const LETTER_TAGS = new Set(['p', 'div', 'br', 'b', 'strong', 'i', 'em', 'u', 'ul', 'ol', 'li', 'h1', 'h2', 'h3']);
+const LETTER_BLOCKS = new Set(['p', 'div', 'h1', 'h2', 'h3', 'li']);
+const looksLikeHtml = (v) => /<\/?[a-z][^>]*>/i.test(String(v || ''));
+function decodeLetterEntities(t) {
+  return String(t).replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n))).replace(/&amp;/g, '&');
+}
+function letterAlignFrom(attrs) {
+  const m = /text-align\s*:\s*(left|right|center|justify)/i.exec(attrs) || /align\s*=\s*["']?(left|right|center|justify)/i.exec(attrs);
+  return m ? m[1].toLowerCase() : null;
+}
+function sanitizeLetterHtml(html) {
+  const raw = String(html || '').replace(/<(script|style)[\s\S]*?<\/\1>/gi, '').replace(/<!--[\s\S]*?-->/g, '');
+  const out = []; const stack = [];
+  for (const m of raw.matchAll(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)/g)) {
+    if (m[4] !== undefined) { out.push(m[4].replace(/&(?!(amp|lt|gt|quot|nbsp|#\d+|#39|apos);)/g, '&amp;').replace(/>/g, '&gt;')); continue; }
+    const closing = m[1] === '/'; const tag = m[2].toLowerCase();
+    if (!LETTER_TAGS.has(tag)) continue;
+    if (tag === 'br') { if (!closing) out.push('<br>'); continue; }
+    if (closing) {
+      const at = stack.lastIndexOf(tag);
+      if (at === -1) continue;
+      while (stack.length > at) out.push(`</${stack.pop()}>`);
+    } else {
+      const al = LETTER_BLOCKS.has(tag) && tag !== 'li' ? letterAlignFrom(m[3] || '') : null;
+      out.push(al ? `<${tag} style="text-align:${al}">` : `<${tag}>`);
+      stack.push(tag);
+    }
+  }
+  while (stack.length) out.push(`</${stack.pop()}>`);
+  return out.join('');
+}
+function letterHtmlToPlain(html) {
+  return decodeLetterEntities(String(html || '').replace(/<(br)\s*\/?>|<\/(p|div|li|h1|h2|h3)>/gi, '\n').replace(/<[^>]+>/g, ''))
+    .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+function parseLetterBlocks(html) {
+  const blocks = []; const lists = []; const fmt = { b: 0, i: 0, u: 0 }; let cur = null;
+  const flush = () => {
+    if (!cur) return;
+    const hasText = cur.runs.some(r => r.text.trim());
+    if (hasText) blocks.push(cur); else if (cur.type !== 'li') blocks.push({ type: 'blank', runs: [] });
+    cur = null;
+  };
+  for (const m of String(html || '').matchAll(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)/g)) {
+    if (m[4] !== undefined) {
+      const text = decodeLetterEntities(m[4]).replace(/[ \t\r\n]+/g, ' ');
+      if (!cur) { if (!text.trim()) continue; cur = { type: 'p', align: 'left', runs: [] }; }
+      cur.runs.push({ text, b: fmt.b > 0, i: fmt.i > 0, u: fmt.u > 0 });
+      continue;
+    }
+    const closing = m[1] === '/'; const tag = m[2].toLowerCase();
+    if (tag === 'br') { if (!cur) cur = { type: 'p', align: 'left', runs: [] }; cur.runs.push({ text: '\n', b: false, i: false, u: false }); continue; }
+    if (['b', 'strong'].includes(tag)) { fmt.b += closing ? -1 : 1; continue; }
+    if (['i', 'em'].includes(tag)) { fmt.i += closing ? -1 : 1; continue; }
+    if (tag === 'u') { fmt.u += closing ? -1 : 1; continue; }
+    if (tag === 'ul' || tag === 'ol') { flush(); if (closing) lists.pop(); else lists.push({ ordered: tag === 'ol', n: 0 }); continue; }
+    if (LETTER_BLOCKS.has(tag)) {
+      flush();
+      if (closing) continue;
+      if (tag === 'li') {
+        const l = lists[lists.length - 1] || { ordered: false, n: 0 };
+        l.n += 1;
+        cur = { type: 'li', align: 'left', ordered: l.ordered, num: l.n, level: Math.max(lists.length, 1), runs: [] };
+      } else cur = { type: tag === 'div' ? 'p' : tag, align: letterAlignFrom(m[3] || '') || 'left', runs: [] };
+    }
+  }
+  flush();
+  return blocks;
+}
+async function drawLetterBody(L, pdfDoc, body) {
+  if (!looksLikeHtml(body)) { L.text(body, { size: 10.5, gap: 8 }); return; }
+  const fonts = {
+    r: L.regular, b: L.bold,
+    i: await pdfDoc.embedFont(StandardFonts.HelveticaOblique),
+    bi: await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique),
+  };
+  const maxW = PDF_W - 2 * PDF_M;
+  for (const blk of parseLetterBlocks(body)) {
+    if (blk.type === 'blank') { L.y -= 8; continue; }
+    const heading = { h1: 16, h2: 13, h3: 11.5 }[blk.type];
+    const size = heading || 10.5;
+    const lineH = size * 1.45;
+    const indent = blk.type === 'li' ? 14 + (blk.level - 1) * 16 : 0;
+    const left = PDF_M + indent;
+    const width = maxW - indent;
+    // words with their styles
+    const words = [];
+    for (const r of blk.runs) {
+      const bold = heading ? true : r.b;
+      const font = bold && r.i ? fonts.bi : bold ? fonts.b : r.i ? fonts.i : fonts.r;
+      for (const part of r.text.split(/(\n|\s+)/)) {
+        if (part === '') continue;
+        if (part === '\n') words.push({ br: true });
+        else words.push({ text: L.safe(part), font, u: r.u, space: /^\s+$/.test(part) });
+      }
+    }
+    const measure = (w) => (w.w ??= w.font.widthOfTextAtSize(w.text, size));
+    const lines = []; let line = []; let lw = 0;
+    const push = () => { while (line.length && line[line.length - 1].space) line.pop(); lines.push(line); line = []; lw = 0; };
+    for (const w of words) {
+      if (w.br) { push(); continue; }
+      if (w.space && !line.length) continue;
+      const wd = measure(w);
+      if (lw + wd > width && line.length && !w.space) push();
+      if (!w.space && wd > width) {   // a single very long word: split it
+        let chunk = '';
+        for (const ch of w.text) {
+          if (w.font.widthOfTextAtSize(chunk + ch, size) > width && chunk) { lines.push([{ text: chunk, font: w.font, u: w.u, w: w.font.widthOfTextAtSize(chunk, size) }]); chunk = ''; }
+          chunk += ch;
+        }
+        if (chunk) { line.push({ text: chunk, font: w.font, u: w.u, w: w.font.widthOfTextAtSize(chunk, size) }); lw = line[0].w; }
+        continue;
+      }
+      line.push(w); lw += wd;
+    }
+    if (line.length) push();
+    if (!lines.length) lines.push([]);
+    lines.forEach((ln, idx) => {
+      L.ensure(lineH);
+      const total = ln.reduce((a, w) => a + measure(w), 0);
+      let x = left;
+      if (blk.align === 'center') x = left + (width - total) / 2;
+      else if (blk.align === 'right') x = left + width - total;
+      if (blk.type === 'li' && idx === 0) {
+        const marker = blk.ordered ? `${blk.num}.` : '\u2022';
+        L.page.drawText(L.safe(marker), { x: left - 12, y: L.y - size, size, font: fonts.r, color: INK });
+      }
+      for (const w of ln) {
+        if (w.text.trim()) L.page.drawText(w.text, { x, y: L.y - size, size, font: w.font, color: INK });
+        if (w.u && w.text.trim()) L.page.drawLine({ start: { x, y: L.y - size - 1.5 }, end: { x: x + measure(w), y: L.y - size - 1.5 }, thickness: 0.6, color: INK });
+        x += measure(w);
+      }
+      L.y -= lineH;
+    });
+    L.y -= heading ? 6 : 4;
+  }
+  L.y -= 4;
+}
+
 async function drawGeneratedLetter(pdfDoc, ctx, queries) {
   const L = await createLayout(pdfDoc);
   L.text(ctx.kindTitle, { size: 17, font: L.bold, gap: 2 });
@@ -624,7 +767,7 @@ async function drawGeneratedLetter(pdfDoc, ctx, queries) {
   drawMetaBlock(L, ctx);
   L.rule(10);
   L.text(`Decision: ${ctx.decisionWord}`, { size: 12, font: L.bold, gap: 6 });
-  if (ctx.body) L.text(ctx.body, { size: 10.5, gap: 8 });
+  if (ctx.body) await drawLetterBody(L, pdfDoc, ctx.body);
   drawQuerySchedule(L, queries);
   drawFingerprint(L, ctx);
 }
@@ -638,7 +781,7 @@ async function drawNoticeAnnex(pdfDoc, ctx, queries) {
   drawMetaBlock(L, ctx);
   L.rule(10);
   L.text(`Decision: ${ctx.decisionWord}`, { size: 12, font: L.bold, gap: 6 });
-  if (ctx.body) L.text(ctx.body, { size: 10.5, gap: 8 });
+  if (ctx.body) await drawLetterBody(L, pdfDoc, ctx.body);
   drawQuerySchedule(L, queries);
   drawFingerprint(L, ctx);
 }
@@ -718,13 +861,46 @@ async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots }) 
 
 // The record itself carries the approvals: its latest file plus a sign-off page for this stage.
 // Built only for approvals. A rejected record is never signed or stamped.
-async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine }) {
+async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine, stage }) {
   const recUrl = rec.stamped_doc_url || rec.file_path;
   const remote = await fetch(recUrl, { redirect: 'follow' });
   if (!remote.ok) throw new Error('The record file is not reachable.');
   const doc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()), { ignoreEncryption: true });
+
+  // 1) The decision is signed and stamped ON the record's first page (stacked above earlier stages)
+  const decider = slots.find(sl => sl.isDecider);
+  const placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, profile: decider?.profile, signedAt: decider?.signed_at, stage: stage || 1 });
+  // 2) ...and the full sign-off page (every named signer) is added at the end
   await appendSignaturePage(doc, { ...ctx, kindTitle: `Record sign-off, ${stageLabel}` }, slots, { heading: 'Record sign-off', decisionLine });
-  return Buffer.from(await doc.save());
+  return { bytes: Buffer.from(await doc.save()), placement };
+}
+
+// Decision block on page 1 of the record: word, signature, company stamp, name/position, date.
+async function drawRecordDecisionStamp(doc, { word, profile, signedAt, stage }) {
+  const page = doc.getPage(0);
+  const { width, height } = page.getSize();
+  const regular = await doc.embedFont(StandardFonts.Helvetica);
+  const bold = await doc.embedFont(StandardFonts.HelveticaBold);
+  const safe = makePdfSafe(regular);
+  const w = 176, h = 86, margin = 18, gapY = 6;
+  const x = Math.max(margin, width - w - margin);
+  const y = Math.min(margin + (Math.max(stage, 1) - 1) * (h + gapY), Math.max(margin, height - h - margin));
+  const green = rgb(0.09, 0.45, 0.24);
+  page.drawRectangle({ x, y, width: w, height: h, color: rgb(1, 1, 1), opacity: 0.92, borderColor: green, borderWidth: 1.2 });
+  page.drawText(safe(word || 'APPROVED'), { x: x + 8, y: y + h - 16, size: 12, font: bold, color: green });
+  if (profile?.signature_image) {
+    const sig = await embedImageFromSource(doc, profile.signature_image);
+    if (sig) { const k = Math.min(78 / sig.width, 30 / sig.height, 1); page.drawImage(sig, { x: x + 8, y: y + h - 52, width: sig.width * k, height: sig.height * k }); }
+  }
+  if (profile?.stamp_image_url) {
+    const st = await embedImageFromSource(doc, profile.stamp_image_url);
+    if (st) { const k = Math.min(52 / st.width, 52 / st.height, 1); page.drawImage(st, { x: x + w - 8 - st.width * k, y: y + h - 18 - st.height * k, width: st.width * k, height: st.height * k }); }
+  }
+  const line = (t, dy, f = regular, sz = 7) => page.drawText(safe(String(t).slice(0, 46)), { x: x + 8, y: y + dy, size: sz, font: f, color: rgb(0.1, 0.1, 0.1) });
+  line(profile?.name || '', 26, bold, 7.5);
+  line([profile?.position, profile?.side].filter(Boolean).join(', '), 17);
+  line(`${profile?.company ? profile.company + ', ' : ''}${flowFormatDate(signedAt)}`, 8);
+  return { page: 1, x: x / width, y: y / height };
 }
 
 // Original record + the new notice, with divider strips (same look as the bundle)
@@ -3703,10 +3879,12 @@ async function prepareDecision(req, { preview }) {
   if (!FLOW_NOTICE_KIND[decision]) return fail(400, 'Choose approve, accept or reject.');
   const source = req.body.noticeSource === 'uploaded' ? 'uploaded' : 'generated';
   const title = String(req.body.title || '').trim();
-  const body = String(req.body.body || '').trim();
+  const bodyInput = String(req.body.body || '').trim();
+  const body = looksLikeHtml(bodyInput) ? sanitizeLetterHtml(bodyInput) : bodyInput;
+  const bodyPlain = looksLikeHtml(body) ? letterHtmlToPlain(body) : body;
   if (title.length < RECORD_TITLE_MIN || title.length > RECORD_TITLE_MAX) return fail(400, `The notice title must be ${RECORD_TITLE_MIN} to ${RECORD_TITLE_MAX} characters.`);
-  if (body.length > 20000) return fail(400, 'The notice text is too long.');
-  if (source === 'generated' && body.length < RECORD_TEXT_MIN) return fail(400, `Write the notice text (at least ${RECORD_TEXT_MIN} characters).`);
+  if (body.length > 60000) return fail(400, 'The notice text is too long.');
+  if (source === 'generated' && bodyPlain.length < RECORD_TEXT_MIN) return fail(400, `Write the notice text (at least ${RECORD_TEXT_MIN} characters).`);
   const respondBy = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.respondBy || '')) ? req.body.respondBy : null;
   const parsedQueries = parseQueryList(req.body.queries);
   if (parsedQueries.error) return fail(400, parsedQueries.error);
@@ -3795,19 +3973,20 @@ async function prepareDecision(req, { preview }) {
   };
   const noticeSlots = slots.filter(sl => sl.isDecider);   // the notice carries the leader's signature and stamp only
   const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots: noticeSlots });
-  let recordBytes = null;
+  let recordBytes = null, recordStampPlacement = null;
   if (decision !== 'rejected') {
     try {
-      recordBytes = await buildRecordWithSignoff({
-        rec: state.rec, ctx, slots, stageLabel: step.label,
+      const built = await buildRecordWithSignoff({
+        stage, rec: state.rec, ctx, slots, stageLabel: step.label,
         decisionLine: `Decision: ${ctx.decisionWord}, ${flowFormatDate(issuedAt)}. The signed notice is attached to this record.`,
       });
+      recordBytes = built.bytes; recordStampPlacement = built.placement;
     } catch (stampErr) {
       console.error('[prepareDecision] record sign-off failed:', stampErr);
       return fail(502, 'The record file could not be opened to add the sign-off page, so nothing was issued. Check that the record PDF is readable and try again.');
     }
   }
-  return { data: { recordBytes, table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
+  return { data: { recordBytes, recordStampPlacement, table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
 }
 
 // Does this user have a signature or stamp saved for the record's project? The database answers, using the
@@ -3897,7 +4076,7 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
       );
       if (dup.rows.length) throw Object.assign(new Error('dup'), { http: 409, publicMessage: 'You already decided this record.' });
 
-      const description = d.body
+      const description = d.body && looksLikeHtml(d.body) ? d.body : d.body
         ? d.body.split(/\n{2,}/).map(p => `<p>${flowEscape(p).replace(/\n/g, '<br>')}</p>`).join('')
         : `<p>Notice attached as PDF.${d.queries.length ? ` ${d.queries.length} ${d.queries.length === 1 ? 'query' : 'queries'} raised.` : ''}</p>`;
       const nIns = await client.query(
@@ -3931,8 +4110,10 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
         // Approval only: the record's latest copy now carries the sign-off page. The original upload (file_path) is kept.
         const cur = await client.query(`SELECT stamp_status FROM ${d.table} WHERE id=$1`, [d.recordId]);
         await client.query(
-          `UPDATE ${d.table} SET stamped_doc_url=$1, signed_by_id=$2, signed_by_role=$3, signed_at=NOW(), stamp_type='STAMPED', stamp_status=$4 WHERE id=$5 AND project_id=$6`,
-          [stampedRecordUrl, userId, role, getStampStatusFromActor(cur.rows[0]?.stamp_status, 'approver'), d.recordId, d.projectId]
+          `UPDATE ${d.table} SET stamped_doc_url=$1, signed_by_id=$2, signed_by_role=$3, signed_at=NOW(), stamp_type='STAMPED', stamp_status=$4,
+                stamp_page=$5, stamp_x=$6, stamp_y=$7 WHERE id=$8 AND project_id=$9`,
+          [stampedRecordUrl, userId, role, getStampStatusFromActor(cur.rows[0]?.stamp_status, 'approver'),
+           d.recordStampPlacement?.page ?? 1, d.recordStampPlacement?.x ?? null, d.recordStampPlacement?.y ?? null, d.recordId, d.projectId]
         );
       }
 
