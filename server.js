@@ -12,6 +12,7 @@ import crypto from 'crypto';
 import { v2 as cloudinary } from 'cloudinary';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { Readable } from 'stream';
+import { layoutStamp, drawStampOnPage, stampPdfBuffer, buildStampPreviewPdf, deriveStampId, pickMark, formatStampDate } from './stamp-renderer.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -121,6 +122,62 @@ async function ensureStampStatusColumns() {
 }
 
 await ensureStampStatusColumns();
+
+// One shared stamp: registry of every stamp the server has drawn (powers /verify/:id).
+async function ensureStampTables() {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS stamp_registry (
+      stamp_id TEXT PRIMARY KEY,
+      project_id INTEGER,
+      record_table TEXT,
+      record_id INTEGER,
+      kind TEXT,
+      signer_user_id INTEGER,
+      signer_role TEXT,
+      signer_name TEXT,
+      signer_position TEXT,
+      company_name TEXT,
+      label TEXT,
+      tz TEXT,
+      file_hash TEXT,
+      signed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS stamp_registry_record_idx ON stamp_registry (record_table, record_id)`);
+    await pool.query(`ALTER TABLE user_stamps ADD COLUMN IF NOT EXISTS mark_type TEXT`);
+  } catch (err) {
+    console.warn('[schema] stamp tables not ensured:', err.message);
+  }
+}
+await ensureStampTables();
+
+const publicBaseUrl = (req) => (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+
+async function registerStamp(db, row) {
+  try {
+    await db.query(
+      `INSERT INTO stamp_registry (stamp_id, project_id, record_table, record_id, kind, signer_user_id, signer_role,
+         signer_name, signer_position, company_name, label, tz, file_hash, signed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (stamp_id) DO NOTHING`,
+      [row.stampId, row.projectId, row.table, row.recordId, row.kind, row.userId, row.role,
+       row.name || null, row.position || null, row.company || null, row.label || null, row.tz || null,
+       row.fileHash || null, row.signedAt || new Date()]
+    );
+  } catch (err) { console.warn('[stamp] registry write failed:', err.message); }
+}
+
+// Builds the renderer input from a signer profile. Name, position and company come from the database.
+function stampSpecFromProfile(profile, { label, signedAt, tz, stampId, baseUrl }) {
+  const sideText = profile.side ? `${flowSideLabel(profile.side)} side` : '';
+  return {
+    markSource: pickMark(profile),
+    name: profile.name,
+    secondary: [profile.position, sideText].filter(Boolean).join(', '),
+    company: profile.company || '',
+    signedAt, tz, stampId, label,
+    verifyUrl: stampId && baseUrl ? `${baseUrl}/verify/${stampId}` : null,
+  };
+}
 
 async function ensureDisplayNameColumns() {
   const userTables = [
@@ -441,7 +498,7 @@ const flowKey = (role, id) => ({ recipient_role: normalizeRole(role), recipient_
 // ── Signature profile (read from the server, not trusted from the browser) ──
 async function loadSignerProfile(projectId, role, userId) {
   const { rows } = await pool.query(
-    `SELECT signer_name, signature_image, stamp_image_url, stamp_style
+    `SELECT signer_name, signature_image, stamp_image_url, stamp_style, mark_type
      FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
     [userId, role, projectId]
   );
@@ -459,6 +516,7 @@ async function loadSignerProfile(projectId, role, userId) {
     side: ps?.side || null,
     signature_image: st.signature_image,
     stamp_image_url: isDecisionMaker(role) ? st.stamp_image_url : null,
+    mark_type: st.mark_type || null,
   };
 }
 
@@ -842,13 +900,20 @@ async function drawNoticeAnnex(pdfDoc, ctx, queries) {
   drawFingerprint(L, ctx);
 }
 
+// Deterministic: preview and the issued copy always show the same ID for the same signing event.
+function decisionStampId(ctx, slot) {
+  if (!ctx.table || !slot?.signed_at) return null;
+  return deriveStampId({ k: 'decision', t: ctx.table, rec: ctx.rec?.id, u: slot.userId, r: slot.role,
+    at: new Date(slot.signed_at).toISOString(), fp: ctx.fingerprint || '' });
+}
+
 async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
   const L = await createLayout(pdfDoc);
   L.text(opts.heading || 'Signatures', { size: 15, font: L.bold, gap: 2 });
   L.text(`${ctx.kindTitle}. Record #${ctx.rec.id}: ${ctx.rec.title}`, { size: 9.5, color: MUTED, gap: 8 });
   L.rule(10);
   if (opts.decisionLine) L.text(opts.decisionLine, { size: 11, font: L.bold, gap: 8 });
-  const boxW = 235, boxH = 122, gapX = 17, gapY = 26;
+  const boxW = 235, boxH = 138, gapX = 17, gapY = 26;
   let col = 0;
   for (const slot of slots) {
     if (col === 0) L.ensure(boxH + gapY + 14);
@@ -857,40 +922,24 @@ async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
     L.page.drawText(L.safe(slot.caption), { x, y: top - 9, size: 8.5, font: L.bold, color: MUTED });
     const boxTop = top - 16;
     const signed = slot.status === 'signed' && slot.profile;
-    L.page.drawRectangle({
-      x, y: boxTop - boxH, width: boxW, height: boxH,
-      borderColor: signed ? INK : MUTED, borderWidth: signed ? 1 : 0.8,
-      borderDashArray: signed ? undefined : [3, 3], color: rgb(1, 1, 1),
-    });
+    if (!(slot.status === 'signed' && slot.profile)) {
+      L.page.drawRectangle({
+        x, y: boxTop - boxH, width: boxW, height: boxH,
+        borderColor: MUTED, borderWidth: 0.8, borderDashArray: [3, 3], color: rgb(1, 1, 1),
+      });
+    }
     if (signed) {
       const p = slot.profile;
-      L.page.drawText('Digitally signed by', { x: x + 8, y: boxTop - 14, size: 7, font: L.regular, color: MUTED });
-      const sigImg = await embedImageFromSource(pdfDoc, p.signature_image);
-      if (sigImg) {
-        const s = Math.min(78 / sigImg.width, 38 / sigImg.height, 1);
-        L.page.drawImage(sigImg, { x: x + 8, y: boxTop - 58, width: sigImg.width * s, height: sigImg.height * s });
+      const stampId = decisionStampId(ctx, slot);
+      if (!ctx.preview && stampId) {
+        await registerStamp(pool, { stampId, projectId: ctx.projectId, table: ctx.table, recordId: ctx.rec?.id, kind: 'decision',
+          userId: slot.userId, role: slot.role, name: p.name, position: slot.position || p.position, company: p.company,
+          label: ctx.decisionWord || 'APPROVED', tz: ctx.tz, fileHash: null, signedAt: slot.signed_at });
       }
-      const stampImg = p.stamp_image_url ? await embedImageFromSource(pdfDoc, p.stamp_image_url) : null;
-      if (stampImg) {
-        const s = Math.min(70 / stampImg.width, 70 / stampImg.height, 1);
-        const w = stampImg.width * s, h = stampImg.height * s;
-        L.page.drawImage(stampImg, { x: x + boxW - w - 8, y: boxTop - 14 - h, width: w, height: h });
-      }
-      const textW = stampImg ? boxW - 100 : boxW - 16;
-      let ty = boxTop - 66;
-      const rows = [
-        { t: p.name, f: L.bold, s: 9.5, c: INK },
-        { t: `${slot.position || p.position || ''}${slot.side ? ', ' + flowSideLabel(slot.side) + ' side' : ''}`, f: L.regular, s: 8, c: INK },
-        { t: p.company ? `Company: ${p.company}` : '', f: L.regular, s: 8, c: INK },
-        { t: flowFormatDateTime(slot.signed_at, ctx.tz), f: L.regular, s: 7.5, c: MUTED },
-      ];
-      for (const r of rows) {
-        if (!r.t) continue;
-        for (const ln of wrapPdfText(L.safe(r.t), r.f, r.s, textW).slice(0, 2)) {
-          L.page.drawText(ln, { x: x + 8, y: ty, size: r.s, font: r.f, color: r.c });
-          ty -= r.s * 1.3;
-        }
-      }
+      const spec = stampSpecFromProfile({ ...p, position: slot.position || p.position, side: slot.side || p.side },
+        { label: ctx.decisionWord || 'APPROVED', signedAt: slot.signed_at, tz: ctx.tz, stampId, baseUrl: ctx.baseUrl });
+      const lay = await layoutStamp(pdfDoc, spec, { width: boxW });
+      lay.paint(L.page, x, boxTop - lay.height);
     } else {
       L.page.drawText(slot.pendingLabel || 'Awaiting signature', { x: x + 8, y: boxTop - 22, size: 9, font: L.bold, color: MUTED });
       L.page.drawText(L.safe(`${slot.position || ''}${slot.side ? ', ' + flowSideLabel(slot.side) + ' side' : ''}`), { x: x + 8, y: boxTop - 36, size: 8, font: L.regular, color: MUTED });
@@ -943,7 +992,7 @@ async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLin
   let placement = null;
   if (placementIn) {
     const decider = slots.find(sl => sl.isDecider);
-    placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, profile: decider?.profile, signedAt: decider?.signed_at, at: placementIn, tz: ctx.tz });
+    placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, slot: decider, ctx, at: placementIn });
   }
   // 2) The sign-off page (every named signer) is always added at the end of the record
   const originalPages = doc.getPageCount();
@@ -953,32 +1002,14 @@ async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLin
 }
 
 // Decision block at the position the approver picked: word, signature, company stamp, name/position, date.
-async function drawRecordDecisionStamp(doc, { word, profile, signedAt, at, tz }) {
+async function drawRecordDecisionStamp(doc, { word, slot, ctx, at }) {
   const pageIdx = Math.min(Math.max((at.page || 1) - 1, 0), doc.getPageCount() - 1);
   const page = doc.getPage(pageIdx);
-  const { width, height } = page.getSize();
-  const regular = await doc.embedFont(StandardFonts.Helvetica);
-  const bold = await doc.embedFont(StandardFonts.HelveticaBold);
-  const safe = makePdfSafe(regular);
-  const w = 176, h = 86, margin = 12;
-  const x = Math.min(Math.max(at.x * width - w / 2, margin), Math.max(margin, width - w - margin));
-  const y = Math.min(Math.max(at.y * height - h / 2, margin), Math.max(margin, height - h - margin));
-  const green = rgb(0.09, 0.45, 0.24);
-  page.drawRectangle({ x, y, width: w, height: h, color: rgb(1, 1, 1), opacity: 0.92, borderColor: green, borderWidth: 1.2 });
-  page.drawText(safe(word || 'APPROVED'), { x: x + 8, y: y + h - 16, size: 12, font: bold, color: green });
-  if (profile?.signature_image) {
-    const sig = await embedImageFromSource(doc, profile.signature_image);
-    if (sig) { const k = Math.min(78 / sig.width, 30 / sig.height, 1); page.drawImage(sig, { x: x + 8, y: y + h - 52, width: sig.width * k, height: sig.height * k }); }
-  }
-  if (profile?.stamp_image_url) {
-    const st = await embedImageFromSource(doc, profile.stamp_image_url);
-    if (st) { const k = Math.min(52 / st.width, 52 / st.height, 1); page.drawImage(st, { x: x + w - 8 - st.width * k, y: y + h - 18 - st.height * k, width: st.width * k, height: st.height * k }); }
-  }
-  const line = (t, dy, f = regular, sz = 7) => page.drawText(safe(String(t).slice(0, 46)), { x: x + 8, y: y + dy, size: sz, font: f, color: rgb(0.1, 0.1, 0.1) });
-  line(profile?.name || '', 26, bold, 7.5);
-  line([profile?.position, profile?.side].filter(Boolean).join(', '), 17);
-  line(`${profile?.company ? profile.company + ', ' : ''}${flowFormatDate(signedAt, tz)}`, 8);
-  return { page: pageIdx + 1, x: x / width, y: y / height };
+  const profile = slot?.profile;
+  const spec = stampSpecFromProfile({ ...(profile || {}), position: slot?.position || profile?.position, side: slot?.side || profile?.side },
+    { label: word || 'APPROVED', signedAt: slot?.signed_at, tz: ctx.tz, stampId: decisionStampId(ctx, slot), baseUrl: ctx.baseUrl });
+  const box = await drawStampOnPage(doc, page, spec, { xRatio: at.x, yRatio: at.y });
+  return { page: pageIdx + 1, x: box.xRatio, y: box.yRatio };
 }
 
 // Original record + the new notice, with divider strips (same look as the bundle)
@@ -3679,8 +3710,8 @@ async function handleAddRecord(req, res) {
     const supportingFiles = req.files?.supportingFiles || [];
     // The attachment arrives pre-converted-to-PDF (and pre-stamped, if the user
     // chose to stamp) from the client. clientStamped is a claim we verify below.
-    const clientStamped = req.body.clientStamped === 'true';
-    const stampType = (req.body.stampType || 'STAMPED').toUpperCase();
+    const clientStamped = req.body.applyStamp === 'true' || req.body.clientStamped === 'true';   // the SERVER draws the stamp
+    const stampType = 'STAMPED';
     const stampPageRaw = req.body.stampPage;
     const stampPage = stampPageRaw === 'append' ? 'append' : Number.parseInt(stampPageRaw, 10);
     const stampX = Number.parseFloat(req.body.stampX);
@@ -3746,13 +3777,11 @@ async function handleAddRecord(req, res) {
     }
 
     // ── STEP 5. Stamp claim (database + metadata) ────────────────────────────
+    let signerProfile = null, stampId = null, stampTz = null;   // the server owns the stamp; the browser only sends where to put it
     if (clientStamped) {
       if (!isDecisionMaker(role)) return fail(403, 'Only decision makers can stamp documents.');
-      const { rows: stampRows } = await pool.query(
-        `SELECT 1 FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
-        [userId, role, projectId]
-      );
-      if (!stampRows.length) return fail(400, 'No stamp profile found. Set up your stamp first.');
+      signerProfile = await loadSignerProfile(projectId, role, userId);
+      if (!signerProfile) return fail(400, 'No stamp profile found. Set up your stamp first.');
       if ((stampPage !== 'append' && (!Number.isInteger(stampPage) || stampPage < 1)) || !Number.isFinite(stampX) || !Number.isFinite(stampY) || stampX < 0 || stampX > 1 || stampY < 0 || stampY > 1) {
         return fail(400, 'Invalid stamp placement metadata supplied.');
       }
@@ -3769,6 +3798,21 @@ async function handleAddRecord(req, res) {
     } catch (parseErr) {
       console.error('[add-record] PDF parse failed:', parseErr.message);
       return fail(400, clientStamped ? 'The stamped PDF could not be verified as a valid PDF.' : 'The official document is not a valid PDF.');
+    }
+    // The server draws the stamp: signed identity comes from the database, never from the browser.
+    if (clientStamped) {
+      try {
+        stampTz = await loadProjectTz(projectId);
+        const origHash = crypto.createHash('sha256').update(officialFile.buffer).digest('hex');
+        stampId = deriveStampId({ k: 'record', p: projectId, u: userId, r: role, ts: Date.now(), h: origHash, n: crypto.randomBytes(4).toString('hex') });
+        const spec = stampSpecFromProfile(signerProfile, { label: 'SIGNED', signedAt: new Date(), tz: stampTz, stampId, baseUrl: publicBaseUrl(req) });
+        const stamped = await stampPdfBuffer(officialFile.buffer, spec, { page: stampPage, x: stampX, y: stampY });
+        officialFile.buffer = stamped.bytes;
+        officialFile.size = stamped.bytes.length;
+      } catch (stampErr) {
+        console.error('[add-record] stamping failed:', stampErr);
+        return fail(500, 'The stamp could not be added to the PDF. Check that the PDF is readable and try again.');
+      }
     }
     const fileHash = crypto.createHash('sha256').update(officialFile.buffer).digest('hex');
 
@@ -3822,6 +3866,10 @@ async function handleAddRecord(req, res) {
         ]
       );
       recordId = recRes.rows[0].id;
+      if (stampApplied && stampId) {
+        await registerStamp(client, { stampId, projectId: Number(projectId), table, recordId, kind: 'record_upload', userId, role,
+          name: signerProfile.name, position: signerProfile.position, company: signerProfile.company, label: 'SIGNED', tz: stampTz, fileHash, signedAt: new Date() });
+      }
       await insertSignerRows(client, { table, recordId, projectId: Number(projectId), stage: 1, side: stage1.side, signers: plan.signers });
       if (parent) {
         const upd = await client.query(`UPDATE ${table} SET superseded_by_id=$1 WHERE id=$2 AND superseded_by_id IS NULL`, [recordId, parent.id]);
@@ -4048,6 +4096,7 @@ async function prepareDecision(req, { preview }) {
       status: isMe ? (preview ? 'pending' : 'signed') : (r.status === 'signed' && p ? 'signed' : 'pending'),
       pendingLabel: isMe && preview ? 'Signs when issued' : 'Awaiting signature',
       profile: p, signed_at: isMe ? issuedAt : r.signed_at,
+      userId: isMe ? userId : r.signer_user_id, role: isMe ? role : r.signer_role,
     });
   }
 
@@ -4071,6 +4120,7 @@ async function prepareDecision(req, { preview }) {
     ccLine: ccList.join('; '),
     rec: state.rec, categoryLabel: FLOW_TABLE_LABELS[table],
     issuerRole: role, issuerSide: step.side, issuedAt, respondBy, title, body,
+    table, projectId, preview, baseUrl: publicBaseUrl(req),
     kindTitle: FLOW_NOTICE_TITLE[kind], decisionWord: FLOW_DECISION_WORD[decision], fingerprint,
   };
   const noticeSlots = slots.filter(sl => sl.isDecider);   // the notice carries the leader's signature and stamp only
@@ -5211,6 +5261,23 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), r
         return res.status(400).json({ error: 'Stamped documents must be submitted as PDF.' });
       }
       try {
+        // The server draws the stamp from the saved profile at the position the reviewer picked.
+        const rvProfile = await loadSignerProfile(projectId, reviewerRole, reviewerId);
+        if (!rvProfile) return res.status(400).json({ error: 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.' });
+        const pgRaw = req.body.stampPage;
+        const placement = { page: pgRaw === 'append' ? 'append' : (parseInt(pgRaw, 10) || 1), x: Number.parseFloat(req.body.stampX), y: Number.parseFloat(req.body.stampY) };
+        if (!Number.isFinite(placement.x) || !Number.isFinite(placement.y) || placement.x < 0 || placement.x > 1 || placement.y < 0 || placement.y > 1) {
+          return res.status(400).json({ error: 'Invalid stamp placement supplied.' });
+        }
+        const rvTz = await loadProjectTz(projectId);
+        const rvStampId = deriveStampId({ k: 'review', p: projectId, rec: recordId, u: reviewerId, r: reviewerRole, ts: Date.now(), n: crypto.randomBytes(4).toString('hex') });
+        const rvSpec = stampSpecFromProfile(rvProfile, { label: 'APPROVED', signedAt: new Date(), tz: rvTz, stampId: rvStampId, baseUrl: publicBaseUrl(req) });
+        const rvStamped = await stampPdfBuffer(req.file.buffer, rvSpec, placement);
+        req.file.buffer = rvStamped.bytes;
+        req.file.size = rvStamped.bytes.length;
+        await registerStamp(pool, { stampId: rvStampId, projectId: Number(projectId), table, recordId: Number(recordId), kind: 'review', userId: reviewerId, role: reviewerRole,
+          name: rvProfile.name, position: rvProfile.position, company: rvProfile.company, label: 'APPROVED', tz: rvTz,
+          fileHash: crypto.createHash('sha256').update(rvStamped.bytes).digest('hex'), signedAt: new Date() });
         const r = await new Promise((resolve, reject) => {
           const stream = cloudinary.uploader.upload_stream(
             { folder: 'oneproject/records', resource_type: 'auto', public_id: `${Date.now()}-${req.file.originalname.replace(/\s+/g, '-')}` },
@@ -5608,7 +5675,7 @@ app.get('/api/my-stamp', authenticateToken, async (req, res) => {
   if (!projectId) return res.status(400).json({ error: 'projectId required' });
   try {
     const { rows } = await pool.query(
-      `SELECT id, signer_name, signature_image, stamp_image_url, stamp_style, updated_at
+      `SELECT id, signer_name, signature_image, stamp_image_url, stamp_style, mark_type, updated_at
        FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
       [user_id, role, projectId]
     );
@@ -5658,51 +5725,57 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
   if (!projectId) return res.status(400).json({ error: 'projectId required' });
   if (!isDM && !isTM) return res.status(403).json({ error: 'Only decision makers and team members can create a signature profile.' });
   try {
+    // One mark, four ways to make it: draw | signature_image | stamp_image | combined (stamp + signature in one image)
     const { signatureBase64 } = req.body;
-    const stampStyle = ['three-part', 'signature-stamp'].includes(req.body.stampStyle)
-      ? req.body.stampStyle : 'compact';
-    const signerName = typeof req.body.signerName === 'string'
-      ? req.body.signerName.trim()
-      : null;
-
-    // Handle signature: either base64 from drawing or uploaded image
-    let signatureImage = null;
-    if (signatureBase64) {
-      signatureImage = signatureBase64;
-    } else if (req.files?.signatureImageFile?.[0]) {
-      const uploadRes = await uploadToCloudinary(req.files.signatureImageFile[0].buffer, 'oneproject/stamps/signatures', 'image');
-      signatureImage = uploadRes.secure_url;
+    const MARK_TYPES = ['draw', 'signature_image', 'stamp_image', 'combined'];
+    const markType = MARK_TYPES.includes(req.body.markType) ? req.body.markType : (signatureBase64 ? 'draw' : 'signature_image');
+    const usesStampImage = markType === 'stamp_image' || markType === 'combined';
+    const signerName = typeof req.body.signerName === 'string' ? req.body.signerName.trim() : null;
+    if (usesStampImage && !isDM) {
+      return res.status(403).json({ error: 'Stamp images are only available to decision makers. Team members can draw a signature or upload a signature image.' });
     }
 
-    // Company stamp upload is decision-maker only. Team members stay signature-only.
-    let stampImageUrl = null;
-    const stampUploadFile = req.files?.stampImage?.[0] || req.files?.stampImageFile?.[0];
-    if (!isDM && stampUploadFile) {
-      return res.status(403).json({ error: 'Company stamp upload is only available to decision makers. Team members can save a signature only.' });
-    }
-    if (isDM && stampUploadFile) {
-      const uploadRes = await uploadToCloudinary(stampUploadFile.buffer, 'oneproject/stamps/company', 'image');
-      stampImageUrl = uploadRes.secure_url;
-    }
-
-    // Ensure a signature is provided
-    if (!signatureImage) {
-      return res.status(400).json({ error: 'A signature is required' });
+    let newMark = null;
+    if (usesStampImage) {
+      const f = req.files?.stampImage?.[0] || req.files?.stampImageFile?.[0];
+      if (f) newMark = (await uploadToCloudinary(f.buffer, 'oneproject/stamps/company', 'image')).secure_url;
+    } else if (markType === 'draw' && signatureBase64) {
+      if (!/^data:image\/(png|jpeg);base64,/i.test(signatureBase64)) return res.status(400).json({ error: 'The drawn signature is not a valid image.' });
+      newMark = signatureBase64;
+    } else if (markType === 'signature_image' && req.files?.signatureImageFile?.[0]) {
+      newMark = (await uploadToCloudinary(req.files.signatureImageFile[0].buffer, 'oneproject/stamps/signatures', 'image')).secure_url;
     }
 
-    const { rows } = await pool.query(
-      `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, stamp_style, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT ON CONSTRAINT uniq_user_stamp_project
-       DO UPDATE SET
-         signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
-         signature_image = COALESCE(EXCLUDED.signature_image, user_stamps.signature_image),
-         stamp_image_url = ${isDM ? 'COALESCE(EXCLUDED.stamp_image_url, user_stamps.stamp_image_url)' : 'NULL'},
-         stamp_style     = EXCLUDED.stamp_style,
-         updated_at      = NOW()
-       RETURNING id, signer_name, signature_image, stamp_image_url, stamp_style, updated_at`,
-      [user_id, role, projectId, signerName, signatureImage || null, isDM ? (stampImageUrl || null) : null, stampStyle]
-    );
+    let rows;
+    if (!newMark) {
+      // No new image: allowed only when the saved row already holds a suitable image for this mode.
+      const cur = await pool.query(`SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`, [user_id, role, projectId]);
+      const have = usesStampImage ? cur.rows[0]?.stamp_image_url : cur.rows[0]?.signature_image;
+      if (!have) return res.status(400).json({ error: usesStampImage ? 'Upload your stamp image first.' : 'Add a signature (drawn or uploaded) first.' });
+      ({ rows } = await pool.query(
+        `UPDATE user_stamps SET mark_type=$4, signer_name=COALESCE($5, signer_name), updated_at=NOW()
+         WHERE user_id=$1 AND user_role=$2 AND project_id=$3
+         RETURNING id, signer_name, signature_image, stamp_image_url, stamp_style, mark_type, updated_at`,
+        [user_id, role, projectId, markType, signerName]
+      ));
+    } else {
+      // The image is stored in signature_image in every mode (legacy readers still find it);
+      // stamp_image_url additionally holds it for the stamp modes, and is cleared otherwise.
+      ({ rows } = await pool.query(
+        `INSERT INTO user_stamps (user_id, user_role, project_id, signer_name, signature_image, stamp_image_url, stamp_style, mark_type, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'compact', $7, NOW())
+         ON CONFLICT ON CONSTRAINT uniq_user_stamp_project
+         DO UPDATE SET
+           signer_name     = COALESCE(EXCLUDED.signer_name, user_stamps.signer_name),
+           signature_image = EXCLUDED.signature_image,
+           stamp_image_url = EXCLUDED.stamp_image_url,
+           stamp_style     = 'compact',
+           mark_type       = EXCLUDED.mark_type,
+           updated_at      = NOW()
+         RETURNING id, signer_name, signature_image, stamp_image_url, stamp_style, mark_type, updated_at`,
+        [user_id, role, projectId, signerName, newMark, usesStampImage ? newMark : null, markType]
+      ));
+    }
     const stamp = rows[0];
     const [companyName, positionSide] = await Promise.all([
       resolveCompanyNameForStamp(projectId, user_id, role),
@@ -5713,6 +5786,81 @@ app.post('/api/my-stamp', authenticateToken, photoUpload.fields([{ name: 'stampI
     stamp.side = positionSide.side;
     res.json({ success: true, stamp });
   } catch (err) { console.error('POST my-stamp:', err); res.status(500).json({ error: 'Failed to save stamp.' }); }
+});
+
+// -- Live stamp preview: the SAME renderer as the real stamp, returned as a one-page PDF --
+app.post('/api/stamp-preview', authenticateToken, photoUpload.fields([{ name: 'markImage', maxCount: 1 }]), async (req, res) => {
+  const { user_id, role } = req.user;
+  const projectId = parseInt(req.query.projectId, 10);
+  if (!projectId) return res.status(400).json({ error: 'projectId required' });
+  try {
+    const saved = await loadSignerProfile(projectId, role, user_id).catch(() => null);
+    const [name, company, ps] = await Promise.all([
+      resolveSignerNameForStamp(projectId, user_id, role),
+      resolveCompanyNameForStamp(projectId, user_id, role),
+      resolvePositionAndSideForStamp(projectId, user_id, role),
+    ]);
+    let markSource = null;
+    const f = req.files?.markImage?.[0];
+    if (f && /^image\/(png|jpeg)$/i.test(f.mimetype)) markSource = `data:${f.mimetype};base64,${f.buffer.toString('base64')}`;
+    else if (typeof req.body.markDataUrl === 'string' && /^data:image\/(png|jpeg);base64,/i.test(req.body.markDataUrl)) markSource = req.body.markDataUrl;
+    else markSource = pickMark(saved);
+    const label = String(req.body.label || 'APPROVED').toUpperCase() === 'SIGNED' ? 'SIGNED' : 'APPROVED';
+    const tz = await loadProjectTz(projectId);
+    const spec = stampSpecFromProfile(
+      { name: saved?.name || name || 'Your Name', company: company || null, position: ps?.position || null, side: ps?.side || null, mark_type: req.body.markType || saved?.mark_type, signature_image: markSource, stamp_image_url: null },
+      { label, signedAt: new Date(), tz, stampId: 'OP-7F3A-92C1', baseUrl: publicBaseUrl(req) }
+    );
+    const out = await buildStampPreviewPdf(spec);
+    res.set({ 'Content-Type': 'application/pdf', 'Cache-Control': 'no-store', 'X-Stamp-Box': `${out.width},${out.height}`, 'Access-Control-Expose-Headers': 'X-Stamp-Box' });
+    res.send(out.bytes);
+  } catch (err) { console.error('POST stamp-preview:', err); res.status(500).json({ error: 'Could not build the stamp preview.' }); }
+});
+
+// -- Verification (public: the Stamp ID is the credential) --
+const STAMP_ID_RE = /^OP-[0-9A-F]{4}-[0-9A-F]{4}$/;
+async function lookupStamp(id) {
+  if (!STAMP_ID_RE.test(String(id || '').toUpperCase())) return null;
+  const { rows } = await pool.query(
+    `SELECT r.*, p.name AS project_name FROM stamp_registry r LEFT JOIN projects p ON p.id = r.project_id WHERE r.stamp_id = $1`,
+    [String(id).toUpperCase()]
+  );
+  return rows[0] || null;
+}
+const stampPublicView = (r) => ({
+  valid: true, stampId: r.stamp_id, signer: r.signer_name, position: r.signer_position, company: r.company_name,
+  action: r.label, project: r.project_name || null, signedAt: formatStampDate(r.signed_at, r.tz || 'UTC'),
+  fileCheckAvailable: Boolean(r.file_hash),
+});
+app.get('/api/verify-stamp/:id', async (req, res) => {
+  try {
+    const r = await lookupStamp(req.params.id);
+    if (!r) return res.status(404).json({ valid: false, message: 'No stamp with this ID was issued by OneProject.' });
+    res.json(stampPublicView(r));
+  } catch (err) { console.error('verify-stamp:', err); res.status(500).json({ valid: false, message: 'Verification is unavailable right now.' }); }
+});
+// Optional: upload the PDF you were given; it matches only if it is byte-identical to the stamped file.
+app.post('/api/verify-stamp/:id', upload.single('file'), async (req, res) => {
+  try {
+    const r = await lookupStamp(req.params.id);
+    if (!r) return res.status(404).json({ valid: false, message: 'No stamp with this ID was issued by OneProject.' });
+    if (!r.file_hash) return res.json({ ...stampPublicView(r), fileMatches: null, message: 'This stamp has no stored file fingerprint to compare against.' });
+    if (!req.file) return res.status(400).json({ message: 'Attach the PDF to compare.' });
+    const h = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
+    res.json({ ...stampPublicView(r), fileMatches: h === r.file_hash });
+  } catch (err) { console.error('verify-stamp file:', err); res.status(500).json({ message: 'Verification is unavailable right now.' }); }
+});
+app.get('/verify/:id', async (req, res) => {
+  const esc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  let r = null;
+  try { r = await lookupStamp(req.params.id); } catch (_) { /* shown as unavailable below */ }
+  const row = (k, v) => v ? `<tr><th>${k}</th><td>${esc(v)}</td></tr>` : '';
+  const v = r ? stampPublicView(r) : null;
+  res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stamp verification</title>
+<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f5f7;color:#1c232d;margin:0;padding:24px}main{max-width:460px;margin:8vh auto;background:#fff;border:1px solid #d5d9df;border-radius:10px;padding:22px}h1{font-size:18px;margin:0 0 4px}p{color:#5b6572;font-size:13px;margin:0 0 14px}table{border-collapse:collapse;width:100%;font-size:14px}th{text-align:left;color:#5b6572;font-weight:600;padding:6px 10px 6px 0;width:34%;vertical-align:top}td{padding:6px 0}.ok{font-weight:700}</style></head><body><main>
+${v ? `<h1 class="ok">Stamp verified</h1><p>This stamp was issued by OneProject.</p><table>${row('Stamp ID', v.stampId)}${row('Action', v.action)}${row('Signed by', v.signer)}${row('Position', v.position)}${row('Company', v.company)}${row('Project', v.project)}${row('Date and time', v.signedAt)}</table>`
+ : `<h1>Stamp not found</h1><p>No stamp with the ID ${esc(req.params.id)} was issued by OneProject. Check the ID printed on the document.</p>`}
+</main></body></html>`);
 });
 
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
