@@ -4536,8 +4536,8 @@ async function buildRecordFlowView(c) {
     is_team_member: r.is_team_member, is_decider: r.is_decider, order_no: r.order_no, status: r.status,
     outcome: r.outcome, signed_at: r.signed_at, first_viewed_at: r.first_viewed_at, last_viewed_at: r.last_viewed_at,
     reminder_sent_at: r.reminder_sent_at,
-    // Personal name and findings are shown only to the signer's own side; the other side sees position, side and time.
-    name: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? await nameOf(r.signer_role, r.signer_user_id) : null,
+    // The personal name is shown to the signer's own side (signed or not); findings only after signing. The other side sees position, side and time.
+    name: (userSide === r.side || isMe(r)) ? await nameOf(r.signer_role, r.signer_user_id) : null,
     queries_raised: Array.isArray(r.findings?.queries) ? r.findings.queries.length : 0,
     user_id: r.signer_user_id,
     findings: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? { note: r.findings?.note || '', queries: Array.isArray(r.findings?.queries) ? r.findings.queries : [] } : null,
@@ -9408,9 +9408,13 @@ app.post('/api/document-approval/create', authenticateToken, upload.single('file
   }
 });
 
-// DEBUG: allow testing the create flow without auth in non-production environments
+// DEBUG: test the create flow without auth (local/dev only)
+// Unauthenticated, so it must be switched on explicitly (ENABLE_DEBUG_ROUTES=true) and never in production.
+// Previously only NODE_ENV === 'production' blocked it, which fails open if NODE_ENV is unset on the host.
 app.post('/api/_debug/document-approval/create', async (req, res) => {
-  if (process.env.NODE_ENV === 'production') return res.status(403).json({ error: 'Disabled in production' });
+  if (process.env.NODE_ENV === 'production' || process.env.ENABLE_DEBUG_ROUTES !== 'true') {
+    return res.status(403).json({ error: 'Disabled' });
+  }
   const { projectId, doc_type, title, description, creator_id, creator_role, side } = req.body || {};
   if (!projectId || !doc_type || !title) return res.status(400).json({ error: 'Missing fields' });
   try {
