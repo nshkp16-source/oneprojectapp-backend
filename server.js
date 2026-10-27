@@ -930,6 +930,13 @@ function decisionStampId(ctx, slot) {
     at: new Date(slot.signed_at).toISOString(), fp: ctx.fingerprint || '' });
 }
 
+// The RECEIVED stamp on the original record is its own event with its own ID (the decision stamp keeps its own).
+function receptionStampId(ctx, slot) {
+  if (!ctx.table || !slot?.signed_at) return null;
+  return deriveStampId({ k: 'reception', t: ctx.table, rec: ctx.rec?.id, u: slot.userId, r: slot.role,
+    at: new Date(slot.signed_at).toISOString(), fp: ctx.fingerprint || '' });
+}
+
 async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
   const L = await createLayout(pdfDoc);
   L.text(opts.heading || 'Signatures', { size: 15, font: L.bold, gap: 2 });
@@ -1026,7 +1033,7 @@ async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots }) 
 
 // The record itself carries the approvals: its latest file plus a sign-off page for this stage.
 // Built only for approvals. A rejected record is never signed or stamped.
-async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine, stage, placementIn }) {
+async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine, stage, placementIn, withSignoffPage = true }) {
   const recUrl = rec.stamped_doc_url || rec.file_path;
   const remote = await fetch(recUrl, { redirect: 'follow' });
   if (!remote.ok) throw new Error('The record file is not reachable.');
@@ -1036,15 +1043,18 @@ async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLin
   let placement = null;
   if (placementIn) {
     const decider = slots.find(sl => sl.isDecider);
-    placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, slot: decider, ctx, at: placementIn });
+    placement = await drawRecordDecisionStamp(doc, { word: 'RECEIVED', slot: decider, ctx, at: placementIn });
+    if (!ctx.preview && decider) {
+      await registerStamp(pool, { stampId: receptionStampId(ctx, decider), projectId: ctx.projectId, table: ctx.table, recordId: rec.id, kind: 'reception',
+        userId: decider.userId, role: decider.role, name: decider.profile?.name, position: decider.position || decider.profile?.position,
+        company: decider.profile?.company, label: 'RECEIVED', tz: ctx.tz, fileHash: null, signedAt: decider.signed_at });
+    }
   }
-  // One stamp per person per document: whoever is already stamped on the record PDF (the approver's chosen
-  // position, or an earlier upload / review stamp) is only referenced on the sign-off page, not stamped again.
+  // A rejection has no sign-off page: the record only receives the optional RECEIVED stamp.
+  if (!withSignoffPage) return { bytes: Buffer.from(await doc.save()), placement };
+  // The RECEIVED stamp is a different event from the decision, so the decider's decision stamp stays on the sign-off page.
+  // Anyone already stamped on this record PDF by an earlier upload or review is only referenced there, not stamped again.
   const signoffSlots = slots.map(sl => ({ ...sl }));
-  if (placement) {
-    const dec = signoffSlots.find(sl => sl.isDecider);
-    if (dec) dec.stampedOnDoc = { page: placement.page, stampId: decisionStampId(ctx, dec) };
-  }
   try {
     const { rows: prior } = await pool.query(
       `SELECT signer_user_id, signer_role, stamp_id FROM stamp_registry WHERE record_table=$1 AND record_id=$2 AND kind IN ('review','record_upload')`,
@@ -1069,7 +1079,7 @@ async function drawRecordDecisionStamp(doc, { word, slot, ctx, at }) {
   const page = doc.getPage(pageIdx);
   const profile = slot?.profile;
   const spec = stampSpecFromProfile({ ...(profile || {}), position: slot?.position || profile?.position, side: slot?.side || profile?.side },
-    { label: word || 'APPROVED', signedAt: slot?.signed_at, tz: ctx.tz, stampId: decisionStampId(ctx, slot), baseUrl: ctx.baseUrl });
+    { label: word || 'RECEIVED', signedAt: slot?.signed_at, tz: ctx.tz, stampId: receptionStampId(ctx, slot), baseUrl: ctx.baseUrl });
   const box = await drawStampOnPage(doc, page, spec, { xRatio: at.x, yRatio: at.y, scale: at.scale });
   return { page: pageIdx + 1, x: box.xRatio, y: box.yRatio };
 }
@@ -4191,17 +4201,17 @@ async function prepareDecision(req, { preview }) {
   const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots: noticeSlots });
   let recordBytes = null, recordStampPlacement = null;
   let placementIn = null;   // where the approver chose to stamp the record (optional)
-  if (decision !== 'rejected' && req.body.stampPlacement) {
+  if (req.body.stampPlacement) {
     try {
       const sp = JSON.parse(String(req.body.stampPlacement));
       const pg = parseInt(sp.page, 10), px = Number(sp.x), py = Number(sp.y);
       if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) placementIn = { page: pg, x: px, y: py, scale: clampStampScale(sp.scale) };
     } catch (_) { /* ignore a malformed placement: the sign-off page still carries the signatures */ }
   }
-  if (decision !== 'rejected') {
+  if (decision !== 'rejected' || placementIn) {
     try {
       const built = await buildRecordWithSignoff({
-        stage, placementIn, rec: state.rec, ctx, slots, stageLabel: step.label,
+        stage, placementIn, withSignoffPage: decision !== 'rejected', rec: state.rec, ctx, slots, stageLabel: step.label,
         decisionLine: `Decision: ${ctx.decisionWord}, ${flowFormatDate(issuedAt, ctx.tz)}. The signed notice is attached to this record.`,
       });
       recordBytes = built.bytes; recordStampPlacement = built.placement;
@@ -4334,12 +4344,20 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
         // Approval only: the record's latest copy now carries the sign-off page. The original upload (file_path) is kept.
         const cur = await client.query(`SELECT stamp_status, stamped_doc_public_id FROM ${d.table} WHERE id=$1`, [d.recordId]);
         previousSignedCopy = cur.rows[0]?.stamped_doc_public_id || null;
-        await client.query(
-          `UPDATE ${d.table} SET stamped_doc_url=$1, signed_by_id=$2, signed_by_role=$3, signed_at=NOW(), stamp_type='STAMPED', stamp_status=$4,
-                stamp_page=$5, stamp_x=$6, stamp_y=$7, stamped_doc_public_id=$10 WHERE id=$8 AND project_id=$9`,
-          [stampedRecordUrl, userId, role, getStampStatusFromActor(cur.rows[0]?.stamp_status, 'approver'),
-           d.recordStampPlacement?.page ?? null, d.recordStampPlacement?.x ?? null, d.recordStampPlacement?.y ?? null, d.recordId, d.projectId, stampedRecordPublicId]
-        );
+        if (d.decision === 'rejected') {
+          // Rejection: only the RECEIVED stamp was added, so just swap the file and keep the record's stamp status.
+          await client.query(
+            `UPDATE ${d.table} SET stamped_doc_url=$1, stamp_page=$2, stamp_x=$3, stamp_y=$4, stamped_doc_public_id=$5 WHERE id=$6 AND project_id=$7`,
+            [stampedRecordUrl, d.recordStampPlacement?.page ?? null, d.recordStampPlacement?.x ?? null, d.recordStampPlacement?.y ?? null, stampedRecordPublicId, d.recordId, d.projectId]
+          );
+        } else {
+          await client.query(
+            `UPDATE ${d.table} SET stamped_doc_url=$1, signed_by_id=$2, signed_by_role=$3, signed_at=NOW(), stamp_type='STAMPED', stamp_status=$4,
+                  stamp_page=$5, stamp_x=$6, stamp_y=$7, stamped_doc_public_id=$10 WHERE id=$8 AND project_id=$9`,
+            [stampedRecordUrl, userId, role, getStampStatusFromActor(cur.rows[0]?.stamp_status, 'approver'),
+             d.recordStampPlacement?.page ?? null, d.recordStampPlacement?.x ?? null, d.recordStampPlacement?.y ?? null, d.recordId, d.projectId, stampedRecordPublicId]
+          );
+        }
       }
 
       // Signers of this stage: tie them to the notice; record the decider's signature
@@ -5869,7 +5887,8 @@ app.post('/api/stamp-preview', authenticateToken, photoUpload.fields([{ name: 'm
     if (f && /^image\/(png|jpeg)$/i.test(f.mimetype)) markSource = `data:${f.mimetype};base64,${f.buffer.toString('base64')}`;
     else if (typeof req.body.markDataUrl === 'string' && /^data:image\/(png|jpeg);base64,/i.test(req.body.markDataUrl)) markSource = req.body.markDataUrl;
     else markSource = pickMark(saved);
-    const label = String(req.body.label || 'APPROVED').toUpperCase() === 'SIGNED' ? 'SIGNED' : 'APPROVED';
+    const wanted = String(req.body.label || 'APPROVED').toUpperCase();
+    const label = ['SIGNED', 'APPROVED', 'RECEIVED'].includes(wanted) ? wanted : 'APPROVED';
     const tz = await loadProjectTz(projectId);
     const spec = stampSpecFromProfile(
       { name: saved?.name || name || 'Your Name', company: company || null, position: ps?.position || null, side: ps?.side || null, mark_type: req.body.markType || saved?.mark_type, signature_image: markSource, stamp_image_url: null },

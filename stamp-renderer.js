@@ -13,7 +13,7 @@
 //  * Layout is measured, never hard-coded: text shrinks to a minimum size, then wraps, and a
 //    running cursor places each line, so long names and positions cannot overlap or overflow.
 
-import { PDFDocument, StandardFonts, rgb, BlendMode } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb, BlendMode, pushGraphicsState, popGraphicsState, concatTransformationMatrix } from 'pdf-lib';
 import crypto from 'crypto';
 
 export const STAMP_BOX_W = 300;          // preferred stamp width in PDF points
@@ -213,17 +213,40 @@ export async function layoutStamp(pdfDoc, spec, { width = STAMP_BOX_W, scale = 1
   return { width: W, height: H, paint };
 }
 
-// Draw on an existing page. xRatio / yRatio are the CENTRE of the stamp, as fractions of the
-// page measured from the bottom-left (the same convention as the placement preview).
+// What the reader actually sees: the visible box (CropBox, else MediaBox) and the page /Rotate value.
+// Placement ratios are measured on that visible page, so a page flagged as rotated 90, 180 or 270 degrees
+// still gets an upright stamp in the right corner.
+function pageGeometry(page) {
+  const cb = page.getCropBox ? page.getCropBox() : page.getMediaBox();
+  const x0 = cb.x, y0 = cb.y, w = cb.width, h = cb.height;
+  const rot = ((Math.round((page.getRotation().angle || 0) / 90) * 90) % 360 + 360) % 360;
+  const sideways = rot === 90 || rot === 270;
+  // matrix that maps "visible page" coordinates onto the page's own (unrotated) coordinates
+  const m = rot === 90 ? [0, 1, -1, 0, x0 + w, y0]
+    : rot === 180 ? [-1, 0, 0, -1, x0 + w, y0 + h]
+    : rot === 270 ? [0, -1, 1, 0, x0, y0 + h]
+    : [1, 0, 0, 1, x0, y0];
+  return { vw: sideways ? h : w, vh: sideways ? w : h, matrix: m };
+}
+
+// Draw on an existing page. xRatio / yRatio are the CENTRE of the stamp, as fractions of the VISIBLE
+// page measured from its bottom-left (the same convention as the placement preview).
 export async function drawStampOnPage(pdfDoc, page, spec, { xRatio = 0.8, yRatio = 0.08, width, scale = 1 } = {}) {
-  const { width: pw, height: ph } = page.getSize();
-  const W = width || Math.min(STAMP_BOX_W, pw * STAMP_MAX_PAGE_FRACTION);
+  const g = pageGeometry(page);
+  const W = width || Math.min(STAMP_BOX_W, g.vw * STAMP_MAX_PAGE_FRACTION);
   const lay = await layoutStamp(pdfDoc, spec, { width: W, scale });
   const m = 12;
-  const x = Math.min(Math.max(xRatio * pw - lay.width / 2, m), Math.max(m, pw - lay.width - m));
-  const y = Math.min(Math.max(yRatio * ph - lay.height / 2, m), Math.max(m, ph - lay.height - m));
-  lay.paint(page, x, y);
-  return { x, y, width: lay.width, height: lay.height, xRatio: (x + lay.width / 2) / pw, yRatio: (y + lay.height / 2) / ph };
+  const x = Math.min(Math.max(xRatio * g.vw - lay.width / 2, m), Math.max(m, g.vw - lay.width - m));
+  const y = Math.min(Math.max(yRatio * g.vh - lay.height / 2, m), Math.max(m, g.vh - lay.height - m));
+  const identity = g.matrix.every((v, i) => v === [1, 0, 0, 1, 0, 0][i]);
+  if (identity) {
+    lay.paint(page, x, y);
+  } else {
+    page.pushOperators(pushGraphicsState(), concatTransformationMatrix(...g.matrix));
+    lay.paint(page, x, y);
+    page.pushOperators(popGraphicsState());
+  }
+  return { x, y, width: lay.width, height: lay.height, xRatio: (x + lay.width / 2) / g.vw, yRatio: (y + lay.height / 2) / g.vh };
 }
 
 // Stamp a PDF buffer. placement = { page: number | 'append', x, y }.
@@ -231,8 +254,8 @@ export async function stampPdfBuffer(buffer, spec, placement) {
   const doc = await PDFDocument.load(buffer, { ignoreEncryption: true });
   let page, pageNo;
   if (placement.page === 'append') {
-    const last = doc.getPage(doc.getPageCount() - 1).getSize();
-    page = doc.addPage([last.width, last.height]);
+    const lastGeo = pageGeometry(doc.getPage(doc.getPageCount() - 1));
+    page = doc.addPage([lastGeo.vw, lastGeo.vh]);
     pageNo = doc.getPageCount();
   } else {
     pageNo = Math.min(Math.max(parseInt(placement.page, 10) || 1, 1), doc.getPageCount());
