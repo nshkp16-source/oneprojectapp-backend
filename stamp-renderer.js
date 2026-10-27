@@ -112,9 +112,11 @@ async function embedImage(pdfDoc, source) {
 let qrLib;   // optional dependency: `npm i qrcode`. Without it the stamp simply prints the ID.
 async function qrMatrix(text) {
   if (qrLib === undefined) {
-    try { const mod = await import('qrcode'); qrLib = mod.default || mod; } catch (_) { qrLib = null; }
+    try { const mod = await import('qrcode'); qrLib = mod.default || mod; }
+    catch (err) { qrLib = null; console.warn('[stamp] QR codes are OFF because the qrcode package could not be loaded (' + err.message + '). Run "npm i qrcode" in the folder that contains stamp-renderer.js, then restart the server.'); }
   }
-  if (!qrLib || !text) return null;
+  if (!qrLib) return null;
+  if (!text) { console.warn('[stamp] QR skipped: no verify URL was given.'); return null; }
   try { return qrLib.create(text, { errorCorrectionLevel: 'M' }).modules; } catch (_) { return null; }
 }
 
