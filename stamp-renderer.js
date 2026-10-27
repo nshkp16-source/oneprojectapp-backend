@@ -131,52 +131,57 @@ function roundedPath(w, h, r) {
   ].join(' ');
 }
 
-// ── layout (measures everything, draws nothing) ──────────────────────────────
+// -- layout (measures everything, draws nothing) ----------------------------
 // spec: { markSource, name, secondary, company, signedAt, tz, stampId, label, verifyUrl }
-export async function layoutStamp(pdfDoc, spec, { width = STAMP_BOX_W } = {}) {
+// scale: 0.8 to 1.2. Everything (text, lines, margins, QR) is scaled together, so the look never changes.
+export const clampStampScale = (v) => Math.min(1.2, Math.max(0.8, Number(v) || 1));
+
+export async function layoutStamp(pdfDoc, spec, { width = STAMP_BOX_W, scale = 1 } = {}) {
+  const k = clampStampScale(scale);
   const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
   const reg = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const safe = safeFor(reg);
   const mark = await embedImage(pdfDoc, spec.markSource);
   const qr = await qrMatrix(spec.verifyUrl);
 
-  const PAD = 8, GAP = 7, HEAD = 16;
-  const FOOT = qr ? 34 : 15;
-  const W = width;
+  const PAD = 8 * k, GAP = 7 * k, HEAD = 16 * k;
+  const FOOT = (qr ? 34 : 15) * k;
+  const W = width * k;
   const markW = mark ? Math.round((W - PAD * 2 - GAP) * 0.38) : 0;
   const detailsW = W - PAD * 2 - (mark ? markW + GAP : 0);
 
   const label = String(spec.label || 'SIGNED').toUpperCase();
   const verb = label === 'SIGNED' ? 'signed' : label.toLowerCase();
   const rows = [
-    { text: `Digitally ${verb} by`, font: reg, size: 7.2, min: 5.6, color: MUTED },
-    { text: spec.name || 'Signer', font: bold, size: 10, min: 6.4, color: ACCENT, maxLines: 2 },
-    { text: spec.secondary || '', font: reg, size: 7.6, min: 5.6, color: INK, maxLines: 2 },
-    { text: spec.company || '', font: reg, size: 7.6, min: 5.6, color: INK, maxLines: 2 },
-    { text: formatStampDate(spec.signedAt, spec.tz), font: reg, size: 6.8, min: 5.2, color: MUTED, maxLines: 2 },
+    { text: `Digitally ${verb} by`, font: reg, size: 7.2 * k, min: 5.6 * k, color: MUTED },
+    { text: spec.name || 'Signer', font: bold, size: 10 * k, min: 6.4 * k, color: ACCENT, maxLines: 2 },
+    { text: spec.secondary || '', font: reg, size: 7.6 * k, min: 5.6 * k, color: INK, maxLines: 2 },
+    { text: spec.company || '', font: reg, size: 7.6 * k, min: 5.6 * k, color: INK, maxLines: 2 },
+    { text: formatStampDate(spec.signedAt, spec.tz), font: reg, size: 6.8 * k, min: 5.2 * k, color: MUTED, maxLines: 2 },
   ].filter((r) => String(r.text).trim()).map((r) => {
     const fit = fitText(safe(r.text), r.font, r.size, r.min, detailsW, r.maxLines || 2);
-    return { ...r, ...fit, leading: fit.size * 1.25, gap: 1.8 };
+    return { ...r, ...fit, leading: fit.size * 1.25, gap: 1.8 * k };
   });
 
   const textH = rows.reduce((t, r) => t + r.lines.length * r.leading + r.gap, 0);
-  const H = Math.max(PAD + HEAD + 4 + textH + 4 + FOOT, 92);
+  const H = Math.max(PAD + HEAD + 4 * k + textH + 4 * k + FOOT, 92 * k);
   const bodyTop = H - HEAD;                // y (from box bottom) where the header ends
   const bodyBottom = FOOT;                 // y where the footer begins
+  const thin = 0.6 * k;
 
   const paint = (page, x, y) => {
     // outline only: no fill, so the page text beneath stays visible
-    page.drawSvgPath(roundedPath(W, H, 6), { x, y: y + H, borderColor: INK, borderWidth: 1, borderOpacity: 0.9, ...MULTIPLY });
+    page.drawSvgPath(roundedPath(W, H, 6 * k), { x, y: y + H, borderColor: INK, borderWidth: 1 * k, borderOpacity: 0.9, ...MULTIPLY });
     // header: label on the left, thin rule below
-    page.drawText(safe(label), { x: x + PAD, y: y + H - HEAD + 5, size: 7, font: bold, color: ACCENT, ...MULTIPLY });
-    page.drawLine({ start: { x: x + PAD, y: y + bodyTop }, end: { x: x + W - PAD, y: y + bodyTop }, thickness: 0.6, color: RULE, ...MULTIPLY });
+    page.drawText(safe(label), { x: x + PAD, y: y + H - HEAD + 5 * k, size: 7 * k, font: bold, color: ACCENT, ...MULTIPLY });
+    page.drawLine({ start: { x: x + PAD, y: y + bodyTop }, end: { x: x + W - PAD, y: y + bodyTop }, thickness: thin, color: RULE, ...MULTIPLY });
     // footer rule + stamp id (+ QR)
-    page.drawLine({ start: { x: x + PAD, y: y + bodyBottom }, end: { x: x + W - PAD, y: y + bodyBottom }, thickness: 0.6, color: RULE, ...MULTIPLY });
+    page.drawLine({ start: { x: x + PAD, y: y + bodyBottom }, end: { x: x + W - PAD, y: y + bodyBottom }, thickness: thin, color: RULE, ...MULTIPLY });
     const idText = safe(`Stamp ID ${spec.stampId || ''}`.trim());
-    page.drawText(idText, { x: x + PAD, y: y + (qr ? FOOT - 12 : 5), size: 6.4, font: bold, color: MUTED, ...MULTIPLY });
+    page.drawText(idText, { x: x + PAD, y: y + (qr ? FOOT - 12 * k : 5 * k), size: 6.4 * k, font: bold, color: MUTED, ...MULTIPLY });
     if (qr) {
-      page.drawText('Scan to verify', { x: x + PAD, y: y + FOOT - 21, size: 5.6, font: reg, color: MUTED, ...MULTIPLY });
-      const qs = 26, cell = qs / qr.size, qx = x + W - PAD - qs, qy = y + (FOOT - qs) / 2 - 0.5;
+      page.drawText('Scan to verify', { x: x + PAD, y: y + FOOT - 21 * k, size: 5.6 * k, font: reg, color: MUTED, ...MULTIPLY });
+      const qs = 26 * k, cell = qs / qr.size, qx = x + W - PAD - qs, qy = y + (FOOT - qs) / 2 - 0.5 * k;
       for (let r = 0; r < qr.size; r++) {
         for (let c = 0; c < qr.size; c++) {
           if (!qr.get(r, c)) continue;
@@ -185,21 +190,21 @@ export async function layoutStamp(pdfDoc, spec, { width = STAMP_BOX_W } = {}) {
       }
     }
     // mark column
-    const areaH = bodyTop - bodyBottom - 6;
+    const areaH = bodyTop - bodyBottom - 6 * k;
     if (mark) {
       const fit = Math.min(markW / mark.width, areaH / mark.height);
       const w = mark.width * fit, h = mark.height * fit;
-      page.drawImage(mark, { x: x + PAD + (markW - w) / 2, y: y + bodyBottom + 3 + (areaH - h) / 2, width: w, height: h, ...MULTIPLY });
+      page.drawImage(mark, { x: x + PAD + (markW - w) / 2, y: y + bodyBottom + 3 * k + (areaH - h) / 2, width: w, height: h, ...MULTIPLY });
       const dx = x + PAD + markW + GAP / 2;
-      page.drawLine({ start: { x: dx, y: y + bodyBottom + 4 }, end: { x: dx, y: y + bodyTop - 4 }, thickness: 0.5, color: RULE, ...MULTIPLY });
+      page.drawLine({ start: { x: dx, y: y + bodyBottom + 4 * k }, end: { x: dx, y: y + bodyTop - 4 * k }, thickness: 0.5 * k, color: RULE, ...MULTIPLY });
     }
     // details column from a running cursor (never fixed offsets)
     const tx = x + PAD + (mark ? markW + GAP : 0);
-    let cursor = y + bodyTop - 5;
+    let cursor = y + bodyTop - 5 * k;
     for (const r of rows) {
       for (const line of r.lines) {
         cursor -= r.leading;
-        if (cursor < y + bodyBottom + 2) break;
+        if (cursor < y + bodyBottom + 2 * k) break;
         page.drawText(line, { x: tx, y: cursor + r.leading * 0.22, size: r.size, font: r.font, color: r.color, ...MULTIPLY });
       }
       cursor -= r.gap;
@@ -210,10 +215,10 @@ export async function layoutStamp(pdfDoc, spec, { width = STAMP_BOX_W } = {}) {
 
 // Draw on an existing page. xRatio / yRatio are the CENTRE of the stamp, as fractions of the
 // page measured from the bottom-left (the same convention as the placement preview).
-export async function drawStampOnPage(pdfDoc, page, spec, { xRatio = 0.8, yRatio = 0.08, width } = {}) {
+export async function drawStampOnPage(pdfDoc, page, spec, { xRatio = 0.8, yRatio = 0.08, width, scale = 1 } = {}) {
   const { width: pw, height: ph } = page.getSize();
   const W = width || Math.min(STAMP_BOX_W, pw * STAMP_MAX_PAGE_FRACTION);
-  const lay = await layoutStamp(pdfDoc, spec, { width: W });
+  const lay = await layoutStamp(pdfDoc, spec, { width: W, scale });
   const m = 12;
   const x = Math.min(Math.max(xRatio * pw - lay.width / 2, m), Math.max(m, pw - lay.width - m));
   const y = Math.min(Math.max(yRatio * ph - lay.height / 2, m), Math.max(m, ph - lay.height - m));
@@ -233,7 +238,7 @@ export async function stampPdfBuffer(buffer, spec, placement) {
     pageNo = Math.min(Math.max(parseInt(placement.page, 10) || 1, 1), doc.getPageCount());
     page = doc.getPage(pageNo - 1);
   }
-  const box = await drawStampOnPage(doc, page, spec, { xRatio: placement.x, yRatio: placement.y });
+  const box = await drawStampOnPage(doc, page, spec, { xRatio: placement.x, yRatio: placement.y, scale: placement.scale });
   return { bytes: Buffer.from(await doc.save()), box, page: pageNo };
 }
 

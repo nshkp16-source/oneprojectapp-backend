@@ -12,7 +12,7 @@ import crypto from 'crypto';
 import { v2 as cloudinary } from 'cloudinary';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { Readable } from 'stream';
-import { layoutStamp, drawStampOnPage, stampPdfBuffer, buildStampPreviewPdf, deriveStampId, pickMark, formatStampDate } from './stamp-renderer.js';
+import { layoutStamp, drawStampOnPage, stampPdfBuffer, buildStampPreviewPdf, deriveStampId, pickMark, formatStampDate, clampStampScale } from './stamp-renderer.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -1070,7 +1070,7 @@ async function drawRecordDecisionStamp(doc, { word, slot, ctx, at }) {
   const profile = slot?.profile;
   const spec = stampSpecFromProfile({ ...(profile || {}), position: slot?.position || profile?.position, side: slot?.side || profile?.side },
     { label: word || 'APPROVED', signedAt: slot?.signed_at, tz: ctx.tz, stampId: decisionStampId(ctx, slot), baseUrl: ctx.baseUrl });
-  const box = await drawStampOnPage(doc, page, spec, { xRatio: at.x, yRatio: at.y });
+  const box = await drawStampOnPage(doc, page, spec, { xRatio: at.x, yRatio: at.y, scale: at.scale });
   return { page: pageIdx + 1, x: box.xRatio, y: box.yRatio };
 }
 
@@ -3870,7 +3870,7 @@ async function handleAddRecord(req, res) {
         const origHash = crypto.createHash('sha256').update(officialFile.buffer).digest('hex');
         stampId = deriveStampId({ k: 'record', p: projectId, u: userId, r: role, ts: Date.now(), h: origHash, n: crypto.randomBytes(4).toString('hex') });
         const spec = stampSpecFromProfile(signerProfile, { label: 'SIGNED', signedAt: new Date(), tz: stampTz, stampId, baseUrl: publicBaseUrl(req) });
-        const stamped = await stampPdfBuffer(officialFile.buffer, spec, { page: stampPage, x: stampX, y: stampY });
+        const stamped = await stampPdfBuffer(officialFile.buffer, spec, { page: stampPage, x: stampX, y: stampY, scale: clampStampScale(req.body.stampScale) });
         officialFile.buffer = stamped.bytes;
         officialFile.size = stamped.bytes.length;
       } catch (stampErr) {
@@ -4195,7 +4195,7 @@ async function prepareDecision(req, { preview }) {
     try {
       const sp = JSON.parse(String(req.body.stampPlacement));
       const pg = parseInt(sp.page, 10), px = Number(sp.x), py = Number(sp.y);
-      if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) placementIn = { page: pg, x: px, y: py };
+      if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) placementIn = { page: pg, x: px, y: py, scale: clampStampScale(sp.scale) };
     } catch (_) { /* ignore a malformed placement: the sign-off page still carries the signatures */ }
   }
   if (decision !== 'rejected') {
@@ -5329,7 +5329,7 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), r
         const rvProfile = await loadSignerProfile(projectId, reviewerRole, reviewerId);
         if (!rvProfile) return res.status(400).json({ error: 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.' });
         const pgRaw = req.body.stampPage;
-        const placement = { page: pgRaw === 'append' ? 'append' : (parseInt(pgRaw, 10) || 1), x: Number.parseFloat(req.body.stampX), y: Number.parseFloat(req.body.stampY) };
+        const placement = { page: pgRaw === 'append' ? 'append' : (parseInt(pgRaw, 10) || 1), x: Number.parseFloat(req.body.stampX), y: Number.parseFloat(req.body.stampY), scale: clampStampScale(req.body.stampScale) };
         if (!Number.isFinite(placement.x) || !Number.isFinite(placement.y) || placement.x < 0 || placement.x > 1 || placement.y < 0 || placement.y > 1) {
           return res.status(409).json({ error: 'This page is out of date and would stamp the document twice. Refresh the page (Ctrl+F5) and try again.' });
         }
@@ -5882,6 +5882,46 @@ app.post('/api/stamp-preview', authenticateToken, photoUpload.fields([{ name: 'm
 });
 
 // -- Verification (public: the Stamp ID is the credential) --
+// Rate limit for the PUBLIC verify routes: a request cap per minute, and a tighter cap on lookups that miss
+// (someone guessing IDs). In-memory, per server process. The client address is the LAST x-forwarded-for entry,
+// which is the one added by your host's proxy; the first entry can be faked by the caller.
+const verifyHits = new Map();
+const verifyMisses = new Map();
+const verifyClientKey = (req) => {
+  const xff = String(req.get('x-forwarded-for') || '').split(',').map((v) => v.trim()).filter(Boolean);
+  return xff.length ? xff[xff.length - 1] : (req.socket?.remoteAddress || 'unknown');
+};
+function verifyGuard(maxPerMinute) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const ip = verifyClientKey(req);
+    const key = `${req.method}:${ip}`;
+    let hit = verifyHits.get(key);
+    if (!hit || now - hit.start > 60000) { hit = { start: now, n: 0 }; verifyHits.set(key, hit); }
+    hit.n += 1;
+    const miss = verifyMisses.get(ip);
+    const missBlocked = miss && now - miss.start <= 600000 && miss.n >= 10;
+    if (hit.n > maxPerMinute || missBlocked) {
+      const wait = missBlocked ? Math.ceil((miss.start + 600000 - now) / 1000) : Math.ceil((hit.start + 60000 - now) / 1000);
+      res.set('Retry-After', String(Math.max(wait, 1)));
+      const text = 'Too many verification attempts. Please wait a few minutes and try again.';
+      if (req.path.startsWith('/verify/')) return res.status(429).type('text/plain').send(text);
+      return res.status(429).json({ valid: false, message: text });
+    }
+    next();
+  };
+}
+function noteVerifyMiss(req) {
+  const ip = verifyClientKey(req), now = Date.now();
+  const m = verifyMisses.get(ip);
+  if (!m || now - m.start > 600000) verifyMisses.set(ip, { start: now, n: 1 }); else m.n += 1;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of verifyHits) if (now - v.start > 120000) verifyHits.delete(k);
+  for (const [k, v] of verifyMisses) if (now - v.start > 600000) verifyMisses.delete(k);
+}, 300000).unref();
+
 const STAMP_ID_RE = /^OP-[0-9A-F]{4}-[0-9A-F]{4}$/;
 async function lookupStamp(id) {
   if (!STAMP_ID_RE.test(String(id || '').toUpperCase())) return null;
@@ -5899,35 +5939,64 @@ const stampPublicView = (r) => ({
   revokedAt: r.revoked_at ? formatStampDate(r.revoked_at, r.tz || 'UTC') : null,
   revokeReason: r.revoked_at ? (r.revoke_reason || null) : null,
 });
-app.get('/api/verify-stamp/:id', async (req, res) => {
+app.get('/api/verify-stamp/:id', verifyGuard(30), async (req, res) => {
   try {
     const r = await lookupStamp(req.params.id);
-    if (!r) return res.status(404).json({ valid: false, message: 'No stamp with this ID was issued by OneProject.' });
+    if (!r) { noteVerifyMiss(req); return res.status(404).json({ valid: false, message: 'No stamp with this ID was issued by OneProject.' }); }
     res.json(stampPublicView(r));
   } catch (err) { console.error('verify-stamp:', err); res.status(500).json({ valid: false, message: 'Verification is unavailable right now.' }); }
 });
 // Optional: upload the PDF you were given; it matches only if it is byte-identical to the stamped file.
-app.post('/api/verify-stamp/:id', upload.single('file'), async (req, res) => {
+app.post('/api/verify-stamp/:id', verifyGuard(10), upload.single('file'), async (req, res) => {
   try {
     const r = await lookupStamp(req.params.id);
-    if (!r) return res.status(404).json({ valid: false, message: 'No stamp with this ID was issued by OneProject.' });
+    if (!r) { noteVerifyMiss(req); return res.status(404).json({ valid: false, message: 'No stamp with this ID was issued by OneProject.' }); }
     if (!r.file_hash) return res.json({ ...stampPublicView(r), fileMatches: null, message: 'This stamp has no stored file fingerprint to compare against.' });
     if (!req.file) return res.status(400).json({ message: 'Attach the PDF to compare.' });
     const h = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
     res.json({ ...stampPublicView(r), fileMatches: h === r.file_hash });
   } catch (err) { console.error('verify-stamp file:', err); res.status(500).json({ message: 'Verification is unavailable right now.' }); }
 });
-app.get('/verify/:id', async (req, res) => {
+app.get('/verify/:id', verifyGuard(30), async (req, res) => {
   const esc = (v) => String(v ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   let r = null;
   try { r = await lookupStamp(req.params.id); } catch (_) { /* shown as unavailable below */ }
+  if (!r) noteVerifyMiss(req);
   const row = (k, v) => v ? `<tr><th>${k}</th><td>${esc(v)}</td></tr>` : '';
   const v = r ? stampPublicView(r) : null;
+  const fileCheck = !v ? '' : (v.fileCheckAvailable ? `
+<hr style="border:none;border-top:1px solid #e3e6ea;margin:18px 0">
+<h2 style="font-size:15px;margin:0 0 6px">Check your copy of the document</h2>
+<p>Upload the PDF you were given. It matches only if it is exactly the file OneProject stamped. The file is compared in memory and is not stored.</p>
+<input type="file" id="chkFile" accept="application/pdf,.pdf"> <button id="chkBtn" type="button">Check file</button>
+<div id="chkOut" class="note" style="display:none"></div>
+<script>
+(function () {
+  var id = ${JSON.stringify(v.stampId)};
+  var btn = document.getElementById('chkBtn'), inp = document.getElementById('chkFile'), out = document.getElementById('chkOut');
+  function show(t) { out.style.display = 'block'; out.textContent = t; }
+  btn.addEventListener('click', function () {
+    if (!inp.files[0]) { show('Choose a PDF first.'); return; }
+    var fd = new FormData(); fd.append('file', inp.files[0]);
+    btn.disabled = true; show('Checking...');
+    fetch('/api/verify-stamp/' + encodeURIComponent(id), { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        btn.disabled = false;
+        if (j.fileMatches === true) show('Match. This is exactly the file OneProject stamped.');
+        else if (j.fileMatches === false) show('No match. This file is different from the stamped original. It may have been edited, or saved again by another program.');
+        else show(j.message || 'This file could not be checked.');
+      })
+      .catch(function () { btn.disabled = false; show('Could not check the file. Try again in a moment.'); });
+  });
+})();
+</script>` : `<p class="note" style="margin-top:14px">This stamp was issued as part of a decision sign-off, so no file fingerprint is stored for it. The signer and the time above are confirmed, but the document itself cannot be compared.</p>`);
   res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stamp verification</title>
-<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f5f7;color:#1c232d;margin:0;padding:24px}main{max-width:460px;margin:8vh auto;background:#fff;border:1px solid #d5d9df;border-radius:10px;padding:22px}h1{font-size:18px;margin:0 0 4px}p{color:#5b6572;font-size:13px;margin:0 0 14px}table{border-collapse:collapse;width:100%;font-size:14px}th{text-align:left;color:#5b6572;font-weight:600;padding:6px 10px 6px 0;width:34%;vertical-align:top}td{padding:6px 0}.ok{font-weight:700}</style></head><body><main>
+<style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f5f7;color:#1c232d;margin:0;padding:24px}main{max-width:460px;margin:8vh auto;background:#fff;border:1px solid #d5d9df;border-radius:10px;padding:22px}h1{font-size:18px;margin:0 0 4px}p{color:#5b6572;font-size:13px;margin:0 0 14px}table{border-collapse:collapse;width:100%;font-size:14px}th{text-align:left;color:#5b6572;font-weight:600;padding:6px 10px 6px 0;width:34%;vertical-align:top}td{padding:6px 0}.ok{font-weight:700}.note{background:#f4f5f7;border:1px solid #e3e6ea;border-radius:8px;padding:10px 12px;font-size:13px;color:#374151;margin-top:10px}button{padding:7px 12px;border:1px solid #9ca3af;background:#fff;border-radius:6px;cursor:pointer}input[type=file]{font-size:13px;max-width:100%}hr+h2{color:#1c232d}</style></head><body><main>
 ${v && v.revoked ? `<h1 class="ok">Stamp revoked</h1><p>This stamp was issued by OneProject but is no longer valid. Do not rely on the document it appears on without confirming with the signer.</p><table>${row('Stamp ID', v.stampId)}${row('Revoked on', v.revokedAt)}${row('Reason', v.revokeReason)}${row('Action', v.action)}${row('Signed by', v.signer)}${row('Position', v.position)}${row('Company', v.company)}${row('Project', v.project)}${row('Originally signed', v.signedAt)}</table>`
  : v ? `<h1 class="ok">Stamp verified</h1><p>This stamp was issued by OneProject.</p><table>${row('Stamp ID', v.stampId)}${row('Action', v.action)}${row('Signed by', v.signer)}${row('Position', v.position)}${row('Company', v.company)}${row('Project', v.project)}${row('Date and time', v.signedAt)}</table>`
  : `<h1>Stamp not found</h1><p>No stamp with the ID ${esc(req.params.id)} was issued by OneProject. Check the ID printed on the document.</p>`}
+${fileCheck}
 </main></body></html>`);
 });
 
