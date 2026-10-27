@@ -123,6 +123,58 @@ async function ensureStampStatusColumns() {
 
 await ensureStampStatusColumns();
 
+// Document & Approval / Control & Reports flow: signing columns, control-report lifecycle, comments, file history.
+// Same as 2026-10-27-document-flow.sql. Each step is separate so one failure cannot skip the others.
+async function ensureDocumentFlowSchema() {
+  const steps = [
+    [`columns`, `ALTER TABLE documents
+      ADD COLUMN IF NOT EXISTS creator_name TEXT,
+      ADD COLUMN IF NOT EXISTS author_stamp_id TEXT,
+      ADD COLUMN IF NOT EXISTS author_signed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS signed_by_name TEXT,
+      ADD COLUMN IF NOT EXISTS signer_stamp_id TEXT,
+      ADD COLUMN IF NOT EXISTS cr_status TEXT,
+      ADD COLUMN IF NOT EXISTS cr_reject_reason TEXT,
+      ADD COLUMN IF NOT EXISTS cr_rejected_by_role TEXT,
+      ADD COLUMN IF NOT EXISTS cr_rejected_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS replaced_at TIMESTAMPTZ`],
+    [`cr_status check`, `DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'documents_cr_status_check' AND conrelid = 'documents'::regclass) THEN
+        ALTER TABLE documents ADD CONSTRAINT documents_cr_status_check CHECK (cr_status IS NULL OR cr_status IN ('shared','rejected','replacement_pending'));
+      END IF; END $$`],
+    [`document_comments`, `CREATE TABLE IF NOT EXISTS document_comments (
+      id BIGSERIAL PRIMARY KEY,
+      document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      project_id BIGINT NOT NULL,
+      author_id BIGINT, author_role TEXT, author_name TEXT,
+      kind TEXT NOT NULL DEFAULT 'comment' CHECK (kind IN ('comment','recommendation')),
+      body TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 2000),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`],
+    [`document_comments index`, `CREATE INDEX IF NOT EXISTS idx_document_comments_doc ON document_comments (document_id, created_at)`],
+    [`document_versions`, `CREATE TABLE IF NOT EXISTS document_versions (
+      id BIGSERIAL PRIMARY KEY,
+      document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      project_id BIGINT NOT NULL,
+      file_name TEXT, file_url TEXT, file_id TEXT, reason TEXT, rejected_by_role TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`],
+    [`document_versions index`, `CREATE INDEX IF NOT EXISTS idx_document_versions_doc ON document_versions (document_id, created_at)`],
+  ];
+  for (const t of ['document_comments', 'document_versions']) {
+    steps.push([`${t} deletion guard`, `DO $$ BEGIN
+      IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'guard_pending_project_mutation') THEN
+        DROP TRIGGER IF EXISTS guard_pending_project_mutation ON public.${t};
+        CREATE TRIGGER guard_pending_project_mutation BEFORE INSERT OR UPDATE OR DELETE ON public.${t}
+          FOR EACH ROW EXECUTE FUNCTION guard_pending_project_mutation();
+      END IF; END $$`]);
+  }
+  for (const [label, sql] of steps) {
+    try { await pool.query(sql); }
+    catch (err) { console.warn(`[schema] document flow (${label}) not ensured:`, err.message); }
+  }
+}
+await ensureDocumentFlowSchema();
+
+
 // One shared stamp: registry of every stamp the server has drawn (powers /verify/:id).
 async function ensureStampTables() {
   try {
@@ -1719,6 +1771,7 @@ const lifecycleWriteExemptPaths = new Set([
 app.use(async (req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
   if (lifecycleWriteExemptPaths.has(req.path)) return next();
+  if (/^\/api\/control-reports\/[^/]+\/(comments\/list|versions)$/.test(req.path)) return next();   // read-only lookups
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return next();
 
@@ -9664,93 +9717,149 @@ function sideLabel(side) {
   return side;
 }
 
-// List document-approval items for a project
+// ---- shared helpers for the document flow --------------------------------
+class DocFlowError extends Error { constructor(status, message) { super(message); this.status = status; } }
+const docFail = (res, err, label) => {
+  if (err instanceof DocFlowError) return res.status(err.status).json({ error: err.message });
+  console.error(label, err);
+  return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+};
+
+// Reads the optional "sign this document" request. Returns null when the user did not ask for a stamp.
+function readDocStampRequest(body) {
+  if (String(body?.applyStamp) !== 'true') return null;
+  const raw = String(body.stampPage ?? '1');
+  const page = raw === 'append' ? 'append' : Number.parseInt(raw, 10);
+  const x = Number.parseFloat(body.stampX), y = Number.parseFloat(body.stampY);
+  if ((page !== 'append' && (!Number.isInteger(page) || page < 1)) || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
+    throw new DocFlowError(400, 'Choose where the stamp goes on the page first.');
+  }
+  return { page, x, y, scale: clampStampScale(body.stampScale) };
+}
+
+// Draws the signer's stamp on a PDF. Identity comes from the database, never from the browser.
+async function stampDocumentBuffer(req, projectId, buffer, request) {
+  if (buffer.subarray(0, 5).toString('latin1') !== '%PDF-') throw new DocFlowError(400, 'Only PDF documents can be signed with a stamp.');
+  const profile = await loadSignerProfile(projectId, req.user.role, req.user.user_id);
+  if (!profile) throw new DocFlowError(400, 'You have not set up a signature or stamp for this project. Open your Signature & Stamp setup, save it, then try again.');
+  const tz = await loadProjectTz(projectId);
+  const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+  const stampId = deriveStampId({ k: 'document', p: projectId, u: req.user.user_id, r: req.user.role, ts: Date.now(), h: hash, n: crypto.randomBytes(4).toString('hex') });
+  const signedAt = new Date();
+  const spec = stampSpecFromProfile(profile, { label: 'SIGNED', signedAt, tz, stampId, baseUrl: publicBaseUrl(req) });
+  const stamped = await stampPdfBuffer(buffer, spec, request);
+  return { bytes: stamped.bytes, stampId, signedAt, profile, tz };
+}
+
+async function registerDocumentStamp(projectId, docId, req, stamped) {
+  await registerStamp(pool, { stampId: stamped.stampId, projectId, table: 'documents', recordId: docId, kind: 'document',
+    userId: req.user.user_id, role: req.user.role, name: stamped.profile.name, position: stamped.profile.position,
+    company: stamped.profile.company, label: 'SIGNED', tz: stamped.tz, fileHash: crypto.createHash('sha256').update(stamped.bytes).digest('hex'), signedAt: stamped.signedAt });
+}
+
+async function fetchDocumentBytes(url) {
+  if (!url) throw new DocFlowError(400, 'This document has no file to sign.');
+  const r = await fetch(url, { redirect: 'follow' });
+  if (!r.ok) throw new DocFlowError(502, 'The document file could not be reached. Try again in a moment.');
+  return Buffer.from(await r.arrayBuffer());
+}
+
+async function uploadDocumentFile(buffer, name, folder) {
+  const up = await scheduleCloudinaryUpload(buffer, name, folder);
+  return { url: up.secure_url || up.url || null, id: up.public_id || null };
+}
+
+// Who is the caller for this document?
+//  author  = the person who created it (or the leader who assigned that team member)
+//  leader  = a side leader / PM of the document's side
+//  member  = anyone else on the same side
+async function documentAccess(req, doc, projectId) {
+  const docSide = String(doc.side || '').toLowerCase();
+  const isAuthorSelf = String(doc.creator_id) === String(req.user.user_id) && normalizeRole(doc.creator_role) === normalizeRole(req.user.role);
+  let isAssigner = false;
+  if (!isAuthorSelf && normalizeRole(doc.creator_role) === 'teammember') {
+    const chk = await pool.query('SELECT 1 FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 AND assigned_by=$4 LIMIT 1', [projectId, String(doc.creator_id), 'TeamMember', req.user.user_id]);
+    isAssigner = chk.rows.length > 0;
+  }
+  const leaderSide = getSide(req.user.role);
+  const isLeader = Boolean(leaderSide) && leaderSide === docSide;
+  let sameSide = isLeader;
+  if (!sameSide) {
+    const mine = await resolveSide(req.user.role, req.user.user_id, projectId);
+    sameSide = Boolean(mine) && mine.toLowerCase() === docSide;
+  }
+  return { isAuthor: isAuthorSelf || isAssigner, isAuthorSelf, isLeader, sameSide };
+}
+
+const DOC_SELECT = `d.id, d.project_id, d.title, d.description, d.category AS doc_type, d.document_date, d.file_name, d.file_url,
+  d.creator_id, d.creator_role, d.creator_name, d.side, d.approval_status AS status, d.approved_by_id, d.approved_by_role, d.signed_by_name,
+  d.approval_date AS reviewed_at, d.rejection_reason, d.is_shared, d.shared_at, d.created_at, d.updated_at,
+  d.author_stamp_id, d.author_signed_at, d.signer_stamp_id, d.cr_status, d.cr_reject_reason, d.cr_rejected_by_role, d.cr_rejected_at, d.replaced_at,
+  (SELECT COUNT(*)::int FROM document_comments c WHERE c.document_id = d.id) AS comment_count`;
+
+// List Document & Approval items. Visible ONLY to the author and to the leaders of the document's side.
 app.post('/api/document-approval', authenticateToken, async (req, res) => {
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const userId = req.user.user_id;
-    const userRole = req.user.role;
-    const userSide = await resolveSide(userRole, userId, projectId); // 'Contractor'|'Consultant'|'Client' or null
-    const isLeader = getSide(userRole) !== null;
-
-    // Visibility rules:
-    // - Creator always sees their documents
-    // - Side leader sees documents for their own side
-    // - Shared documents appear in DA only for the same side
-    // Build query requiring both creator id+role match, OR documents belonging
-    // to the caller's resolved side. This prevents collisions where numeric
-    // ids overlap across role tables.
-    const params = [projectId, userId, userRole];
-     let q = `SELECT id, project_id, title, description, category AS doc_type, document_date, file_name, file_url, creator_id, creator_role, side, approval_status AS status, approved_by_id, approved_by_role, approval_date AS reviewed_at, rejection_reason, is_shared, shared_at, created_at
-       FROM documents WHERE project_id = $1 AND ((creator_id = $2 AND lower(creator_role) = lower($3))`;
-
-    if (userSide) {
-      params.push(userSide.toLowerCase());
-      q += ` OR lower(side) = $4`;
+    const leaderSide = getSide(req.user.role) ? await resolveSide(req.user.role, req.user.user_id, projectId) : null;
+    const params = [projectId, req.user.user_id, req.user.role];
+    let q = `SELECT ${DOC_SELECT} FROM documents d
+       WHERE d.project_id = $1 AND ((d.creator_id = $2 AND lower(d.creator_role) = lower($3))`;
+    if (leaderSide) { params.push(leaderSide.toLowerCase()); q += ` OR lower(d.side) = $4`; }
+    else {
+      // a leader who assigned a team member also sees that member's documents
+      q += ` OR (lower(d.creator_role) = 'teammember' AND EXISTS (SELECT 1 FROM assignments_view av WHERE av.project_id = d.project_id AND av.role_id::text = d.creator_id::text AND av.role = 'TeamMember' AND av.assigned_by = $2))`;
     }
-
-    q += `) ORDER BY created_at DESC`;
-
+    q += `) ORDER BY d.created_at DESC`;
     const { rows } = await pool.query(q, params);
-    const normalizedRows = rows.map(row => {
-      if (row.is_shared) {
-        row.status = 'shared';
-      } else if (row.status === 'pending') {
-        row.status = 'pending_approval';
-      }
+    const documents = rows.map(row => {
+      if (row.is_shared) row.status = 'shared';
+      else if (row.status === 'pending') row.status = 'pending_approval';
       return row;
     });
-    return res.json({ documents: normalizedRows });
+    return res.json({ documents });
   } catch (err) {
-    console.error('POST /api/document-approval:', err);
-    return res.status(500).json({ error: 'Failed to load documents' });
+    return docFail(res, err, 'POST /api/document-approval:');
   }
 });
 
-// Create a new document (draft for team members, auto-approved for side leaders)
+// Create. The author may sign it right away (optional). Leaders' own documents are signed off at creation.
 app.post('/api/document-approval/create', authenticateToken, upload.single('file'), requireProjectLifecycleWrite, async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   const { doc_type, title, description } = req.body;
   if (!doc_type || !title) return res.status(400).json({ error: 'Missing fields' });
   try {
-    let fileUrl = null; let fileName = null; let fileId = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'documents');
-      fileUrl = uploaded.secure_url || uploaded.url || null;
-      fileName = req.file.originalname;
-      fileId = uploaded.public_id || null;
+    const stampReq = readDocStampRequest(req.body);
+    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
+    let buffer = req.file ? req.file.buffer : null;
+    let stamped = null;
+    if (stampReq) { stamped = await stampDocumentBuffer(req, projectId, buffer, stampReq); buffer = stamped.bytes; }
+    let fileUrl = null, fileName = null, fileId = null;
+    if (buffer) {
+      const up = await uploadDocumentFile(buffer, req.file.originalname, 'documents');
+      fileUrl = up.url; fileId = up.id; fileName = req.file.originalname;
     }
-    // Resolve side: for leaders/PMs use role mapping, for TeamMember use assignment for this project
     const resolvedSide = await resolveSide(req.user.role, req.user.user_id, projectId);
     const side = sideLabel(resolvedSide);
-    
-    // Side leaders auto-approve their own documents; team members save drafts first
     const isLeader = getSide(req.user.role) !== null;
-    // DB check constraint only allows 'draft','pending_approval','approved','rejected'
+    // The database only allows 'draft','pending_approval','approved','rejected'. 'approved' is shown to users as "Signed".
     const approvalStatus = isLeader ? 'approved' : 'draft';
-    const approvedById = isLeader ? req.user.user_id : null;
-    const approvedByRole = isLeader ? req.user.role : null;
-    
-    let q = `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side, approval_status`;
-    let params = [projectId, title, description || null, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, side, approvalStatus];
-    let paramIdx = 12;
-    
+    const creatorName = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
+    const cols = ['project_id','title','description','category','file_name','file_id','file_url','creator_id','creator_role','creator_name','side','approval_status'];
+    const vals = [projectId, title, description || null, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, creatorName || null, side, approvalStatus];
+    if (stamped) { cols.push('author_stamp_id','author_signed_at'); vals.push(stamped.stampId, stamped.signedAt); }
     if (isLeader) {
-      q += `, approved_by_id, approved_by_role, approval_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$${paramIdx},$${paramIdx+1},NOW())`;
-      params.push(approvedById, approvedByRole);
-    } else {
-      q += `) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`;
+      cols.push('approved_by_id','approved_by_role','signed_by_name','approval_date'); vals.push(req.user.user_id, req.user.role, creatorName || null, new Date());
+      if (stamped) { cols.push('signer_stamp_id'); vals.push(stamped.stampId); }
     }
-    
-    console.log('CREATE DOCUMENT SQL:', q, params);
-    console.log('CREATE DOCUMENT CONTEXT: user=', { id: req.user.user_id, role: req.user.role, isLeader }, 'file=', req.file ? req.file.originalname : null);
-    const insert = await pool.query(q + ` RETURNING id`, params);
+    const ph = vals.map((_, k) => `$${k + 1}`).join(',');
+    const insert = await pool.query(`INSERT INTO documents(${cols.join(',')}) VALUES(${ph}) RETURNING id`, vals);
+    if (stamped) await registerDocumentStamp(projectId, insert.rows[0].id, req, stamped);
     return res.json({ success: true, id: insert.rows[0].id });
   } catch (err) {
-    console.error('POST /api/document-approval/create:', err);
-    return res.status(500).json({ error: 'Failed to create document' });
+    return docFail(res, err, 'POST /api/document-approval/create:');
   }
 });
 
@@ -9796,11 +9905,13 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
     }
     if (!isCreator && !isAssignedBy) return res.status(403).json({ error: 'Not allowed' });
     let fileUrl = null; let fileName = null; let fileId = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'documents');
-      fileUrl = uploaded.secure_url || uploaded.url || null;
-      fileName = req.file.originalname;
-      fileId = uploaded.public_id || null;
+    const stampReq = readDocStampRequest(req.body);
+    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
+    let stamped = null, newBuffer = req.file ? req.file.buffer : null;
+    if (stampReq) { stamped = await stampDocumentBuffer(req, projectId, newBuffer, stampReq); newBuffer = stamped.bytes; }
+    if (newBuffer) {
+      const up = await uploadDocumentFile(newBuffer, req.file.originalname, 'documents');
+      fileUrl = up.url; fileId = up.id; fileName = req.file.originalname;
     }
     const doc_type = req.body.doc_type || null;
     const title = req.body.title || null;
@@ -9812,66 +9923,75 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
     if (description) { updates.push(`description=$${idx++}`); params.push(description); }
     if (doc_type) { updates.push(`category=$${idx++}`); params.push(doc_type); }
     if (fileName) { updates.push(`file_name=$${idx++}`, `file_id=$${idx++}`, `file_url=$${idx++}`); params.push(fileName, fileId, fileUrl); }
-    updates.push(`approval_status='pending_approval'`, `is_shared=false`, `rejection_reason=NULL`, `updated_at=NOW()`);
+    if (stamped) { updates.push(`author_stamp_id=$${idx++}`, `author_signed_at=$${idx++}`); params.push(stamped.stampId, stamped.signedAt); }
+    updates.push(`approval_status='pending_approval'`, `is_shared=false`, `cr_status=NULL`, `rejection_reason=NULL`, `updated_at=NOW()`);
     const q = `UPDATE documents SET ${updates.join(', ')} WHERE id=$${idx} AND project_id=$${idx+1}`;
     params.push(docId, projectId);
     await pool.query(q, params);
+    if (stamped) await registerDocumentStamp(projectId, docId, req, stamped);
     return res.json({ success: true });
   } catch (err) {
-    console.error('PUT /api/document-approval/:id/resubmit:', err);
-    return res.status(500).json({ error: 'Failed to resubmit' });
+    return docFail(res, err, 'PUT /api/document-approval/:id/resubmit:');
   }
 });
 
-// Review (approve/reject)
+// Leader review: sign (optionally with a stamp) or return to the author with a reason.
 app.post('/api/document-approval/:id/review', authenticateToken, async (req, res) => {
   const docId = req.params.id;
   const { projectId, action, comment } = req.body || {};
   if (!projectId || !action) return res.status(400).json({ error: 'Missing fields' });
   if (!['approved','rejected'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
   try {
-    const { rows } = await pool.query('SELECT id, approval_status, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT * FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-
-    const docSide = (rows[0].side || '').toLowerCase();
-    const userSide = getSide(req.user.role);
-    if (!userSide) return res.status(403).json({ error: 'Only side leaders can review documents' });
-    if (userSide !== docSide) return res.status(403).json({ error: 'You can only review documents for your side' });
-
-    if (action === 'approved') {
-      await pool.query(`UPDATE documents SET approval_status='approved', approved_by_id=$1, approved_by_role=$2, approval_date=NOW(), updated_at=NOW() WHERE id=$3`, [req.user.user_id, req.user.role, docId]);
+    const doc = rows[0];
+    const access = await documentAccess(req, doc, projectId);
+    if (!access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can review documents.' });
+    if (doc.approval_status !== 'pending_approval') return res.status(400).json({ error: 'This document is not waiting for review.' });
+    const reason = String(comment || '').trim();
+    if (action === 'rejected') {
+      if (reason.length < 3) throw new DocFlowError(400, 'Write the reason, so the author knows what to correct.');
+      await pool.query(`UPDATE documents SET approval_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2`, [reason, docId]);
     } else {
-      await pool.query(`UPDATE documents SET approval_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2`, [comment || null, docId]);
+      const stampReq = readDocStampRequest(req.body);
+      let stamped = null, fileSet = '';
+      const params = [req.user.user_id, req.user.role, null, null, docId];
+      if (stampReq) {
+        const bytes = await fetchDocumentBytes(doc.file_url);
+        stamped = await stampDocumentBuffer(req, projectId, bytes, stampReq);
+        const up = await uploadDocumentFile(stamped.bytes, doc.file_name || 'document.pdf', 'documents');
+        fileSet = `, file_url=$6, file_id=$7`;
+        params.push(up.url, up.id);
+        params[3] = stamped.stampId;
+      }
+      const signerName = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
+      params[2] = signerName || null;
+      await pool.query(`UPDATE documents SET approval_status='approved', approved_by_id=$1, approved_by_role=$2, signed_by_name=$3, signer_stamp_id=$4, approval_date=NOW(), rejection_reason=NULL, updated_at=NOW()${fileSet} WHERE id=$5`, params);
+      if (stamped) await registerDocumentStamp(projectId, docId, req, stamped);
     }
-    // Insert approval note
-    await pool.query(`INSERT INTO document_approval_notes(document_id, note_text, created_by_id, created_by_role, is_visible_to_creator) VALUES($1,$2,$3,$4,$5)`, [docId, comment || (action === 'approved' ? 'Approved' : 'Rejected'), req.user.user_id, req.user.role, true]);
+    await pool.query(`INSERT INTO document_approval_notes(document_id, note_text, created_by_id, created_by_role, is_visible_to_creator) VALUES($1,$2,$3,$4,$5)`,
+      [docId, reason || (action === 'approved' ? 'Signed' : 'Returned'), req.user.user_id, req.user.role, true]);
     return res.json({ success: true });
   } catch (err) {
-    console.error('POST /api/document-approval/:id/review:', err);
-    return res.status(500).json({ error: 'Failed to submit review' });
+    return docFail(res, err, 'POST /api/document-approval/:id/review:');
   }
 });
 
-// Share to Control & Report
+// Share a signed document to Control & Report (leader of that side only)
 app.post('/api/document-approval/:id/share', authenticateToken, async (req, res) => {
   const docId = req.params.id;
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT approval_status, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT * FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Only approved documents can be shared' });
-
-    const docSide = (rows[0].side || '').toLowerCase();
-    const userSide = getSide(req.user.role);
-    if (!userSide) return res.status(403).json({ error: 'Only side leaders can share documents' });
-    if (userSide !== docSide) return res.status(403).json({ error: 'You can only share documents for your side' });
-
-    await pool.query('UPDATE documents SET is_shared=true, shared_at=NOW(), updated_at=NOW() WHERE id=$1', [docId]);
+    if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Sign the document before sharing it.' });
+    const access = await documentAccess(req, rows[0], projectId);
+    if (!access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can share documents.' });
+    await pool.query(`UPDATE documents SET is_shared=true, cr_status='shared', shared_at=NOW(), updated_at=NOW() WHERE id=$1`, [docId]);
     return res.json({ success: true });
   } catch (err) {
-    console.error('POST /api/document-approval/:id/share:', err);
-    return res.status(500).json({ error: 'Failed to share document' });
+    return docFail(res, err, 'POST /api/document-approval/:id/share:');
   }
 });
 
@@ -9932,107 +10052,243 @@ app.delete('/api/document-approval/:id', authenticateToken, async (req, res) => 
   }
 });
 
-// Download document file (returns URL)
+// Download document file (returns URL). Author and side leaders always; same-side members only once shared and not under review.
 app.get('/api/document-approval/:id/download', authenticateToken, async (req, res) => {
   const docId = req.params.id;
   const projectId = req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT file_url, creator_id, creator_role, side, is_shared FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT file_url, creator_id, creator_role, side, is_shared, cr_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    const row = rows[0];
-    const docSide = (row.side || '').toLowerCase();
-    const userSide = getSide(req.user.role);
-
-    // Allow if creator or the team-member's assigner
-    const isCreator = String(row.creator_id) === String(req.user.user_id) && normalizeRole(row.creator_role) === normalizeRole(req.user.role);
-    let isAssignedBy = false;
-    if (!isCreator && normalizeRole(row.creator_role) === 'teammember') {
-      const assignCheck = await pool.query('SELECT 1 FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 AND assigned_by=$4 LIMIT 1', [projectId, String(row.creator_id), 'TeamMember', req.user.user_id]);
-      if (assignCheck.rows.length) isAssignedBy = true;
-    }
-    if (isCreator || isAssignedBy) return res.json({ url: row.file_url || null });
-
-    // Allow side leaders for same side
-    if (userSide && userSide === docSide) return res.json({ url: row.file_url || null });
-
-    // Allow if shared and user belongs to same side (resolve for TeamMember)
-    if (row.is_shared) {
-      const sideResolved = await resolveSide(req.user.role, req.user.user_id, projectId);
-      if (sideResolved && sideResolved.toLowerCase() === docSide) return res.json({ url: row.file_url || null });
-    }
-
+    const access = await documentAccess(req, rows[0], projectId);
+    if (access.isAuthor || access.isLeader) return res.json({ url: rows[0].file_url || null });
+    if (rows[0].is_shared && access.sameSide && (rows[0].cr_status || 'shared') === 'shared') return res.json({ url: rows[0].file_url || null });
     return res.status(403).json({ error: 'Access denied' });
   } catch (err) {
-    console.error('GET /api/document-approval/:id/download:', err);
-    return res.status(500).json({ error: 'Failed to download' });
+    return docFail(res, err, 'GET /api/document-approval/:id/download:');
   }
 });
 
-// CONTROL & REPORT — list shared documents
+// CONTROL & REPORT — list. Same-side users see shared documents; a document under rejection/replacement is visible to its author and the leaders only.
 app.post('/api/control-reports', authenticateToken, async (req, res) => {
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
     const side = await resolveSide(req.user.role, req.user.user_id, projectId);
     if (!side) return res.status(403).json({ error: 'Access denied' });
+    const isLeader = getSide(req.user.role) !== null;
     const { rows } = await pool.query(
-      `SELECT id, project_id, title, description, category AS doc_type, file_name, file_url, creator_id, creator_role, side, is_shared, shared_at, approval_date AS reviewed_at, created_at
-       FROM documents WHERE project_id=$1 AND is_shared = true AND lower(side) = $2 ORDER BY shared_at DESC NULLS LAST`,
-      [projectId, side.toLowerCase()]
+      `SELECT ${DOC_SELECT} FROM documents d
+        WHERE d.project_id=$1 AND d.is_shared = true AND lower(d.side) = $2
+          AND ( COALESCE(d.cr_status,'shared') = 'shared'
+                OR $3::boolean
+                OR (d.creator_id = $4 AND lower(d.creator_role) = lower($5)) )
+        ORDER BY d.shared_at DESC NULLS LAST`,
+      [projectId, side.toLowerCase(), isLeader, req.user.user_id, req.user.role]
     );
-    return res.json({ documents: rows });
+    return res.json({ documents: rows.map(r => ({ ...r, cr_status: r.cr_status || 'shared' })) });
   } catch (err) {
-    console.error('POST /api/control-reports:', err);
-    return res.status(500).json({ error: 'Failed to load control reports' });
+    return docFail(res, err, 'POST /api/control-reports:');
   }
 });
 
-// CONTROL & REPORT — create (leader direct add)
+// CONTROL & REPORT — create (leader direct add, optional stamp)
 app.post('/api/control-reports/create', authenticateToken, upload.single('file'), requireProjectLifecycleWrite, async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   const { doc_type, title, description } = req.body;
   if (!doc_type || !title || !description) return res.status(400).json({ error: 'Missing fields' });
   try {
-    // Only side leaders (Client/ClientPM, Contractor/ContractorPM, Consultant/ConsultantPM) can add direct C&R records
     const userSide = getSide(req.user.role);
     if (!userSide) return res.status(403).json({ error: 'Only side leaders can add control & report records' });
-    let fileUrl = null; let fileName = null; let fileId = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'control_reports');
-      fileUrl = uploaded.secure_url || uploaded.url || null;
-      fileName = req.file.originalname;
-      fileId = uploaded.public_id || null;
-    }
-    const side = sideLabel(getSide(req.user.role));
+    const stampReq = readDocStampRequest(req.body);
+    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
+    let buffer = req.file ? req.file.buffer : null, stamped = null;
+    if (stampReq) { stamped = await stampDocumentBuffer(req, projectId, buffer, stampReq); buffer = stamped.bytes; }
+    let fileUrl = null, fileName = null, fileId = null;
+    if (buffer) { const up = await uploadDocumentFile(buffer, req.file.originalname, 'control_reports'); fileUrl = up.url; fileId = up.id; fileName = req.file.originalname; }
+    const side = sideLabel(userSide);
+    const name = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
     const insert = await pool.query(
-      `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, side, approval_status, approved_by_id, approved_by_role, approval_date, is_shared, shared_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'approved',$11,$12,NOW(),true,NOW()) RETURNING id`,
-      [projectId, title, description, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, side, req.user.user_id, req.user.role]
+      `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, creator_name, side, approval_status, approved_by_id, approved_by_role, signed_by_name, signer_stamp_id, author_stamp_id, author_signed_at, approval_date, is_shared, cr_status, shared_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'approved',$8,$9,$10,$12,$12,$13,NOW(),true,'shared',NOW()) RETURNING id`,
+      [projectId, title, description, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, name || null, side, stamped ? stamped.stampId : null, stamped ? stamped.signedAt : null]
     );
+    if (stamped) await registerDocumentStamp(projectId, insert.rows[0].id, req, stamped);
     return res.json({ success: true, id: insert.rows[0].id });
   } catch (err) {
-    console.error('POST /api/control-reports/create:', err);
-    return res.status(500).json({ error: 'Failed to create control report' });
+    return docFail(res, err, 'POST /api/control-reports/create:');
   }
 });
 
+// loads a shared document the caller may act on
+async function loadControlDoc(req, res, projectId) {
+  const { rows } = await pool.query('SELECT * FROM documents WHERE id=$1 AND project_id=$2 AND is_shared = true', [req.params.id, projectId]);
+  if (!rows.length) { res.status(404).json({ error: 'Document not found' }); return null; }
+  const access = await documentAccess(req, rows[0], projectId);
+  if (!access.sameSide) { res.status(403).json({ error: 'Access denied' }); return null; }
+  return { doc: rows[0], access };
+}
+
 // CONTROL & REPORT — download
 app.get('/api/control-reports/:id/download', authenticateToken, async (req, res) => {
-  const id = req.params.id;
   const projectId = req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT file_url, side FROM documents WHERE id=$1 AND project_id=$2', [id, projectId]);
-    if (!rows.length) return res.status(404).json({ error: 'Not found' });
-    const docSide = (rows[0].side || '').toLowerCase();
-    const side = await resolveSide(req.user.role, req.user.user_id, projectId);
-    if (!side || side.toLowerCase() !== docSide) return res.status(403).json({ error: 'Access denied' });
-    return res.json({ url: rows[0].file_url || null });
+    const got = await loadControlDoc(req, res, projectId);
+    if (!got) return;
+    const status = got.doc.cr_status || 'shared';
+    if (status !== 'shared' && !got.access.isAuthor && !got.access.isLeader) return res.status(403).json({ error: 'This document is being corrected.' });
+    return res.json({ url: got.doc.file_url || null });
   } catch (err) {
-    console.error('GET /api/control-reports/:id/download:', err);
-    return res.status(500).json({ error: 'Failed to download' });
+    return docFail(res, err, 'GET /api/control-reports/:id/download:');
+  }
+});
+
+// CONTROL & REPORT — comments / recommendations (same side only)
+app.post('/api/control-reports/:id/comments/list', authenticateToken, async (req, res) => {
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const got = await loadControlDoc(req, res, projectId);
+    if (!got) return;
+    const { rows } = await pool.query('SELECT id, author_id, author_role, author_name, kind, body, created_at FROM document_comments WHERE document_id=$1 ORDER BY created_at ASC', [req.params.id]);
+    return res.json({ comments: rows });
+  } catch (err) {
+    return docFail(res, err, 'POST /api/control-reports/:id/comments/list:');
+  }
+});
+
+app.post('/api/control-reports/:id/comments', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+  const { projectId, body, kind } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  const text = String(body || '').trim();
+  if (text.length < 2) return res.status(400).json({ error: 'Write your comment first.' });
+  if (text.length > 2000) return res.status(400).json({ error: 'Keep the comment under 2000 characters.' });
+  try {
+    const got = await loadControlDoc(req, res, projectId);
+    if (!got) return;
+    if ((got.doc.cr_status || 'shared') !== 'shared' && !got.access.isAuthor && !got.access.isLeader) return res.status(403).json({ error: 'This document is being corrected.' });
+    const name = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
+    const k = kind === 'recommendation' ? 'recommendation' : 'comment';
+    const ins = await pool.query(
+      `INSERT INTO document_comments(document_id, project_id, author_id, author_role, author_name, kind, body) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id, created_at`,
+      [req.params.id, projectId, req.user.user_id, req.user.role, name || null, k, text]);
+    return res.json({ success: true, id: ins.rows[0].id });
+  } catch (err) {
+    return docFail(res, err, 'POST /api/control-reports/:id/comments:');
+  }
+});
+
+// CONTROL & REPORT — leader rejects a shared document (or a replacement) with a reason
+app.post('/api/control-reports/:id/reject', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+  const { projectId, reason } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const got = await loadControlDoc(req, res, projectId);
+    if (!got) return;
+    if (!got.access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can reject a shared document.' });
+    const status = got.doc.cr_status || 'shared';
+    if (!['shared', 'replacement_pending'].includes(status)) return res.status(400).json({ error: 'This document is already waiting for a replacement.' });
+    const why = String(reason || '').trim();
+    if (why.length < 3) throw new DocFlowError(400, 'Write the reason, so the author knows what to correct.');
+    if (status === 'replacement_pending') {
+      await pool.query(`UPDATE documents SET cr_status='rejected', cr_reject_reason=$1, cr_rejected_by_role=$2, cr_rejected_at=NOW(), updated_at=NOW() WHERE id=$3`, [why, req.user.role, req.params.id]);
+    } else {
+      await pool.query(`INSERT INTO document_versions(document_id, project_id, file_name, file_url, file_id, reason, rejected_by_role) VALUES($1,$2,$3,$4,$5,$6,$7)`, [req.params.id, projectId, got.doc.file_name, got.doc.file_url, got.doc.file_id, why, req.user.role]);
+      await pool.query(`UPDATE documents SET cr_status='rejected', cr_reject_reason=$1, cr_rejected_by_role=$2, cr_rejected_at=NOW(), updated_at=NOW() WHERE id=$3`, [why, req.user.role, req.params.id]);
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    return docFail(res, err, 'POST /api/control-reports/:id/reject:');
+  }
+});
+
+// CONTROL & REPORT — author replaces the rejected file (optionally signing it)
+app.post('/api/control-reports/:id/replace', authenticateToken, upload.single('file'), requireProjectLifecycleWrite, async (req, res) => {
+  const projectId = req.body.projectId;
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const got = await loadControlDoc(req, res, projectId);
+    if (!got) return;
+    if (!got.access.isAuthor) return res.status(403).json({ error: 'Only the author can replace this document.' });
+    if (got.doc.cr_status !== 'rejected') return res.status(400).json({ error: 'This document is not waiting for a replacement.' });
+    if (!req.file) throw new DocFlowError(400, 'Attach the corrected file.');
+    const stampReq = readDocStampRequest(req.body);
+    let buffer = req.file.buffer, stamped = null;
+    if (stampReq) { stamped = await stampDocumentBuffer(req, projectId, buffer, stampReq); buffer = stamped.bytes; }
+    const up = await uploadDocumentFile(buffer, req.file.originalname, 'control_reports');
+    await pool.query(
+      `UPDATE documents SET file_name=$1, file_url=$2, file_id=$3, cr_status='replacement_pending', replaced_at=NOW(),
+         author_stamp_id=COALESCE($4, author_stamp_id), author_signed_at=COALESCE($5, author_signed_at), updated_at=NOW() WHERE id=$6`,
+      [req.file.originalname, up.url, up.id, stamped ? stamped.stampId : null, stamped ? stamped.signedAt : null, req.params.id]);
+    if (stamped) await registerDocumentStamp(projectId, req.params.id, req, stamped);
+    return res.json({ success: true });
+  } catch (err) {
+    return docFail(res, err, 'POST /api/control-reports/:id/replace:');
+  }
+});
+
+// CONTROL & REPORT — leader signs/accepts the replacement; it becomes visible to the side again
+app.post('/api/control-reports/:id/accept', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const got = await loadControlDoc(req, res, projectId);
+    if (!got) return;
+    if (!got.access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can accept a replacement.' });
+    if (got.doc.cr_status !== 'replacement_pending') return res.status(400).json({ error: 'There is no replacement waiting for you.' });
+    const stampReq = readDocStampRequest(req.body);
+    const params = [req.user.user_id, req.user.role, null, null, req.params.id];
+    let fileSet = '', stamped = null;
+    if (stampReq) {
+      const bytes = await fetchDocumentBytes(got.doc.file_url);
+      stamped = await stampDocumentBuffer(req, projectId, bytes, stampReq);
+      const up = await uploadDocumentFile(stamped.bytes, got.doc.file_name || 'document.pdf', 'control_reports');
+      fileSet = `, file_url=$6, file_id=$7`; params.push(up.url, up.id); params[3] = stamped.stampId;
+    }
+    params[2] = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
+    await pool.query(`UPDATE documents SET approved_by_id=$1, approved_by_role=$2, signed_by_name=$3, signer_stamp_id=$4, approval_date=NOW(), cr_status='shared', cr_reject_reason=NULL, shared_at=NOW(), updated_at=NOW()${fileSet} WHERE id=$5`, params);
+    if (stamped) await registerDocumentStamp(projectId, req.params.id, req, stamped);
+    return res.json({ success: true });
+  } catch (err) {
+    return docFail(res, err, 'POST /api/control-reports/:id/accept:');
+  }
+});
+
+// Streams a document's file through the server so the browser can read it (for choosing a stamp position).
+// Author and side leaders always; same-side members only while it is shared and not under correction.
+app.get('/api/document-file/:id', authenticateToken, async (req, res) => {
+  const projectId = req.query.projectId;
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM documents WHERE id=$1 AND project_id=$2', [req.params.id, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    const doc = rows[0];
+    const access = await documentAccess(req, doc, projectId);
+    const open = doc.is_shared && access.sameSide && (doc.cr_status || 'shared') === 'shared';
+    if (!(access.isAuthor || access.isLeader || open)) return res.status(403).json({ error: 'Access denied' });
+    const bytes = await fetchDocumentBytes(doc.file_url);
+    res.set('Content-Type', 'application/pdf');
+    res.set('Cache-Control', 'private, no-store');
+    return res.send(bytes);
+  } catch (err) {
+    return docFail(res, err, 'GET /api/document-file/:id:');
+  }
+});
+
+// CONTROL & REPORT — earlier versions that were rejected (author and leaders)
+app.post('/api/control-reports/:id/versions', authenticateToken, async (req, res) => {
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const got = await loadControlDoc(req, res, projectId);
+    if (!got) return;
+    if (!got.access.isAuthor && !got.access.isLeader) return res.status(403).json({ error: 'Access denied' });
+    const { rows } = await pool.query('SELECT id, file_name, file_url, reason, rejected_by_role, created_at FROM document_versions WHERE document_id=$1 ORDER BY created_at DESC', [req.params.id]);
+    return res.json({ versions: rows });
+  } catch (err) {
+    return docFail(res, err, 'POST /api/control-reports/:id/versions:');
   }
 });
 
