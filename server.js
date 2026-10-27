@@ -144,13 +144,36 @@ async function ensureStampTables() {
     )`);
     await pool.query(`CREATE INDEX IF NOT EXISTS stamp_registry_record_idx ON stamp_registry (record_table, record_id)`);
     await pool.query(`ALTER TABLE user_stamps ADD COLUMN IF NOT EXISTS mark_type TEXT`);
+    await pool.query(`ALTER TABLE stamp_registry
+      ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS revoked_by_user_id INTEGER,
+      ADD COLUMN IF NOT EXISTS revoked_by_role TEXT,
+      ADD COLUMN IF NOT EXISTS revoke_reason TEXT`);
   } catch (err) {
     console.warn('[schema] stamp tables not ensured:', err.message);
   }
 }
 await ensureStampTables();
 
-const publicBaseUrl = (req) => (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+// Address printed inside every QR code. Set PUBLIC_BASE_URL (for example https://oneproject.example.com) on the host;
+// without it the address of the current request is used, which is wrong for stamps made on localhost.
+let warnedBaseUrl = false;
+const publicBaseUrl = (req) => {
+  const fixed = String(process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (fixed) return fixed;
+  const proto = String(req.get('x-forwarded-proto') || req.protocol || 'http').split(',')[0].trim();
+  const base = `${proto}://${req.get('host')}`;
+  if (!warnedBaseUrl) {
+    warnedBaseUrl = true;
+    console.warn(`[stamp] PUBLIC_BASE_URL is not set. QR codes will point to ${base}, which only works from this address. Set PUBLIC_BASE_URL to your real domain before stamping real documents.`);
+  }
+  return base;
+};
+if (!String(process.env.PUBLIC_BASE_URL || '').trim()) {
+  console.warn('[stamp] PUBLIC_BASE_URL is not set (QR codes will use the address of each request).');
+} else if (/localhost|127\.0\.0\.1/i.test(process.env.PUBLIC_BASE_URL)) {
+  console.warn('[stamp] PUBLIC_BASE_URL points to localhost. QR codes will not open on phones.');
+}
 
 async function registerStamp(db, row) {
   try {
@@ -936,10 +959,31 @@ async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
           userId: slot.userId, role: slot.role, name: p.name, position: slot.position || p.position, company: p.company,
           label: ctx.decisionWord || 'APPROVED', tz: ctx.tz, fileHash: null, signedAt: slot.signed_at });
       }
-      const spec = stampSpecFromProfile({ ...p, position: slot.position || p.position, side: slot.side || p.side },
-        { label: ctx.decisionWord || 'APPROVED', signedAt: slot.signed_at, tz: ctx.tz, stampId, baseUrl: ctx.baseUrl });
-      const lay = await layoutStamp(pdfDoc, spec, { width: boxW });
-      lay.paint(L.page, x, boxTop - lay.height);
+      if (slot.stampedOnDoc) {
+        // Already stamped on the document itself: never draw a second stamp, just point to it.
+        const sid = slot.stampedOnDoc.stampId || stampId;
+        const where = slot.stampedOnDoc.page ? `Stamp placed on page ${slot.stampedOnDoc.page} of this record` : 'Stamp already placed on this record';
+        const roleLine = `${slot.position || p.position || ''}${slot.side ? ', ' + flowSideLabel(slot.side) + ' side' : ''}`;
+        L.page.drawRectangle({ x, y: boxTop - 76, width: boxW, height: 76, borderColor: MUTED, borderWidth: 0.8, color: rgb(1, 1, 1) });
+        const rows = [
+          { t: p.name, f: L.bold, s: 9.5, c: INK },
+          { t: roleLine, f: L.regular, s: 8, c: INK },
+          { t: where, f: L.regular, s: 8, c: INK },
+          { t: sid ? `Stamp ID ${sid}` : '', f: L.bold, s: 7.5, c: MUTED },
+          { t: flowFormatDateTime(slot.signed_at, ctx.tz), f: L.regular, s: 7.5, c: MUTED },
+        ];
+        let ty = boxTop - 15;
+        for (const r of rows) {
+          if (!String(r.t).trim()) continue;
+          L.page.drawText(L.safe(String(r.t)).slice(0, 62), { x: x + 8, y: ty, size: r.s, font: r.f, color: r.c });
+          ty -= r.s * 1.45;
+        }
+      } else {
+        const spec = stampSpecFromProfile({ ...p, position: slot.position || p.position, side: slot.side || p.side },
+          { label: ctx.decisionWord || 'APPROVED', signedAt: slot.signed_at, tz: ctx.tz, stampId, baseUrl: ctx.baseUrl });
+        const lay = await layoutStamp(pdfDoc, spec, { width: boxW });
+        lay.paint(L.page, x, boxTop - lay.height);
+      }
     } else {
       L.page.drawText(slot.pendingLabel || 'Awaiting signature', { x: x + 8, y: boxTop - 22, size: 9, font: L.bold, color: MUTED });
       L.page.drawText(L.safe(`${slot.position || ''}${slot.side ? ', ' + flowSideLabel(slot.side) + ' side' : ''}`), { x: x + 8, y: boxTop - 36, size: 8, font: L.regular, color: MUTED });
@@ -994,9 +1038,27 @@ async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLin
     const decider = slots.find(sl => sl.isDecider);
     placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, slot: decider, ctx, at: placementIn });
   }
+  // One stamp per person per document: whoever is already stamped on the record PDF (the approver's chosen
+  // position, or an earlier upload / review stamp) is only referenced on the sign-off page, not stamped again.
+  const signoffSlots = slots.map(sl => ({ ...sl }));
+  if (placement) {
+    const dec = signoffSlots.find(sl => sl.isDecider);
+    if (dec) dec.stampedOnDoc = { page: placement.page, stampId: decisionStampId(ctx, dec) };
+  }
+  try {
+    const { rows: prior } = await pool.query(
+      `SELECT signer_user_id, signer_role, stamp_id FROM stamp_registry WHERE record_table=$1 AND record_id=$2 AND kind IN ('review','record_upload')`,
+      [ctx.table, rec.id]
+    );
+    for (const sl of signoffSlots) {
+      if (sl.stampedOnDoc) continue;
+      const hit = prior.find(r => Number(r.signer_user_id) === Number(sl.userId) && r.signer_role === sl.role);
+      if (hit) sl.stampedOnDoc = { stampId: hit.stamp_id };
+    }
+  } catch (_) { /* registry unavailable: fall back to stamping on the sign-off page */ }
   // 2) The sign-off page (every named signer) is always added at the end of the record
   const originalPages = doc.getPageCount();
-  await appendSignaturePage(doc, { ...ctx, kindTitle: `Record sign-off, ${stageLabel}` }, slots, { heading: 'Record sign-off', decisionLine });
+  await appendSignaturePage(doc, { ...ctx, kindTitle: `Record sign-off, ${stageLabel}` }, signoffSlots, { heading: 'Record sign-off', decisionLine });
   await addFlowFooters(doc, { left: `${ctx.projectName}  |  ${ctx.recordRef}  |  Record sign-off`, fromIndex: originalPages });
   return { bytes: Buffer.from(await doc.save()), placement };
 }
@@ -3710,7 +3772,8 @@ async function handleAddRecord(req, res) {
     const supportingFiles = req.files?.supportingFiles || [];
     // The attachment arrives pre-converted-to-PDF (and pre-stamped, if the user
     // chose to stamp) from the client. clientStamped is a claim we verify below.
-    const clientStamped = req.body.applyStamp === 'true' || req.body.clientStamped === 'true';   // the SERVER draws the stamp
+    const clientStamped = req.body.applyStamp === 'true';   // the SERVER draws the stamp
+    const oldPageSentStamp = req.body.clientStamped === 'true' && req.body.applyStamp !== 'true';
     const stampType = 'STAMPED';
     const stampPageRaw = req.body.stampPage;
     const stampPage = stampPageRaw === 'append' ? 'append' : Number.parseInt(stampPageRaw, 10);
@@ -3718,6 +3781,7 @@ async function handleAddRecord(req, res) {
     const stampY = Number.parseFloat(req.body.stampY);
     const fail = (status, message) => res.status(status).json({ success: false, message });
     console.log('[add-record] 📝 Request:', { userId, role, clientStamped, stampType, stampPage, stampX, stampY });
+    if (oldPageSentStamp) return fail(409, 'This page is out of date and would stamp the document twice. Refresh the page (Ctrl+F5) and try again.');
 
     // ── STEP 1. Text fields (free) ───────────────────────────────────────────
     const table = resolveTable(req.body.recordType);
@@ -5267,7 +5331,7 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), r
         const pgRaw = req.body.stampPage;
         const placement = { page: pgRaw === 'append' ? 'append' : (parseInt(pgRaw, 10) || 1), x: Number.parseFloat(req.body.stampX), y: Number.parseFloat(req.body.stampY) };
         if (!Number.isFinite(placement.x) || !Number.isFinite(placement.y) || placement.x < 0 || placement.x > 1 || placement.y < 0 || placement.y > 1) {
-          return res.status(400).json({ error: 'Invalid stamp placement supplied.' });
+          return res.status(409).json({ error: 'This page is out of date and would stamp the document twice. Refresh the page (Ctrl+F5) and try again.' });
         }
         const rvTz = await loadProjectTz(projectId);
         const rvStampId = deriveStampId({ k: 'review', p: projectId, rec: recordId, u: reviewerId, r: reviewerRole, ts: Date.now(), n: crypto.randomBytes(4).toString('hex') });
@@ -5828,9 +5892,12 @@ async function lookupStamp(id) {
   return rows[0] || null;
 }
 const stampPublicView = (r) => ({
-  valid: true, stampId: r.stamp_id, signer: r.signer_name, position: r.signer_position, company: r.company_name,
+  valid: !r.revoked_at, stampId: r.stamp_id, signer: r.signer_name, position: r.signer_position, company: r.company_name,
   action: r.label, project: r.project_name || null, signedAt: formatStampDate(r.signed_at, r.tz || 'UTC'),
   fileCheckAvailable: Boolean(r.file_hash),
+  revoked: Boolean(r.revoked_at),
+  revokedAt: r.revoked_at ? formatStampDate(r.revoked_at, r.tz || 'UTC') : null,
+  revokeReason: r.revoked_at ? (r.revoke_reason || null) : null,
 });
 app.get('/api/verify-stamp/:id', async (req, res) => {
   try {
@@ -5858,9 +5925,52 @@ app.get('/verify/:id', async (req, res) => {
   const v = r ? stampPublicView(r) : null;
   res.set('Content-Type', 'text/html; charset=utf-8').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stamp verification</title>
 <style>body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f5f7;color:#1c232d;margin:0;padding:24px}main{max-width:460px;margin:8vh auto;background:#fff;border:1px solid #d5d9df;border-radius:10px;padding:22px}h1{font-size:18px;margin:0 0 4px}p{color:#5b6572;font-size:13px;margin:0 0 14px}table{border-collapse:collapse;width:100%;font-size:14px}th{text-align:left;color:#5b6572;font-weight:600;padding:6px 10px 6px 0;width:34%;vertical-align:top}td{padding:6px 0}.ok{font-weight:700}</style></head><body><main>
-${v ? `<h1 class="ok">Stamp verified</h1><p>This stamp was issued by OneProject.</p><table>${row('Stamp ID', v.stampId)}${row('Action', v.action)}${row('Signed by', v.signer)}${row('Position', v.position)}${row('Company', v.company)}${row('Project', v.project)}${row('Date and time', v.signedAt)}</table>`
+${v && v.revoked ? `<h1 class="ok">Stamp revoked</h1><p>This stamp was issued by OneProject but is no longer valid. Do not rely on the document it appears on without confirming with the signer.</p><table>${row('Stamp ID', v.stampId)}${row('Revoked on', v.revokedAt)}${row('Reason', v.revokeReason)}${row('Action', v.action)}${row('Signed by', v.signer)}${row('Position', v.position)}${row('Company', v.company)}${row('Project', v.project)}${row('Originally signed', v.signedAt)}</table>`
+ : v ? `<h1 class="ok">Stamp verified</h1><p>This stamp was issued by OneProject.</p><table>${row('Stamp ID', v.stampId)}${row('Action', v.action)}${row('Signed by', v.signer)}${row('Position', v.position)}${row('Company', v.company)}${row('Project', v.project)}${row('Date and time', v.signedAt)}</table>`
  : `<h1>Stamp not found</h1><p>No stamp with the ID ${esc(req.params.id)} was issued by OneProject. Check the ID printed on the document.</p>`}
 </main></body></html>`);
+});
+
+// ---- Revocation: the signer can withdraw their own stamp. The record stays (audit trail); the verify page shows REVOKED. ----
+app.get('/api/my-issued-stamps', authenticateToken, async (req, res) => {
+  const { user_id, role } = req.user;
+  const projectId = parseInt(req.query.projectId, 10);
+  if (!projectId) return res.status(400).json({ error: 'projectId required' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT stamp_id, label, kind, record_table, record_id, signed_at, tz, revoked_at, revoke_reason
+         FROM stamp_registry
+        WHERE signer_user_id = $1 AND signer_role = $2 AND project_id = $3
+        ORDER BY signed_at DESC LIMIT 25`,
+      [user_id, role, projectId]
+    );
+    res.json({ stamps: rows.map(r => ({
+      stampId: r.stamp_id, action: r.label, kind: r.kind, recordTable: r.record_table, recordId: r.record_id,
+      signedAt: formatStampDate(r.signed_at, r.tz || 'UTC'), revoked: Boolean(r.revoked_at),
+      revokedAt: r.revoked_at ? formatStampDate(r.revoked_at, r.tz || 'UTC') : null, revokeReason: r.revoke_reason || null,
+    })) });
+  } catch (err) { console.error('GET my-issued-stamps:', err); res.status(500).json({ error: 'Could not load your stamps.' }); }
+});
+app.post('/api/stamps/:id/revoke', authenticateToken, async (req, res) => {
+  const { user_id, role } = req.user;
+  const id = String(req.params.id || '').toUpperCase();
+  const reason = String(req.body?.reason || '').trim().slice(0, 500);
+  if (!STAMP_ID_RE.test(id)) return res.status(400).json({ error: 'Invalid Stamp ID.' });
+  if (reason.length < 3) return res.status(400).json({ error: 'Give a short reason for revoking this stamp.' });
+  try {
+    const { rows } = await pool.query(`SELECT signer_user_id, signer_role, revoked_at FROM stamp_registry WHERE stamp_id = $1`, [id]);
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: 'Stamp not found.' });
+    if (Number(row.signer_user_id) !== Number(user_id) || row.signer_role !== role) {
+      return res.status(403).json({ error: 'Only the person who issued this stamp can revoke it.' });
+    }
+    if (row.revoked_at) return res.status(409).json({ error: 'This stamp is already revoked.' });
+    await pool.query(
+      `UPDATE stamp_registry SET revoked_at = NOW(), revoked_by_user_id = $2, revoked_by_role = $3, revoke_reason = $4 WHERE stamp_id = $1 AND revoked_at IS NULL`,
+      [id, user_id, role, reason]
+    );
+    res.json({ success: true });
+  } catch (err) { console.error('POST stamps revoke:', err); res.status(500).json({ error: 'Could not revoke the stamp.' }); }
 });
 
 app.delete('/api/delete-record', authenticateToken, async (req, res) => {
