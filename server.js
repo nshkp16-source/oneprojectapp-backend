@@ -9773,16 +9773,22 @@ async function uploadDocumentFile(buffer, name, folder) {
 //  author  = the person who created it (or the leader who assigned that team member)
 //  leader  = a side leader / PM of the document's side
 //  member  = anyone else on the same side
+const roleKeyOf = (role) => String(role || '').toLowerCase().replace(/[\s_-]+/g, '');
 async function documentAccess(req, doc, projectId) {
   const docSide = String(doc.side || '').toLowerCase();
   const isAuthorSelf = String(doc.creator_id) === String(req.user.user_id) && normalizeRole(doc.creator_role) === normalizeRole(req.user.role);
+  // the leader who assigned the team member to the project is "their" leader, whatever side the assignment names
   let isAssigner = false;
-  if (!isAuthorSelf && normalizeRole(doc.creator_role) === 'teammember') {
-    const chk = await pool.query('SELECT 1 FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 AND assigned_by=$4 LIMIT 1', [projectId, String(doc.creator_id), 'TeamMember', req.user.user_id]);
+  if (!isAuthorSelf && roleKeyOf(doc.creator_role) === 'teammember') {
+    const chk = await pool.query(
+      `SELECT 1 FROM team_member_assignments
+        WHERE project_id=$1 AND team_member_id=$2 AND assigned_by=$3
+          AND lower(regexp_replace(COALESCE(assigned_by_role,''), '[ _-]', '', 'g')) = $4 LIMIT 1`,
+      [projectId, doc.creator_id, req.user.user_id, roleKeyOf(req.user.role)]);
     isAssigner = chk.rows.length > 0;
   }
   const leaderSide = getSide(req.user.role);
-  const isLeader = Boolean(leaderSide) && leaderSide === docSide;
+  const isLeader = Boolean(leaderSide) && (leaderSide === docSide || isAssigner);
   let sameSide = isLeader;
   if (!sameSide) {
     const mine = await resolveSide(req.user.role, req.user.user_id, projectId);
@@ -9797,23 +9803,27 @@ const DOC_SELECT = `d.id, d.project_id, d.title, d.description, d.category AS do
   d.author_stamp_id, d.author_signed_at, d.signer_stamp_id, d.cr_status, d.cr_reject_reason, d.cr_rejected_by_role, d.cr_rejected_at, d.replaced_at,
   (SELECT COUNT(*)::int FROM document_comments c WHERE c.document_id = d.id) AS comment_count`;
 
-// List Document & Approval items. Visible ONLY to the author and to the leaders of the document's side.
+// List Document & Approval items. Visible ONLY to the author and to the leaders that review it:
+// the leaders of the document's side, and the leader who assigned the author to the project.
 app.post('/api/document-approval', authenticateToken, async (req, res) => {
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const leaderSide = getSide(req.user.role) ? await resolveSide(req.user.role, req.user.user_id, projectId) : null;
-    const params = [projectId, req.user.user_id, req.user.role];
-    let q = `SELECT ${DOC_SELECT} FROM documents d
-       WHERE d.project_id = $1 AND ((d.creator_id = $2 AND lower(d.creator_role) = lower($3))`;
-    if (leaderSide) { params.push(leaderSide.toLowerCase()); q += ` OR lower(d.side) = $4`; }
-    else {
-      // a leader who assigned a team member also sees that member's documents
-      q += ` OR (lower(d.creator_role) = 'teammember' AND EXISTS (SELECT 1 FROM assignments_view av WHERE av.project_id = d.project_id AND av.role_id::text = d.creator_id::text AND av.role = 'TeamMember' AND av.assigned_by = $2))`;
-    }
-    q += `) ORDER BY d.created_at DESC`;
+    const isLeaderRole = getSide(req.user.role) !== null;
+    const leaderSide = isLeaderRole ? await resolveSide(req.user.role, req.user.user_id, projectId) : null;
+    const assignedByMe = `EXISTS (SELECT 1 FROM team_member_assignments tma
+        WHERE tma.project_id = d.project_id AND lower(d.creator_role) = 'teammember' AND tma.team_member_id = d.creator_id
+          AND tma.assigned_by = $2 AND lower(regexp_replace(COALESCE(tma.assigned_by_role,''), '[ _-]', '', 'g')) = $4)`;
+    const params = [projectId, req.user.user_id, req.user.role, isLeaderRole ? roleKeyOf(req.user.role) : '__none__', leaderSide ? leaderSide.toLowerCase() : null];
+    const q = `SELECT ${DOC_SELECT}, (${assignedByMe}) AS assigned_by_me FROM documents d
+       WHERE d.project_id = $1 AND (
+         (d.creator_id = $2 AND lower(d.creator_role) = lower($3))
+         OR (d.approval_status <> 'draft' AND ( ($5::text IS NOT NULL AND lower(d.side) = $5) OR ${assignedByMe} ))
+       ) ORDER BY d.created_at DESC`;
     const { rows } = await pool.query(q, params);
     const documents = rows.map(row => {
+      row.can_review = isLeaderRole && ((leaderSide && String(row.side || '').toLowerCase() === leaderSide.toLowerCase()) || row.assigned_by_me === true);
+      delete row.assigned_by_me;
       if (row.is_shared) row.status = 'shared';
       else if (row.status === 'pending') row.status = 'pending_approval';
       return row;
