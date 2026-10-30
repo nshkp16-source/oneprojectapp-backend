@@ -158,6 +158,17 @@ async function ensureDocumentFlowSchema() {
       file_name TEXT, file_url TEXT, file_id TEXT, reason TEXT, rejected_by_role TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`],
     [`document_versions index`, `CREATE INDEX IF NOT EXISTS idx_document_versions_doc ON document_versions (document_id, created_at)`],
+    // Control & Reports comments are now queries (a question about something missing or unclear).
+    [`document_comments kind`, `DO $$ BEGIN
+      ALTER TABLE document_comments DROP CONSTRAINT IF EXISTS document_comments_kind_check;
+      ALTER TABLE document_comments ADD CONSTRAINT document_comments_kind_check CHECK (kind IN ('comment','recommendation','query'));
+    END $$`],
+    // Which documents each person has already opened, so folders and cards can show "new".
+    [`document_reads`, `CREATE TABLE IF NOT EXISTS document_reads (
+      document_id BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL, user_role TEXT NOT NULL,
+      seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (document_id, user_id, user_role))`],
   ];
   for (const t of ['document_comments', 'document_versions']) {
     steps.push([`${t} deletion guard`, `DO $$ BEGIN
@@ -1772,6 +1783,7 @@ app.use(async (req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
   if (lifecycleWriteExemptPaths.has(req.path)) return next();
   if (/^\/api\/control-reports\/[^/]+\/(comments\/list|versions)$/.test(req.path)) return next();   // read-only lookups
+  if (/^\/api\/documents\/[^/]+\/read$/.test(req.path)) return next();   // marking a document as read
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return next();
 
@@ -9803,6 +9815,44 @@ const DOC_SELECT = `d.id, d.project_id, d.title, d.description, d.category AS do
   d.author_stamp_id, d.author_signed_at, d.signer_stamp_id, d.cr_status, d.cr_reject_reason, d.cr_rejected_by_role, d.cr_rejected_at, d.replaced_at,
   (SELECT COUNT(*)::int FROM document_comments c WHERE c.document_id = d.id) AS comment_count`;
 
+// ---- folders and read / unread --------------------------------------------
+// A document type is a folder. "Draft" is reserved for each person's private drafts.
+function cleanFolderName(raw) {
+  const name = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  if (!name) return '';
+  if (/^drafts?$/i.test(name)) throw new DocFlowError(400, 'Draft is reserved for private drafts. Choose another folder name.');
+  return name;
+}
+
+// Whoever acts on a document has, by definition, seen it.
+async function markDocRead(docId, req) {
+  try {
+    await pool.query(
+      `INSERT INTO document_reads(document_id, user_id, user_role, seen_at) VALUES($1,$2,$3,NOW())
+       ON CONFLICT (document_id, user_id, user_role) DO UPDATE SET seen_at = NOW()`,
+      [docId, String(req.user.user_id), String(req.user.role)]);
+  } catch (err) { console.warn('[docs] mark read failed:', err.message); }
+}
+
+// Adds row.unread: something happened to the document (new file, sign-off, share, query) after this person last opened it.
+async function attachUnread(req, rows) {
+  if (!rows.length) return rows;
+  const { rows: act } = await pool.query(
+    `SELECT d.id,
+            GREATEST(d.created_at, d.updated_at, d.shared_at,
+                     (SELECT MAX(c.created_at) FROM document_comments c WHERE c.document_id = d.id),
+                     (SELECT MAX(v.created_at) FROM document_versions v WHERE v.document_id = d.id)) AS activity_at,
+            (SELECT r.seen_at FROM document_reads r WHERE r.document_id = d.id AND r.user_id = $2 AND r.user_role = $3) AS seen_at
+       FROM documents d WHERE d.id = ANY($1::bigint[])`,
+    [rows.map(r => r.id), String(req.user.user_id), String(req.user.role)]);
+  const byId = new Map(act.map(a => [String(a.id), a]));
+  for (const row of rows) {
+    const a = byId.get(String(row.id));
+    row.unread = Boolean(a) && (!a.seen_at || (a.activity_at && new Date(a.activity_at) > new Date(a.seen_at)));
+  }
+  return rows;
+}
+
 // List Document & Approval items. Visible ONLY to the author and to the leaders that review it:
 // the leaders of the document's side, and the leader who assigned the author to the project.
 app.post('/api/document-approval', authenticateToken, async (req, res) => {
@@ -9828,19 +9878,25 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
       else if (row.status === 'pending') row.status = 'pending_approval';
       return row;
     });
+    await attachUnread(req, documents);
     return res.json({ documents });
   } catch (err) {
     return docFail(res, err, 'POST /api/document-approval:');
   }
 });
 
-// Create. The author may sign it right away (optional). Leaders' own documents are signed off at creation.
+// Create. The first choice is "Draft" (private) or a folder (document type). A folder makes it readable by the submitter's leader.
+// Leaders' own documents in a folder start as Signed. Signing with a stamp is optional.
 app.post('/api/document-approval/create', authenticateToken, upload.single('file'), requireProjectLifecycleWrite, async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
-  const { doc_type, title, description } = req.body;
-  if (!doc_type || !title) return res.status(400).json({ error: 'Missing fields' });
+  const { title, description } = req.body;
+  const toDraft = String(req.body.submit_to || '') === 'draft';
+  let doc_type = req.body.doc_type;
+  if (!title || (!toDraft && !doc_type)) return res.status(400).json({ error: 'Missing fields' });
   try {
+    doc_type = cleanFolderName(doc_type);
+    if (!toDraft && !doc_type) throw new DocFlowError(400, 'Choose a folder first.');
     const stampReq = readDocStampRequest(req.body);
     if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
     let buffer = req.file ? req.file.buffer : null;
@@ -9855,19 +9911,20 @@ app.post('/api/document-approval/create', authenticateToken, upload.single('file
     const side = sideLabel(resolvedSide);
     const isLeader = getSide(req.user.role) !== null;
     // The database only allows 'draft','pending_approval','approved','rejected'. 'approved' is shown to users as "Signed".
-    const approvalStatus = isLeader ? 'approved' : 'draft';
+    const approvalStatus = toDraft ? 'draft' : (isLeader ? 'approved' : 'pending_approval');
     const creatorName = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
     const cols = ['project_id','title','description','category','file_name','file_id','file_url','creator_id','creator_role','creator_name','side','approval_status'];
-    const vals = [projectId, title, description || null, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, creatorName || null, side, approvalStatus];
+    const vals = [projectId, title, description || null, doc_type || 'Draft', fileName, fileId, fileUrl, req.user.user_id, req.user.role, creatorName || null, side, approvalStatus];
     if (stamped) { cols.push('author_stamp_id','author_signed_at'); vals.push(stamped.stampId, stamped.signedAt); }
-    if (isLeader) {
+    if (isLeader && !toDraft) {
       cols.push('approved_by_id','approved_by_role','signed_by_name','approval_date'); vals.push(req.user.user_id, req.user.role, creatorName || null, new Date());
       if (stamped) { cols.push('signer_stamp_id'); vals.push(stamped.stampId); }
     }
     const ph = vals.map((_, k) => `$${k + 1}`).join(',');
     const insert = await pool.query(`INSERT INTO documents(${cols.join(',')}) VALUES(${ph}) RETURNING id`, vals);
     if (stamped) await registerDocumentStamp(projectId, insert.rows[0].id, req, stamped);
-    return res.json({ success: true, id: insert.rows[0].id });
+    await markDocRead(insert.rows[0].id, req);
+    return res.json({ success: true, id: insert.rows[0].id, status: approvalStatus });
   } catch (err) {
     return docFail(res, err, 'POST /api/document-approval/create:');
   }
@@ -9923,7 +9980,7 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
       const up = await uploadDocumentFile(newBuffer, req.file.originalname, 'documents');
       fileUrl = up.url; fileId = up.id; fileName = req.file.originalname;
     }
-    const doc_type = req.body.doc_type || null;
+    const doc_type = req.body.doc_type ? cleanFolderName(req.body.doc_type) : null;
     const title = req.body.title || null;
     const description = req.body.description || null;
     const updates = [];
@@ -9939,13 +9996,14 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
     params.push(docId, projectId);
     await pool.query(q, params);
     if (stamped) await registerDocumentStamp(projectId, docId, req, stamped);
+    await markDocRead(docId, req);
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'PUT /api/document-approval/:id/resubmit:');
   }
 });
 
-// Leader review: sign (optionally with a stamp) or return to the author with a reason.
+// Leader review: sign (optionally with a stamp) or return to the submitter with a reason.
 app.post('/api/document-approval/:id/review', authenticateToken, async (req, res) => {
   const docId = req.params.id;
   const { projectId, action, comment } = req.body || {};
@@ -9960,7 +10018,7 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
     if (doc.approval_status !== 'pending_approval') return res.status(400).json({ error: 'This document is not waiting for review.' });
     const reason = String(comment || '').trim();
     if (action === 'rejected') {
-      if (reason.length < 3) throw new DocFlowError(400, 'Write the reason, so the author knows what to correct.');
+      if (reason.length < 3) throw new DocFlowError(400, 'Write the reason, so the submitter knows what to correct.');
       await pool.query(`UPDATE documents SET approval_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2`, [reason, docId]);
     } else {
       const stampReq = readDocStampRequest(req.body);
@@ -9981,6 +10039,7 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
     }
     await pool.query(`INSERT INTO document_approval_notes(document_id, note_text, created_by_id, created_by_role, is_visible_to_creator) VALUES($1,$2,$3,$4,$5)`,
       [docId, reason || (action === 'approved' ? 'Signed' : 'Returned'), req.user.user_id, req.user.role, true]);
+    await markDocRead(docId, req);
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'POST /api/document-approval/:id/review:');
@@ -9999,19 +10058,21 @@ app.post('/api/document-approval/:id/share', authenticateToken, async (req, res)
     const access = await documentAccess(req, rows[0], projectId);
     if (!access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can share documents.' });
     await pool.query(`UPDATE documents SET is_shared=true, cr_status='shared', shared_at=NOW(), updated_at=NOW() WHERE id=$1`, [docId]);
+    await markDocRead(docId, req);
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'POST /api/document-approval/:id/share:');
   }
 });
 
-// Submit draft for approval
+// Move a draft into a folder (document type). From then on the submitter's leader can read it.
+// A team member's document waits for the leader; a leader's own document becomes Signed.
 app.post('/api/document-approval/:id/submit', authenticateToken, async (req, res) => {
   const docId = req.params.id;
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
-    const { rows } = await pool.query('SELECT creator_id, creator_role FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
+    const { rows } = await pool.query('SELECT creator_id, creator_role, approval_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     const docCreatorId = String(rows[0].creator_id);
     const docCreatorRole = rows[0].creator_role;
@@ -10022,11 +10083,20 @@ app.post('/api/document-approval/:id/submit', authenticateToken, async (req, res
       if (assignCheck.rows.length) isAssignedBy = true;
     }
     if (!isCreator && !isAssignedBy) return res.status(403).json({ error: 'Not allowed' });
-    await pool.query("UPDATE documents SET approval_status='pending_approval', updated_at=NOW() WHERE id=$1", [docId]);
+    if (rows[0].approval_status !== 'draft') return res.status(400).json({ error: 'Only a draft can be moved into a folder.' });
+    const folder = cleanFolderName(req.body.doc_type);
+    if (!folder) throw new DocFlowError(400, 'Choose a folder first.');
+    if (getSide(docCreatorRole) !== null && isCreator) {
+      const signerName = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
+      await pool.query(`UPDATE documents SET category=$1, approval_status='approved', approved_by_id=$2, approved_by_role=$3, signed_by_name=$4, approval_date=NOW(), rejection_reason=NULL, updated_at=NOW() WHERE id=$5`,
+        [folder, req.user.user_id, req.user.role, signerName || null, docId]);
+    } else {
+      await pool.query(`UPDATE documents SET category=$1, approval_status='pending_approval', updated_at=NOW() WHERE id=$2`, [folder, docId]);
+    }
+    await markDocRead(docId, req);
     return res.json({ success: true });
   } catch (err) {
-    console.error('POST /api/document-approval/:id/submit:', err);
-    return res.status(500).json({ error: 'Failed to submit' });
+    return docFail(res, err, 'POST /api/document-approval/:id/submit:');
   }
 });
 
@@ -10096,7 +10166,9 @@ app.post('/api/control-reports', authenticateToken, async (req, res) => {
         ORDER BY d.shared_at DESC NULLS LAST`,
       [projectId, side.toLowerCase(), isLeader, req.user.user_id, req.user.role]
     );
-    return res.json({ documents: rows.map(r => ({ ...r, cr_status: r.cr_status || 'shared' })) });
+    const docs = rows.map(r => ({ ...r, cr_status: r.cr_status || 'shared' }));
+    await attachUnread(req, docs);
+    return res.json({ documents: docs });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports:');
   }
@@ -10122,9 +10194,10 @@ app.post('/api/control-reports/create', authenticateToken, upload.single('file')
     const insert = await pool.query(
       `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, creator_name, side, approval_status, approved_by_id, approved_by_role, signed_by_name, signer_stamp_id, author_stamp_id, author_signed_at, approval_date, is_shared, cr_status, shared_at)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'approved',$8,$9,$10,$12,$12,$13,NOW(),true,'shared',NOW()) RETURNING id`,
-      [projectId, title, description, doc_type || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, name || null, side, stamped ? stamped.stampId : null, stamped ? stamped.signedAt : null]
+      [projectId, title, description, cleanFolderName(doc_type) || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, name || null, side, stamped ? stamped.stampId : null, stamped ? stamped.signedAt : null]
     );
     if (stamped) await registerDocumentStamp(projectId, insert.rows[0].id, req, stamped);
+    await markDocRead(insert.rows[0].id, req);
     return res.json({ success: true, id: insert.rows[0].id });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/create:');
@@ -10180,10 +10253,11 @@ app.post('/api/control-reports/:id/comments', authenticateToken, requireProjectL
     if (!got) return;
     if ((got.doc.cr_status || 'shared') !== 'shared' && !got.access.isAuthor && !got.access.isLeader) return res.status(403).json({ error: 'This document is being corrected.' });
     const name = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
-    const k = kind === 'recommendation' ? 'recommendation' : 'comment';
+    const k = kind === 'recommendation' ? 'recommendation' : 'query';
     const ins = await pool.query(
       `INSERT INTO document_comments(document_id, project_id, author_id, author_role, author_name, kind, body) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id, created_at`,
       [req.params.id, projectId, req.user.user_id, req.user.role, name || null, k, text]);
+    await markDocRead(req.params.id, req);
     return res.json({ success: true, id: ins.rows[0].id });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/:id/comments:');
@@ -10201,27 +10275,30 @@ app.post('/api/control-reports/:id/reject', authenticateToken, requireProjectLif
     const status = got.doc.cr_status || 'shared';
     if (!['shared', 'replacement_pending'].includes(status)) return res.status(400).json({ error: 'This document is already waiting for a replacement.' });
     const why = String(reason || '').trim();
-    if (why.length < 3) throw new DocFlowError(400, 'Write the reason, so the author knows what to correct.');
+    if (why.length < 3) throw new DocFlowError(400, 'Write the reason, so the submitter knows what to correct.');
     if (status === 'replacement_pending') {
+      await pool.query(`INSERT INTO document_versions(document_id, project_id, file_name, file_url, file_id, reason, rejected_by_role) VALUES($1,$2,$3,$4,$5,$6,$7)`, [req.params.id, projectId, got.doc.file_name, got.doc.file_url, got.doc.file_id, why, req.user.role]);
       await pool.query(`UPDATE documents SET cr_status='rejected', cr_reject_reason=$1, cr_rejected_by_role=$2, cr_rejected_at=NOW(), updated_at=NOW() WHERE id=$3`, [why, req.user.role, req.params.id]);
     } else {
       await pool.query(`INSERT INTO document_versions(document_id, project_id, file_name, file_url, file_id, reason, rejected_by_role) VALUES($1,$2,$3,$4,$5,$6,$7)`, [req.params.id, projectId, got.doc.file_name, got.doc.file_url, got.doc.file_id, why, req.user.role]);
       await pool.query(`UPDATE documents SET cr_status='rejected', cr_reject_reason=$1, cr_rejected_by_role=$2, cr_rejected_at=NOW(), updated_at=NOW() WHERE id=$3`, [why, req.user.role, req.params.id]);
     }
+    await markDocRead(req.params.id, req);
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/:id/reject:');
   }
 });
 
-// CONTROL & REPORT — author replaces the rejected file (optionally signing it)
+// CONTROL & REPORT — submitter uploads the corrected file (optionally signing it).
+// body.mode 'revision' (default): same card, the rejected file stays in the history. 'replace': the rejected file is dropped from the history.
 app.post('/api/control-reports/:id/replace', authenticateToken, upload.single('file'), requireProjectLifecycleWrite, async (req, res) => {
   const projectId = req.body.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
     const got = await loadControlDoc(req, res, projectId);
     if (!got) return;
-    if (!got.access.isAuthor) return res.status(403).json({ error: 'Only the author can replace this document.' });
+    if (!got.access.isAuthor) return res.status(403).json({ error: 'Only the submitter can replace this document.' });
     if (got.doc.cr_status !== 'rejected') return res.status(400).json({ error: 'This document is not waiting for a replacement.' });
     if (!req.file) throw new DocFlowError(400, 'Attach the corrected file.');
     const stampReq = readDocStampRequest(req.body);
@@ -10233,6 +10310,10 @@ app.post('/api/control-reports/:id/replace', authenticateToken, upload.single('f
          author_stamp_id=COALESCE($4, author_stamp_id), author_signed_at=COALESCE($5, author_signed_at), updated_at=NOW() WHERE id=$6`,
       [req.file.originalname, up.url, up.id, stamped ? stamped.stampId : null, stamped ? stamped.signedAt : null, req.params.id]);
     if (stamped) await registerDocumentStamp(projectId, req.params.id, req, stamped);
+    if (String(req.body.mode) === 'replace') {
+      await pool.query(`DELETE FROM document_versions WHERE id = (SELECT id FROM document_versions WHERE document_id=$1 ORDER BY created_at DESC, id DESC LIMIT 1)`, [req.params.id]);
+    }
+    await markDocRead(req.params.id, req);
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/:id/replace:');
@@ -10260,6 +10341,7 @@ app.post('/api/control-reports/:id/accept', authenticateToken, requireProjectLif
     params[2] = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
     await pool.query(`UPDATE documents SET approved_by_id=$1, approved_by_role=$2, signed_by_name=$3, signer_stamp_id=$4, approval_date=NOW(), cr_status='shared', cr_reject_reason=NULL, shared_at=NOW(), updated_at=NOW()${fileSet} WHERE id=$5`, params);
     if (stamped) await registerDocumentStamp(projectId, req.params.id, req, stamped);
+    await markDocRead(req.params.id, req);
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/:id/accept:');
@@ -10299,6 +10381,23 @@ app.post('/api/control-reports/:id/versions', authenticateToken, async (req, res
     return res.json({ versions: rows });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/:id/versions:');
+  }
+});
+
+// Opening a document card marks it as read for this person (folders and cards drop their "new" marker).
+app.post('/api/documents/:id/read', authenticateToken, async (req, res) => {
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM documents WHERE id=$1 AND project_id=$2', [req.params.id, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Document not found' });
+    const access = await documentAccess(req, rows[0], projectId);
+    const open = rows[0].is_shared && access.sameSide;
+    if (!(access.isAuthor || access.isLeader || open)) return res.status(403).json({ error: 'Access denied' });
+    await markDocRead(req.params.id, req);
+    return res.json({ success: true });
+  } catch (err) {
+    return docFail(res, err, 'POST /api/documents/:id/read:');
   }
 });
 
