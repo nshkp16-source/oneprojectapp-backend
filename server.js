@@ -134,6 +134,7 @@ async function ensureDocumentFlowSchema() {
       ADD COLUMN IF NOT EXISTS author_signed_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS signed_by_name TEXT,
       ADD COLUMN IF NOT EXISTS signer_stamp_id TEXT,
+      ADD COLUMN IF NOT EXISTS deadline DATE,
       ADD COLUMN IF NOT EXISTS cr_status TEXT,
       ADD COLUMN IF NOT EXISTS cr_reject_reason TEXT,
       ADD COLUMN IF NOT EXISTS cr_rejected_by_role TEXT,
@@ -1822,7 +1823,7 @@ app.use(async (req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
   if (lifecycleWriteExemptPaths.has(req.path)) return next();
   if (/^\/api\/control-reports\/[^/]+\/(comments\/list|versions)$/.test(req.path)) return next();   // read-only lookups
-  if (/^\/api\/documents\/[^/]+\/read$/.test(req.path)) return next();   // marking a document as read
+  if (/^\/api\/documents\/[^/]+\/(events|read)$/.test(req.path)) return next();   // document history and read markers
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return next();
 
@@ -10080,6 +10081,7 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
       if (assignCheck.rows.length) isAssignedBy = true;
     }
     if (!isCreator && !isAssignedBy) return res.status(403).json({ error: 'Not allowed' });
+    if (rows[0].approval_status !== 'rejected') return res.status(400).json({ error: 'Only rejected documents can be resubmitted.' });
     let fileUrl = null; let fileName = null; let fileId = null;
     const stampReq = readDocStampRequest(req.body);
     if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
@@ -10174,6 +10176,7 @@ app.post('/api/document-approval/:id/share', authenticateToken, async (req, res)
     const { rows } = await pool.query('SELECT * FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Sign the document before sharing it.' });
+    if (rows[0].cr_status && rows[0].cr_status !== 'shared') return res.status(400).json({ error: 'This document is under correction and cannot be shared again.' });
     const access = await documentAccess(req, rows[0], projectId);
     if (!access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can share documents.' });
     await pool.query(`UPDATE documents SET is_shared=true, cr_status='shared', shared_at=NOW(), updated_at=NOW() WHERE id=$1`, [docId]);
@@ -10252,6 +10255,9 @@ app.delete('/api/document-approval/:id', authenticateToken, async (req, res) => 
     }
     if (!isCreator && !isAssignedBy) {
       if (!userSide || userSide !== docSide) return res.status(403).json({ error: 'Not allowed' });
+    }
+    if (isCreator && !['draft', 'rejected'].includes(rows[0].approval_status || '')) {
+      return res.status(403).json({ error: 'Only draft or rejected documents can be deleted by the author.' });
     }
     await pool.query('DELETE FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     return res.json({ success: true });
