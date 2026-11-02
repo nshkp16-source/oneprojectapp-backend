@@ -1,0 +1,454 @@
+// Consultant verification: requests, answers, certified progress, rework, hold points and completion certification.
+//
+// Flow
+//   1. A contractor leader requests verification of an activity (progress up to a date, a hold point, or completion).
+//      The request freezes the claimed figures and gets a respond-by date (project setting, default 7 days).
+//   2. A named consultant inspector (team member) may recommend first, then a consultant leader decides:
+//        verified | verified_with_changes (own figure and reason) | rejected (reason and rework).
+//   3. A decision on progress sets the activity's certified progress and re-syncs the linked milestone.
+//      A verified decision also ends the consultant's temporary milestone value, if one is active.
+//   4. A verified completion closes the activity (and its tasks). If the consultant lists snags, the activity
+//      closes automatically when the last snag is closed.
+//
+// Wiring in server.js:
+//
+//   import { registerVerificationRoutes } from './verificationRoutes.js';
+//   registerVerificationRoutes(app, {
+//     pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload,
+//     wcSide, isWCLeader, sideRoles, notify, flowKey,     // same dependencies as reportRoutes.js
+//   });
+
+import { certifiedAfterDecision, respondByDate } from './progressRules.js';
+import { syncMilestone } from './activityRoutes.js';
+
+class HttpError extends Error {
+  constructor(status, message, extra = {}) { super(message); this.status = status; this.extra = extra; }
+}
+function fail(res, err, label) {
+  if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, ...err.extra });
+  if (err && err.code === '55000') return res.status(409).json({ error: err.message });   // a database rule said no
+  console.error(label, err);
+  return res.status(500).json({ error: 'Server error.' });
+}
+
+const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(String(v)));
+const dateOnly = (v) => (v instanceof Date
+  ? `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
+  : String(v || '').slice(0, 10));
+
+async function isMember(deps, projectId, userId, role) {
+  if (deps.isProjectMember) return deps.isProjectMember(projectId, userId, role);
+  const r = await deps.pool.query(`SELECT 1 FROM assignments_view WHERE project_id = $1 AND role_id = $2 AND role = $3 LIMIT 1`, [projectId, userId, role]);
+  return r.rows.length > 0;
+}
+async function leadersOf(deps, projectId, side) {
+  if (deps.leadersOf) return deps.leadersOf(projectId, side);
+  if (!deps.sideRoles) return [];
+  const r = await deps.pool.query(
+    `SELECT role, role_id FROM assignments_view WHERE project_id = $1 AND role = ANY($2::text[])`, [projectId, deps.sideRoles(side)]);
+  return r.rows.map((x) => deps.flowKey(x.role, x.role_id));
+}
+async function notifySafe(deps, args) {
+  if (!deps.notify || !args.recipients?.length) return;
+  try { await deps.notify(args); } catch (err) { console.error('[verification] notification failed (non-fatal):', err.message); }
+}
+
+/** Close an activity (and its tasks) once completion is certified and nothing is open. Returns true when closed. */
+export async function closeIfCertified(client, activityId, actor) {
+  const act = (await client.query(`SELECT id, status, side FROM planning_execution WHERE id = $1 FOR UPDATE`, [activityId])).rows[0];
+  if (!act || act.status === 'closed') return false;
+  const certified = (await client.query(
+    `SELECT 1 FROM activity_verifications WHERE activity_id = $1 AND kind = 'completion' AND status IN ('verified','verified_with_changes') LIMIT 1`, [activityId])).rows.length > 0;
+  if (!certified) return false;
+  const open = (await client.query(`SELECT 1 FROM rework_items WHERE activity_id = $1 AND status <> 'closed' LIMIT 1`, [activityId])).rows.length > 0;
+  if (open) return false;
+  await client.query(
+    `UPDATE planning_execution
+     SET status = 'closed', closed_at = NOW(), closed_by_id = $2, closed_by_role = $3,
+         actual_end = CURRENT_DATE, certified_progress_pct = 100, certified_at = NOW(), updated_at = NOW()
+     WHERE id = $1`, [activityId, actor.id, actor.role]);
+  await client.query(
+    `UPDATE workspace_work_center SET status = 'closed', closed_at = NOW(), closed_by_id = $2, closed_by_role = $3, updated_at = NOW()
+     WHERE activity_id = $1 AND status <> 'closed'`, [activityId, actor.id, actor.role]);
+  return true;
+}
+
+async function syncLinkedMilestone(client, act, actor) {
+  const kind = act.baseline_milestone_id ? 'baseline' : act.additional_milestone_id ? 'additional' : null;
+  if (!kind || !act.drives_milestone) return null;
+  const id = act.baseline_milestone_id || act.additional_milestone_id;
+  const table = kind === 'baseline' ? 'milestones' : 'additional_milestones';
+  const col = kind === 'baseline' ? 'baseline_milestone_id' : 'additional_milestone_id';
+  return { kind, id, table, col };
+}
+
+export function registerVerificationRoutes(app, deps) {
+  const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
+  const leaderOn = (role, side) => isWCLeader(role) && wcSide(role) === side;
+
+  async function loadActivity(client, activityId, lock = false) {
+    return (await client.query(`SELECT * FROM planning_execution WHERE id = $1 ${lock ? 'FOR UPDATE' : ''}`, [activityId])).rows[0];
+  }
+
+  // ── 1. request ─────────────────────────────────────────────────────────────
+  app.post('/api/activities/:activityId/verifications', authenticateToken,
+    upload.single('attachment'), requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!leaderOn(role, 'Contractor')) throw new HttpError(403, 'Only contractor leaders and PMs can request verification.');
+      const b = req.body || {};
+      const kind = b.kind || 'progress';
+      if (!['progress', 'hold_point', 'completion'].includes(kind)) throw new HttpError(400, 'kind must be progress, hold_point, or completion.');
+
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const act = await loadActivity(client, parseInt(req.params.activityId, 10), true);
+      if (!act || act.side !== 'Contractor') throw new HttpError(404, 'Contractor activity not found.');
+      if (!(await isMember(deps, act.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      if (act.status === 'closed') throw new HttpError(409, 'This activity is closed.');
+
+      const today = (await client.query(`SELECT to_char(CURRENT_DATE, 'YYYY-MM-DD') AS d, to_char(CURRENT_DATE + 1, 'YYYY-MM-DD') AS d1`)).rows[0];
+      const cutOff = b.cutOffDate || today.d;
+      if (!isDate(cutOff)) throw new HttpError(400, 'cutOffDate must be a valid date (YYYY-MM-DD).');
+      if (cutOff > today.d1) throw new HttpError(400, 'The cut-off date cannot be in the future.');
+      if (cutOff < dateOnly(act.start_date)) throw new HttpError(400, 'The cut-off date cannot be before the activity start.');
+
+      let stageId = null;
+      if (kind === 'progress') {
+        if (!(Number(act.progress_pct) > Number(act.certified_progress_pct)))
+          throw new HttpError(409, 'There is nothing new to verify: claimed progress is not above certified progress.');
+      } else if (kind === 'hold_point') {
+        stageId = parseInt(b.stageId, 10);
+        const st = (await client.query(
+          `SELECT s.* FROM task_stages s JOIN workspace_work_center w ON w.id = s.task_id WHERE s.id = $1 AND w.activity_id = $2`, [stageId, act.id])).rows[0];
+        if (!st) throw new HttpError(400, 'Choose a stage of this activity.');
+        if (!st.is_hold_point) throw new HttpError(400, 'That stage is not a hold point.');
+        if (st.hold_verified_at) throw new HttpError(409, 'That hold point is already verified.');
+        if (!st.completed_at) throw new HttpError(409, 'The stage must be completed (a report approved) before its hold point is verified.');
+      } else {
+        if (act.status !== 'completed') throw new HttpError(409, 'Claimed progress must reach 100% before completion can be certified.');
+        const open = (await client.query(`SELECT COUNT(*)::int AS n FROM rework_items WHERE activity_id = $1 AND status <> 'closed'`, [act.id])).rows[0].n;
+        if (open) throw new HttpError(409, `${open} rework or snag item(s) are still open.`);
+      }
+
+      const days = (await client.query(`SELECT verification_response_days AS d FROM projects WHERE id = $1`, [act.project_id])).rows[0]?.d || 7;
+      const respondBy = respondByDate(today.d, days);
+
+      const figures = (await client.query(
+        `SELECT w.id AS task_id, w.title, w.weight_pct, w.progress_pct, w.target_quantity,
+                COALESCE((SELECT SUM(p.quantity_done) FROM workspace_work_center_progress p
+                          WHERE p.task_id = w.id AND p.validation_status = 'approved' AND p.report_date <= $2), 0) AS approved_quantity
+         FROM workspace_work_center w WHERE w.activity_id = $1 ORDER BY w.id`, [act.id, cutOff])).rows
+        .map((r) => ({ ...r, weight_pct: Number(r.weight_pct), progress_pct: Number(r.progress_pct),
+                       target_quantity: r.target_quantity == null ? null : Number(r.target_quantity), approved_quantity: Number(r.approved_quantity) }));
+
+      let attachments = [];
+      if (req.file) {
+        const up = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'verifications/requests');
+        attachments = [{ name: req.file.originalname, id: up.public_id, url: up.secure_url }];
+      }
+
+      let ver;
+      try {
+        ver = (await client.query(`
+          INSERT INTO activity_verifications
+            (project_id, activity_id, kind, stage_id, cut_off_date, claimed_progress_pct, claimed_figures,
+             requested_by_id, requested_by_role, request_note, attachments, respond_by)
+          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
+          [act.project_id, act.id, kind, stageId, cutOff, act.progress_pct, JSON.stringify(figures), userId, role,
+           String(b.note || '').trim() || null, JSON.stringify(attachments), respondBy])).rows[0];
+      } catch (err) {
+        if (err.code === '23505') throw new HttpError(409, 'A request of this kind is already waiting for the consultant.');
+        throw err;
+      }
+
+      // named signers: consultant inspectors (team members) first, then named consultant leaders
+      const named = Array.isArray(b.signers) ? b.signers : (typeof b.signers === 'string' && b.signers ? JSON.parse(b.signers) : []);
+      let order = 0;
+      for (const s of named) {
+        const id = parseInt(s.user_id, 10);
+        const isTeam = s.role === 'TeamMember';
+        if (!id) throw new HttpError(400, 'Each named signer needs a user_id.');
+        if (isTeam) {
+          const ok = (await client.query(
+            `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant'`, [act.project_id, id])).rows.length;
+          if (!ok) throw new HttpError(403, 'A named inspector must be a consultant team member of this project.');
+        } else if (!leaderOn(s.role || '', 'Consultant')) {
+          throw new HttpError(403, 'A named leader must be a consultant leader or PM.');
+        }
+        await client.query(
+          `INSERT INTO verification_signers (verification_id, project_id, signer_role, signer_user_id, signer_position, is_team_member, is_decider, order_no)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (verification_id, signer_role, signer_user_id) DO NOTHING`,
+          [ver.id, act.project_id, s.role, id, s.position || null, isTeam, !isTeam, isTeam ? order : 100 + order]);
+        order += 1;
+      }
+      await client.query('COMMIT');
+
+      const recipients = [...(await leadersOf(deps, act.project_id, 'Consultant')),
+        ...named.filter((s) => s.role === 'TeamMember').map((s) => deps.flowKey('TeamMember', parseInt(s.user_id, 10)))];
+      const what = { progress: 'progress', hold_point: 'a hold point', completion: 'completion' }[kind];
+      await notifySafe(deps, { projectId: act.project_id, entityId: ver.id, entityType: 'activity_verification',
+        message: `Verification of ${what} requested for "${act.title}". Please respond by ${respondBy}.`,
+        actorId: userId, actorRole: role, recipients });
+      return res.status(201).json({ success: true, verification: ver });
+    } catch (err) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, err, 'POST /api/activities/:activityId/verifications:');
+    } finally { if (client) client.release(); }
+  });
+
+  // ── 2a. inspector recommendation (named consultant team member) ───────────
+  app.put('/api/verifications/:id/inspect', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      if (role !== 'TeamMember') throw new HttpError(403, 'Only a named consultant inspector can record a recommendation.');
+      const outcome = req.body?.outcome;
+      if (!['recommend_verify', 'recommend_changes', 'recommend_reject'].includes(outcome))
+        throw new HttpError(400, 'outcome must be recommend_verify, recommend_changes, or recommend_reject.');
+      const r = await pool.query(
+        `UPDATE verification_signers s SET status = 'signed', outcome = $3, note = $4, signed_at = NOW(),
+                first_viewed_at = COALESCE(first_viewed_at, NOW())
+         FROM activity_verifications v
+         WHERE s.verification_id = v.id AND v.id = $1 AND v.status = 'pending'
+           AND s.signer_role = 'TeamMember' AND s.signer_user_id = $2 AND s.status = 'pending'
+         RETURNING s.*, v.project_id, v.activity_id`, [req.params.id, userId, outcome, String(req.body?.note || '').trim() || null]);
+      if (!r.rows.length) throw new HttpError(404, 'No pending request is waiting for you on this verification.');
+      await notifySafe(deps, { projectId: r.rows[0].project_id, entityId: r.rows[0].verification_id, entityType: 'activity_verification',
+        message: 'The consultant inspector has recorded a recommendation on a verification request.',
+        actorId: userId, actorRole: role, recipients: await leadersOf(deps, r.rows[0].project_id, 'Consultant') });
+      return res.json({ success: true, signer: r.rows[0] });
+    } catch (err) { return fail(res, err, 'PUT /api/verifications/:id/inspect:'); }
+  });
+
+  // ── 2b. decision (consultant leader) ───────────────────────────────────────
+  app.put('/api/verifications/:id/decide', authenticateToken, upload.single('attachment'),
+    requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!leaderOn(role, 'Consultant')) throw new HttpError(403, 'Only consultant leaders and PMs can decide on a verification.');
+      const actor = { id: userId, role };
+      const b = req.body || {};
+      const status = b.status;
+      if (!['verified', 'verified_with_changes', 'rejected'].includes(status))
+        throw new HttpError(400, 'status must be verified, verified_with_changes, or rejected.');
+      const reason = String(b.reason || '').trim();
+      if (status !== 'verified' && !reason) throw new HttpError(400, 'A reason is required.');
+
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const v = (await client.query(`SELECT * FROM activity_verifications WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+      if (!v) throw new HttpError(404, 'Verification not found.');
+      if (v.status !== 'pending') throw new HttpError(409, `This request is already ${v.status.replace(/_/g, ' ')}.`);
+      if (!(await isMember(deps, v.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const act = await loadActivity(client, v.activity_id, true);
+
+      if (status === 'verified_with_changes' && v.kind !== 'progress')
+        throw new HttpError(400, 'Only a progress verification can be verified with changes. Verify it, or reject it with a reason.');
+      let certifiedInput = null;
+      if (status === 'verified_with_changes') {
+        certifiedInput = Number(b.certified_progress_pct);
+        if (!Number.isFinite(certifiedInput) || certifiedInput < 0 || certifiedInput > 100)
+          throw new HttpError(400, 'certified_progress_pct must be between 0 and 100.');
+      }
+      if (v.kind === 'completion' && status === 'verified' && Number(act.progress_pct) < 100)
+        throw new HttpError(409, 'Claimed progress dropped below 100% after the request. Reject it so the contractor can request again.');
+
+      const pendingInspectors = (await client.query(
+        `SELECT id FROM verification_signers WHERE verification_id = $1 AND is_team_member AND status = 'pending'`, [v.id])).rows;
+      if (pendingInspectors.length) {
+        if (String(b.skip_inspectors) !== 'true')
+          throw new HttpError(409, 'The named inspector has not recorded a recommendation yet.', { code: 'INSPECTOR_PENDING', pending: pendingInspectors.length });
+        await client.query(
+          `UPDATE verification_signers SET status = 'replaced', replaced_at = NOW(), replaced_by_user_id = $2, replaced_by_role = $3
+           WHERE verification_id = $1 AND is_team_member AND status = 'pending'`, [v.id, userId, role]);
+      }
+
+      let rework = Array.isArray(b.rework) ? b.rework : (typeof b.rework === 'string' && b.rework ? JSON.parse(b.rework) : []);
+      if (status === 'rejected' && !rework.length) rework = [{ reason }];
+      if (rework.some((r) => !String(r.reason || '').trim())) throw new HttpError(400, 'Every rework or snag item needs a reason.');
+
+      let attachments = [];
+      if (req.file) {
+        const up = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'verifications/decisions');
+        attachments = [{ name: req.file.originalname, id: up.public_id, url: up.secure_url }];
+      }
+
+      const certified = status === 'rejected' ? null
+        : certifiedAfterDecision(act.certified_progress_pct, { status, claimed_progress_pct: v.claimed_progress_pct, certified_progress_pct: certifiedInput });
+      const certifiedFigures = b.certified_figures ? (typeof b.certified_figures === 'string' ? JSON.parse(b.certified_figures) : b.certified_figures) : null;
+
+      const decided = (await client.query(
+        `UPDATE activity_verifications
+         SET status = $2, certified_progress_pct = $3, certified_figures = $4::jsonb, decision_reason = $5,
+             decision_attachments = $6::jsonb, decided_by_id = $7, decided_by_role = $8, decided_at = NOW()
+         WHERE id = $1 RETURNING *`,
+        [v.id, status, certified, certifiedFigures ? JSON.stringify(certifiedFigures) : null, reason || null,
+         JSON.stringify(attachments), userId, role])).rows[0];
+
+      await client.query(
+        `INSERT INTO verification_signers (verification_id, project_id, signer_role, signer_user_id, is_decider, order_no, status, outcome, note, signed_at)
+         VALUES ($1,$2,$3,$4,true,200,'signed',$5,$6,NOW())
+         ON CONFLICT (verification_id, signer_role, signer_user_id)
+         DO UPDATE SET status = 'signed', outcome = EXCLUDED.outcome, note = EXCLUDED.note, signed_at = NOW()`,
+        [v.id, v.project_id, role, userId, status, reason || null]);
+
+      for (const item of rework) {
+        await client.query(
+          `INSERT INTO rework_items (project_id, activity_id, task_id, verification_id, kind, reason, raised_by_id, raised_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [v.project_id, v.activity_id, item.task_id || null, v.id, v.kind === 'completion' && status !== 'rejected' ? 'snag' : 'rework',
+           String(item.reason).trim(), userId, role]);
+      }
+
+      let closed = false, milestone = null;
+      if (status !== 'rejected') {
+        if (v.kind === 'hold_point') {
+          await client.query(`UPDATE task_stages SET hold_verified_at = NOW() WHERE id = $1`, [v.stage_id]);
+        } else {
+          await client.query(
+            `UPDATE planning_execution SET certified_progress_pct = $2, certified_at = NOW(), updated_at = NOW() WHERE id = $1`,
+            [act.id, v.kind === 'completion' ? 100 : certified]);
+        }
+        // the consultant's temporary milestone value ends once corrected work is verified
+        const link = await syncLinkedMilestone(client, act, actor);
+        if (link && v.kind !== 'hold_point') {
+          await client.query(
+            `UPDATE milestone_progress_overrides SET ended_at = NOW(), ended_reason = 'replaced_by_verification'
+             WHERE ${link.col} = $1 AND ended_at IS NULL`, [link.id]);
+          await client.query(
+            `UPDATE ${link.table} SET override_pct = NULL, override_reason = NULL, override_by_id = NULL, override_by_role = NULL, override_at = NULL WHERE id = $1`, [link.id]);
+        }
+        if (v.kind === 'completion') closed = await closeIfCertified(client, act.id, actor);
+        if (link && v.kind !== 'hold_point') milestone = await syncMilestone(client, link.kind, link.id, actor);
+      }
+      await client.query('COMMIT');
+
+      const label = { verified: 'verified', verified_with_changes: 'verified with changes', rejected: 'rejected' }[status];
+      await notifySafe(deps, { projectId: v.project_id, entityId: v.id, entityType: 'activity_verification',
+        message: `Verification for "${act.title}" was ${label}${reason ? `: ${reason}` : '.'}${closed ? ' The activity is now closed.' : ''}`,
+        actorId: userId, actorRole: role,
+        recipients: [...(await leadersOf(deps, v.project_id, 'Contractor'))] });
+      return res.json({ success: true, verification: decided, certified_progress_pct: certified, activity_closed: closed, milestone, rework_items: rework.length });
+    } catch (err) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, err, 'PUT /api/verifications/:id/decide:');
+    } finally { if (client) client.release(); }
+  });
+
+  // ── 2c. withdraw ───────────────────────────────────────────────────────────
+  app.put('/api/verifications/:id/withdraw', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!leaderOn(role, 'Contractor')) throw new HttpError(403, 'Only contractor leaders and PMs can withdraw a request.');
+      const r = await pool.query(
+        `UPDATE activity_verifications SET status = 'withdrawn' WHERE id = $1 AND status = 'pending' RETURNING *`, [req.params.id]);
+      if (!r.rows.length) throw new HttpError(409, 'Only a pending request can be withdrawn.');
+      return res.json({ success: true, verification: r.rows[0] });
+    } catch (err) { return fail(res, err, 'PUT /api/verifications/:id/withdraw:'); }
+  });
+
+  // ── 3. rework and snags ────────────────────────────────────────────────────
+  app.post('/api/activities/:activityId/rework', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!leaderOn(role, 'Consultant')) throw new HttpError(403, 'Only consultant leaders and PMs can raise rework or snags.');
+      const kind = req.body?.kind || 'rework';
+      if (!['rework', 'snag'].includes(kind)) throw new HttpError(400, 'kind must be rework or snag.');
+      const reason = String(req.body?.reason || '').trim();
+      if (!reason) throw new HttpError(400, 'A reason is required.');
+      const act = await loadActivity(pool, parseInt(req.params.activityId, 10));
+      if (!act || act.side !== 'Contractor') throw new HttpError(404, 'Contractor activity not found.');
+      if (!(await isMember(deps, act.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      if (act.status === 'closed') throw new HttpError(409, 'This activity is closed.');
+      const item = (await pool.query(
+        `INSERT INTO rework_items (project_id, activity_id, task_id, kind, reason, raised_by_id, raised_by_role)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+        [act.project_id, act.id, req.body?.task_id || null, kind, reason, userId, role])).rows[0];
+      await notifySafe(deps, { projectId: act.project_id, entityId: item.id, entityType: 'rework_item',
+        message: `A ${kind} item was raised on "${act.title}": ${reason}`, actorId: userId, actorRole: role,
+        recipients: await leadersOf(deps, act.project_id, 'Contractor') });
+      return res.status(201).json({ success: true, item });
+    } catch (err) { return fail(res, err, 'POST /api/activities/:activityId/rework:'); }
+  });
+
+  app.put('/api/rework/:id/correct', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!leaderOn(role, 'Contractor')) throw new HttpError(403, 'Only contractor leaders and PMs can mark rework as corrected.');
+      const r = await pool.query(
+        `UPDATE rework_items SET status = 'corrected', corrected_at = NOW(), corrected_by_id = $2, corrected_by_role = $3, correction_note = $4
+         WHERE id = $1 AND status = 'open' RETURNING *`, [req.params.id, userId, role, String(req.body?.note || '').trim() || null]);
+      if (!r.rows.length) throw new HttpError(409, 'Only an open item can be marked as corrected.');
+      await notifySafe(deps, { projectId: r.rows[0].project_id, entityId: r.rows[0].id, entityType: 'rework_item',
+        message: 'A rework or snag item was marked as corrected. Please check it.', actorId: userId, actorRole: role,
+        recipients: await leadersOf(deps, r.rows[0].project_id, 'Consultant') });
+      return res.json({ success: true, item: r.rows[0] });
+    } catch (err) { return fail(res, err, 'PUT /api/rework/:id/correct:'); }
+  });
+
+  app.put('/api/rework/:id/close', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!leaderOn(role, 'Consultant')) throw new HttpError(403, 'Only consultant leaders and PMs can close rework or snags.');
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const r = await client.query(
+        `UPDATE rework_items SET status = 'closed', closed_at = NOW(), closed_by_id = $2, closed_by_role = $3
+         WHERE id = $1 AND status IN ('open','corrected') RETURNING *`, [req.params.id, userId, role]);
+      if (!r.rows.length) throw new HttpError(409, 'This item is already closed.');
+      const closed = await closeIfCertified(client, r.rows[0].activity_id, { id: userId, role });
+      let milestone = null;
+      if (closed) {
+        const act = await loadActivity(client, r.rows[0].activity_id);
+        const link = await syncLinkedMilestone(client, act, { id: userId, role });
+        if (link) milestone = await syncMilestone(client, link.kind, link.id, { id: userId, role });
+      }
+      await client.query('COMMIT');
+      return res.json({ success: true, item: r.rows[0], activity_closed: closed, milestone });
+    } catch (err) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, err, 'PUT /api/rework/:id/close:');
+    } finally { if (client) client.release(); }
+  });
+
+  // ── 4. lists (contractor and consultant sides only: the client never sees claimed figures) ──
+  app.get('/api/activities/:activityId/verifications', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const s = isWCLeader(role) ? wcSide(role) : null;
+      const member = role === 'TeamMember';
+      if (s !== 'Contractor' && s !== 'Consultant' && !member) throw new HttpError(403, 'You cannot see verification details.');
+      const act = await loadActivity(pool, parseInt(req.params.activityId, 10));
+      if (!act) throw new HttpError(404, 'Activity not found.');
+      if (!(await isMember(deps, act.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const verifications = (await pool.query(
+        `SELECT v.*, (v.status = 'pending' AND v.respond_by < CURRENT_DATE) AS overdue,
+                COALESCE((SELECT json_agg(s ORDER BY s.order_no) FROM verification_signers s WHERE s.verification_id = v.id), '[]') AS signers
+         FROM activity_verifications v WHERE v.activity_id = $1 ORDER BY v.id DESC`, [act.id])).rows;
+      const rework = (await pool.query(`SELECT * FROM rework_items WHERE activity_id = $1 ORDER BY id DESC`, [act.id])).rows;
+      return res.json({ verifications, rework });
+    } catch (err) { return fail(res, err, 'GET /api/activities/:activityId/verifications:'); }
+  });
+
+  app.get('/api/verifications/pending', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.query.projectId, 10);
+      if (!projectId) throw new HttpError(400, 'projectId is required.');
+      const s = isWCLeader(role) ? wcSide(role) : null;
+      if (s !== 'Contractor' && s !== 'Consultant' && role !== 'TeamMember') throw new HttpError(403, 'You cannot see verification requests.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const rows = (await pool.query(
+        `SELECT v.*, pe.title AS activity_title, (v.respond_by < CURRENT_DATE) AS overdue
+         FROM activity_verifications v JOIN planning_execution pe ON pe.id = v.activity_id
+         WHERE v.project_id = $1 AND v.status = 'pending'
+           AND ($2 = 'Consultant' OR $2 = 'Contractor'
+                OR EXISTS (SELECT 1 FROM verification_signers x WHERE x.verification_id = v.id AND x.signer_role = 'TeamMember' AND x.signer_user_id = $3))
+         ORDER BY v.respond_by, v.id`, [projectId, s || 'TeamMember', userId])).rows;
+      return res.json({ pending: rows });
+    } catch (err) { return fail(res, err, 'GET /api/verifications/pending:'); }
+  });
+}

@@ -14,6 +14,10 @@ import { v2 as cloudinary } from 'cloudinary';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { Readable } from 'stream';
 import { layoutStamp, drawStampOnPage, stampPdfBuffer, buildStampPreviewPdf, deriveStampId, pickMark, formatStampDate, clampStampScale } from './stamp-renderer.js';
+import { registerActivityRoutes } from './activityRoutes.js';
+import { registerReportRoutes } from './reportRoutes.js';
+import { registerVerificationRoutes } from './verificationRoutes.js';
+import { registerMilestoneRoutes, milestoneCompletionCheck, typedProgressBlockedReason } from './milestoneRoutes.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -1263,11 +1267,14 @@ function canEditSchedule(role) {
 
 async function recalculateScheduleProgress(client, table, foreignKey, milestoneId) {
   const milestoneTable = table === 'milestone_progress_entries' ? 'milestones' : 'additional_milestones';
-  const { rows: milestoneRows } = await client.query(`SELECT quantity FROM ${milestoneTable} WHERE id=$1 FOR UPDATE`, [milestoneId]);
+  const { rows: milestoneRows } = await client.query(`SELECT quantity, progress_source, executed, progress_pct, activity_status FROM ${milestoneTable} WHERE id=$1 FOR UPDATE`, [milestoneId]);
   if (!milestoneRows.length) return null;
+  // progress of a milestone driven by activities is written by syncMilestone, never rebuilt from typed entries
+  if (milestoneRows[0].progress_source === 'activities')
+    return { executed: Number(milestoneRows[0].executed), progress_pct: Number(milestoneRows[0].progress_pct), activity_status: milestoneRows[0].activity_status };
   const planned = Number(milestoneRows[0].quantity) || 0;
   const { rows: entries } = await client.query(
-    `SELECT id,qty_executed,report_date FROM ${table} WHERE ${foreignKey}=$1 ORDER BY report_date ASC,id ASC FOR UPDATE`,
+    `SELECT id,qty_executed,report_date FROM ${table} WHERE ${foreignKey}=$1 AND superseded_at IS NULL ORDER BY report_date ASC,id ASC FOR UPDATE`,
     [milestoneId]
   );
   let cumulative = 0;
@@ -7465,12 +7472,15 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
   if (!projectId||!milestoneId||!reportDate||!qty||qty<=0) return res.status(400).json({ error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required' });
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const msRes = await client.query('SELECT * FROM milestones WHERE id=$1 AND project_id=$2 FOR UPDATE', [milestoneId, projectId]);
     if (!msRes.rows.length) return res.status(404).json({ error: 'Milestone not found' });
     const ms = msRes.rows[0];
+    const typedBlocked = await typedProgressBlockedReason(client, 'baseline', milestoneId);
+    if (typedBlocked) { await client.query('ROLLBACK'); return res.status(409).json({ error: typedBlocked }); }
     if (ms.activity_status==='completed') return res.status(409).json({ error: 'Milestone is already completed' });
     const planned=parseFloat(ms.quantity)||0, prevExec=parseFloat(ms.executed)||0, newExecuted=prevExec+qty;
     if (planned>0&&newExecuted>planned) return res.status(422).json({ error: `Cannot exceed planned quantity of ${planned} ${ms.unit||''}. Remaining: ${(planned-prevExec).toFixed(3)}` });
@@ -7491,12 +7501,15 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
   const { milestoneId, reportDate, remarks } = req.body;
   const qty = parseFloat(req.body.qtyExecuted);
   if (!projectId||!milestoneId||!reportDate||!qty||qty<=0) return res.status(400).json({ error: 'Valid projectId, milestoneId, reportDate and positive qtyExecuted are required' });
+  if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const msRes=await client.query('SELECT * FROM additional_milestones WHERE id=$1 AND project_id=$2 FOR UPDATE',[milestoneId,projectId]);
     if (!msRes.rows.length) return res.status(404).json({ error: 'Additional milestone not found' });
     const ms=msRes.rows[0];
+    const typedBlocked = await typedProgressBlockedReason(client, 'additional', milestoneId);
+    if (typedBlocked) { await client.query('ROLLBACK'); return res.status(409).json({ error: typedBlocked }); }
     if (ms.activity_status==='completed') return res.status(409).json({ error: 'Milestone is already completed' });
     const planned=parseFloat(ms.quantity)||0,prevExec=parseFloat(ms.executed)||0,newExecuted=prevExec+qty;
     if (planned>0&&newExecuted>planned) return res.status(422).json({ error:`Cannot exceed planned quantity. Remaining: ${(planned-prevExec).toFixed(3)} ${ms.unit||''}` });
@@ -7576,6 +7589,8 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     if (!msRes.rows.length) return res.status(404).json({ error: 'Milestone not found' });
     const ms=msRes.rows[0];
     if (ms.activity_status==='completed') return res.status(409).json({ error: 'Milestone is already completed' });
+    const completionCheck = await milestoneCompletionCheck(client, isExt ? 'additional' : 'baseline', milestoneId);
+    if (!completionCheck.ok) { await client.query('ROLLBACK'); return res.status(422).json({ error: completionCheck.reasons.join(' '), reasons: completionCheck.reasons }); }
     const planned=parseFloat(ms.quantity)||0,exec=parseFloat(ms.executed)||0;
     if (planned>0&&exec<planned) return res.status(422).json({ error:`Cannot complete: only ${exec} of ${planned} ${ms.unit||''} executed` });
     await client.query(`UPDATE ${table} SET activity_status='completed',progress_pct=100,completed_at=now(),updated_at=now() WHERE id=$1`,[milestoneId]);
@@ -7929,6 +7944,48 @@ async function resolveSide(role, user_id, projectId) {
 // =============================================================================
 
 // ── List all activities for the caller's side (leaders + PMs + TeamMembers) ──
+// =============================================================================
+//  ACTIVITY / TASK / REPORT / VERIFICATION / MILESTONE MODEL (2026-11 redesign)
+//  These routes are registered BEFORE the older handlers on purpose: for the same path the first
+//  registered handler answers, so the new POST /api/work-center-progress and its /validate route win.
+// =============================================================================
+const progressModelDeps = {
+  pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload,
+  wcSide, isWCLeader, sideRoles, flowKey,
+  notify: ({ projectId, entityId, entityType, message, actorId, actorRole, recipients }) =>
+    notifyRecordUsers({ projectId, recordId: entityId, table: entityType, message, actorId, actorRole, recipients }),
+};
+registerActivityRoutes(app, progressModelDeps);
+registerReportRoutes(app, progressModelDeps);
+registerVerificationRoutes(app, progressModelDeps);
+registerMilestoneRoutes(app, progressModelDeps);
+
+// Tasks now belong to an activity and carry a weight, so the old create route is replaced.
+app.post('/api/work-center', authenticateToken, (_req, res) => res.status(410).json({
+  error: 'Tasks are now created with their activity (POST /api/planning-execution/create-with-tasks) or added to an existing activity (POST /api/planning-execution/:activityId/tasks).',
+}));
+
+// Friendly refusals instead of database errors. next() hands over to the original handler when nothing blocks.
+app.delete('/api/planning-execution/:activityId', authenticateToken, async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      `SELECT (SELECT COUNT(*)::int FROM workspace_work_center WHERE activity_id = $1) AS tasks,
+              (SELECT COUNT(*)::int FROM activity_verifications WHERE activity_id = $1) AS verifications`, [parseInt(req.params.activityId, 10)]);
+    if (r.rows[0].tasks > 0 || r.rows[0].verifications > 0)
+      return res.status(409).json({ error: 'This activity has tasks or verification history, so it cannot be deleted. Close it through completion certification instead.' });
+    return next();
+  } catch (err) { return next(err); }
+});
+app.delete('/api/work-center/:taskId', authenticateToken, async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM workspace_work_center_progress WHERE task_id = $1 AND validation_status IN ('approved','voided')`, [parseInt(req.params.taskId, 10)]);
+    if (r.rows[0].n > 0)
+      return res.status(409).json({ error: 'This task has approved reports, which are part of the project record. It cannot be deleted. It is closed when its activity is certified complete.' });
+    return next();
+  } catch (err) { return next(err); }
+});
+
 app.post('/api/planning-execution', authenticateToken, async (req, res) => {
   try {
     const { user_id, role } = req.user;
@@ -7942,11 +7999,9 @@ app.post('/api/planning-execution', authenticateToken, async (req, res) => {
       SELECT
         pe.*,
         (pe.creator_id = $2)                           AS is_creator,
-        COALESCE((
-          SELECT ROUND(AVG(t.progress_pct)::numeric, 1)
-          FROM   planning_execution_tracking t
-          WHERE  t.activity_id = pe.id
-        ), 0)                                          AS avg_progress,
+        CASE WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
+             ELSE COALESCE((SELECT t.progress_pct FROM planning_execution_tracking t WHERE t.activity_id = pe.id
+                            ORDER BY t.report_date DESC, t.created_at DESC LIMIT 1), 0) END                                          AS avg_progress,
         CASE WHEN pe.planned_quantity > 0 THEN LEAST(100, ROUND((COALESCE((
           SELECT SUM(t.actual_quantity)
           FROM   planning_execution_tracking t
@@ -7981,14 +8036,11 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
     const result = await pool.query(`
       SELECT id, title, milestone_name, status, start_date, end_date,
              planned_quantity, unit,
+             activity_type, progress_pct, certified_progress_pct, certified_at, baseline_milestone_id, additional_milestone_id, drives_milestone,
              -- recommended (latest entry only):
-             COALESCE((
-               SELECT t.progress_pct
-               FROM   planning_execution_tracking t
-               WHERE  t.activity_id = pe.id
-               ORDER  BY t.report_date DESC, t.created_at DESC
-               LIMIT  1
-             ), 0) AS avg_progress,
+             CASE WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
+             ELSE COALESCE((SELECT t.progress_pct FROM planning_execution_tracking t WHERE t.activity_id = pe.id
+                            ORDER BY t.report_date DESC, t.created_at DESC LIMIT 1), 0) END AS avg_progress,
              LEAST(100, COALESCE((
                SELECT SUM(t.actual_quantity)
                FROM   planning_execution_tracking t
@@ -8152,6 +8204,7 @@ app.put('/api/planning-execution', authenticateToken,
     );
     return res.json({ success: true, record: updated.rows[0] });
   } catch (err) {
+    if (err && err.code === '55000') return res.status(409).json({ error: err.message });
     console.error('PUT /api/planning-execution:', err);
     return res.status(500).json({ error: 'Server error.' });
   }
@@ -8394,6 +8447,7 @@ app.post('/api/planning-execution-tracking', authenticateToken,
 
     return res.status(201).json({ success: true, entry: result.rows[0] });
   } catch (err) {
+    if (err && err.code === '55000') return res.status(409).json({ error: err.message });
     console.error('POST /api/planning-execution-tracking:', err);
     return res.status(500).json({ error: 'Server error.' });
   }
@@ -8503,11 +8557,15 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
           pe.status      AS activity_status,
           pe.start_date  AS activity_start_date,
           pe.end_date    AS activity_end_date,
-          COALESCE((
-            SELECT ROUND(AVG(t.progress_pct)::numeric, 1)
-            FROM   planning_execution_tracking t
-            WHERE  t.activity_id = pe.id
-          ), 0)                                                      AS activity_progress
+          pe.activity_type                                           AS activity_type,
+          pe.unit                                                    AS activity_unit,
+          pe.certified_progress_pct                                  AS activity_certified_progress,
+          COALESCE((SELECT json_agg(json_build_object('id', s.id, 'seq', s.seq, 'title', s.title, 'weight_pct', s.weight_pct,
+                      'is_hold_point', s.is_hold_point, 'completed_at', s.completed_at, 'hold_verified_at', s.hold_verified_at) ORDER BY s.seq)
+                    FROM task_stages s WHERE s.task_id = w.id), '[]'::json) AS stages,
+          CASE WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
+             ELSE COALESCE((SELECT t.progress_pct FROM planning_execution_tracking t WHERE t.activity_id = pe.id
+                            ORDER BY t.report_date DESC, t.created_at DESC LIMIT 1), 0) END                                                      AS activity_progress
         FROM workspace_work_center w
         LEFT JOIN planning_execution pe ON pe.id = w.activity_id
         WHERE w.project_id = $1
@@ -8529,11 +8587,15 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
           pe.status      AS activity_status,
           pe.start_date  AS activity_start_date,
           pe.end_date    AS activity_end_date,
-          COALESCE((
-            SELECT ROUND(AVG(t.progress_pct)::numeric, 1)
-            FROM   planning_execution_tracking t
-            WHERE  t.activity_id = pe.id
-          ), 0)                                                      AS activity_progress
+          pe.activity_type                                           AS activity_type,
+          pe.unit                                                    AS activity_unit,
+          pe.certified_progress_pct                                  AS activity_certified_progress,
+          COALESCE((SELECT json_agg(json_build_object('id', s.id, 'seq', s.seq, 'title', s.title, 'weight_pct', s.weight_pct,
+                      'is_hold_point', s.is_hold_point, 'completed_at', s.completed_at, 'hold_verified_at', s.hold_verified_at) ORDER BY s.seq)
+                    FROM task_stages s WHERE s.task_id = w.id), '[]'::json) AS stages,
+          CASE WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
+             ELSE COALESCE((SELECT t.progress_pct FROM planning_execution_tracking t WHERE t.activity_id = pe.id
+                            ORDER BY t.report_date DESC, t.created_at DESC LIMIT 1), 0) END                                                      AS activity_progress
         FROM workspace_work_center w
         LEFT JOIN planning_execution pe ON pe.id = w.activity_id
         WHERE w.project_id = $1
