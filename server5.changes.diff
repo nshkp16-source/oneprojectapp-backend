@@ -1,0 +1,907 @@
+--- /mnt/user-data/uploads/server.js	2026-10-24 14:49:11.920900000 +0000
++++ server.js	2026-10-25 18:16:35.342043918 +0000
+@@ -217,6 +217,7 @@
+     'superseded_by_id INTEGER',
+     'notice_source TEXT',
+     'respond_by DATE',
++    'stamped_doc_public_id TEXT',
+   ];
+   for (const table of VALID_RECORD_TABLES) {
+     for (const column of columns) {
+@@ -229,7 +230,7 @@
+        id SERIAL PRIMARY KEY,
+        record_table TEXT NOT NULL,
+        record_id INTEGER NOT NULL,
+-       project_id INTEGER NOT NULL,
++       project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        stage INTEGER NOT NULL,
+        side TEXT NOT NULL,
+        signer_role TEXT NOT NULL,
+@@ -259,7 +260,7 @@
+        record_table TEXT NOT NULL,
+        record_id INTEGER NOT NULL,
+        notice_id INTEGER NOT NULL,
+-       project_id INTEGER NOT NULL,
++       project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL,
+        ref TEXT,
+        query TEXT NOT NULL,
+@@ -278,6 +279,9 @@
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`,
+     `CREATE INDEX IF NOT EXISTS record_queries_record_idx ON record_queries (record_table, record_id)`,
++    `ALTER TABLE record_queries ADD COLUMN IF NOT EXISTS raised_by TEXT`,
++    // One live row per person per stage: stops duplicates and double-clicks racing each other
++    `CREATE UNIQUE INDEX IF NOT EXISTS record_signers_one_active ON record_signers (record_table, record_id, stage, signer_role, signer_user_id) WHERE status <> 'replaced'`,
+   ];
+   for (const sql of statements) {
+     try { await pool.query(sql); }
+@@ -383,7 +387,35 @@
+ }
+ 
+ // ── Notifications to named people or the whole project ──────────────────────
+-async function notifyRecordUsers({ projectId, recordId, table, message, actorId, actorRole, recipients }) {
++// Email for the few events people must not miss. In-app notifications still happen for everything.
++const FLOW_EMAIL_TABLE = {
++  Client: 'clients', Contractor: 'contractors', Consultant: 'consultants',
++  ClientPM: 'client_project_managers', ContractorPM: 'contractor_project_managers',
++  ConsultantPM: 'consultant_project_managers', TeamMember: 'team_members',
++};
++async function emailFlowRecipients(recipients, subject, message, projectId) {
++  try {
++    const { rows: pr } = await pool.query('SELECT name FROM projects WHERE id=$1', [projectId]);
++    const project = pr[0]?.name || 'your project';
++    const from = process.env.MAIL_FROM || 'skyprincenkp16@gmail.com';
++    const link = process.env.APP_BASE_URL ? `<p><a href="${flowEscape(process.env.APP_BASE_URL)}">Open OneProjectApp</a></p>` : '';
++    const seen = new Set();
++    for (const r of recipients || []) {
++      const role = normalizeRole(r.recipient_role); const id = Number(r.recipient_role_id ?? r.user_id);
++      const table = FLOW_EMAIL_TABLE[role];
++      if (!table || !Number.isInteger(id) || seen.has(`${role}:${id}`)) continue;
++      seen.add(`${role}:${id}`);
++      const { rows } = await pool.query(`SELECT email FROM ${table} WHERE id=$1 LIMIT 1`, [id]).catch(() => ({ rows: [] }));
++      const to = rows[0]?.email;
++      if (!to) continue;
++      await transporter.sendMail({
++        from, to, subject: `${subject} - ${project}`,
++        html: `<p>${flowEscape(message)}</p><p style="color:#64748b;font-size:12px;">Project: ${flowEscape(project)}</p>${link}`,
++      }).catch(err => console.error('[record-flow] email failed (non-fatal):', err.message));
++    }
++  } catch (err) { console.error('[record-flow] email error (non-fatal):', err.message); }
++}
++async function notifyRecordUsers({ projectId, recordId, table, message, actorId, actorRole, recipients, email = false, emailSubject = '' }) {
+   if (!recipients || !recipients.length) return null;
+   let client;
+   try {
+@@ -396,6 +428,7 @@
+     );
+     await insertNotificationRecipients(client, n.rows[0].id, recipients);
+     await client.query('COMMIT');
++    if (email) emailFlowRecipients(recipients, emailSubject || 'OneProjectApp update', message, projectId);   // not awaited
+     return n.rows[0].id;
+   } catch (err) {
+     if (client) await client.query('ROLLBACK').catch(() => {});
+@@ -413,7 +446,7 @@
+     [userId, role, projectId]
+   );
+   const st = rows[0];
+-  if (!st || !st.signature_image) return null;
++  if (!st || (!st.signature_image && !st.stamp_image_url)) return null;   // nothing saved at all
+   const [name, company, ps] = await Promise.all([
+     resolveSignerNameForStamp(projectId, userId, role),
+     resolveCompanyNameForStamp(projectId, userId, role),
+@@ -429,6 +462,19 @@
+   };
+ }
+ 
++// Reason a signer cannot sign yet. Only one case counts: the user has saved neither a signature nor a stamp
++// for this project. Anything saved (signature and/or stamp image) is accepted.
++async function explainMissingSignerSetup(projectId, role, userId, needStamp) {
++  const { rows } = await pool.query(
++    `SELECT signature_image, stamp_image_url FROM user_stamps WHERE user_id=$1 AND user_role=$2 AND project_id=$3 LIMIT 1`,
++    [userId, role, projectId]
++  );
++  const st = rows[0];
++  if (st && (st.signature_image || st.stamp_image_url)) return null;
++  return 'You have not set up a signature or stamp for this project, so ' +
++    (needStamp ? 'the decision' : 'your review') + ' cannot be signed. Open your Signature & Stamp setup, save it, then try again.';
++}
++
+ async function embedImageFromSource(pdfDoc, source) {
+   if (!source) return null;
+   try {
+@@ -564,23 +610,46 @@
+   return L;
+ }
+ 
+-function flowFormatDateTime(value) {
++const FLOW_REF_PREFIX = { contractual_records: 'CON', administrative_records: 'ADM', safety_records: 'SAF', operational_records: 'OPS', financial_records: 'FIN' };
++const flowRecordRef = (table, rec) => `${FLOW_REF_PREFIX[table] || 'REC'}-${String(rec.id).padStart(3, '0')}${rec.revision_no ? ` Rev ${rec.revision_no}` : ''}`;
++const DEFAULT_FLOW_TZ = 'Africa/Kigali';
++const flowValidTz = (tz) => { try { new Intl.DateTimeFormat('en-GB', { timeZone: tz }); return tz; } catch (_) { return DEFAULT_FLOW_TZ; } };
++function flowFormatDateTime(value, tz) {
+   if (!value) return '';
+-  return new Date(value).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }) + ' UTC';
++  return new Date(value).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short', timeZone: flowValidTz(tz || DEFAULT_FLOW_TZ) });
+ }
+-function flowFormatDate(value) {
++function flowFormatDate(value, tz) {
+   if (!value) return '';
+-  return new Date(value).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
++  return new Date(value).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: flowValidTz(tz || DEFAULT_FLOW_TZ) });
++}
++async function loadProjectMemberKeys(projectId) {
++  const { rows } = await pool.query(
++    `SELECT 'Client' AS role, client_id AS id FROM projects WHERE id=$1 AND client_id IS NOT NULL
++     UNION ALL SELECT 'Contractor', contractor_id FROM contractor_assignments WHERE project_id=$1
++     UNION ALL SELECT 'Consultant', consultant_id FROM consultant_assignments WHERE project_id=$1
++     UNION ALL SELECT 'ClientPM', client_pm_id FROM client_pm_assignments WHERE project_id=$1
++     UNION ALL SELECT 'ContractorPM', contractor_pm_id FROM contractor_pm_assignments WHERE project_id=$1
++     UNION ALL SELECT 'ConsultantPM', consultant_pm_id FROM consultant_pm_assignments WHERE project_id=$1
++     UNION ALL SELECT 'TeamMember', team_member_id FROM team_member_assignments WHERE project_id=$1`,
++    [projectId]
++  );
++  return new Set(rows.map(r => `${r.role}:${r.id}`));
++}
++async function loadProjectTz(projectId) {
++  const { rows } = await pool.query('SELECT time_zone FROM projects WHERE id=$1', [projectId]).catch(() => ({ rows: [] }));
++  return flowValidTz(rows[0]?.time_zone || DEFAULT_FLOW_TZ);
+ }
+ 
+ function drawMetaBlock(L, ctx) {
++  L.metaRow('To', ctx.toLine);
++  L.metaRow('From', ctx.fromLine);
++  L.metaRow('Cc', ctx.ccLine);
+   L.metaRow('Project', ctx.projectName);
+-  L.metaRow('Record', `#${ctx.rec.id}  ${ctx.rec.title}${ctx.rec.revision_no ? `  (Revision ${ctx.rec.revision_no})` : ''}`);
+-  L.metaRow('Category', ctx.categoryLabel);
+-  L.metaRow('Record added by', `${flowRoleLabel(ctx.rec.role)}, ${flowFormatDate(ctx.rec.issued_date)}`);
+-  L.metaRow('Issued by', `${flowRoleLabel(ctx.issuerRole)} (${flowSideLabel(ctx.issuerSide)} side)`);
+-  L.metaRow('Date issued', flowFormatDate(ctx.issuedAt));
+-  L.metaRow('Respond by', ctx.respondBy ? flowFormatDate(ctx.respondBy) : '');
++  L.metaRow('Contract ref.', ctx.contractRef);
++  L.metaRow('Reference', ctx.recordRef);
++  L.metaRow('Subject', `${ctx.decisionWord}: ${ctx.rec.title}`);
++  L.metaRow('Date', flowFormatDate(ctx.issuedAt, ctx.tz));
++  L.metaRow('Respond by', ctx.respondBy ? flowFormatDate(ctx.respondBy, ctx.tz) : '');
+ }
+ 
+ function drawQuerySchedule(L, queries) {
+@@ -588,9 +657,9 @@
+   L.ensure(60);
+   L.text('Query schedule', { size: 11, font: L.bold, gap: 4 });
+   L.table(
+-    ['No.', 'Reference', 'Query', 'Required action'],
+-    [30, 82, 195, 180],
+-    queries.map((q, i) => [String(i + 1), q.ref || '', q.query, q.required_action || ''])
++    ['No.', 'Reference', 'Query', 'Required action', 'Raised by'],
++    [26, 68, 160, 142, 100],
++    queries.map((q, i) => [String(i + 1), q.ref || '', q.query, q.required_action || '', q.by || ''])
+   );
+ }
+ 
+@@ -603,6 +672,149 @@
+ }
+ 
+ // The system letter (a full notice built from the form)
++// ---- Formatted notice text (rich letter) ----------------------------------------------------
++// The notice text is written in a small editor (bold, italic, underline, headings, lists, alignment).
++// The server keeps only a safe subset of tags and draws it into the letter PDF.
++const LETTER_TAGS = new Set(['p', 'div', 'br', 'b', 'strong', 'i', 'em', 'u', 'ul', 'ol', 'li', 'h1', 'h2', 'h3']);
++const LETTER_BLOCKS = new Set(['p', 'div', 'h1', 'h2', 'h3', 'li']);
++const looksLikeHtml = (v) => /<\/?[a-z][^>]*>/i.test(String(v || ''));
++function decodeLetterEntities(t) {
++  return String(t).replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
++    .replace(/&#39;|&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n))).replace(/&amp;/g, '&');
++}
++function letterAlignFrom(attrs) {
++  const m = /text-align\s*:\s*(left|right|center|justify)/i.exec(attrs) || /align\s*=\s*["']?(left|right|center|justify)/i.exec(attrs);
++  return m ? m[1].toLowerCase() : null;
++}
++function sanitizeLetterHtml(html) {
++  const raw = String(html || '').replace(/<(script|style)[\s\S]*?<\/\1>/gi, '').replace(/<!--[\s\S]*?-->/g, '');
++  const out = []; const stack = [];
++  for (const m of raw.matchAll(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)/g)) {
++    if (m[4] !== undefined) { out.push(m[4].replace(/&(?!(amp|lt|gt|quot|nbsp|#\d+|#39|apos);)/g, '&amp;').replace(/>/g, '&gt;')); continue; }
++    const closing = m[1] === '/'; const tag = m[2].toLowerCase();
++    if (!LETTER_TAGS.has(tag)) continue;
++    if (tag === 'br') { if (!closing) out.push('<br>'); continue; }
++    if (closing) {
++      const at = stack.lastIndexOf(tag);
++      if (at === -1) continue;
++      while (stack.length > at) out.push(`</${stack.pop()}>`);
++    } else {
++      const al = LETTER_BLOCKS.has(tag) && tag !== 'li' ? letterAlignFrom(m[3] || '') : null;
++      out.push(al ? `<${tag} style="text-align:${al}">` : `<${tag}>`);
++      stack.push(tag);
++    }
++  }
++  while (stack.length) out.push(`</${stack.pop()}>`);
++  return out.join('');
++}
++function letterHtmlToPlain(html) {
++  return decodeLetterEntities(String(html || '').replace(/<(br)\s*\/?>|<\/(p|div|li|h1|h2|h3)>/gi, '\n').replace(/<[^>]+>/g, ''))
++    .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
++}
++function parseLetterBlocks(html) {
++  const blocks = []; const lists = []; const fmt = { b: 0, i: 0, u: 0 }; let cur = null;
++  const flush = () => {
++    if (!cur) return;
++    const hasText = cur.runs.some(r => r.text.trim());
++    if (hasText) blocks.push(cur); else if (cur.type !== 'li') blocks.push({ type: 'blank', runs: [] });
++    cur = null;
++  };
++  for (const m of String(html || '').matchAll(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>|([^<]+)/g)) {
++    if (m[4] !== undefined) {
++      const text = decodeLetterEntities(m[4]).replace(/[ \t\r\n]+/g, ' ');
++      if (!cur) { if (!text.trim()) continue; cur = { type: 'p', align: 'left', runs: [] }; }
++      cur.runs.push({ text, b: fmt.b > 0, i: fmt.i > 0, u: fmt.u > 0 });
++      continue;
++    }
++    const closing = m[1] === '/'; const tag = m[2].toLowerCase();
++    if (tag === 'br') { if (!cur) cur = { type: 'p', align: 'left', runs: [] }; cur.runs.push({ text: '\n', b: false, i: false, u: false }); continue; }
++    if (['b', 'strong'].includes(tag)) { fmt.b += closing ? -1 : 1; continue; }
++    if (['i', 'em'].includes(tag)) { fmt.i += closing ? -1 : 1; continue; }
++    if (tag === 'u') { fmt.u += closing ? -1 : 1; continue; }
++    if (tag === 'ul' || tag === 'ol') { flush(); if (closing) lists.pop(); else lists.push({ ordered: tag === 'ol', n: 0 }); continue; }
++    if (LETTER_BLOCKS.has(tag)) {
++      flush();
++      if (closing) continue;
++      if (tag === 'li') {
++        const l = lists[lists.length - 1] || { ordered: false, n: 0 };
++        l.n += 1;
++        cur = { type: 'li', align: 'left', ordered: l.ordered, num: l.n, level: Math.max(lists.length, 1), runs: [] };
++      } else cur = { type: tag === 'div' ? 'p' : tag, align: letterAlignFrom(m[3] || '') || 'left', runs: [] };
++    }
++  }
++  flush();
++  return blocks;
++}
++async function drawLetterBody(L, pdfDoc, body) {
++  if (!looksLikeHtml(body)) { L.text(body, { size: 10.5, gap: 8 }); return; }
++  const fonts = {
++    r: L.regular, b: L.bold,
++    i: await pdfDoc.embedFont(StandardFonts.HelveticaOblique),
++    bi: await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique),
++  };
++  const maxW = PDF_W - 2 * PDF_M;
++  for (const blk of parseLetterBlocks(body)) {
++    if (blk.type === 'blank') { L.y -= 8; continue; }
++    const heading = { h1: 16, h2: 13, h3: 11.5 }[blk.type];
++    const size = heading || 10.5;
++    const lineH = size * 1.45;
++    const indent = blk.type === 'li' ? 14 + (blk.level - 1) * 16 : 0;
++    const left = PDF_M + indent;
++    const width = maxW - indent;
++    // words with their styles
++    const words = [];
++    for (const r of blk.runs) {
++      const bold = heading ? true : r.b;
++      const font = bold && r.i ? fonts.bi : bold ? fonts.b : r.i ? fonts.i : fonts.r;
++      for (const part of r.text.split(/(\n|\s+)/)) {
++        if (part === '') continue;
++        if (part === '\n') words.push({ br: true });
++        else words.push({ text: L.safe(part), font, u: r.u, space: /^\s+$/.test(part) });
++      }
++    }
++    const measure = (w) => (w.w ??= w.font.widthOfTextAtSize(w.text, size));
++    const lines = []; let line = []; let lw = 0;
++    const push = () => { while (line.length && line[line.length - 1].space) line.pop(); lines.push(line); line = []; lw = 0; };
++    for (const w of words) {
++      if (w.br) { push(); continue; }
++      if (w.space && !line.length) continue;
++      const wd = measure(w);
++      if (lw + wd > width && line.length && !w.space) push();
++      if (!w.space && wd > width) {   // a single very long word: split it
++        let chunk = '';
++        for (const ch of w.text) {
++          if (w.font.widthOfTextAtSize(chunk + ch, size) > width && chunk) { lines.push([{ text: chunk, font: w.font, u: w.u, w: w.font.widthOfTextAtSize(chunk, size) }]); chunk = ''; }
++          chunk += ch;
++        }
++        if (chunk) { line.push({ text: chunk, font: w.font, u: w.u, w: w.font.widthOfTextAtSize(chunk, size) }); lw = line[0].w; }
++        continue;
++      }
++      line.push(w); lw += wd;
++    }
++    if (line.length) push();
++    if (!lines.length) lines.push([]);
++    lines.forEach((ln, idx) => {
++      L.ensure(lineH);
++      const total = ln.reduce((a, w) => a + measure(w), 0);
++      let x = left;
++      if (blk.align === 'center') x = left + (width - total) / 2;
++      else if (blk.align === 'right') x = left + width - total;
++      if (blk.type === 'li' && idx === 0) {
++        const marker = blk.ordered ? `${blk.num}.` : '\u2022';
++        L.page.drawText(L.safe(marker), { x: left - 12, y: L.y - size, size, font: fonts.r, color: INK });
++      }
++      for (const w of ln) {
++        if (w.text.trim()) L.page.drawText(w.text, { x, y: L.y - size, size, font: w.font, color: INK });
++        if (w.u && w.text.trim()) L.page.drawLine({ start: { x, y: L.y - size - 1.5 }, end: { x: x + measure(w), y: L.y - size - 1.5 }, thickness: 0.6, color: INK });
++        x += measure(w);
++      }
++      L.y -= lineH;
++    });
++    L.y -= heading ? 6 : 4;
++  }
++  L.y -= 4;
++}
++
+ async function drawGeneratedLetter(pdfDoc, ctx, queries) {
+   const L = await createLayout(pdfDoc);
+   L.text(ctx.kindTitle, { size: 17, font: L.bold, gap: 2 });
+@@ -611,7 +823,7 @@
+   drawMetaBlock(L, ctx);
+   L.rule(10);
+   L.text(`Decision: ${ctx.decisionWord}`, { size: 12, font: L.bold, gap: 6 });
+-  if (ctx.body) L.text(ctx.body, { size: 10.5, gap: 8 });
++  if (ctx.body) await drawLetterBody(L, pdfDoc, ctx.body);
+   drawQuerySchedule(L, queries);
+   drawFingerprint(L, ctx);
+ }
+@@ -625,16 +837,17 @@
+   drawMetaBlock(L, ctx);
+   L.rule(10);
+   L.text(`Decision: ${ctx.decisionWord}`, { size: 12, font: L.bold, gap: 6 });
+-  if (ctx.body) L.text(ctx.body, { size: 10.5, gap: 8 });
++  if (ctx.body) await drawLetterBody(L, pdfDoc, ctx.body);
+   drawQuerySchedule(L, queries);
+   drawFingerprint(L, ctx);
+ }
+ 
+-async function appendSignaturePage(pdfDoc, ctx, slots) {
++async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
+   const L = await createLayout(pdfDoc);
+-  L.text('Signatures', { size: 15, font: L.bold, gap: 2 });
++  L.text(opts.heading || 'Signatures', { size: 15, font: L.bold, gap: 2 });
+   L.text(`${ctx.kindTitle}. Record #${ctx.rec.id}: ${ctx.rec.title}`, { size: 9.5, color: MUTED, gap: 8 });
+   L.rule(10);
++  if (opts.decisionLine) L.text(opts.decisionLine, { size: 11, font: L.bold, gap: 8 });
+   const boxW = 235, boxH = 122, gapX = 17, gapY = 26;
+   let col = 0;
+   for (const slot of slots) {
+@@ -669,7 +882,7 @@
+         { t: p.name, f: L.bold, s: 9.5, c: INK },
+         { t: `${slot.position || p.position || ''}${slot.side ? ', ' + flowSideLabel(slot.side) + ' side' : ''}`, f: L.regular, s: 8, c: INK },
+         { t: p.company ? `Company: ${p.company}` : '', f: L.regular, s: 8, c: INK },
+-        { t: flowFormatDateTime(slot.signed_at), f: L.regular, s: 7.5, c: MUTED },
++        { t: flowFormatDateTime(slot.signed_at, ctx.tz), f: L.regular, s: 7.5, c: MUTED },
+       ];
+       for (const r of rows) {
+         if (!r.t) continue;
+@@ -688,22 +901,88 @@
+ }
+ 
+ // Notice PDF = (system letter | the user's own PDF + annex) + signature page
++async function addFlowFooters(doc, { left, fromIndex = 0 }) {
++  const font = await doc.embedFont(StandardFonts.Helvetica);
++  const safe = makePdfSafe(font);
++  const total = doc.getPageCount();
++  for (let i = fromIndex; i < total; i++) {
++    const page = doc.getPage(i); const { width } = page.getSize();
++    const right = `Page ${i + 1} of ${total}`;
++    page.drawLine({ start: { x: PDF_M, y: 34 }, end: { x: width - PDF_M, y: 34 }, thickness: 0.5, color: RULE });
++    page.drawText(safe(String(left)).slice(0, 95), { x: PDF_M, y: 22, size: 8, font, color: MUTED });
++    page.drawText(right, { x: width - PDF_M - font.widthOfTextAtSize(right, 8), y: 22, size: 8, font, color: MUTED });
++  }
++}
++
+ async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots }) {
+   const out = await PDFDocument.create();
++  let ownPages = 0;
+   if (source === 'uploaded') {
+     const up = await PDFDocument.load(uploadedBytes);
+     const pages = await out.copyPages(up, up.getPageIndices());
+     pages.forEach(p => out.addPage(p));
++    ownPages = pages.length;
+     if (queries.length || ctx.body) await drawNoticeAnnex(out, ctx, queries);
+   } else {
+     await drawGeneratedLetter(out, ctx, queries);
+   }
+   await appendSignaturePage(out, ctx, slots);
++  await addFlowFooters(out, { left: `${ctx.projectName}  |  ${ctx.recordRef}  |  ${ctx.kindTitle}`, fromIndex: ownPages });   // never over the leader's own pages
+   return Buffer.from(await out.save());
+ }
+ 
++// The record itself carries the approvals: its latest file plus a sign-off page for this stage.
++// Built only for approvals. A rejected record is never signed or stamped.
++async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLine, stage, placementIn }) {
++  const recUrl = rec.stamped_doc_url || rec.file_path;
++  const remote = await fetch(recUrl, { redirect: 'follow' });
++  if (!remote.ok) throw new Error('The record file is not reachable.');
++  const doc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()), { ignoreEncryption: true });
++
++  // 1) Only if the approver chose a spot: the decision block goes exactly there (never over content by default)
++  let placement = null;
++  if (placementIn) {
++    const decider = slots.find(sl => sl.isDecider);
++    placement = await drawRecordDecisionStamp(doc, { word: ctx.decisionWord, profile: decider?.profile, signedAt: decider?.signed_at, at: placementIn, tz: ctx.tz });
++  }
++  // 2) The sign-off page (every named signer) is always added at the end of the record
++  const originalPages = doc.getPageCount();
++  await appendSignaturePage(doc, { ...ctx, kindTitle: `Record sign-off, ${stageLabel}` }, slots, { heading: 'Record sign-off', decisionLine });
++  await addFlowFooters(doc, { left: `${ctx.projectName}  |  ${ctx.recordRef}  |  Record sign-off`, fromIndex: originalPages });
++  return { bytes: Buffer.from(await doc.save()), placement };
++}
++
++// Decision block at the position the approver picked: word, signature, company stamp, name/position, date.
++async function drawRecordDecisionStamp(doc, { word, profile, signedAt, at, tz }) {
++  const pageIdx = Math.min(Math.max((at.page || 1) - 1, 0), doc.getPageCount() - 1);
++  const page = doc.getPage(pageIdx);
++  const { width, height } = page.getSize();
++  const regular = await doc.embedFont(StandardFonts.Helvetica);
++  const bold = await doc.embedFont(StandardFonts.HelveticaBold);
++  const safe = makePdfSafe(regular);
++  const w = 176, h = 86, margin = 12;
++  const x = Math.min(Math.max(at.x * width - w / 2, margin), Math.max(margin, width - w - margin));
++  const y = Math.min(Math.max(at.y * height - h / 2, margin), Math.max(margin, height - h - margin));
++  const green = rgb(0.09, 0.45, 0.24);
++  page.drawRectangle({ x, y, width: w, height: h, color: rgb(1, 1, 1), opacity: 0.92, borderColor: green, borderWidth: 1.2 });
++  page.drawText(safe(word || 'APPROVED'), { x: x + 8, y: y + h - 16, size: 12, font: bold, color: green });
++  if (profile?.signature_image) {
++    const sig = await embedImageFromSource(doc, profile.signature_image);
++    if (sig) { const k = Math.min(78 / sig.width, 30 / sig.height, 1); page.drawImage(sig, { x: x + 8, y: y + h - 52, width: sig.width * k, height: sig.height * k }); }
++  }
++  if (profile?.stamp_image_url) {
++    const st = await embedImageFromSource(doc, profile.stamp_image_url);
++    if (st) { const k = Math.min(52 / st.width, 52 / st.height, 1); page.drawImage(st, { x: x + w - 8 - st.width * k, y: y + h - 18 - st.height * k, width: st.width * k, height: st.height * k }); }
++  }
++  const line = (t, dy, f = regular, sz = 7) => page.drawText(safe(String(t).slice(0, 46)), { x: x + 8, y: y + dy, size: sz, font: f, color: rgb(0.1, 0.1, 0.1) });
++  line(profile?.name || '', 26, bold, 7.5);
++  line([profile?.position, profile?.side].filter(Boolean).join(', '), 17);
++  line(`${profile?.company ? profile.company + ', ' : ''}${flowFormatDate(signedAt, tz)}`, 8);
++  return { page: pageIdx + 1, x: x / width, y: y / height };
++}
++
+ // Original record + the new notice, with divider strips (same look as the bundle)
+-async function buildDecisionBundle({ rec, noticeBytes, noticeLabel }) {
++async function buildDecisionBundle({ rec, noticeBytes, noticeLabel, recordBytes, tz }) {
+   const out = await PDFDocument.create();
+   const labelFont = await out.embedFont(StandardFonts.Helvetica);
+   const labelBold = await out.embedFont(StandardFonts.HelveticaBold);
+@@ -716,10 +995,15 @@
+     page.drawText(makePdfSafe(labelFont)(meta), { x: 150, y: 25, size: 9, font: labelFont, color: MUTED, maxWidth: 420 });
+   };
+   const recUrl = rec.stamped_doc_url || rec.file_path;
+-  const remote = await fetch(recUrl, { redirect: 'follow' });
+-  if (!remote.ok) throw new Error('The original record file is not reachable.');
+-  const recDoc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
+-  strip('ORIGINAL RECORD', String(rec.title || 'Untitled'), `Added by ${flowRoleLabel(rec.role) || 'Unknown'}, ${flowFormatDate(rec.issued_date)}`);
++  let recDoc;
++  if (recordBytes) {
++    recDoc = await PDFDocument.load(recordBytes);
++  } else {
++    const remote = await fetch(recUrl, { redirect: 'follow' });
++    if (!remote.ok) throw new Error('The original record file is not reachable.');
++    recDoc = await PDFDocument.load(Buffer.from(await remote.arrayBuffer()));
++  }
++  strip(recordBytes ? 'RECORD + SIGN-OFF' : 'ORIGINAL RECORD', String(rec.title || 'Untitled'), `Added by ${flowRoleLabel(rec.role) || 'Unknown'}, ${flowFormatDate(rec.issued_date, tz)}`);
+   (await out.copyPages(recDoc, recDoc.getPageIndices())).forEach(p => out.addPage(p));
+   const noticeDoc = await PDFDocument.load(noticeBytes);
+   strip(noticeLabel, 'Preview, not yet issued', 'Shown exactly as it will be issued');
+@@ -1538,7 +1822,7 @@
+ }
+ 
+ async function queueProjectDeletionAssets(client, projectId) {
+-  const assetColumns = ['cloudinary_public_id', 'attachment_public_id', 'public_id', 'file_id', 'attachment_id', 'linked_file_id', 'supporting_file_public_id'];
++  const assetColumns = ['cloudinary_public_id', 'attachment_public_id', 'public_id', 'file_id', 'attachment_id', 'linked_file_id', 'supporting_file_public_id', 'stamped_doc_public_id'];
+   const directColumns = await client.query(
+     `SELECT c.table_name,c.column_name
+      FROM information_schema.columns c
+@@ -3565,8 +3849,8 @@
+       ? `Revision ${revisionNo} of record #${parent.id} added by ${role}: "${title}" (${openQueries.length} ${openQueries.length === 1 ? 'query' : 'queries'} answered)`
+       : `New record added by ${role}: "${title}"`;
+     const projectRecipients = await getProjectRecipientKeys(projectId, userId, role).catch(() => []);
+-    const notificationId = await notifyRecordUsers({ projectId, recordId, table, message: whole, actorId: userId, actorRole: role, recipients: projectRecipients });
+-    await notifyRecordUsers({
++    const notificationId = await notifyRecordUsers({ email: Boolean(parent), emailSubject: 'Revision submitted', projectId, recordId, table, message: whole, actorId: userId, actorRole: role, recipients: projectRecipients });
++    await notifyRecordUsers({ email: true, emailSubject: 'Action needed: review and sign',
+       projectId, recordId, table, actorId: userId, actorRole: role,
+       message: `You are named to review and sign "${title}" (${stage1.label}).`,
+       recipients: plan.signers.map(s => flowKey(s.role, s.user_id)),
+@@ -3627,6 +3911,7 @@
+       ref: String(item?.ref || '').trim().slice(0, 120),
+       query: query.slice(0, 1500),
+       required_action: String(item?.required_action || '').trim().slice(0, 1000),
++      by: String(item?.by || '').trim().slice(0, 120),
+     });
+   }
+   if (out.length > FLOW_MAX_QUERIES) return { error: `At most ${FLOW_MAX_QUERIES} queries per notice.` };
+@@ -3673,10 +3958,12 @@
+   if (!FLOW_NOTICE_KIND[decision]) return fail(400, 'Choose approve, accept or reject.');
+   const source = req.body.noticeSource === 'uploaded' ? 'uploaded' : 'generated';
+   const title = String(req.body.title || '').trim();
+-  const body = String(req.body.body || '').trim();
++  const bodyInput = String(req.body.body || '').trim();
++  const body = looksLikeHtml(bodyInput) ? sanitizeLetterHtml(bodyInput) : bodyInput;
++  const bodyPlain = looksLikeHtml(body) ? letterHtmlToPlain(body) : body;
+   if (title.length < RECORD_TITLE_MIN || title.length > RECORD_TITLE_MAX) return fail(400, `The notice title must be ${RECORD_TITLE_MIN} to ${RECORD_TITLE_MAX} characters.`);
+-  if (body.length > 20000) return fail(400, 'The notice text is too long.');
+-  if (source === 'generated' && body.length < RECORD_TEXT_MIN) return fail(400, `Write the notice text (at least ${RECORD_TEXT_MIN} characters).`);
++  if (body.length > 60000) return fail(400, 'The notice text is too long.');
++  if (source === 'generated' && bodyPlain.length < RECORD_TEXT_MIN) return fail(400, `Write the notice text (at least ${RECORD_TEXT_MIN} characters).`);
+   const respondBy = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body.respondBy || '')) ? req.body.respondBy : null;
+   const parsedQueries = parseQueryList(req.body.queries);
+   if (parsedQueries.error) return fail(400, parsedQueries.error);
+@@ -3707,10 +3994,25 @@
+     }
+     const waiting = planRows.filter(r => !r.is_decider && r.status !== 'signed');
+     if (waiting.length) return fail(409, `Waiting for ${waiting.map(w => w.signer_position || flowRoleLabel(w.signer_role)).join(', ')} to sign first.`);
++    const objecting = planRows.filter(r => !r.is_decider && r.status === 'signed' && r.outcome === 'queries');
++    if (decision !== 'rejected') {
++      const { rows: unresolved } = await pool.query(
++        `SELECT seq FROM record_queries WHERE record_table=$1 AND responded_in_record_id=$2 AND issuer_side=$3 AND status <> 'resolved' ORDER BY seq`,
++        [table, recordId, step.side]
++      );
++      if (unresolved.length) {
++        return fail(409, `You cannot ${decision === 'accepted' ? 'accept' : 'approve'} while ${unresolved.length === 1 ? 'an answered query is' : unresolved.length + ' answered queries are'} still unresolved (${unresolved.map(u => 'no. ' + u.seq).join(', ')}). Mark each as Resolved, or Reopen it, then decide.`);
++      }
++    }
++    if (decision !== 'rejected' && objecting.length) {
++      return fail(409, `You cannot ${decision === 'accepted' ? 'accept' : 'approve'} while queries from ${objecting.map(o => o.signer_position || flowRoleLabel(o.signer_role)).join(', ')} are open. They must clear them by signing again with "No queries", or you can reject this record. If they have left the project, replace them.`);
++    }
+   }
+ 
++  const setupProblem = await explainMissingSignerSetup(projectId, role, userId, true);
++  if (setupProblem) return fail(400, setupProblem);
+   const profile = await loadSignerProfile(projectId, role, userId);
+-  if (!profile) return fail(400, 'Set up your signature first, then issue the decision.');
++  if (!profile) return fail(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
+ 
+   let nextPlan = null;
+   if (decision === 'approved' && state.steps[stage]) {
+@@ -3740,6 +4042,7 @@
+     const isMe = Boolean(r.is_decider);
+     const p = isMe ? profile : (r.status === 'signed' ? await loadSignerProfile(projectId, r.signer_role, r.signer_user_id) : null);
+     slots.push({
++      isDecider: Boolean(r.is_decider),
+       caption: r.is_decider ? 'Decision by' : (r.is_team_member ? 'Checked by (team)' : 'Co-signed by'),
+       position: r.signer_position, side: r.side,
+       status: isMe ? (preview ? 'pending' : 'signed') : (r.status === 'signed' && p ? 'signed' : 'pending'),
+@@ -3749,23 +4052,82 @@
+   }
+ 
+   const fingerprint = state.rec.signature_hash || await hashRemoteFile(state.rec.file_path);
+-  const { rows: pr } = await pool.query('SELECT name FROM projects WHERE id=$1', [projectId]);
++  const { rows: pr } = await pool.query('SELECT name, contract_reference FROM projects WHERE id=$1', [projectId]);
+   const kind = FLOW_NOTICE_KIND[decision];
++  const deciderSlot = slots.find(sl => sl.isDecider);
++  const issuerLabel = `${deciderSlot?.profile?.position || flowRoleLabel(role)}, ${flowSideLabel(step.side)} side`;
++  for (const q of queries) if (!q.by) q.by = issuerLabel;   // every query says who raised it
++  const [toName, toCompany] = await Promise.all([
++    resolveDisplayNameFor(state.rec.role, state.rec.uploaded_by, projectId).catch(() => null),
++    resolveCompanyNameForStamp(projectId, state.rec.uploaded_by, state.rec.role).catch(() => null),
++  ]);
++  const joinParts = (...a) => a.filter(Boolean).join(', ');
++  const ccList = slots.filter(sl => !sl.isDecider).map(sl => sl.position || sl.profile?.position).filter(Boolean);
+   const ctx = {
+-    projectName: pr[0]?.name || '', rec: state.rec, categoryLabel: FLOW_TABLE_LABELS[table],
++    tz: await loadProjectTz(projectId), projectName: pr[0]?.name || '', contractRef: pr[0]?.contract_reference || '',
++    recordRef: flowRecordRef(table, state.rec),
++    toLine: joinParts(toName, flowRoleLabel(state.rec.role), toCompany),
++    fromLine: joinParts(deciderSlot?.profile?.name, issuerLabel, deciderSlot?.profile?.company),
++    ccLine: ccList.join('; '),
++    rec: state.rec, categoryLabel: FLOW_TABLE_LABELS[table],
+     issuerRole: role, issuerSide: step.side, issuedAt, respondBy, title, body,
+     kindTitle: FLOW_NOTICE_TITLE[kind], decisionWord: FLOW_DECISION_WORD[decision], fingerprint,
+   };
+-  const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots });
+-  return { data: { table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
++  const noticeSlots = slots.filter(sl => sl.isDecider);   // the notice carries the leader's signature and stamp only
++  const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots: noticeSlots });
++  let recordBytes = null, recordStampPlacement = null;
++  let placementIn = null;   // where the approver chose to stamp the record (optional)
++  if (decision !== 'rejected' && req.body.stampPlacement) {
++    try {
++      const sp = JSON.parse(String(req.body.stampPlacement));
++      const pg = parseInt(sp.page, 10), px = Number(sp.x), py = Number(sp.y);
++      if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) placementIn = { page: pg, x: px, y: py };
++    } catch (_) { /* ignore a malformed placement: the sign-off page still carries the signatures */ }
++  }
++  if (decision !== 'rejected') {
++    try {
++      const built = await buildRecordWithSignoff({
++        stage, placementIn, rec: state.rec, ctx, slots, stageLabel: step.label,
++        decisionLine: `Decision: ${ctx.decisionWord}, ${flowFormatDate(issuedAt, ctx.tz)}. The signed notice is attached to this record.`,
++      });
++      recordBytes = built.bytes; recordStampPlacement = built.placement;
++    } catch (stampErr) {
++      console.error('[prepareDecision] record sign-off failed:', stampErr);
++      return fail(502, 'The record file could not be opened to add the sign-off page, so nothing was issued. Check that the record PDF is readable and try again.');
++    }
++  }
++  return { data: { tz: ctx.tz, recordBytes, recordStampPlacement, table, projectId, recordId, state, stage, step, decision, kind, source, title, body, respondBy, queries, planRows, deciderRow, nextPlan, noticeBytes, supportingFiles, ctx, profile, issuedAt } };
+ }
+ 
++// Does this user have a signature or stamp saved for the record's project? The database answers, using the
++// project of the record itself (not whatever project the browser thinks is active).
++app.get('/api/signing-readiness', authenticateToken, async (req, res) => {
++  const { user_id: userId, role } = req.user;
++  try {
++    let projectId = parseInt(req.query.projectId, 10);
++    const recordId = parseInt(req.query.recordId, 10);
++    const table = req.query.recordType ? resolveTable(req.query.recordType) : null;
++    if (table && recordId) {
++      const { rows } = await pool.query(`SELECT project_id FROM ${table} WHERE id=$1`, [recordId]);
++      if (!rows[0]) return res.status(404).json({ error: 'Record not found.' });
++      projectId = rows[0].project_id;
++    }
++    if (!projectId) return res.status(400).json({ error: 'projectId or recordId required' });
++    if (!await userHasProjectAccess(userId, role, projectId)) return res.status(403).json({ error: 'You are not a member of this project.' });
++    const problem = await explainMissingSignerSetup(projectId, role, userId, String(req.query.mode) !== 'review');
++    res.json({ ready: !problem, message: problem });
++  } catch (err) {
++    console.error('GET signing-readiness:', err);
++    res.status(500).json({ error: 'Could not check your signature setup.' });
++  }
++});
++
+ app.post('/api/decision-preview', authenticateToken, decisionUpload, async (req, res) => {
+   try {
+     const r = await prepareDecision(req, { preview: true });
+     if (r.fail) return res.status(r.fail.status).json({ success: false, message: r.fail.message });
+     const d = r.data;
+-    const bundle = await buildDecisionBundle({ rec: d.state.rec, noticeBytes: d.noticeBytes, noticeLabel: FLOW_NOTICE_TITLE[d.kind].split(' (')[0] });
++    const bundle = await buildDecisionBundle({ rec: d.state.rec, noticeBytes: d.noticeBytes, noticeLabel: FLOW_NOTICE_TITLE[d.kind].split(' (')[0], recordBytes: d.recordBytes, tz: d.tz });
+     res.set('Content-Type', 'application/pdf');
+     res.set('Content-Disposition', 'inline; filename="decision-preview.pdf"');
+     return res.send(bundle);
+@@ -3787,12 +4149,17 @@
+ 
+     // Upload the signed notice (permanent step, tracked for cleanup)
+     const noticeHash = crypto.createHash('sha256').update(d.noticeBytes).digest('hex');
+-    let noticeUrl, noticeAttachmentId;
++    let noticeUrl, noticeAttachmentId, stampedRecordUrl = null, stampedRecordPublicId = null, stampedRecordType = 'raw', previousSignedCopy = null;
+     const supportingRows = [];
+     try {
+       const up = await uploadRecordFile({ buffer: d.noticeBytes }, 'oneproject/records', `${Date.now()}-notice-${d.recordId}.pdf`);
+       uploaded.push({ public_id: up.public_id, resource_type: up.resource_type });
+       noticeUrl = up.secure_url; noticeAttachmentId = up.public_id;
++      if (d.recordBytes) {
++        const upRec = await uploadRecordFile({ buffer: d.recordBytes }, 'oneproject/records', `${Date.now()}-signed-record-${d.recordId}.pdf`);
++        uploaded.push({ public_id: upRec.public_id, resource_type: upRec.resource_type });
++        stampedRecordUrl = upRec.secure_url; stampedRecordPublicId = upRec.public_id; stampedRecordType = upRec.resource_type;
++      }
+       const settled = await Promise.allSettled(d.supportingFiles.map(f => uploadRecordFile(f, 'oneproject/record-supporting')));
+       settled.forEach((s, i) => {
+         if (s.status !== 'fulfilled') return;
+@@ -3819,7 +4186,7 @@
+       );
+       if (dup.rows.length) throw Object.assign(new Error('dup'), { http: 409, publicMessage: 'You already decided this record.' });
+ 
+-      const description = d.body
++      const description = d.body && looksLikeHtml(d.body) ? d.body : d.body
+         ? d.body.split(/\n{2,}/).map(p => `<p>${flowEscape(p).replace(/\n/g, '<br>')}</p>`).join('')
+         : `<p>Notice attached as PDF.${d.queries.length ? ` ${d.queries.length} ${d.queries.length === 1 ? 'query' : 'queries'} raised.` : ''}</p>`;
+       const nIns = await client.query(
+@@ -3849,6 +4216,17 @@
+       else if (d.decision === 'accepted') newStatus = 'approved_record';
+       else newStatus = { contractor: 'pending_client_acceptance', consultant: 'pending_contractor_acceptance', client: 'pending_contractor_acceptance' }[d.state.uploaderSide] || 'pending_review';
+       await client.query(`UPDATE ${d.table} SET status=$1 WHERE id=$2 AND project_id=$3`, [newStatus, d.recordId, d.projectId]);
++      if (stampedRecordUrl) {
++        // Approval only: the record's latest copy now carries the sign-off page. The original upload (file_path) is kept.
++        const cur = await client.query(`SELECT stamp_status, stamped_doc_public_id FROM ${d.table} WHERE id=$1`, [d.recordId]);
++        previousSignedCopy = cur.rows[0]?.stamped_doc_public_id || null;
++        await client.query(
++          `UPDATE ${d.table} SET stamped_doc_url=$1, signed_by_id=$2, signed_by_role=$3, signed_at=NOW(), stamp_type='STAMPED', stamp_status=$4,
++                stamp_page=$5, stamp_x=$6, stamp_y=$7, stamped_doc_public_id=$10 WHERE id=$8 AND project_id=$9`,
++          [stampedRecordUrl, userId, role, getStampStatusFromActor(cur.rows[0]?.stamp_status, 'approver'),
++           d.recordStampPlacement?.page ?? null, d.recordStampPlacement?.x ?? null, d.recordStampPlacement?.y ?? null, d.recordId, d.projectId, stampedRecordPublicId]
++        );
++      }
+ 
+       // Signers of this stage: tie them to the notice; record the decider's signature
+       if (d.deciderRow) {
+@@ -3864,9 +4242,9 @@
+       for (let i = 0; i < d.queries.length; i++) {
+         const q = d.queries[i];
+         await client.query(
+-          `INSERT INTO record_queries (record_table, record_id, notice_id, project_id, seq, ref, query, required_action, issuer_role, issuer_side)
+-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+-          [d.table, d.recordId, noticeId, d.projectId, i + 1, q.ref, q.query, q.required_action, role, d.step.side]
++          `INSERT INTO record_queries (record_table, record_id, notice_id, project_id, seq, ref, query, required_action, issuer_role, issuer_side, raised_by)
++           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
++          [d.table, d.recordId, noticeId, d.projectId, i + 1, q.ref, q.query, q.required_action, role, d.step.side, q.by || null]
+         );
+       }
+       if (d.nextPlan) await insertSignerRows(client, { table: d.table, recordId: d.recordId, projectId: d.projectId, stage: d.nextPlan.stage, side: d.nextPlan.side, signers: d.nextPlan.signers });
+@@ -3879,6 +4257,11 @@
+       return fail(500, 'The decision could not be saved. Nothing was changed.');
+     } finally { if (client) { client.release(); client = null; } }
+ 
++    // The earlier signed copy of this record is superseded: remove it from storage (non-fatal)
++    if (previousSignedCopy && previousSignedCopy !== stampedRecordPublicId) {
++      await removeUploadedRecordFiles([{ public_id: previousSignedCopy, resource_type: stampedRecordType }]).catch(() => {});
++    }
++
+     // Notifications (non-fatal)
+     const q = d.queries.length;
+     const message = d.decision === 'rejected'
+@@ -3886,8 +4269,11 @@
+       : `${role} ${d.decision} record #${d.recordId} "${d.state.rec.title}" with notice #${noticeId}`;
+     const recipients = await getProjectRecipientKeys(d.projectId, userId, role).catch(() => []);
+     await notifyRecordUsers({ projectId: d.projectId, recordId: d.recordId, table: d.table, message, actorId: userId, actorRole: role, recipients });
++    if (d.state.rec.uploaded_by && !(Number(d.state.rec.uploaded_by) === Number(userId) && normalizeRole(d.state.rec.role) === normalizeRole(role))) {
++      emailFlowRecipients([flowKey(d.state.rec.role, d.state.rec.uploaded_by)], `Decision issued: ${FLOW_DECISION_WORD[d.decision]}`, message, d.projectId);   // not awaited
++    }
+     if (d.nextPlan) {
+-      await notifyRecordUsers({
++      await notifyRecordUsers({ email: true, emailSubject: 'Action needed: review and sign',
+         projectId: d.projectId, recordId: d.recordId, table: d.table, actorId: userId, actorRole: role,
+         message: `You are named to review and sign "${d.state.rec.title}" (${d.state.steps[d.stage].label}).`,
+         recipients: d.nextPlan.signers.map(s => flowKey(s.role, s.user_id)),
+@@ -3920,14 +4306,19 @@
+     const state = await getRecordFlowState(table, projectId, recordId);
+     if (!state || state.isLocked || !state.stage) return fail(409, 'This record is not waiting for signatures.');
+     const { rows } = await pool.query(
+-      `SELECT * FROM record_signers WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND signer_role=$4 AND signer_user_id=$5 AND status='pending' AND is_decider=FALSE`,
++      `SELECT * FROM record_signers WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND signer_role=$4 AND signer_user_id=$5 AND is_decider=FALSE AND (status='pending' OR (status='signed' AND outcome='queries' AND notice_id IS NULL))`,
+       [table, recordId, state.stage, role, userId]
+     );
+     const mine = rows[0];
+-    if (!mine) return fail(403, 'You are not a named signer for this stage, or you already signed.');
++    if (!mine) return fail(403, 'You are not a named signer for this stage, or your review is already final.');
++    const setupProblem = await explainMissingSignerSetup(projectId, role, userId, false);
++    if (setupProblem) return fail(400, setupProblem);
+     const profile = await loadSignerProfile(projectId, role, userId);
+-    if (!profile) return fail(400, 'Set up your signature first, then sign.');
+-    const findings = { note, queries: outcome === 'queries' ? parsed.queries : [] };
++    if (!profile) return fail(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
++    // Signing again after raising queries keeps the earlier review in the history
++    const earlier = mine.status === 'signed' ? [{ outcome: mine.outcome, note: mine.findings?.note || '', queries: mine.findings?.queries || [], signed_at: mine.signed_at }] : [];
++    const raisedBy = `${mine.signer_position || flowRoleLabel(role)}, ${flowSideLabel(mine.side)} side`;
++    const findings = { note, queries: outcome === 'queries' ? parsed.queries.map(q => ({ ...q, by: raisedBy })) : [], history: [...(mine.findings?.history || []), ...earlier] };
+     await pool.query(
+       `UPDATE record_signers SET status='signed', outcome=$1, findings=$2, signed_at=NOW(), first_viewed_at=COALESCE(first_viewed_at, NOW()) WHERE id=$3`,
+       [outcome, JSON.stringify(findings), mine.id]
+@@ -3989,6 +4380,7 @@
+     }
+     res.json({ success: true, first_viewed_at: upd.rows[0].first_viewed_at });
+   } catch (err) {
++    if (err && err.code === '55000') return res.status(204).end();   // read-only project: nothing to record
+     console.error('[record-view]', err);
+     res.status(500).json({ error: 'Failed to record the view.' });
+   }
+@@ -4016,7 +4408,7 @@
+     );
+     if (!rows.length) return fail(409, `A reminder was already sent in the last ${FLOW_REMIND_COOLDOWN_HOURS} hours, or nobody is waiting.`);
+     await pool.query(`UPDATE record_signers SET reminder_sent_at=NOW() WHERE id = ANY($1::int[])`, [rows.map(r => r.id)]);
+-    await notifyRecordUsers({
++    await notifyRecordUsers({ email: true, emailSubject: 'Reminder: waiting for your signature',
+       projectId, recordId, table, actorId: userId, actorRole: role,
+       message: `Reminder: "${state.rec.title}" is waiting for your signature.`,
+       recipients: rows.map(r => flowKey(r.signer_role, r.signer_user_id)),
+@@ -4042,7 +4434,13 @@
+     const { rows } = await pool.query(`SELECT * FROM record_signers WHERE id=$1 AND project_id=$2`, [signerId, projectId]);
+     const row = rows[0];
+     if (!row) return fail(404, 'Signer not found.');
+-    if (row.status !== 'pending') return fail(409, 'Only a pending signer can be replaced.');
++    let replaceable = row.status === 'pending';
++    if (!replaceable && row.status === 'signed' && row.outcome === 'queries' && !row.notice_id && !row.is_decider) {
++      // A checker whose queries block approval can be replaced only if they left the project
++      replaceable = !(await userHasProjectAccess(row.signer_user_id, row.signer_role, projectId));
++      if (!replaceable) return fail(409, 'This team member is still on the project. They can clear their queries by signing again, or you can reject the record.');
++    }
++    if (!replaceable) return fail(409, 'Only a pending signer, or a team member who has left the project, can be replaced.');
+     if (!isDecisionMaker(role) || getSide(role) !== row.side) return fail(403, 'Only a leader of the same side can replace a signer.');
+     const state = await getRecordFlowState(row.record_table, projectId, row.record_id);
+     if (!state || state.isLocked || state.stage !== row.stage) return fail(409, 'This signer can no longer be replaced.');
+@@ -4064,7 +4462,7 @@
+     );
+     await client.query(`UPDATE record_signers SET status='replaced', replaced_at=NOW(), replaced_by_user_id=$1, replaced_by_role=$2, replaced_by_signer_id=$3 WHERE id=$4`, [userId, role, ins.rows[0].id, row.id]);
+     await client.query('COMMIT');
+-    await notifyRecordUsers({
++    await notifyRecordUsers({ email: true, emailSubject: 'Action needed: review and sign',
+       projectId, recordId: row.record_id, table: row.record_table, actorId: userId, actorRole: role,
+       message: `You are named to review and sign "${state.rec.title}" in place of ${row.signer_position || flowRoleLabel(row.signer_role)}.`,
+       recipients: [flowKey(cand.role, cand.user_id)],
+@@ -4102,7 +4500,7 @@
+       [status, role, userId, queryId]
+     );
+     if (q.responded_by_id) {
+-      await notifyRecordUsers({
++      await notifyRecordUsers({ email: status === 'reopened', emailSubject: 'Query reopened',
+         projectId, recordId: q.responded_in_record_id || q.record_id, table: q.record_table, actorId: userId, actorRole: role,
+         message: `Query ${q.seq} was ${status === 'resolved' ? 'resolved' : 'reopened'} by ${role}.`,
+         recipients: [flowKey(q.responded_by_role, q.responded_by_id)],
+@@ -4118,25 +4516,35 @@
+ // ── Card data: signing plan, queries, revisions, buttons ────────────────────
+ async function buildRecordFlowView(c) {
+   const { rec, projectId, userId, userRole, userSide, userIsDM, isUploader, isLocked, isRejected, steps,
+-          btnState, pendingRole, approveLabel, workflowSteps, embeddedNotices, signersByRecord, queriesByRecord, allQueries, nameOf } = c;
++          btnState, pendingRole, approveLabel, workflowSteps, embeddedNotices, signersByRecord, queriesByRecord, allQueries, nameOf, projectTz, memberKeys, table } = c;
+   const isNoticeRecord = Boolean(rec.notice_tied_id);
+   const planRows = signersByRecord.get(rec.id) || [];
+   const pendingIdx = workflowSteps.findIndex(s => s.status === 'pending');
+   const stage = !isNoticeRecord && !isLocked && pendingIdx >= 0 ? pendingIdx + 1 : null;
+   const isMe = (r) => r.signer_role === userRole && Number(r.signer_user_id) === Number(userId);
+ 
+-  const publicSigner = async (r) => ({
++  const publicSigner = async (r) => {
++  const openQueries = r.status === 'signed' && r.outcome === 'queries' && !r.notice_id && !r.is_decider;
++  const sameSideLeader = Boolean(stage) && r.stage === stage && userIsDM && userSide === r.side;
++  // Only leaders of the signer's own side are told that someone is no longer on the project
++  const leftProject = sameSideLeader && (r.status === 'pending' || openQueries)
++    ? !memberKeys.has(`${normalizeRole(r.signer_role)}:${r.signer_user_id}`) : false;
++  return {
++    open_queries: openQueries, left_project: leftProject,
++    can_resign: Boolean(stage) && r.stage === stage && openQueries && isMe(r),
+     id: r.id, position: r.signer_position || flowRoleLabel(r.signer_role), side: r.side, role: r.signer_role,
+     is_team_member: r.is_team_member, is_decider: r.is_decider, order_no: r.order_no, status: r.status,
+     outcome: r.outcome, signed_at: r.signed_at, first_viewed_at: r.first_viewed_at, last_viewed_at: r.last_viewed_at,
+     reminder_sent_at: r.reminder_sent_at,
+-    name: r.status === 'signed' ? await nameOf(r.signer_role, r.signer_user_id) : null,
++    // Personal name and findings are shown only to the signer's own side; the other side sees position, side and time.
++    name: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? await nameOf(r.signer_role, r.signer_user_id) : null,
+     queries_raised: Array.isArray(r.findings?.queries) ? r.findings.queries.length : 0,
+     user_id: r.signer_user_id,
+-    findings: r.status === 'signed' ? { note: r.findings?.note || '', queries: Array.isArray(r.findings?.queries) ? r.findings.queries : [] } : null,
++    findings: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? { note: r.findings?.note || '', queries: Array.isArray(r.findings?.queries) ? r.findings.queries : [] } : null,
+     is_me: isMe(r),
+-    can_replace: Boolean(stage) && r.status === 'pending' && r.stage === stage && userIsDM && userSide === r.side,
+-  });
++    can_replace: sameSideLeader && (r.status === 'pending' || (openQueries && leftProject)),
++  };
++  };
+ 
+   const stages = [];
+   for (const st of [1, 2]) {
+@@ -4161,16 +4569,20 @@
+     if (me && me.status === 'pending') {
+       if (me.is_decider) {
+         const waiting = stageRows.filter(r => !r.is_decider && r.status !== 'signed');
++        const objecting = stageRows.filter(r => !r.is_decider && r.status === 'signed' && r.outcome === 'queries' && !r.notice_id);
+         if (waiting.length) { btn = 'awaiting_signers'; pend = waiting.map(w => w.signer_position || flowRoleLabel(w.signer_role)).join(', '); }
++        else if (objecting.length) { btn = 'queries_open'; pend = objecting.map(o => o.signer_position || flowRoleLabel(o.signer_role)).join(', '); }
+         else { btn = 'can_approve'; label = steps[stage - 1].action === 'accepted' ? 'Accept' : 'Approve'; }
+       } else btn = 'sign_review';
+-    } else if (me && me.status === 'signed') btn = 'signed_waiting';
++    } else if (me && me.status === 'signed' && me.outcome === 'queries' && !me.notice_id && !me.is_decider) btn = 'sign_review_again';
++    else if (me && me.status === 'signed') btn = 'signed_waiting';
+     else if (userIsDM && userSide === steps[stage - 1].side) btn = 'not_named';
++    else if (!userIsDM && userSide === steps[stage - 1].side) btn = 'not_named_comment';   // unnamed team members can only comment
+   }
+ 
+   const qOut = (q) => ({
+     id: q.id, notice_id: q.notice_id, seq: q.seq, ref: q.ref, query: q.query, required_action: q.required_action,
+-    status: q.status, response: q.response, responded_at: q.responded_at, resolved_at: q.resolved_at, issuer_side: q.issuer_side,
++    status: q.status, response: q.response, responded_at: q.responded_at, resolved_at: q.resolved_at, issuer_side: q.issuer_side, raised_by: q.raised_by || null,
+     can_review: userIsDM && userSide === q.issuer_side && ['answered', 'resolved'].includes(q.status),
+   });
+   const ownQueries = (queriesByRecord.get(rec.id) || []).map(qOut);
+@@ -4196,7 +4608,7 @@
+     btn_state: btn, pending_role: pend, approve_label: label,
+     revision_of_id: rec.revision_of_id || null, revision_no: rec.revision_no || 0, superseded_by_id: rec.superseded_by_id || null,
+     notice_source: rec.notice_source || null, respond_by: rec.respond_by || null,
+-    current_stage: stage,
++    current_stage: stage, time_zone: projectTz, reference: flowRecordRef(table, rec),
+     signing_plan: stages,
+     my_signer: stage ? (() => { const me = stageRows.find(r => isMe(r) && r.status === 'pending'); return me ? { id: me.id, stage, is_decider: me.is_decider, first_viewed_at: me.first_viewed_at } : null; })() : null,
+     can_remind: Boolean(stage) && (isUploader || (userIsDM && userSide === getSide(rec.role))),
+@@ -4562,6 +4974,8 @@
+     const queriesByRecord = new Map();
+     for (const qr of allQueries) { if (!queriesByRecord.has(qr.record_id)) queriesByRecord.set(qr.record_id, []); queriesByRecord.get(qr.record_id).push(qr); }
+     const nameCache = new Map();
++    const projectTz = await loadProjectTz(projectId);
++    const memberKeys = await loadProjectMemberKeys(projectId);
+     const nameOf = async (r, id) => {
+       const k = `${r}:${id}`;
+       if (!nameCache.has(k)) nameCache.set(k, await resolveDisplayNameFor(r, id, projectId).catch(() => null));
+@@ -4683,7 +5097,7 @@
+       const flowView = await buildRecordFlowView({
+         rec, projectId, userId, userRole, userSide, userIsDM, isUploader, isLocked, isRejected, steps,
+         btnState, pendingRole, approveLabel, workflowSteps, embeddedNotices,
+-        signersByRecord, queriesByRecord, allQueries, nameOf,
++        signersByRecord, queriesByRecord, allQueries, nameOf, projectTz, memberKeys, table,
+       });
+       return {
+         ...rec,
+@@ -4825,7 +5239,7 @@
+       if (action === 'rejected') {
+         newStatus = 'rejected';
+         await pool.query(
+-          `UPDATE ${table} SET status=$1, stamped_doc_url=NULL, stamp_type=NULL, stamp_status=NULL, signed_by_id=NULL, signed_by_role=NULL, signed_at=NULL WHERE id=$2 AND project_id=$3`,
++          `UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`,   // rejecting never clears earlier stamps
+           [newStatus, recordId, projectId]
+         );
+       } else {

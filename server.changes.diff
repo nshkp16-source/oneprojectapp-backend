@@ -1,0 +1,25 @@
+--- /mnt/user-data/uploads/server.js	2026-10-24 14:49:11.920900000 +0000
++++ server.js	2026-10-24 14:59:27.845202155 +0000
+@@ -4130,10 +4130,11 @@
+     is_team_member: r.is_team_member, is_decider: r.is_decider, order_no: r.order_no, status: r.status,
+     outcome: r.outcome, signed_at: r.signed_at, first_viewed_at: r.first_viewed_at, last_viewed_at: r.last_viewed_at,
+     reminder_sent_at: r.reminder_sent_at,
+-    name: r.status === 'signed' ? await nameOf(r.signer_role, r.signer_user_id) : null,
++    // Personal name and findings are shown only to the signer's own side; the other side sees position, side and time.
++    name: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? await nameOf(r.signer_role, r.signer_user_id) : null,
+     queries_raised: Array.isArray(r.findings?.queries) ? r.findings.queries.length : 0,
+     user_id: r.signer_user_id,
+-    findings: r.status === 'signed' ? { note: r.findings?.note || '', queries: Array.isArray(r.findings?.queries) ? r.findings.queries : [] } : null,
++    findings: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? { note: r.findings?.note || '', queries: Array.isArray(r.findings?.queries) ? r.findings.queries : [] } : null,
+     is_me: isMe(r),
+     can_replace: Boolean(stage) && r.status === 'pending' && r.stage === stage && userIsDM && userSide === r.side,
+   });
+@@ -4825,7 +4826,7 @@
+       if (action === 'rejected') {
+         newStatus = 'rejected';
+         await pool.query(
+-          `UPDATE ${table} SET status=$1, stamped_doc_url=NULL, stamp_type=NULL, stamp_status=NULL, signed_by_id=NULL, signed_by_role=NULL, signed_at=NULL WHERE id=$2 AND project_id=$3`,
++          `UPDATE ${table} SET status=$1 WHERE id=$2 AND project_id=$3`,   // rejecting never clears earlier stamps
+           [newStatus, recordId, projectId]
+         );
+       } else {

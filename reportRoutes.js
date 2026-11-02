@@ -20,10 +20,13 @@
 //   });
 
 import {
-  taskProgress, activityProgress, buildDailyEntry, checkPercentageReport, stageUnlocked,
+  taskProgress, activityProgress, buildDailyEntry, checkPercentageReport, stageUnlocked, delayDays,
 } from './progressRules.js';
 
 const DAY = (v) => String(v || '').slice(0, 10);
+const DATE = (v) => v instanceof Date
+  ? `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
+  : DAY(v);
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(String(v)));
 const round2 = (x) => Math.round((Number(x) + Number.EPSILON) * 100) / 100;
 
@@ -110,12 +113,18 @@ export async function recomputeActivity(client, activityId, { dates = [], actor 
     const entry = buildDailyEntry(todays);
     const join = (field) => todays.map((r) => String(r[field] || '').trim()).filter(Boolean).join('; ') || null;
     const asOf = tasks.length ? activityProgress(tasksProgress(day)) : 0;
+    const calculatedDelay = delayDays({
+      plannedEnd: DATE(act.end_date),
+      actualEnd: DATE(act.actual_end),
+      status: act.status,
+      today: new Date(`${day}T00:00:00.000Z`),
+    });
     await client.query(`
       INSERT INTO planning_execution_tracking
         (activity_id, report_date, actual_quantity, unit, manpower_used, equipment_used, materials_used,
          progress_pct, issues, day_remark, delay_days, status_change_to_closed, logged_by, logged_by_role,
          source, contributions, recomputed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,false,$11,$12,'work_center',$13::jsonb,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,$12,$13,'work_center',$14::jsonb,NOW())
       ON CONFLICT (activity_id, report_date) DO UPDATE SET
         -- a typed entry on the same date keeps its own figures; only the contributions are added to it
         actual_quantity = CASE WHEN planning_execution_tracking.source = 'work_center' THEN EXCLUDED.actual_quantity ELSE planning_execution_tracking.actual_quantity END,
@@ -126,10 +135,11 @@ export async function recomputeActivity(client, activityId, { dates = [], actor 
         progress_pct    = CASE WHEN planning_execution_tracking.source = 'work_center' THEN EXCLUDED.progress_pct    ELSE planning_execution_tracking.progress_pct END,
         issues          = CASE WHEN planning_execution_tracking.source = 'work_center' THEN EXCLUDED.issues          ELSE planning_execution_tracking.issues END,
         day_remark      = CASE WHEN planning_execution_tracking.source = 'work_center' THEN EXCLUDED.day_remark      ELSE planning_execution_tracking.day_remark END,
+        delay_days      = CASE WHEN planning_execution_tracking.source = 'work_center' THEN EXCLUDED.delay_days      ELSE planning_execution_tracking.delay_days END,
         contributions   = EXCLUDED.contributions,
         recomputed_at   = NOW()`,
       [activityId, day, entry.actual_quantity, act.unit, join('manpower'), join('equipment'), join('materials'),
-       asOf, join('issues'), entry.day_remark || null, actor?.id ?? act.creator_id, actor?.role ?? act.creator_role,
+       asOf, join('issues'), entry.day_remark || null, calculatedDelay, actor?.id ?? act.creator_id, actor?.role ?? act.creator_role,
        JSON.stringify(entry.contributions)]);
   }
 
@@ -339,5 +349,73 @@ export function registerReportRoutes(app, deps) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       return fail(res, err, 'PUT /api/work-center-progress/:progressId/validate:');
     } finally { if (client) client.release(); }
+  });
+
+  app.get('/api/planning-execution/closeout-report', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.query.projectId, 10);
+      const audience = String(req.query.audience || 'side');
+      if (!projectId) throw new HttpError(400, 'projectId is required.');
+      if (!['side', 'client'].includes(audience)) throw new HttpError(400, 'audience must be side or client.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      if (audience === 'client' && wcSide(role) !== 'Client') throw new HttpError(403, 'Only client-side users can download the client report.');
+      if (audience === 'side' && !['Contractor', 'Consultant'].includes(wcSide(role)))
+        throw new HttpError(403, 'This report is available to contractor and consultant project members.');
+
+      const reportSide = 'Contractor';
+      const clientReport = audience === 'client';
+      const rows = (await pool.query(`
+        SELECT pe.id AS activity_id, pe.title AS activity_title, pe.activity_type,
+               CASE WHEN $2::boolean THEN NULL ELSE pe.status END AS status,
+               to_char(pe.start_date, 'YYYY-MM-DD') AS start_date,
+               to_char(pe.end_date, 'YYYY-MM-DD') AS end_date,
+               CASE WHEN pe.actual_end IS NOT NULL THEN GREATEST(pe.actual_end - pe.end_date, 0)
+                    ELSE GREATEST(CURRENT_DATE - pe.end_date, 0) END AS calculated_delay_days,
+               pe.planned_quantity, pe.unit,
+               CASE WHEN $2::boolean THEN pe.certified_progress_pct ELSE pe.progress_pct END AS activity_progress_pct,
+               CASE WHEN $2::boolean THEN NULL ELSE w.title END AS task_title,
+               CASE WHEN $2::boolean THEN NULL ELSE w.weight_pct END AS task_weight_pct,
+               CASE WHEN $2::boolean THEN NULL ELSE w.target_quantity END AS task_target_quantity,
+               CASE WHEN $2::boolean THEN NULL ELSE w.progress_pct END AS task_progress_pct,
+               CASE WHEN $2::boolean THEN NULL ELSE p.approved_report_count END AS approved_report_count,
+               CASE WHEN $2::boolean THEN NULL ELSE p.approved_quantity END AS approved_quantity,
+               CASE WHEN $2::boolean THEN NULL ELSE v.pending_verifications END AS pending_verifications
+        FROM planning_execution pe
+        LEFT JOIN workspace_work_center w ON w.activity_id = pe.id AND NOT $2::boolean
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS approved_report_count,
+                 COALESCE(SUM(quantity_done), 0) AS approved_quantity
+          FROM workspace_work_center_progress
+          WHERE task_id = w.id AND validation_status = 'approved'
+        ) p ON true
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*)::int AS pending_verifications
+          FROM activity_verifications
+          WHERE activity_id = pe.id AND status = 'pending'
+        ) v ON true
+        WHERE pe.project_id = $1 AND pe.side = $3
+        ORDER BY pe.start_date, pe.id, w.id`, [projectId, clientReport, reportSide])).rows;
+      const headers = [
+        'Activity ID', 'Activity', 'Type', 'Status', 'Start date', 'End date',
+        'Planned quantity', 'Unit', 'Activity progress (%)', 'Calculated delay (days)', 'Task', 'Task share (%)',
+        'Task target', 'Task progress (%)', 'Approved reports', 'Approved quantity',
+        'Pending verifications',
+      ];
+      const quote = (value) => {
+        let text = value == null ? '' : String(value);
+        if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+        return `"${text.replace(/"/g, '""')}"`;
+      };
+      const csv = [headers, ...rows.map((row) => [
+        row.activity_id, row.activity_title, row.activity_type, row.status, row.start_date, row.end_date,
+        row.planned_quantity, row.unit, row.activity_progress_pct, row.calculated_delay_days, row.task_title, row.task_weight_pct,
+        row.task_target_quantity, row.task_progress_pct, row.approved_report_count, row.approved_quantity,
+        row.pending_verifications,
+      ])].map((line) => line.map(quote).join(',')).join('\r\n');
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="oneproject-closeout-${clientReport ? 'client' : 'project'}-${projectId}.csv"`);
+      return res.status(200).send(`\uFEFF${csv}`);
+    } catch (err) { return fail(res, err, 'GET /api/planning-execution/closeout-report:'); }
   });
 }

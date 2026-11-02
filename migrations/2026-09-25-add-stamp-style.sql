@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE user_stamps
+  ADD COLUMN IF NOT EXISTS stamp_style TEXT NOT NULL DEFAULT 'compact';
+
+COMMIT;

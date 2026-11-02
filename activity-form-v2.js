@@ -54,11 +54,11 @@ function _pe2Measured() { return _pe2.type === 'quantity' || _pe2.type === 'coun
 
 // ── data ─────────────────────────────────────────────────────────────────────
 async function _pe2Fetch(path) {
-  try {
-    const res = await _wcFetch(`${API}${path}`);
-    if (res && res.ok) return await res.json();
-  } catch (e) { /* non-fatal: the form still works without the list */ }
-  return null;
+  const res = await _wcFetch(`${API}${path}`);
+  if (!res) throw new Error('Your session could not be refreshed. Please sign in again.');
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || data.message || `Unable to load form data (HTTP ${res.status}).`);
+  return data;
 }
 
 async function _peOpenAddForm() {
@@ -66,10 +66,16 @@ async function _peOpenAddForm() {
   if (!isWCLeader(window.currentUserRole)) { alert('Only side leaders can add activities.'); return; }
   const projectId = typeof ensureActiveProjectId === 'function' ? await ensureActiveProjectId() : localStorage.getItem('activeProjectId');
   if (!projectId) return;
-  const [ms, tm] = await Promise.all([
-    _pe2Fetch(`/project-milestones?projectId=${encodeURIComponent(projectId)}`),
-    _pe2Fetch(`/work-center/team-members?projectId=${encodeURIComponent(projectId)}`),
-  ]);
+  let ms, tm;
+  try {
+    [ms, tm] = await Promise.all([
+      _pe2Fetch(`/project-milestones?projectId=${encodeURIComponent(projectId)}`),
+      _pe2Fetch(`/work-center/team-members?projectId=${encodeURIComponent(projectId)}`),
+    ]);
+  } catch (err) {
+    alert(`Could not load activity form data: ${err.message}`);
+    return;
+  }
   _pe2 = { projectId, type: _pe2DefaultType(), milestones: (ms && ms.milestones) || [], members: (tm && tm.members) || [],
            tasks: [_pe2NewTask()], weightsEdited: false };
   expandGrayPart(_pe2FormHtml());

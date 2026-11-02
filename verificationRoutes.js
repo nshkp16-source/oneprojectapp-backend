@@ -86,6 +86,23 @@ export function registerVerificationRoutes(app, deps) {
   const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
   const leaderOn = (role, side) => isWCLeader(role) && wcSide(role) === side;
 
+  app.get('/api/verification-inspectors', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.query.projectId, 10);
+      if (!projectId) throw new HttpError(400, 'projectId is required.');
+      if (!leaderOn(role, 'Contractor')) throw new HttpError(403, 'Only contractor leaders and PMs can choose verification inspectors.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const inspectors = (await pool.query(
+        `SELECT t.id, t.email, tma.name AS title, tma.position
+         FROM team_member_assignments tma
+         JOIN team_members t ON t.id = tma.team_member_id
+         WHERE tma.project_id = $1 AND tma.assigned_part = 'Consultant'
+         ORDER BY tma.position NULLS LAST, tma.name, t.email`, [projectId])).rows;
+      return res.json({ inspectors });
+    } catch (err) { return fail(res, err, 'GET /api/verification-inspectors:'); }
+  });
+
   async function loadActivity(client, activityId, lock = false) {
     return (await client.query(`SELECT * FROM planning_execution WHERE id = $1 ${lock ? 'FOR UPDATE' : ''}`, [activityId])).rows[0];
   }

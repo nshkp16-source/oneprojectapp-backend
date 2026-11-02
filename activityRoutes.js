@@ -220,6 +220,192 @@ function fail(res, err, label) {
 export function registerActivityRoutes(app, deps) {
   const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
 
+  app.get('/api/planning-execution/:activityId/activity-card', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.query.projectId, 10);
+      const activityId = parseInt(req.params.activityId, 10);
+      if (!projectId) throw new HttpError(400, 'projectId is required.');
+      if (!activityId) throw new HttpError(400, 'activityId is required.');
+      if (!(await isMember(deps, projectId, userId, role)))
+        throw new HttpError(403, 'You are not a member of this project.');
+
+      const activity = (await pool.query(
+        `SELECT id, project_id, side, creator_id, milestone_name, title, description, start_date, end_date,
+                planned_quantity, unit, status, activity_type, done_when, planned_work,
+                planned_manpower, planned_equipment, planned_materials, progress_pct,
+                certified_progress_pct, certified_at, baseline_milestone_id, additional_milestone_id,
+                drives_milestone, milestone_weight_pct,
+                CASE WHEN status = 'closed' THEN GREATEST(COALESCE(actual_end, end_date) - end_date, 0)
+                     ELSE GREATEST(CURRENT_DATE - end_date, 0) END AS calculated_delay_days
+         FROM planning_execution WHERE id = $1 AND project_id = $2`,
+        [activityId, projectId])).rows[0];
+      if (!activity) throw new HttpError(404, 'Activity not found.');
+
+      let viewerSide = wcSide(role);
+      if (!viewerSide && role === 'TeamMember') {
+        const membership = await pool.query(
+          `SELECT assigned_part FROM team_member_assignments
+           WHERE project_id = $1 AND team_member_id = $2 LIMIT 1`, [projectId, userId]);
+        viewerSide = membership.rows[0]?.assigned_part || null;
+      }
+      const canViewContractorActivity = ['Consultant', 'Client'].includes(viewerSide) && activity.side === 'Contractor';
+      if (!viewerSide || (viewerSide !== activity.side && !canViewContractorActivity))
+        throw new HttpError(403, 'You cannot view this activity.');
+
+      const clientView = viewerSide === 'Client';
+      const taskRows = clientView ? [] : (await pool.query(
+        `SELECT id, title, description, assigned_members, status, start_date, end_date,
+                weight_pct, target_quantity, progress_pct
+         FROM workspace_work_center WHERE activity_id = $1 ORDER BY id`, [activityId])).rows;
+      const stages = clientView ? [] : (await pool.query(
+        `SELECT s.id, s.task_id, s.seq, s.title, s.weight_pct, s.is_hold_point,
+                s.completed_at, s.hold_verified_at
+         FROM task_stages s JOIN workspace_work_center w ON w.id = s.task_id
+         WHERE w.activity_id = $1 ORDER BY s.task_id, s.seq`, [activityId])).rows;
+      const stagesByTask = new Map();
+      for (const stage of stages) {
+        if (!stagesByTask.has(stage.task_id)) stagesByTask.set(stage.task_id, []);
+        stagesByTask.get(stage.task_id).push(stage);
+      }
+      return res.json({
+        activity: {
+          ...activity,
+          progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
+          status: clientView ? null : activity.status,
+          claimed_progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
+          certified_progress_pct: Number(activity.certified_progress_pct) || 0,
+        },
+        tasks: taskRows.map((task) => ({
+          ...task,
+          assigned_members: parseJson(task.assigned_members, [], 'assigned_members'),
+          progress_pct: clientView ? null : Number(task.progress_pct) || 0,
+          weight_pct: Number(task.weight_pct) || 0,
+          target_quantity: task.target_quantity == null ? null : Number(task.target_quantity),
+          stages: stagesByTask.get(task.id) || [],
+        })),
+        can_add_task: isWCLeader(role) && activity.side === viewerSide && activity.status !== 'closed',
+        can_edit_activity: isWCLeader(role) && String(activity.creator_id) === String(userId) && activity.status !== 'closed',
+        viewer_side: viewerSide,
+      });
+    } catch (err) { return fail(res, err, 'GET /api/planning-execution/:activityId/activity-card:'); }
+  });
+
+  app.put('/api/planning-execution/:activityId/plan', authenticateToken,
+    upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!isWCLeader(role)) throw new HttpError(403, 'Only leaders and PMs can update an activity.');
+      const projectId = parseInt(req.body?.projectId, 10);
+      const activityId = parseInt(req.params.activityId, 10);
+      if (!projectId || !activityId) throw new HttpError(400, 'projectId and activityId are required.');
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const activity = (await client.query(
+        `SELECT * FROM planning_execution WHERE id = $1 AND project_id = $2 FOR UPDATE`,
+        [activityId, projectId])).rows[0];
+      if (!activity) throw new HttpError(404, 'Activity not found.');
+      if (String(activity.creator_id) !== String(userId)) throw new HttpError(403, 'Only the creating leader can edit this activity.');
+      if (activity.status === 'closed') throw new HttpError(409, 'A closed activity cannot be edited.');
+      if (wcSide(role) !== activity.side) throw new HttpError(403, 'You cannot edit an activity from the other side.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+
+      const title = String(req.body?.title || '').trim();
+      const start = String(req.body?.start_date || '').slice(0, 10);
+      const end = String(req.body?.end_date || '').slice(0, 10);
+      const type = String(req.body?.activity_type || '');
+      if (!title) throw new HttpError(400, 'title is required.');
+      if (!isDate(start) || !isDate(end) || end < start) throw new HttpError(400, 'Enter valid activity dates with the end date on or after the start date.');
+      if (!ACTIVITY_TYPES.includes(type)) throw new HttpError(400, `activity_type must be one of: ${ACTIVITY_TYPES.join(', ')}.`);
+
+      const tasks = (await client.query(
+        `SELECT id, weight_pct, to_char(start_date, 'YYYY-MM-DD') AS start_date,
+                to_char(end_date, 'YYYY-MM-DD') AS end_date
+         FROM workspace_work_center WHERE activity_id = $1 ORDER BY id FOR UPDATE`, [activityId])).rows;
+      if (tasks.some((task) => task.start_date < start || task.end_date > end))
+        throw new HttpError(409, 'Activity dates must contain the date range of every existing task.');
+
+      const typeChanged = type !== activity.activity_type;
+      const reports = (await client.query(
+          `SELECT 1 FROM workspace_work_center_progress p
+           JOIN workspace_work_center w ON w.id = p.task_id
+           WHERE w.activity_id = $1 LIMIT 1`, [activityId])).rows.length;
+      const execution = (await client.query(
+          `SELECT 1 FROM planning_execution_tracking WHERE activity_id = $1 LIMIT 1`, [activityId])).rows.length;
+      const hasProgress = reports > 0 || execution > 0;
+      if (typeChanged && hasProgress)
+        throw new HttpError(409, 'The activity type cannot change after reports or execution entries exist.');
+
+      const measured = type === 'quantity' || type === 'count';
+      const plannedQuantity = req.body?.planned_quantity === '' || req.body?.planned_quantity == null
+        ? null : Number(req.body.planned_quantity);
+      const unit = String(req.body?.unit || '').trim();
+      if (measured && !(plannedQuantity > 0)) throw new HttpError(400, 'planned_quantity must be above 0 for quantity and count activities.');
+      if (measured && !unit) throw new HttpError(400, 'unit is required for quantity and count activities.');
+      if (hasProgress && measured && (
+        plannedQuantity !== Number(activity.planned_quantity) || unit !== String(activity.unit || '')
+      )) throw new HttpError(409, 'The planned amount and unit cannot change after reports or execution entries exist.');
+      const reportDates = (await client.query(
+        `SELECT to_char(MIN(report_date), 'YYYY-MM-DD') AS first_day,
+                to_char(MAX(report_date), 'YYYY-MM-DD') AS last_day
+         FROM (
+           SELECT p.report_date FROM workspace_work_center_progress p
+           JOIN workspace_work_center w ON w.id = p.task_id WHERE w.activity_id = $1
+           UNION ALL
+           SELECT report_date FROM planning_execution_tracking WHERE activity_id = $1
+         ) reports`, [activityId])).rows[0];
+      if ((reportDates.first_day && reportDates.first_day < start) ||
+          (reportDates.last_day && reportDates.last_day > end))
+        throw new HttpError(409, 'Activity dates must contain every existing report and execution date.');
+      if (type === 'stages' && tasks.length) {
+        const counts = (await client.query(
+          `SELECT w.id, COUNT(s.id)::int AS stage_count FROM workspace_work_center w
+           LEFT JOIN task_stages s ON s.task_id = w.id
+           WHERE w.activity_id = $1 GROUP BY w.id`, [activityId])).rows;
+        if (counts.some((row) => row.stage_count < 1))
+          throw new HttpError(409, 'Every existing task needs at least one configured stage before this can be a stages activity.');
+      }
+      if (measured && tasks.length) {
+        const weights = tasks.map((task) => Number(task.weight_pct));
+        if (!weightsValid(weights)) throw new HttpError(409, 'Existing task weights are invalid; fix the task breakdown before editing this activity.');
+      }
+
+      let file = null;
+      if (req.file) {
+        file = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'planning_execution/plans');
+      }
+      const updated = (await client.query(`
+        UPDATE planning_execution SET
+          title = $1, description = $2, done_when = $3, start_date = $4, end_date = $5,
+          activity_type = $6, planned_quantity = $7, unit = $8, planned_work = $9,
+          planned_manpower = $10, planned_equipment = $11, planned_materials = $12,
+          linked_file_name = COALESCE($13, linked_file_name),
+          linked_file_id = COALESCE($14, linked_file_id),
+          linked_file_url = COALESCE($15, linked_file_url),
+          updated_at = NOW()
+        WHERE id = $16 RETURNING *`,
+      [title, req.body.description || '', req.body.done_when || '', start, end, type,
+       measured ? plannedQuantity : null, measured ? unit : null,
+       req.body.planned_work || '', req.body.planned_manpower || '',
+       req.body.planned_equipment || '', req.body.planned_materials || '',
+       req.file?.originalname || null, file?.public_id || null, file?.secure_url || null, activityId])).rows[0];
+
+      if (measured && tasks.length) {
+        for (const task of tasks) {
+          await client.query(
+            `UPDATE workspace_work_center SET target_quantity = $2, updated_at = NOW() WHERE id = $1`,
+            [task.id, Math.round((plannedQuantity * Number(task.weight_pct) / 100 + Number.EPSILON) * 1000) / 1000]);
+        }
+      }
+      await client.query('COMMIT');
+      return res.json({ success: true, activity: updated });
+    } catch (err) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, err, 'PUT /api/planning-execution/:activityId/plan:');
+    } finally { if (client) client.release(); }
+  });
+
   // Create an activity, its tasks (with weights and stages) and the milestone link in one transaction.
   app.post('/api/planning-execution/create-with-tasks', authenticateToken,
     upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
