@@ -31,17 +31,27 @@ function render(card, viewerRole = 'ConsultantPM') {
 }
 
 test('activity tabs expose Certification only for milestone-driving activity', () => {
-  const linked = render({
+  const linkedCard = {
     viewer_side: 'Consultant',
     activity: { id: 1, title: 'Foundation', side: 'Contractor', drives_milestone: true, activity_type: 'quantity', planned_quantity: 200, unit: 'm3' },
     tasks: [],
     progress_reports: [],
-  });
+  };
+  const linked = render(linkedCard);
   assert.match(linked, /data-pe-tab="certification"/);
   assert.match(linked, /data-pe-tab="overview"/);
   assert.match(linked, /data-pe-tab="tasks"/);
   assert.match(linked, /data-pe-tab="progress"/);
   assert.doesNotMatch(linked, /Save Execution Entry|pe-save-actual/);
+  const wrapperContext = {
+    window: { currentUserRole: 'ConsultantPM', currentUserId: 8 },
+    isWCLeader: () => true,
+    escapeHtml: String,
+    __card: linkedCard,
+  };
+  vm.createContext(wrapperContext);
+  vm.runInContext(source, wrapperContext);
+  assert.doesNotThrow(() => vm.runInContext(`_peActivityCardHtml(__card)`, wrapperContext));
 
   const standalone = render({
     viewer_side: 'Contractor',
