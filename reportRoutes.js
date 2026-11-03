@@ -145,6 +145,35 @@ export async function recomputeActivity(client, activityId, { dates = [], actor 
   return { progress_pct: progress, status, tasks: current };
 }
 
+async function recomputeStandaloneTask(client, taskId) {
+  const task = (await client.query(
+    `SELECT * FROM workspace_work_center WHERE id = $1 AND activity_id IS NULL FOR UPDATE`, [taskId])).rows[0];
+  if (!task) return null;
+  const reports = (await client.query(
+    `SELECT *, to_char(report_date, 'YYYY-MM-DD') AS day
+     FROM workspace_work_center_progress WHERE task_id = $1 ORDER BY report_date, id`, [taskId])).rows;
+  const stages = (await client.query(
+    `SELECT * FROM task_stages WHERE task_id = $1 ORDER BY seq`, [taskId])).rows;
+  const approved = reports.filter((report) => report.validation_status === 'approved');
+  const progress = taskProgress(task.activity_type, task, approved, stages);
+  const actualStart = approved.length ? approved[0].day : null;
+  let status = task.status;
+  if (status !== 'closed') {
+    if (progress >= 100) status = 'completed';
+    else status = approved.length ? 'ongoing' : 'not_yet_started';
+  }
+  await client.query(
+    `UPDATE workspace_work_center SET progress_pct = $2, actual_start = $3, status = $4, updated_at = NOW() WHERE id = $1`,
+    [taskId, progress, actualStart, status]);
+  const doneStages = new Set(approved.map((report) => report.stage_id).filter((id) => id != null));
+  for (const stage of stages) {
+    await client.query(
+      `UPDATE task_stages SET completed_at = CASE WHEN $2 THEN COALESCE(completed_at, NOW()) ELSE NULL END WHERE id = $1`,
+      [stage.id, doneStages.has(stage.id)]);
+  }
+  return { id: taskId, progress_pct: progress, status };
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 async function isMember(deps, projectId, userId, role) {
@@ -188,8 +217,9 @@ export function registerReportRoutes(app, deps) {
       if (!String(b.workDone || '').trim()) throw new HttpError(400, 'workDone is required.');
 
       const task = (await pool.query(
-        `SELECT w.*, pe.activity_type, pe.status AS activity_status, pe.title AS activity_title
-         FROM workspace_work_center w JOIN planning_execution pe ON pe.id = w.activity_id
+        `SELECT w.*, COALESCE(w.activity_type, pe.activity_type) AS activity_type,
+                pe.status AS activity_status, pe.title AS activity_title
+         FROM workspace_work_center w LEFT JOIN planning_execution pe ON pe.id = w.activity_id
          WHERE w.id = $1 AND w.project_id = $2`, [taskId, projectId])).rows[0];
       if (!task) throw new HttpError(404, 'Task not found.');
       const assigned = Array.isArray(task.assigned_members) ? task.assigned_members : [];
@@ -264,7 +294,7 @@ export function registerReportRoutes(app, deps) {
 
       await notifySafe(deps, {
         projectId, entityId: entry.id, entityType: 'work_center_progress',
-        message: `A progress report on "${task.title}" (${task.activity_title}) is waiting for validation.`,
+        message: `A progress report on "${task.title}"${task.activity_title ? ` (${task.activity_title})` : ''} is waiting for validation.`,
         actorId: userId, actorRole: role, recipients: await leadersOf(deps, projectId, task.side),
       });
       return res.status(201).json({ success: true, entry, warning });
@@ -297,7 +327,7 @@ export function registerReportRoutes(app, deps) {
                to_char(p.report_date, 'YYYY-MM-DD') AS day
         FROM workspace_work_center_progress p
         JOIN workspace_work_center w ON w.id = p.task_id
-        JOIN planning_execution pe ON pe.id = w.activity_id
+        LEFT JOIN planning_execution pe ON pe.id = w.activity_id
         WHERE p.id = $1 AND w.project_id = $2
         FOR UPDATE OF p`, [req.params.progressId, projectId])).rows[0];
       if (!row) throw new HttpError(404, 'Progress entry not found.');
@@ -333,7 +363,11 @@ export function registerReportRoutes(app, deps) {
       }
 
       let result = null;
-      if (decision !== 'rejected') result = await recomputeActivity(client, row.activity_id, { dates: [row.day], actor: { id: userId, role } });
+      if (decision !== 'rejected') {
+        result = row.activity_id
+          ? await recomputeActivity(client, row.activity_id, { dates: [row.day], actor: { id: userId, role } })
+          : await recomputeStandaloneTask(client, row.task_id);
+      }
       await client.query('COMMIT');
 
       const verb = { approved: 'approved', rejected: 'rejected', voided: 'voided' }[decision];
@@ -342,8 +376,12 @@ export function registerReportRoutes(app, deps) {
         message: `Your report on "${row.task_title}" (${row.report_date instanceof Date ? row.day : row.day}) was ${verb}${notes ? `: ${notes}` : '.'}`,
         actorId: userId, actorRole: role, recipients: [deps.flowKey('TeamMember', row.member_id)],
       });
-      return res.json({ success: true, entry: updated.rows[0], activity: result && { id: row.activity_id, progress_pct: result.progress_pct, status: result.status },
-                        task: result && result.tasks.find((t) => t.id === row.task_id) });
+      return res.json({
+        success: true,
+        entry: updated.rows[0],
+        activity: row.activity_id && result ? { id: row.activity_id, progress_pct: result.progress_pct, status: result.status } : null,
+        task: result && (row.activity_id ? result.tasks.find((t) => t.id === row.task_id) : result),
+      });
     } catch (err) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       return fail(res, err, 'PUT /api/work-center-progress/:progressId/validate:');

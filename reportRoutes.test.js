@@ -217,3 +217,22 @@ test('count activity: passed items drive progress, failed cannot exceed done', a
   const d = await decide(leader, ok.body.entry.id, 'approved');
   assert.equal(d.body.activity.progress_pct, 33.33);                  // 4 passed of 12
 });
+
+test('standalone quantity task reports and approval update task progress without an activity', async () => {
+  const [task] = await q(`
+    INSERT INTO workspace_work_center
+      (project_id, title, description, assigned_members, priority, status, start_date, end_date,
+       creator_id, creator_role, side, activity_id, activity_type, target_quantity, standalone_unit, weight_pct)
+    VALUES (1,'Standalone excavation','', '[{"id":101}]'::jsonb, 'normal', 'ongoing',
+       '2026-03-01','2026-04-30',5,'ContractorPM','Contractor',NULL,'quantity',20,'m3',100)
+    RETURNING id`);
+  const submitted = await report(m(101), { taskId: task.id, reportDate: '2026-03-10', quantityDone: 10 });
+  assert.equal(submitted.status, 201, JSON.stringify(submitted.body));
+  const approved = await decide(leader, submitted.body.entry.id, 'approved');
+  assert.equal(approved.status, 200, JSON.stringify(approved.body));
+  assert.equal(approved.body.activity, null);
+  assert.equal(approved.body.task.progress_pct, 50);
+  const [stored] = await q(`SELECT activity_id, progress_pct FROM workspace_work_center WHERE id=$1`, [task.id]);
+  assert.equal(stored.activity_id, null);
+  assert.equal(Number(stored.progress_pct), 50);
+});

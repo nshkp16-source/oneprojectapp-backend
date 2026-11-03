@@ -22,7 +22,8 @@ load() {
            "$HERE/migrations/2026-11-01-activity-task-progress.sql" \
            "$HERE/migrations/2026-11-02-verification-and-milestone-link.sql" \
            "$HERE/migrations/2026-11-03-void-approved-reports.sql" \
-           "$HERE/migrations/2026-11-04-verification-reminders.sql"; do
+           "$HERE/migrations/2026-11-04-verification-reminders.sql" \
+           "$HERE/migrations/2026-11-05-standalone-work-center-tasks.sql"; do
     $PSQL -d "$DB" -f "$f" > /dev/null 2>/tmp/run-tests-load.err || { echo "Failed loading $f"; cat /tmp/run-tests-load.err; exit 1; }
   done
 }

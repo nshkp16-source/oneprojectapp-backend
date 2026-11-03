@@ -328,6 +328,21 @@ export function registerActivityRoutes(app, deps) {
          FROM workspace_work_center WHERE activity_id = $1 ORDER BY id FOR UPDATE`, [activityId])).rows;
       if (tasks.some((task) => task.start_date < start || task.end_date > end))
         throw new HttpError(409, 'Activity dates must contain the date range of every existing task.');
+      const linkedMilestone = activity.baseline_milestone_id
+        ? { kind: 'baseline', id: activity.baseline_milestone_id }
+        : activity.additional_milestone_id
+          ? { kind: 'additional', id: activity.additional_milestone_id }
+          : null;
+      if (linkedMilestone) {
+        const milestone = MILESTONE[linkedMilestone.kind];
+        const bounds = (await client.query(
+          `SELECT planned_start, planned_end FROM ${milestone.table} WHERE id = $1 AND project_id = $2::text`,
+          [linkedMilestone.id, String(projectId)])).rows[0];
+        if (bounds?.planned_start && start < dateOnly(bounds.planned_start))
+          throw new HttpError(400, `The activity cannot start before its milestone (${dateOnly(bounds.planned_start)}).`);
+        if (bounds?.planned_end && end > dateOnly(bounds.planned_end))
+          throw new HttpError(400, `The activity cannot end after its milestone (${dateOnly(bounds.planned_end)}).`);
+      }
 
       const typeChanged = type !== activity.activity_type;
       const reports = (await client.query(
@@ -464,9 +479,13 @@ export function registerActivityRoutes(app, deps) {
       if (kind) {
         const m = MILESTONE[kind];
         const ms = (await client.query(
-          `SELECT id, title, progress_source, executed, progress_pct, quantity, unit FROM ${m.table}
+          `SELECT id, title, planned_start, planned_end, progress_source, executed, progress_pct, quantity, unit FROM ${m.table}
            WHERE id = $1 AND project_id = $2::text FOR UPDATE`, [milestoneId, String(projectId)])).rows[0];
         if (!ms) throw new HttpError(400, 'That milestone does not belong to this project.');
+        if (ms.planned_start && b.start_date < dateOnly(ms.planned_start))
+          throw new HttpError(400, `The activity cannot start before its milestone (${dateOnly(ms.planned_start)}).`);
+        if (ms.planned_end && b.end_date > dateOnly(ms.planned_end))
+          throw new HttpError(400, `The activity cannot end after its milestone (${dateOnly(ms.planned_end)}).`);
         milestoneTitle = ms.title;
 
         if (drives) {
@@ -588,7 +607,10 @@ export function registerActivityRoutes(app, deps) {
                   { task_id: null, title: String(task.title).trim(), before: null, after: after[after.length - 1] }],
         progress_before: progressBefore, progress_after: progressAfter,
       };
-      if (preview) { await client.query('ROLLBACK'); return res.json({ preview: true, ...summary }); }
+      const visibleSummary = side === 'Client'
+        ? { ...summary, weights: summary.weights.map((row, i) => ({ ...row, title: row.task_id == null ? row.title : `Task ${i + 1}` })) }
+        : summary;
+      if (preview) { await client.query('ROLLBACK'); return res.json({ preview: true, ...visibleSummary }); }
 
       const needsTarget = act.activity_type === 'quantity' || act.activity_type === 'count';
       const planned = Number(act.planned_quantity);
@@ -617,7 +639,7 @@ export function registerActivityRoutes(app, deps) {
       await client.query('COMMIT');
       notifyAssigned(deps, { projectId: act.project_id, userId, role }, act.title,
         [{ ...created, assigned_members: parseJson(created.assigned_members, [], 'assigned_members') }]).catch(() => {});
-      return res.status(201).json({ success: true, task: created, ...summary });
+      return res.status(201).json({ success: true, task: created, ...visibleSummary });
     } catch (err) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       return fail(res, err, 'POST /api/planning-execution/:activityId/tasks:');

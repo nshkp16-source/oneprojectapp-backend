@@ -48,7 +48,7 @@ before(async () => {
   await pool.query(`INSERT INTO team_members (id, email) VALUES (101,'a@x'),(102,'b@x'),(201,'k@x')`);
   await pool.query(`INSERT INTO team_member_assignments (project_id, team_member_id, assigned_by, assigned_part) VALUES (1,101,5,'Contractor'),(1,102,5,'Contractor'),(1,201,8,'Consultant')`);
   await pool.query(`INSERT INTO project_schedules (id, project_id, planned_start, planned_finish) VALUES (1,'1','2026-01-01','2026-12-31')`);
-  await pool.query(`INSERT INTO milestones (id, schedule_id, project_id, title, planned_start, planned_end, quantity, unit) VALUES (1,1,'1','Foundation','2026-01-01','2026-03-01',400,'m3')`);
+  await pool.query(`INSERT INTO milestones (id, schedule_id, project_id, title, planned_start, planned_end, quantity, unit) VALUES (1,1,'1','Foundation','2026-01-01','2026-05-01',400,'m3')`);
   server = app.listen(0); base = `http://127.0.0.1:${server.address().port}`;
 });
 after(async () => { server.close(); await pool.end(); });

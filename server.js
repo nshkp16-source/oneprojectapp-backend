@@ -7994,10 +7994,8 @@ registerReportRoutes(app, progressModelDeps);
 registerVerificationRoutes(app, progressModelDeps);
 registerMilestoneRoutes(app, progressModelDeps);
 
-// Tasks now belong to an activity and carry a weight, so the old create route is replaced.
-app.post('/api/work-center', authenticateToken, (_req, res) => res.status(410).json({
-  error: 'Tasks are now created with their activity (POST /api/planning-execution/create-with-tasks) or added to an existing activity (POST /api/planning-execution/:activityId/tasks).',
-}));
+// Keep the later Work Center route available for standalone tasks.
+app.post('/api/work-center', authenticateToken, (_req, _res, next) => next());
 
 // Friendly refusals instead of database errors. next() hands over to the original handler when nothing blocks.
 app.delete('/api/planning-execution/:activityId', authenticateToken, async (req, res, next) => {
@@ -8613,16 +8611,17 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
             WHERE v.task_id = w.id AND v.viewer_id = $2
           )                                                          AS is_viewed,
           pe.title       AS activity_title,
-          pe.status      AS activity_status,
+          COALESCE(pe.status, 'not_yet_started') AS activity_status,
           pe.start_date  AS activity_start_date,
           pe.end_date    AS activity_end_date,
-          pe.activity_type                                           AS activity_type,
-          pe.unit                                                    AS activity_unit,
+          COALESCE(w.activity_type, pe.activity_type)                AS activity_type,
+          COALESCE(w.standalone_unit, pe.unit)                       AS activity_unit,
           pe.certified_progress_pct                                  AS activity_certified_progress,
           COALESCE((SELECT json_agg(json_build_object('id', s.id, 'seq', s.seq, 'title', s.title, 'weight_pct', s.weight_pct,
                       'is_hold_point', s.is_hold_point, 'completed_at', s.completed_at, 'hold_verified_at', s.hold_verified_at) ORDER BY s.seq)
                     FROM task_stages s WHERE s.task_id = w.id), '[]'::json) AS stages,
-          CASE WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
+          CASE WHEN w.activity_id IS NULL THEN w.progress_pct
+               WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
              ELSE COALESCE((SELECT t.progress_pct FROM planning_execution_tracking t WHERE t.activity_id = pe.id
                             ORDER BY t.report_date DESC, t.created_at DESC LIMIT 1), 0) END                                                      AS activity_progress
         FROM workspace_work_center w
@@ -8643,16 +8642,17 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
             WHERE v.task_id = w.id AND v.viewer_id = $2
           )                                                          AS is_viewed,
           pe.title       AS activity_title,
-          pe.status      AS activity_status,
+          COALESCE(pe.status, 'not_yet_started') AS activity_status,
           pe.start_date  AS activity_start_date,
           pe.end_date    AS activity_end_date,
-          pe.activity_type                                           AS activity_type,
-          pe.unit                                                    AS activity_unit,
+          COALESCE(w.activity_type, pe.activity_type)                AS activity_type,
+          COALESCE(w.standalone_unit, pe.unit)                       AS activity_unit,
           pe.certified_progress_pct                                  AS activity_certified_progress,
           COALESCE((SELECT json_agg(json_build_object('id', s.id, 'seq', s.seq, 'title', s.title, 'weight_pct', s.weight_pct,
                       'is_hold_point', s.is_hold_point, 'completed_at', s.completed_at, 'hold_verified_at', s.hold_verified_at) ORDER BY s.seq)
                     FROM task_stages s WHERE s.task_id = w.id), '[]'::json) AS stages,
-          CASE WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
+          CASE WHEN w.activity_id IS NULL THEN w.progress_pct
+               WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
              ELSE COALESCE((SELECT t.progress_pct FROM planning_execution_tracking t WHERE t.activity_id = pe.id
                             ORDER BY t.report_date DESC, t.created_at DESC LIMIT 1), 0) END                                                      AS activity_progress
         FROM workspace_work_center w
@@ -8712,84 +8712,90 @@ app.post('/api/work-center', authenticateToken,
       return res.status(403).json({ error: 'Only leaders and PMs can create tasks.' });
 
     const side = wcSide(role);
+    const b = req.body || {};
+    const projectId = parseInt(b.projectId, 10);
+    const title = String(b.title || '').trim();
+    const startDate = validDate(b.start_date);
+    const endDate = validDate(b.end_date);
+    const type = String(b.activity_type || '');
+    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!title) return res.status(400).json({ error: 'title is required.' });
+    if (!startDate || !endDate || endDate < startDate)
+      return res.status(400).json({ error: 'Enter valid task dates with the end date on or after the start date.' });
+    const projectSide = await resolveSide(role, user_id, projectId);
+    if (!projectSide || projectSide !== side)
+      return res.status(403).json({ error: 'You are not a member of this project on your side.' });
+    if (b.activity_id) return res.status(400).json({
+      error: 'Linked tasks must be added through POST /api/planning-execution/:activityId/tasks.'
+    });
+    if (!['quantity', 'count', 'stages', 'percentage'].includes(type))
+      return res.status(400).json({ error: 'activity_type must be quantity, count, stages, or percentage.' });
 
-    const {
-      projectId,
-      title,
-      description  = '',
-      work_package = '',
-      assigned_members,
-      priority     = 'normal',
-      status       = 'ongoing',
-      start_date,
-      end_date,
-      activity_id  = null,
-    } = req.body;
+    const planned = b.planned_quantity === '' || b.planned_quantity == null ? null : Number(b.planned_quantity);
+    const unit = String(b.unit || '').trim() || null;
+    if (['quantity', 'count'].includes(type) && !(planned > 0))
+      return res.status(400).json({ error: 'planned_quantity must be above 0 for quantity and count tasks.' });
+    if (['quantity', 'count'].includes(type) && !unit)
+      return res.status(400).json({ error: 'unit is required for quantity and count tasks.' });
+    if (type === 'count' && !Number.isInteger(planned))
+      return res.status(400).json({ error: 'The planned count must be a whole number.' });
 
-    if (!projectId)              return res.status(400).json({ error: 'projectId is required.' });
-    if (!title?.trim())          return res.status(400).json({ error: 'title is required.' });
-    if (!start_date)             return res.status(400).json({ error: 'start_date is required.' });
-    if (!end_date)               return res.status(400).json({ error: 'end_date is required.' });
-    if (!['low','normal','high'].includes(priority))
-      return res.status(400).json({ error: 'priority must be low, normal, or high.' });
-    if (!['ongoing','completed','closed'].includes(status))
-      return res.status(400).json({ error: 'status must be ongoing, completed, or closed.' });
-
-    let members = [];
-    try { members = JSON.parse(assigned_members || '[]'); }
+    let members;
+    try { members = typeof b.assigned_members === 'string' ? JSON.parse(b.assigned_members) : b.assigned_members; }
     catch { return res.status(400).json({ error: 'assigned_members must be valid JSON.' }); }
-    if (!members.length)
+    if (!Array.isArray(members) || !members.length)
       return res.status(400).json({ error: 'At least one team member must be assigned.' });
-
-    // Verify all members belong to the same side
-    const memberIds = members.map(m => parseInt(m.id, 10)).filter(Boolean);
+    const memberIds = [...new Set(members.map((m) => parseInt(m.id, 10)).filter(Boolean))];
+    if (memberIds.length !== members.length)
+      return res.status(400).json({ error: 'Assigned team members must be valid and unique.' });
     const check = await pool.query(
       `SELECT COUNT(*) AS cnt FROM team_member_assignments
        WHERE project_id = $1 AND team_member_id = ANY($2::int[]) AND assigned_part = $3`,
-      [projectId, memberIds, side]
-    );
+      [projectId, memberIds, side]);
     if (parseInt(check.rows[0].cnt, 10) !== memberIds.length)
-      return res.status(403).json({
-        error: 'One or more assigned members do not belong to your side.'
-      });
+      return res.status(403).json({ error: 'One or more assigned members do not belong to your side.' });
 
-    // Validate activity_id belongs to the same side and project
-    let resolvedActivityId = null;
-    if (activity_id) {
-      const actCheck = await pool.query(
-        `SELECT id FROM planning_execution
-         WHERE id = $1 AND project_id = $2 AND side = $3`,
-        [activity_id, projectId, side]
-      );
-      if (actCheck.rows.length) resolvedActivityId = activity_id;
+    let stages = [];
+    try { stages = typeof b.stages === 'string' ? JSON.parse(b.stages || '[]') : (b.stages || []); }
+    catch { return res.status(400).json({ error: 'stages must be valid JSON.' }); }
+    if (type === 'stages') {
+      if (!Array.isArray(stages) || !stages.length || stages.some((s) => !String(s.title || '').trim()))
+        return res.status(400).json({ error: 'A stages task needs at least one stage with a title.' });
+      if (stages.some((stage) => stage.is_hold_point))
+        return res.status(400).json({ error: 'Hold points require a linked activity and cannot be used on a standalone task.' });
+      const weights = stages.map((s) => Number(s.weight_pct));
+      if (weights.some((w) => !(w > 0) || w > 100) ||
+          weights.reduce((sum, weight) => sum + Math.round(weight * 100), 0) !== 10000)
+        return res.status(400).json({ error: 'Stage weights must be above 0 and add up to exactly 100.' });
+    } else if (stages.length) {
+      return res.status(400).json({ error: 'Stages can only be supplied for a stages task.' });
     }
 
-    let linkedFileName = null, linkedFileId = null, linkedFileUrl = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(
-        req.file.buffer, req.file.originalname, 'work_center/tasks'
-      );
-      linkedFileName = req.file.originalname;
-      linkedFileId   = uploaded.public_id;
-      linkedFileUrl  = uploaded.secure_url;
-    }
-
-    const result = await pool.query(`
-      INSERT INTO workspace_work_center
-        (project_id, title, description, work_package, assigned_members,
-         priority, status, start_date, end_date,
-         linked_file_name, linked_file_id, linked_file_url,
-         creator_id, creator_role, side, activity_id)
-      VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-      RETURNING *
-    `, [
-      projectId, title.trim(), description, work_package,
-      JSON.stringify(members), priority, status, start_date, end_date,
-      linkedFileName, linkedFileId, linkedFileUrl,
-      user_id, role, side, resolvedActivityId,
-    ]);
-
-    return res.status(201).json({ success: true, task: result.rows[0] });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(`
+        INSERT INTO workspace_work_center
+          (project_id, title, description, assigned_members, priority, status, start_date, end_date,
+           creator_id, creator_role, side, activity_id, activity_type, target_quantity, standalone_unit, weight_pct)
+        VALUES ($1,$2,$3,$4::jsonb,'normal','ongoing',$5,$6,$7,$8,$9,NULL,$10,$11,$12,100)
+        RETURNING *`,
+      [projectId, title, String(b.description || ''), JSON.stringify(members), startDate, endDate,
+       user_id, role, side, type, planned, unit]);
+      const task = result.rows[0];
+      for (let i = 0; i < stages.length; i++) {
+        const stage = stages[i];
+        await client.query(
+          `INSERT INTO task_stages (task_id, project_id, seq, title, weight_pct, is_hold_point)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [task.id, projectId, i + 1, String(stage.title).trim(), Number(stage.weight_pct), !!stage.is_hold_point]);
+      }
+      await client.query('COMMIT');
+      return res.status(201).json({ success: true, task });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally { client.release(); }
   } catch (err) {
     console.error('POST /api/work-center:', err);
     return res.status(500).json({ error: 'Server error.' });

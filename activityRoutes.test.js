@@ -46,13 +46,28 @@ before(async () => {
   await pool.query(`INSERT INTO team_member_assignments (project_id, team_member_id, assigned_by, assigned_part) VALUES (1,101,5,'Contractor'),(1,102,5,'Contractor'),(1,103,5,'Contractor'),(1,201,8,'Consultant')`);
   await pool.query(`INSERT INTO project_schedules (id, project_id, planned_start, planned_finish) VALUES (1,'1','2026-01-01','2026-12-31')`);
   await pool.query(`INSERT INTO milestones (id, schedule_id, project_id, title, planned_start, planned_end, quantity, unit, executed, progress_pct) VALUES
-    (1,1,'1','Foundation','2026-01-01','2026-03-01',400,'m3',120,30),(2,1,'1','Walls','2026-03-02','2026-05-01',100,'m2',0,0)`);
+    (1,1,'1','Foundation','2026-01-01','2026-05-01',400,'m3',120,30),(2,1,'1','Walls','2026-03-02','2026-05-01',100,'m2',0,0)`);
   await pool.query(`INSERT INTO milestone_progress_entries (milestone_id, project_id, report_date, qty_executed, cumulative_after_entry, progress_pct_after_entry) VALUES (1,'1','2026-01-10',120,120,30)`);
   server = app.listen(0); base = `http://127.0.0.1:${server.address().port}`;
 });
 after(async () => { server.close(); await pool.end(); });
 
 let actA, actB;
+
+test('activity dates must stay inside the selected milestone period', async () => {
+  const before = await call('POST', '/api/planning-execution/create-with-tasks', contractor, {
+    ...base1, title: 'Too early', start_date: '2025-12-31', baseline_milestone_id: 1,
+    tasks: [{ title: 'Work', assigned_members: members }],
+  });
+  assert.equal(before.status, 400);
+  assert.match(before.body.error, /cannot start before its milestone/);
+  const after = await call('POST', '/api/planning-execution/create-with-tasks', contractor, {
+    ...base1, title: 'Too late', end_date: '2026-05-02', baseline_milestone_id: 1,
+    tasks: [{ title: 'Work', assigned_members: members }],
+  });
+  assert.equal(after.status, 400);
+  assert.match(after.body.error, /cannot end after its milestone/);
+});
 
 test('linking to a milestone with typed progress asks for confirmation and writes nothing', async () => {
   const before = (await q(`SELECT COUNT(*)::int n FROM planning_execution`))[0].n;

@@ -15,7 +15,7 @@ This repository contains the backend application and the activity, task, report,
 | `notificationTarget.js` | Authenticated workflow notification target resolution. |
 | `verificationReminderJob.js` | Scheduled overdue verification notifications. |
 | `docRules.js`, `stamp-renderer.js` | Unchanged copies of your files, so this folder runs on its own. |
-| `migrations/` | The four SQL migrations, in order. |
+| `migrations/` | The dated SQL migrations, in order. |
 | `*.test.js`, `run-tests.sh` | Backend tests and a script that runs them on a scratch database. |
 
 ## Step 1: back up, then migrate a COPY first
@@ -23,11 +23,12 @@ This repository contains the backend application and the activity, task, report,
 1. Make a backup of your database. The migrations convert existing data and are not reversible, so the backup is your way back.
 2. Restore that backup into a scratch database and apply, in this order:
    `migrations/2026-11-01-activity-task-progress.sql`, `2026-11-02-verification-and-milestone-link.sql`,
-   `2026-11-03-void-approved-reports.sql`, then `migrations/2026-11-04-verification-reminders.sql`.
+   `2026-11-03-void-approved-reports.sql`, `migrations/2026-11-04-verification-reminders.sql`,
+   then `migrations/2026-11-05-standalone-work-center-tasks.sql`.
 3. Look at the notice printed by the first migration. It says how many tasks were moved under "General works (migrated)" and how many activities became the percentage type.
-4. Only when the copy looks right, apply the same four files to the real database.
+4. Only when the copy looks right, apply the same five files to the real database.
 
-What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified.
+What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified. The fifth migration allows new Work Center tasks without a parent activity and stores their own progress type, target, unit, or stages.
 
 ## Step 2: run the tests
 
@@ -47,7 +48,7 @@ Deploy this repository's `server.js` together with its imported route modules an
 
 1. Imports for the four route modules.
 2. A registration block just before the first planning-execution route. Because it comes first, the new `POST /api/work-center-progress` and `PUT /api/work-center-progress/:progressId/validate` answer instead of the old ones (same paths).
-3. `POST /api/work-center` (old task creation) now answers 410 with a message. Tasks are created with their activity or added to one.
+3. `POST /api/work-center` creates standalone tasks. Linked tasks are created with an activity or added through the activity task route.
 4. Delete guards: an activity with tasks or verification history, and a task with approved reports, answer 409 with a clear message instead of a database error.
 5. `POST /api/report-progress` and `POST /api/report-additional-progress` now check `canEditSchedule` (they had no role check) and refuse typed entry on a milestone that takes its progress from activities.
 6. `POST /api/complete-milestone` also runs the new completion check for derived milestones.
