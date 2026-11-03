@@ -18,6 +18,9 @@ import { registerActivityRoutes } from './activityRoutes.js';
 import { registerReportRoutes } from './reportRoutes.js';
 import { registerVerificationRoutes } from './verificationRoutes.js';
 import { registerMilestoneRoutes, milestoneCompletionCheck, typedProgressBlockedReason } from './milestoneRoutes.js';
+import { delayDays } from './progressRules.js';
+import { resolveNotificationTarget } from './notificationTarget.js';
+import { sendOverdueVerificationReminders } from './verificationReminderJob.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -7938,6 +7941,37 @@ async function resolveSide(role, user_id, projectId) {
   return r.rows.length ? r.rows[0].assigned_part : null;
 }
 
+app.get('/api/notifications/target', authenticateToken, async (req, res) => {
+  try {
+    const { user_id: userId, role } = req.user;
+    const userRole = normalizeRole(role);
+    const projectId = Number(req.query.projectId);
+    const entityId = Number(req.query.entityId);
+    const entityType = String(req.query.entityType || '');
+    if (!Number.isSafeInteger(projectId) || projectId <= 0 ||
+        !Number.isSafeInteger(entityId) || entityId <= 0 || !entityType) {
+      return res.status(400).json({ error: 'projectId, entityType and entityId are required.' });
+    }
+
+    const membership = await pool.query(
+      `SELECT 1 FROM assignments_view
+       WHERE project_id = $1 AND role_id = $2 AND role = $3 LIMIT 1`,
+      [projectId, userId, userRole],
+    );
+    if (!membership.rows.length)
+      return res.status(403).json({ error: 'You are not a member of this project.' });
+    const viewerSide = await resolveSide(userRole, userId, projectId);
+    if (!viewerSide) return res.status(403).json({ error: 'You are not a member of this project.' });
+    const target = await resolveNotificationTarget({
+      pool, projectId, entityType, entityId, userId, role: userRole, viewerSide,
+    });
+    if (!target) return res.status(404).json({ error: 'The notification target is no longer available to you.' });
+    return res.json({ target });
+  } catch (err) {
+    console.error('GET /api/notifications/target:', err);
+    return res.status(500).json({ error: 'Unable to resolve this notification target.' });
+  }
+});
 
 // =============================================================================
 //  PLANNING & EXECUTION ROUTES
@@ -8035,6 +8069,8 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
 
     const result = await pool.query(`
       SELECT id, title, milestone_name, status, start_date, end_date,
+             to_char(end_date, 'YYYY-MM-DD') AS planned_end,
+             to_char(actual_end, 'YYYY-MM-DD') AS actual_finish,
              planned_quantity, unit,
              activity_type, progress_pct, certified_progress_pct, certified_at, baseline_milestone_id, additional_milestone_id, drives_milestone,
              -- recommended (latest entry only):
@@ -8052,7 +8088,16 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
       ORDER  BY milestone_name ASC NULLS LAST, created_at DESC
     `, [projectId, side]);
 
-    return res.json({ records: result.rows, activities: result.rows });
+    const records = result.rows.map((row) => {
+      const { planned_end, actual_finish, ...activity } = row;
+      activity.calculated_delay_days = delayDays({
+        plannedEnd: planned_end,
+        actualEnd: actual_finish,
+        status: activity.status,
+      });
+      return activity;
+    });
+    return res.json({ records, activities: records });
   } catch (err) {
     console.error('GET /api/planning-execution:', err);
     return res.status(500).json({ error: 'Server error.' });
@@ -8316,6 +8361,9 @@ app.get('/api/planning-execution-tracking', authenticateToken, async (req, res) 
     const result = await pool.query(`
       SELECT
         t.*,
+        to_char(pe.end_date, 'YYYY-MM-DD') AS planned_end,
+        to_char(pe.actual_end, 'YYYY-MM-DD') AS actual_end,
+        pe.status AS activity_status,
         CASE WHEN pe.planned_quantity > 0
           THEN LEAST(100, (t.actual_quantity / pe.planned_quantity) * 100)
           ELSE 0 END AS daily_progress_pct,
@@ -8329,7 +8377,16 @@ app.get('/api/planning-execution-tracking', authenticateToken, async (req, res) 
       ORDER BY t.report_date ASC, t.created_at ASC
     `, [activityId]);
 
-    return res.json({ entries: result.rows });
+    const entries = result.rows.map((row) => {
+      const { planned_end, actual_end, activity_status, delay_reason: _legacyDelayReason, ...entry } = row;
+      entry.delay_days = delayDays({
+        plannedEnd: planned_end,
+        actualEnd: actual_end,
+        status: activity_status,
+      });
+      return entry;
+    });
+    return res.json({ entries });
   } catch (err) {
     console.error('GET /api/planning-execution-tracking:', err);
     return res.status(500).json({ error: 'Server error.' });
@@ -8356,26 +8413,25 @@ app.post('/api/planning-execution-tracking', authenticateToken,
       progress_pct            = '0',
       day_remark              = '',
       issues                  = '',
-      delay_days              = '0',
-      delay_reason            = '',
       status_change_to_closed = '0',
     } = req.body;
 
     if (!projectId)           return res.status(400).json({ error: 'projectId is required.' });
     if (!activity_id)         return res.status(400).json({ error: 'activity_id is required.' });
     if (!report_date)         return res.status(400).json({ error: 'report_date is required.' });
+    const normalizedReportDate = validDate(report_date);
+    if (!normalizedReportDate) return res.status(400).json({ error: 'report_date must be a valid date.' });
     if (!actual_quantity)     return res.status(400).json({ error: 'actual_quantity is required.' });
     if (!day_remark.trim())   return res.status(400).json({ error: 'day_remark is required.' });
 
     const pct   = parseFloat(progress_pct);
-    const delay = parseInt(delay_days, 10);
-    if (isNaN(pct)   || pct < 0   || pct > 100)
+    if (isNaN(pct) || pct < 0 || pct > 100)
       return res.status(400).json({ error: 'progress_pct must be 0–100.' });
-    if (isNaN(delay) || delay < 0)
-      return res.status(400).json({ error: 'delay_days must be 0 or more.' });
 
     const actCheck = await pool.query(
-      `SELECT id, creator_id, unit AS planned_unit
+      `SELECT id, creator_id, unit AS planned_unit, status,
+              to_char(end_date, 'YYYY-MM-DD') AS planned_end,
+              to_char(actual_end, 'YYYY-MM-DD') AS actual_end
        FROM planning_execution WHERE id = $1 AND project_id = $2`,
       [activity_id, projectId]
     );
@@ -8385,6 +8441,12 @@ app.post('/api/planning-execution-tracking', authenticateToken,
       return res.status(403).json({
         error: 'Only the creating leader can log execution entries.'
       });
+    const markClosed = status_change_to_closed === '1' || status_change_to_closed === true;
+    const delay = delayDays({
+      plannedEnd: actCheck.rows[0].planned_end,
+      actualEnd: markClosed ? normalizedReportDate : actCheck.rows[0].actual_end,
+      status: markClosed ? 'closed' : actCheck.rows[0].status,
+    });
     const existingEntry = await pool.query(
       `SELECT id FROM planning_execution_tracking
        WHERE activity_id=$1 AND report_date=$2 LIMIT 1`,
@@ -8403,8 +8465,6 @@ app.post('/api/planning-execution-tracking', authenticateToken,
       attachmentUrl  = uploaded.secure_url;
     }
 
-    const markClosed = status_change_to_closed === '1' || status_change_to_closed === true;
-
     const result = await pool.query(`
       INSERT INTO planning_execution_tracking
         (activity_id, report_date, actual_quantity, unit,
@@ -8413,14 +8473,13 @@ app.post('/api/planning-execution-tracking', authenticateToken,
          delay_days, delay_reason, status_change_to_closed,
          attachment_name, attachment_id, attachment_url,
          logged_by, logged_by_role)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,$12,$13,$14,$15,$16,$17)
       RETURNING *
     `, [
-      activity_id, report_date, actual_quantity,
+      activity_id, normalizedReportDate, actual_quantity,
       unit || actCheck.rows[0].planned_unit,
       manpower_used, equipment_used, materials_used,
-      pct, day_remark.trim(), issues,
-      delay, delay_reason, markClosed,
+      pct, day_remark.trim(), issues, delay, markClosed,
       attachmentName, attachmentId, attachmentUrl,
       user_id, role,
     ]);
@@ -8428,8 +8487,8 @@ app.post('/api/planning-execution-tracking', authenticateToken,
     // ── Auto-update activity status based on entry ────────────────────────────
     if (markClosed) {
       await pool.query(
-        `UPDATE planning_execution SET status = 'closed' WHERE id = $1`,
-        [activity_id]
+        `UPDATE planning_execution SET status = 'closed', actual_end = COALESCE(actual_end, $2) WHERE id = $1`,
+        [activity_id, normalizedReportDate]
       );
     } else if (pct >= 100) {
       await pool.query(
@@ -10809,6 +10868,11 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 
 setTimeout(() => {
+  const runVerificationReminders = () => sendOverdueVerificationReminders({
+    pool, notifyRecordUsers, flowKey, normalizeRole,
+  });
+  runVerificationReminders();
+  setInterval(runVerificationReminders, 15 * 60 * 1000);
   sendDueMeetingReminders();
   setInterval(sendDueMeetingReminders, 15 * 60 * 1000);
 }, 30 * 1000);

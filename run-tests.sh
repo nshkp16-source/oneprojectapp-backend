@@ -31,7 +31,8 @@ FAILED=0
 node --test \
   "$HERE/progressRules.test.js" "$HERE/workflow-dashboard.test.js" \
   "$HERE/project-resolution.test.js" "$HERE/activity-form-v2.test.js" \
-  "$HERE/wc-reports-v2.test.js" "$HERE/wc-views.test.js" || FAILED=1
+  "$HERE/wc-reports-v2.test.js" "$HERE/wc-views.test.js" \
+  "$HERE/notificationTarget.test.js" "$HERE/verificationReminderJob.test.js" || FAILED=1
 for t in activityRoutes reportRoutes verificationRoutes milestoneRoutes; do
   $PSQL -d "$ADMIN_DB" -c "DROP DATABASE IF EXISTS $DB" -c "CREATE DATABASE $DB"
   load

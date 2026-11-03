@@ -1,17 +1,19 @@
 # Activity, task, report and verification model
 
-These modules implement the backend half of the redesign. The active application entry point is the root `server.js`, which imports the route modules from this folder. `backend/server.js` is a separate server snapshot; do not copy it over the root server without reviewing its unrelated differences.
+This repository contains the backend application and the activity, task, report, verification, and milestone redesign. `server.js` is the backend entry point and imports the route modules from this repository.
 
 ## What is in this folder
 
 | File | What it is |
 |---|---|
-| `server.js` | A packaged server snapshot; the active root server is `../server.js`. |
+| `server.js` | Backend application entry point. |
 | `progressRules.js` | Pure rules: weights, progress per activity type, claimed and certified progress, milestone derivation, delay. |
 | `activityRoutes.js` | Create/edit activities, create/add tasks with a weight preview, milestone sync. |
 | `reportRoutes.js` | Member reports, leader approval, rejection and voiding, automatic recompute, close-out export. |
 | `verificationRoutes.js` | Verification requests, inspector and leader answers, rework and snags, completion certification. |
 | `milestoneRoutes.js` | Breakdown request, consultant's temporary value, milestone progress detail, completion check. |
+| `notificationTarget.js` | Authenticated workflow notification target resolution. |
+| `verificationReminderJob.js` | Scheduled overdue verification notifications. |
 | `docRules.js`, `stamp-renderer.js` | Unchanged copies of your files, so this folder runs on its own. |
 | `migrations/` | The four SQL migrations, in order. |
 | `*.test.js`, `run-tests.sh` | Backend tests and a script that runs them on a scratch database. |
@@ -35,11 +37,11 @@ The tests need a THROWAWAY PostgreSQL database. The script drops and recreates i
     PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=yourpassword \
     bash ./run-tests.sh
 
-`SCHEMA_DIR` must contain `completely_schema.sql`, `run_after_completely.sql` and your dated migrations. Install the root project's dependencies first; `jsdom` and `acorn` are used by the dashboard tests. Expected last line: `ALL TESTS PASSED`.
+`SCHEMA_DIR` must contain `completely_schema.sql`, `run_after_completely.sql` and your dated migrations. Install this backend repository's dependencies first; `jsdom` and `acorn` are used by the dashboard tests. Expected last line: `ALL TESTS PASSED`.
 
-## Step 3: deploy the application
+## Step 3: deploy the backend
 
-Deploy the root `server.js` together with the route modules, `progressRules.js`, and `stamp-renderer.js` in this folder. The dashboard also loads `backend/activity-form-v2.js` and `backend/workflow-dashboard.js` as relative static assets, so keep those URLs available from the dashboard host. The root `server.js` imports `backend/stamp-renderer.js`; do not replace it with this folder's separate server snapshot.
+Deploy this repository's `server.js` together with its imported route modules and support files. The dashboard is hosted separately; deploy its UI assets with the frontend rather than treating them as backend server files.
 
 ## What was patched in server.js
 
@@ -53,6 +55,9 @@ Deploy the root `server.js` together with the route modules, `progressRules.js`,
 8. The three average-based activity progress queries now use the weighted progress when the activity has tasks, and the latest entry otherwise.
 9. The simple activity list returns the new columns.
 10. The execution-log route and the activity update route answer 409 (not 500) when a database rule refuses, for example closing a contractor activity that the consultant has not certified.
+11. Workflow notifications resolve to their activity, task, verification, or milestone destination after project-membership and entity access checks.
+12. Execution-entry delay values are calculated from the activity's planned end and actual finish (or the current date while open); submitted delay values are ignored.
+13. Pending verification requests past their response date notify consultant leaders and pending inspectors once per day.
 
 ## Try it by hand
 
@@ -107,13 +112,13 @@ Use the JWT your app issues at login. Replace the ids and tokens.
 ## Dashboard status
 
 - Implemented in the dashboard: activity creation and task breakdown; activity cards with task weights/progress and Add Task; activity-type-specific member reports; leader approval/rejection and approved-report voiding; verification requests, inspector recommendations, consultant decisions, rework/snags; linked-milestone progress, breakdown requests and temporary values; activity-plan editing; client-safe activity views; close-out CSV download; calculated delay; overdue verification reminders; and workflow notification deep links.
-- The member report and workflow screens are loaded from `backend/workflow-dashboard.js`. The Vercel frontend copy is at `frontend/backend/workflow-dashboard.js`. Their APIs enforce roles and calculate progress server-side.
+- The member report and workflow screens use `workflow-dashboard.js`; frontend hosting and deployment are separate from this backend repository.
 - Activity-driven milestones show certified activity breakdown, coverage, temporary values and breakdown requests in the schedule detail. Typed progress entry is disabled for those milestones.
 
 ## Not built yet
 
 - Authenticated real-browser and database verification. Apply migrations to a backup/test database first; production data has not been changed or tested here.
-- The deployed Vercel project must be updated from this workspace before the new frontend behavior is live.
+- Frontend deployment is separate and was not performed as part of this backend work.
 
 ## Known limits
 

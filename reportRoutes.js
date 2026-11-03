@@ -117,7 +117,6 @@ export async function recomputeActivity(client, activityId, { dates = [], actor 
       plannedEnd: DATE(act.end_date),
       actualEnd: DATE(act.actual_end),
       status: act.status,
-      today: new Date(`${day}T00:00:00.000Z`),
     });
     await client.query(`
       INSERT INTO planning_execution_tracking
@@ -368,10 +367,10 @@ export function registerReportRoutes(app, deps) {
       const rows = (await pool.query(`
         SELECT pe.id AS activity_id, pe.title AS activity_title, pe.activity_type,
                CASE WHEN $2::boolean THEN NULL ELSE pe.status END AS status,
+               pe.status AS delay_status,
                to_char(pe.start_date, 'YYYY-MM-DD') AS start_date,
                to_char(pe.end_date, 'YYYY-MM-DD') AS end_date,
-               CASE WHEN pe.actual_end IS NOT NULL THEN GREATEST(pe.actual_end - pe.end_date, 0)
-                    ELSE GREATEST(CURRENT_DATE - pe.end_date, 0) END AS calculated_delay_days,
+               to_char(pe.actual_end, 'YYYY-MM-DD') AS actual_end,
                pe.planned_quantity, pe.unit,
                CASE WHEN $2::boolean THEN pe.certified_progress_pct ELSE pe.progress_pct END AS activity_progress_pct,
                CASE WHEN $2::boolean THEN NULL ELSE w.title END AS task_title,
@@ -396,6 +395,14 @@ export function registerReportRoutes(app, deps) {
         ) v ON true
         WHERE pe.project_id = $1 AND pe.side = $3
         ORDER BY pe.start_date, pe.id, w.id`, [projectId, clientReport, reportSide])).rows;
+      const reportRows = rows.map((row) => ({
+        ...row,
+        calculated_delay_days: delayDays({
+          plannedEnd: row.end_date,
+          actualEnd: row.actual_end,
+          status: row.delay_status,
+        }),
+      }));
       const headers = [
         'Activity ID', 'Activity', 'Type', 'Status', 'Start date', 'End date',
         'Planned quantity', 'Unit', 'Activity progress (%)', 'Calculated delay (days)', 'Task', 'Task share (%)',
@@ -407,7 +414,7 @@ export function registerReportRoutes(app, deps) {
         if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
         return `"${text.replace(/"/g, '""')}"`;
       };
-      const csv = [headers, ...rows.map((row) => [
+      const csv = [headers, ...reportRows.map((row) => [
         row.activity_id, row.activity_title, row.activity_type, row.status, row.start_date, row.end_date,
         row.planned_quantity, row.unit, row.activity_progress_pct, row.calculated_delay_days, row.task_title, row.task_weight_pct,
         row.task_target_quantity, row.task_progress_pct, row.approved_report_count, row.approved_quantity,

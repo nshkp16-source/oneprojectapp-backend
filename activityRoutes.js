@@ -16,7 +16,7 @@
 
 import {
   ACTIVITY_TYPES, splitEqual, weightsValid, rebalanceForNew,
-  activityProgress, milestoneDerivedProgress, milestoneCoverage, effectiveMilestoneProgress,
+  activityProgress, milestoneDerivedProgress, milestoneCoverage, effectiveMilestoneProgress, delayDays,
 } from './progressRules.js';
 
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !Number.isNaN(Date.parse(String(v)));
@@ -235,12 +235,15 @@ export function registerActivityRoutes(app, deps) {
                 planned_quantity, unit, status, activity_type, done_when, planned_work,
                 planned_manpower, planned_equipment, planned_materials, progress_pct,
                 certified_progress_pct, certified_at, baseline_milestone_id, additional_milestone_id,
-                drives_milestone, milestone_weight_pct,
-                CASE WHEN status = 'closed' THEN GREATEST(COALESCE(actual_end, end_date) - end_date, 0)
-                     ELSE GREATEST(CURRENT_DATE - end_date, 0) END AS calculated_delay_days
+                drives_milestone, milestone_weight_pct, actual_end
          FROM planning_execution WHERE id = $1 AND project_id = $2`,
         [activityId, projectId])).rows[0];
       if (!activity) throw new HttpError(404, 'Activity not found.');
+      activity.calculated_delay_days = delayDays({
+        plannedEnd: dateOnly(activity.end_date),
+        actualEnd: dateOnly(activity.actual_end),
+        status: activity.status,
+      });
 
       let viewerSide = wcSide(role);
       if (!viewerSide && role === 'TeamMember') {

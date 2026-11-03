@@ -1,4 +1,4 @@
--- Store the last overdue reminder so the scheduled job sends one notification per request.
+-- Store the last overdue reminder so the scheduled job can notify once per day.
 BEGIN;
 
 ALTER TABLE activity_verifications
