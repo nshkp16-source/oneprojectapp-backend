@@ -48,6 +48,17 @@ test('a team member cannot open another member work-center notification', async 
   }), null);
 });
 
+test('a task query notification opens the task queries for its addressed member', async () => {
+  const pool = mockPool([{
+    sql: 'FROM work_center_queries',
+    rows: [{ task_id: 17, recipient_id: 8, side: 'Contractor', assigned_members: [{ id: 8 }] }],
+  }]);
+  assert.deepEqual(await resolveNotificationTarget({
+    pool, projectId: 2, entityType: 'work_center_query', entityId: 31,
+    userId: 8, role: 'TeamMember', viewerSide: 'Contractor',
+  }), { tab: 'work-center', recordId: 17, type: 'query' });
+});
+
 test('a pending consultant inspector opens the verification decision screen', async () => {
   const pool = mockPool([
     { sql: 'FROM activity_verifications', rows: [{ activity_id: 41, side: 'Contractor' }] },
@@ -56,7 +67,7 @@ test('a pending consultant inspector opens the verification decision screen', as
   assert.deepEqual(await resolveNotificationTarget({
     pool, projectId: 2, entityType: 'activity_verification', entityId: 13,
     userId: 8, role: 'TeamMember', viewerSide: 'Consultant',
-  }), { tab: 'planning-execution', type: 'verification' });
+  }), { tab: 'planning-execution', type: 'verification', recordId: 41, verificationId: 13 });
 });
 
 test('a consultant leader opens the verification decision screen', async () => {
@@ -66,7 +77,7 @@ test('a consultant leader opens the verification decision screen', async () => {
   assert.deepEqual(await resolveNotificationTarget({
     pool, projectId: 2, entityType: 'activity_verification', entityId: 13,
     userId: 8, role: 'Consultant', viewerSide: 'Consultant',
-  }), { tab: 'planning-execution', type: 'verification' });
+  }), { tab: 'planning-execution', type: 'verification', recordId: 41, verificationId: 13 });
 });
 
 test('a contractor opens the activity for its verification notification', async () => {

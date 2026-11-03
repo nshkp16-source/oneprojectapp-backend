@@ -23,7 +23,8 @@ load() {
            "$HERE/migrations/2026-11-02-verification-and-milestone-link.sql" \
            "$HERE/migrations/2026-11-03-void-approved-reports.sql" \
            "$HERE/migrations/2026-11-04-verification-reminders.sql" \
-           "$HERE/migrations/2026-11-05-standalone-work-center-tasks.sql"; do
+           "$HERE/migrations/2026-11-05-standalone-work-center-tasks.sql" \
+           "$HERE/migrations/2026-11-06-work-center-queries.sql"; do
     $PSQL -d "$DB" -f "$f" > /dev/null 2>/tmp/run-tests-load.err || { echo "Failed loading $f"; cat /tmp/run-tests-load.err; exit 1; }
   done
 }
@@ -31,10 +32,11 @@ load() {
 FAILED=0
 node --test \
   "$HERE/progressRules.test.js" "$HERE/workflow-dashboard.test.js" \
+  "$HERE/activity-card-ui.test.js" \
   "$HERE/project-resolution.test.js" "$HERE/activity-form-v2.test.js" \
   "$HERE/wc-reports-v2.test.js" "$HERE/wc-views.test.js" \
   "$HERE/notificationTarget.test.js" "$HERE/verificationReminderJob.test.js" || FAILED=1
-for t in activityRoutes reportRoutes verificationRoutes milestoneRoutes; do
+for t in activityRoutes reportRoutes verificationRoutes milestoneRoutes taskQueryRoutes; do
   $PSQL -d "$ADMIN_DB" -c "DROP DATABASE IF EXISTS $DB" -c "CREATE DATABASE $DB"
   load
   echo "== $t"

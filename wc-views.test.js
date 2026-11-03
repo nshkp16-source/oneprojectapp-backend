@@ -21,15 +21,25 @@ function extract(names) {
 }
 
 const HELPERS = ['_wcFmtDate', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
-  '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml', '_wcReportFieldsHtml', '_wcEntryFigure'];
+  'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
+  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcQueryPanelHtml', '_wcTabifyDetail'];
 
 function views() {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
   const ctx = dom.getInternalVMContext();
   vm.runInContext(`function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
   vm.runInContext(extract(HELPERS), ctx);
+  vm.runInContext(`function tabbed(task, entries, queries, leader) {
+    document.body.innerHTML = leader ? _wcPMView(task, entries) : _wcMemberView(task, entries);
+    _wcTabifyDetail(document.body, task, entries, queries, leader, true);
+    return document;
+  }`, ctx);
   const render = (fn, task, entries) => { dom.window.__t = task; dom.window.__e = entries; dom.window.document.body.innerHTML = vm.runInContext(`${fn}(window.__t, window.__e)`, ctx); return dom.window.document; };
-  return { member: (t, e) => render('_wcMemberView', t, e), leader: (t, e) => render('_wcPMView', t, e) };
+  return {
+    member: (t, e) => render('_wcMemberView', t, e),
+    leader: (t, e) => render('_wcPMView', t, e),
+    tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
+  };
 }
 
 const task = { id: 5, title: 'Block A', assigned_members: [{ id: 101, email: 'a@x' }], activity_id: 3, activity_title: 'Excavation', activity_status: 'ongoing',
@@ -79,4 +89,41 @@ test('leader view: validate buttons only on pending reports, void button only on
 test('leader view: no void button once the task is closed', () => {
   const d = views().leader({ ...task, status: 'closed' }, entries);
   assert.equal([...d.querySelectorAll('[data-validate-action="voided"]')].length, 0);
+});
+
+test('expanded leader task uses summary and Details, Reports, Queries tabs with the activity plan', () => {
+  const t = { ...task, title: 'Excavate trenches', priority: 'high', description: 'Dig to the levels on drawing S-04.',
+    activity_description: 'Excavate grid B foundation.', activity_done_when: 'Formation levels confirmed.',
+    activity_planned_quantity: 200, activity_planned_work: 'Excavate and remove spoil.',
+    activity_planned_manpower: '6 workers', activity_planned_equipment: '1 excavator',
+    activity_planned_materials: 'Not required', activity_milestone_title: 'Foundation',
+    activity_milestone_start: '2026-03-01', activity_milestone_end: '2026-04-30',
+    activity_start_date: '2026-03-05', activity_end_date: '2026-04-20' };
+  const queries = [{ id: 21, asked_by_role: 'ContractorPM', recipient_email: 'a@x',
+    question: 'Please explain the measurement.', answer: 'Measured from the drawing.', status: 'answered',
+    created_at: '2026-03-10' }];
+  const d = views().tabbed(t, entries, queries, true);
+  assert.deepEqual([...d.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent.trim().replace(/\s+\d+$/, '')),
+    ['Details', 'Reports', 'Queries']);
+  assert.match(d.body.textContent, /20%/);
+  assert.match(d.body.textContent, /Required priorityHigh/);
+  assert.match(d.body.textContent, /Foundation/);
+  assert.match(d.body.textContent, /Formation levels confirmed/);
+  assert.match(d.body.textContent, /Planned manpower6 workers/);
+  assert.match(d.body.textContent, /Please explain the measurement/);
+  assert.ok(d.querySelector('[data-wc-pane="reports"]'));
+  assert.ok(d.querySelector('[data-wc-pane="queries"]'));
+});
+
+test('expanded member task separates progress, previous reports and queries; closed task hides progress', () => {
+  const d = views().tabbed(task, entries.filter((entry) => entry.member_id === 101), [], false);
+  const tabs = [...d.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('data-wc-tab'));
+  assert.deepEqual(tabs, ['details', 'progress', 'my-reports', 'queries']);
+  assert.ok(d.querySelector('[data-wc-pane="my-reports"]')?.textContent.includes('My Previous Submissions'));
+  assert.ok(d.querySelector('[data-wc-pane="progress"]'));
+
+  const closed = views().tabbed({ ...task, status: 'closed' }, [], [], false);
+  assert.deepEqual([...closed.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('data-wc-tab')),
+    ['details', 'my-reports', 'queries']);
+  assert.equal(closed.querySelector('[data-wc-pane="progress"]'), null);
 });

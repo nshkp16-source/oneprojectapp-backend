@@ -231,11 +231,17 @@ export function registerActivityRoutes(app, deps) {
         throw new HttpError(403, 'You are not a member of this project.');
 
       const activity = (await pool.query(
-        `SELECT id, project_id, side, creator_id, milestone_name, title, description, start_date, end_date,
+        `SELECT id, project_id, side, creator_id, creator_role, created_at, milestone_name, title, description, start_date, end_date,
                 planned_quantity, unit, status, activity_type, done_when, planned_work,
                 planned_manpower, planned_equipment, planned_materials, progress_pct,
                 certified_progress_pct, certified_at, baseline_milestone_id, additional_milestone_id,
-                drives_milestone, milestone_weight_pct, actual_end
+                drives_milestone, milestone_weight_pct, actual_end, linked_file_name,
+                (SELECT title FROM milestones WHERE id = planning_execution.baseline_milestone_id) AS baseline_milestone_title,
+                (SELECT to_char(planned_start, 'YYYY-MM-DD') FROM milestones WHERE id = planning_execution.baseline_milestone_id) AS baseline_milestone_start,
+                (SELECT to_char(planned_end, 'YYYY-MM-DD') FROM milestones WHERE id = planning_execution.baseline_milestone_id) AS baseline_milestone_end,
+                (SELECT title FROM additional_milestones WHERE id = planning_execution.additional_milestone_id) AS additional_milestone_title,
+                (SELECT to_char(planned_start, 'YYYY-MM-DD') FROM additional_milestones WHERE id = planning_execution.additional_milestone_id) AS additional_milestone_start,
+                (SELECT to_char(planned_end, 'YYYY-MM-DD') FROM additional_milestones WHERE id = planning_execution.additional_milestone_id) AS additional_milestone_end
          FROM planning_execution WHERE id = $1 AND project_id = $2`,
         [activityId, projectId])).rows[0];
       if (!activity) throw new HttpError(404, 'Activity not found.');
@@ -258,9 +264,11 @@ export function registerActivityRoutes(app, deps) {
 
       const clientView = viewerSide === 'Client';
       const taskRows = clientView ? [] : (await pool.query(
-        `SELECT id, title, description, assigned_members, status, start_date, end_date,
-                weight_pct, target_quantity, progress_pct
-         FROM workspace_work_center WHERE activity_id = $1 ORDER BY id`, [activityId])).rows;
+        `SELECT w.id, w.title, w.description, w.assigned_members, w.status, w.start_date, w.end_date,
+                w.weight_pct, w.target_quantity, w.progress_pct, w.priority,
+                (SELECT COUNT(*)::int FROM workspace_work_center_progress p
+                 WHERE p.task_id = w.id AND p.validation_status = 'pending') AS pending_report_count
+         FROM workspace_work_center w WHERE w.activity_id = $1 ORDER BY w.id`, [activityId])).rows;
       const stages = clientView ? [] : (await pool.query(
         `SELECT s.id, s.task_id, s.seq, s.title, s.weight_pct, s.is_hold_point,
                 s.completed_at, s.hold_verified_at
@@ -271,6 +279,16 @@ export function registerActivityRoutes(app, deps) {
         if (!stagesByTask.has(stage.task_id)) stagesByTask.set(stage.task_id, []);
         stagesByTask.get(stage.task_id).push(stage);
       }
+      const progressReports = clientView || !taskRows.length ? [] : (await pool.query(
+        `SELECT p.id, p.task_id, w.title AS task_title, p.report_date, p.member_id,
+                tm.email AS member_email, p.work_done, p.quantity_done, p.quantity_failed,
+                p.progress_pct, p.stage_id, p.manpower, p.equipment, p.materials,
+                p.issues, p.notes, p.submitted_at, p.validated_at
+         FROM workspace_work_center_progress p
+         JOIN workspace_work_center w ON w.id = p.task_id
+         JOIN team_members tm ON tm.id = p.member_id
+         WHERE w.activity_id = $1 AND p.validation_status = 'approved'
+         ORDER BY p.report_date, p.submitted_at, p.id`, [activityId])).rows;
       return res.json({
         activity: {
           ...activity,
@@ -278,6 +296,7 @@ export function registerActivityRoutes(app, deps) {
           status: clientView ? null : activity.status,
           claimed_progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
           certified_progress_pct: Number(activity.certified_progress_pct) || 0,
+          client_view: clientView,
         },
         tasks: taskRows.map((task) => ({
           ...task,
@@ -287,6 +306,7 @@ export function registerActivityRoutes(app, deps) {
           target_quantity: task.target_quantity == null ? null : Number(task.target_quantity),
           stages: stagesByTask.get(task.id) || [],
         })),
+        progress_reports: progressReports,
         can_add_task: isWCLeader(role) && activity.side === viewerSide && activity.status !== 'closed',
         can_edit_activity: isWCLeader(role) && String(activity.creator_id) === String(userId) && activity.status !== 'closed',
         viewer_side: viewerSide,

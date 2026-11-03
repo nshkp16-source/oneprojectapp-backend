@@ -93,15 +93,17 @@
 
   function activityEditHtml(activity) {
     const date = (value) => esc(String(value || '').slice(0, 10));
-    const input = (label, name, value = '', type = 'text') => `<label>${label}<input name="${name}" type="${type}" value="${esc(value)}" style="${inputStyle}"${['title', 'start_date', 'end_date'].includes(name) ? ' required' : ''}></label>`;
+    const milestoneStart = activity.baseline_milestone_start || activity.additional_milestone_start || '';
+    const milestoneEnd = activity.baseline_milestone_end || activity.additional_milestone_end || '';
+    const input = (label, name, value = '', type = 'text', bounds = '') => `<label>${label}<input name="${name}" type="${type}" value="${esc(value)}" style="${inputStyle}"${bounds}${['title', 'start_date', 'end_date'].includes(name) ? ' required' : ''}></label>`;
     const measured = ['quantity', 'count'].includes(activity.activity_type);
     return `<details data-wf-edit-plan style="${panelStyle};margin-top:12px;">
       <summary style="cursor:pointer;font-weight:700;">Edit activity plan</summary>
       <form data-wf-edit-form>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:9px;margin-top:10px;">
         ${input('Title', 'title', activity.title)}
-        ${input('Start date', 'start_date', date(activity.start_date), 'date')}
-        ${input('End date', 'end_date', date(activity.end_date), 'date')}
+        ${input('Start date', 'start_date', date(activity.start_date), 'date', `${milestoneStart ? ` min="${esc(date(milestoneStart))}"` : ''}${milestoneEnd ? ` max="${esc(date(milestoneEnd))}"` : ''}`)}
+        ${input('End date', 'end_date', date(activity.end_date), 'date', `${milestoneStart ? ` min="${esc(date(milestoneStart))}"` : ''}${milestoneEnd ? ` max="${esc(date(milestoneEnd))}"` : ''}`)}
         <label>Activity type<select name="activity_type" style="${inputStyle}">
           ${['quantity', 'count', 'stages', 'percentage'].map((type) => `<option value="${type}"${activity.activity_type === type ? ' selected' : ''}>${type[0].toUpperCase()}${type.slice(1)}</option>`).join('')}
         </select></label>
@@ -121,6 +123,7 @@
       </form>
     </details>`;
   }
+  window._peActivityEditHtml = activityEditHtml;
 
   window._wcMemberView = function (task, entries) {
     const rows = entries.length ? [...entries].reverse().map((entry) => `
@@ -261,35 +264,9 @@
 
   window._peActivityCardHtml = function (card) {
     const html = typeof originalActivityHtml === 'function' ? originalActivityHtml(card) : activityBaseHtml(card);
-    if (!card || !card.activity) return html;
-    if (card.viewer_side === 'Client') return html;
-    const kind = card.activity.baseline_milestone_id ? 'baseline' : card.activity.additional_milestone_id ? 'additional' : null;
-    const milestoneId = card.activity.baseline_milestone_id || card.activity.additional_milestone_id;
-    const contractor = card.activity.side === 'Contractor';
-    const delay = Math.max(0, Number(card.activity.calculated_delay_days) || 0);
-    return `${html}<section id="wf-activity-controls-${esc(card.activity.id)}" data-milestone-kind="${kind || ''}" data-milestone-id="${milestoneId || ''}"
-      style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:14px;">
-      <div style="grid-column:1/-1;font-size:12px;color:${delay ? '#b91c1c' : '#047857'};font-weight:700;">${delay ? `Calculated delay: ${delay} day(s)` : 'No delay past the planned finish date'}</div>
-      ${card.can_edit_activity ? `<div style="grid-column:1/-1;">${activityEditHtml(card.activity)}</div>` : ''}
-      <div style="${panelStyle}"><strong>Verification &amp; rework</strong><div data-wf-verifications style="font-size:12px;color:#6b7280;margin-top:8px;">Loading…</div>
-        ${contractor && card.can_add_task ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
-          <select data-wf-request-kind style="${inputStyle};width:auto;">
-            <option value="progress">Progress verification</option><option value="hold_point">Hold point inspection</option><option value="completion">Completion certification</option>
-          </select><select data-wf-stage style="${inputStyle};width:auto;"><option value="">Choose hold point</option>
-            ${card.tasks.flatMap(task => task.stages || []).filter(stage => stage.is_hold_point && !stage.hold_verified_at).map(stage => `<option value="${esc(stage.id)}">${esc(stage.title)}</option>`).join('')}</select>
-        </div><textarea data-wf-request-note rows="2" placeholder="Request note" style="${inputStyle};margin-top:6px;"></textarea>
-        <label style="display:block;font-size:12px;margin-top:6px;">Name consultant inspectors (optional)
-          <select data-wf-inspectors multiple size="3" style="${inputStyle};margin-top:4px;"><option disabled>Loading inspectors…</option></select>
-        </label>
-        <input data-wf-request-file type="file" style="margin-top:6px;">
-        <button type="button" data-wf-request-submit style="margin-top:6px;">Request verification</button>` : ''}
-      </div>
-      ${kind && contractor ? `<div style="${panelStyle}"><strong>Linked milestone</strong><div data-wf-milestone style="font-size:12px;color:#6b7280;margin-top:8px;">Loading…</div></div>` : ''}
-      ${card.viewer_side === 'Consultant' && contractor ? `<div style="${panelStyle}"><strong>Raise rework or snag</strong>
-        <select data-wf-rework-kind style="${inputStyle};margin-top:8px;"><option value="rework">Rework</option><option value="snag">Snag</option></select>
-        <textarea data-wf-rework-reason rows="2" placeholder="Describe the issue" style="${inputStyle};margin-top:6px;"></textarea>
-        <button type="button" data-wf-rework-submit style="margin-top:6px;">Raise item</button></div>` : ''}
-    </section>`;
+    if (!card?.can_edit_activity || typeof originalActivityHtml !== 'function') return html;
+    return html.replace(/<div data-pe-pane="overview"[^>]*>/,
+      openingTag => `${openingTag}${activityEditHtml(card.activity)}`);
   };
 
   window._peUpdateStatusBadge = function (activity, entries) {
@@ -309,14 +286,11 @@
 
   window._peWireActivityCard = function (recordId, card) {
     if (typeof originalActivityWire === 'function') originalActivityWire(recordId, card);
-    if (card.viewer_side === 'Client') return;
-    loadActivityWorkflow(recordId, card);
     const detail = document.getElementById(`pe-detail-inner-${recordId}`);
     detail?.querySelector('[data-wf-save-plan]')?.addEventListener('click', () => saveActivityPlan(recordId, detail));
-    if (typeof originalActivityWire !== 'function') wireAddTask(recordId, card, detail);
   };
 
-  if (typeof originalActivityHtml !== 'function' && typeof originalRenderPEShell === 'function') {
+  if (typeof originalRenderPEShell === 'function') {
     window._renderPEShell = function (...args) {
       originalRenderPEShell.apply(this, args);
       const header = document.querySelector('.bottom-fixed-header');
@@ -326,41 +300,19 @@
       actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;';
       const pending = document.createElement('button');
       pending.type = 'button';
+      pending.className = 'rc-btn rc-btn--sm';
       pending.textContent = 'Pending verifications';
       pending.addEventListener('click', () => window.openPendingVerifications());
       actions.appendChild(pending);
       if (isWCLeader(window.currentUserRole) && ['Contractor', 'Consultant', 'Client'].includes(wcSide(window.currentUserRole))) {
         const closeout = document.createElement('button');
         closeout.type = 'button';
+        closeout.className = 'rc-btn rc-btn--sm';
         closeout.textContent = 'Download close-out CSV';
         closeout.addEventListener('click', () => window.downloadCloseoutReport());
         actions.appendChild(closeout);
       }
       header.appendChild(actions);
-    };
-  }
-
-  if (typeof originalActivityHtml !== 'function' && typeof originalPELoadDetail === 'function') {
-    window._peLoadDetail = async function (recordId, tabKey) {
-      if (tabKey !== 'planning-execution') return;
-      const detail = document.getElementById(`pe-detail-inner-${recordId}`);
-      if (!detail || detail.dataset.workflowCardLoaded === 'true') return;
-      detail.innerHTML = '<p style="color:#6b7280;text-align:center;padding:18px;">Loading activity details…</p>';
-      try {
-        const projectId = await ensureActiveProjectId();
-        if (!projectId) return;
-        const card = await responseData(await _wcFetch(
-          `${API}/planning-execution/${encodeURIComponent(recordId)}/activity-card?projectId=${encodeURIComponent(projectId)}`,
-        ));
-        if (card.viewer_side === card.activity.side) {
-          await originalPELoadDetail(recordId, tabKey);
-        } else detail.innerHTML = '';
-        detail.insertAdjacentHTML('beforeend', window._peActivityCardHtml(card));
-        detail.dataset.workflowCardLoaded = 'true';
-        window._peWireActivityCard(recordId, card);
-      } catch (error) {
-        detail.insertAdjacentHTML('beforeend', `<p style="color:#b91c1c;">Activity details could not be loaded: ${esc(error.message)}</p>`);
-      }
     };
   }
 
@@ -647,67 +599,34 @@
       const result = await responseData(await _wcFetch(`${API}/verifications/pending?projectId=${encodeURIComponent(projectId)}`));
       rows = result.pending || [];
       if (verificationId) rows = rows.filter((item) => String(item.id) === String(verificationId));
-    } catch (error) { return alert(`Unable to load pending verifications: ${error.message}`); }
+    } catch (error) {
+      expandGrayPart(`<section style="padding:18px;"><p style="color:#b91c1c;">Unable to load pending verifications: ${esc(error.message)}</p>
+        <button class="btn" type="button" onclick="collapseGrayPart()">Close</button></section>`);
+      return;
+    }
+    if (verificationId && window._openActivityVerificationNotification) {
+      const opened = await window._openActivityVerificationNotification(verificationId);
+      if (opened) return;
+    }
+    if (rows.length === 1 && window._openActivityVerificationNotification) {
+      const opened = await window._openActivityVerificationNotification(rows[0].id);
+      if (opened) return;
+    }
     const body = rows.length ? rows.map((item) => `
-      <article style="${panelStyle};margin:10px 0;">
-        <strong>${esc(item.activity_title)}</strong> · ${esc(item.kind.replaceAll('_', ' '))}
-        <div style="font-size:12px;margin-top:5px;">Respond by ${esc(String(item.respond_by).slice(0, 10))} ${item.overdue ? '<strong style="color:#b91c1c;">OVERDUE</strong>' : ''}</div>
-        <div style="display:flex;gap:7px;flex-wrap:wrap;margin-top:8px;">
-          <button type="button" data-wf-open-activity="${esc(item.activity_id)}">Open activity</button>
-          ${window.currentUserRole === 'TeamMember' ? `<select data-wf-inspect-outcome="${esc(item.id)}"><option value="recommend_verify">Recommend verify</option><option value="recommend_changes">Recommend changes</option><option value="recommend_reject">Recommend reject</option></select><button type="button" data-wf-inspect="${esc(item.id)}">Send recommendation</button>` : ''}
-          ${isWCLeader(window.currentUserRole) && wcSide(window.currentUserRole) === 'Consultant' ? `
-            <select data-wf-decision="${esc(item.id)}"><option value="verified">Verify</option><option value="verified_with_changes">Verify with changes</option><option value="rejected">Reject</option></select>
-            <input data-wf-certified="${esc(item.id)}" type="number" min="0" max="100" placeholder="Certified %" style="width:100px;">
-            <input data-wf-decision-reason="${esc(item.id)}" placeholder="Reason / snags" style="${inputStyle};max-width:240px;">
-            <button type="button" data-wf-decide="${esc(item.id)}">Submit decision</button>` : ''}
-        </div>
-      </article>`).join('') : '<p>No pending verification requests.</p>';
-    const modal = document.createElement('div');
-    modal.style.cssText = 'position:fixed;inset:0;background:#0008;z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px;';
-    modal.innerHTML = `<section style="background:#fff;border-radius:12px;width:min(760px,100%);max-height:85vh;overflow:auto;padding:18px;">
-      <header style="display:flex;justify-content:space-between;align-items:center;"><strong>Pending verifications</strong><button type="button" data-wf-close-modal>Close</button></header>${body}</section>`;
-    document.body.appendChild(modal);
-    modal.querySelector('[data-wf-close-modal]').addEventListener('click', () => modal.remove());
-    modal.querySelectorAll('[data-wf-inspect]').forEach((button) => button.addEventListener('click', async () => {
-      const id = button.dataset.wfInspect;
-      const outcome = modal.querySelector(`[data-wf-inspect-outcome="${id}"]`).value;
-      await workflowAction(`/verifications/${id}/inspect`, 'PUT', { outcome });
-      modal.remove();
-    }));
-    modal.querySelectorAll('[data-wf-decide]').forEach((button) => button.addEventListener('click', async () => {
-      const id = button.dataset.wfDecide;
-      const verification = rows.find((row) => String(row.id) === String(id));
-      const decision = modal.querySelector(`[data-wf-decision="${id}"]`).value;
-      const reason = modal.querySelector(`[data-wf-decision-reason="${id}"]`).value.trim();
-      const body = { status: decision, reason };
-      if (decision === 'verified_with_changes') body.certified_progress_pct = Number(modal.querySelector(`[data-wf-certified="${id}"]`).value);
-      if (decision === 'rejected' || (decision === 'verified' && verification?.kind === 'completion' && reason)) {
-        body.rework = reason.split(/\n+/).filter(Boolean).map((line) => ({ reason: line }));
-      }
-      try {
-        await responseData(await _wcFetch(`${API}/verifications/${id}/decide`, { method: 'PUT', body: JSON.stringify(body) }));
-        modal.remove();
-        alert('Verification decision saved.');
-      } catch (error) {
-        if (error.message.includes('inspector has not recorded')) {
-          if (confirm(`${error.message} Proceed without their recommendation?`)) {
-            body.skip_inspectors = true;
-            try { await responseData(await _wcFetch(`${API}/verifications/${id}/decide`, { method: 'PUT', body: JSON.stringify(body) })); modal.remove(); }
-            catch (retryError) { alert(retryError.message); }
-          }
-        } else alert(error.message);
-      }
-    }));
-    modal.querySelectorAll('[data-wf-open-activity]').forEach((button) => button.addEventListener('click', () => {
-      const activity = button.dataset.wfOpenActivity;
-      modal.remove();
-      const tab = document.querySelector('[data-tab="planning-execution"]');
-      tab?.click();
-      setTimeout(() => {
-        const card = document.querySelector(`.doc-item[data-id="${activity}"]`);
-        card?.querySelector('[data-action="toggle"]')?.click();
-      }, 250);
-    }));
+      <button type="button" class="rc-btn" data-wf-open-verification="${esc(item.id)}"
+        style="width:100%;text-align:left;margin:6px 0;padding:12px;">
+        <strong>${esc(item.activity_title)}</strong> · ${esc(String(item.kind).replace(/_/g, ' '))}
+        <span style="display:block;margin-top:4px;font-size:12px;color:${item.overdue ? '#b91c1c' : '#64748b'};">
+          Respond by ${esc(String(item.respond_by).slice(0, 10))}${item.overdue ? ' · Overdue' : ''}</span>
+      </button>`).join('') : '<p style="color:#64748b;">No pending verification requests.</p>';
+    expandGrayPart(`<section style="padding:18px;overflow:auto;height:100%;box-sizing:border-box;">
+      <button class="btn" type="button" onclick="collapseGrayPart()">← Back</button>
+      <h3 style="margin:14px 0 8px;color:#0f172a;">Pending verifications</h3>${body}</section>`);
+    document.getElementById('grayContent')?.querySelectorAll('[data-wf-open-verification]').forEach((button) =>
+      button.addEventListener('click', async () => {
+        collapseGrayPart();
+        await window._openActivityVerificationNotification?.(button.dataset.wfOpenVerification);
+      }));
   };
 
   window.downloadCloseoutReport = async function () {
@@ -785,12 +704,26 @@
         if (result.target.tab === 'work-center') {
           return await _openRecordNotification('workspace_work_center', String(result.target.recordId));
         }
+        if (result.target.type === 'activity' && target.entityType === 'activity_verification') {
+          return await window._openActivityVerificationNotification(target.entityId, result.target);
+        }
+        if (result.target.type === 'activity' && target.entityType === 'rework_item') {
+          const activityId = String(result.target.recordId);
+          sessionStorage.setItem(`pe-activity-tab-${activityId}`, 'certification');
+          collapseGrayPart();
+          const opened = await _openRecordNotification('planning_execution', activityId);
+          if (!opened) return false;
+          const tab = await _waitForElement(`#pe-detail-inner-${CSS.escape(activityId)} [data-pe-tab="certification"]`);
+          tab?.click();
+          const item = await _waitForElement(`#pe-rework-${CSS.escape(String(target.entityId))}`);
+          item?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          return Boolean(item);
+        }
         if (result.target.type === 'activity') {
           return await _openRecordNotification('planning_execution', String(result.target.recordId));
         }
         if (result.target.type === 'verification') {
-          await window.openPendingVerifications(target.entityId);
-          return true;
+          return await window._openActivityVerificationNotification(target.entityId, result.target);
         }
         if (result.target.type === 'milestone') {
           await window.openMilestoneDeepLink(result.target.milestone);

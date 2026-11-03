@@ -12,7 +12,7 @@ function setup({ legacyActivityCard = true } = {}) {
     _wcWireDetailButtons: () => {},
   };
   if (legacyActivityCard) {
-    window._peActivityCardHtml = () => '<main>activity card</main>';
+    window._peActivityCardHtml = () => '<main><div data-pe-pane="overview"></div></main>';
     window._peWireActivityCard = () => {};
   }
   const context = {
@@ -63,14 +63,14 @@ test('leader view retains existing task controls and adds audited void controls'
   assert.match(html, /4 completed, 1 failed/);
 });
 
-test('activity workflow controls are hidden for clients and rendered for activities', () => {
+test('activity workflow does not append duplicate verification controls to the tabbed card', () => {
   const window = setup();
   const client = window._peActivityCardHtml({
     viewer_side: 'Client',
     activity: { id: 1, side: 'Contractor' },
     tasks: [],
   });
-  assert.equal(client, '<main>activity card</main>');
+  assert.equal(client, '<main><div data-pe-pane="overview"></div></main>');
 
   const html = window._peActivityCardHtml({
     viewer_side: 'Contractor',
@@ -78,11 +78,32 @@ test('activity workflow controls are hidden for clients and rendered for activit
     activity: { id: 2, side: 'Contractor', baseline_milestone_id: 3 },
     tasks: [{ stages: [{ id: 7, title: 'Inspection', is_hold_point: true }] }],
   });
-  assert.match(html, /Progress verification/);
-  assert.match(html, /Hold point inspection/);
-  assert.match(html, /Completion certification/);
-  assert.match(html, /Inspection/);
-  assert.match(html, /Linked milestone/);
+  assert.equal(html, '<main><div data-pe-pane="overview"></div></main>');
+  assert.doesNotMatch(html, /wf-activity-controls|Request verification/);
+});
+
+test('activity plan editing stays inside the Overview tab for its creator', () => {
+  const window = setup();
+  const html = window._peActivityCardHtml({
+    can_edit_activity: true,
+    activity: { id: 2, title: 'Excavate', start_date: '2026-03-01', end_date: '2026-03-15', activity_type: 'quantity' },
+  });
+  assert.match(html, /data-pe-pane="overview"/);
+  assert.match(html, /Edit activity plan/);
+  assert.doesNotMatch(window._peActivityCardHtml({
+    can_edit_activity: false,
+    activity: { id: 2 },
+  }), /Edit activity plan/);
+});
+
+test('pending verification navigation uses the activity card instead of a modal', () => {
+  const start = source.indexOf('window.openPendingVerifications =');
+  const end = source.indexOf('window.downloadCloseoutReport =', start);
+  assert.ok(start >= 0 && end > start);
+  const pendingWorkflow = source.slice(start, end);
+  assert.match(pendingWorkflow, /_openActivityVerificationNotification/);
+  assert.match(pendingWorkflow, /expandGrayPart/);
+  assert.doesNotMatch(pendingWorkflow, /position:fixed|document\.createElement\('div'\)/);
 });
 
 test('activity cards also render when the deployed dashboard has no legacy card renderer', () => {

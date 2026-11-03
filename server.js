@@ -18,6 +18,7 @@ import { registerActivityRoutes } from './activityRoutes.js';
 import { registerReportRoutes } from './reportRoutes.js';
 import { registerVerificationRoutes } from './verificationRoutes.js';
 import { registerMilestoneRoutes, milestoneCompletionCheck, typedProgressBlockedReason } from './milestoneRoutes.js';
+import { registerTaskQueryRoutes } from './taskQueryRoutes.js';
 import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget } from './notificationTarget.js';
 import { sendOverdueVerificationReminders } from './verificationReminderJob.js';
@@ -7993,6 +7994,7 @@ registerActivityRoutes(app, progressModelDeps);
 registerReportRoutes(app, progressModelDeps);
 registerVerificationRoutes(app, progressModelDeps);
 registerMilestoneRoutes(app, progressModelDeps);
+registerTaskQueryRoutes(app, progressModelDeps);
 
 // Keep the later Work Center route available for standalone tasks.
 app.post('/api/work-center', authenticateToken, (_req, _res, next) => next());
@@ -8014,6 +8016,10 @@ app.delete('/api/work-center/:taskId', authenticateToken, async (req, res, next)
       `SELECT COUNT(*)::int AS n FROM workspace_work_center_progress WHERE task_id = $1 AND validation_status IN ('approved','voided')`, [parseInt(req.params.taskId, 10)]);
     if (r.rows[0].n > 0)
       return res.status(409).json({ error: 'This task has approved reports, which are part of the project record. It cannot be deleted. It is closed when its activity is certified complete.' });
+    const queries = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM work_center_queries WHERE task_id = $1`, [parseInt(req.params.taskId, 10)]);
+    if (queries.rows[0].n > 0)
+      return res.status(409).json({ error: 'This task has question history, which is part of the project record. It cannot be deleted.' });
     return next();
   } catch (err) { return next(err); }
 });
@@ -8031,6 +8037,23 @@ app.post('/api/planning-execution', authenticateToken, async (req, res) => {
       SELECT
         pe.*,
         (pe.creator_id = $2)                           AS is_creator,
+        (SELECT m.title FROM milestones m WHERE m.id = pe.baseline_milestone_id) AS baseline_milestone_title,
+        (SELECT to_char(m.planned_start, 'YYYY-MM-DD') FROM milestones m WHERE m.id = pe.baseline_milestone_id) AS baseline_milestone_start,
+        (SELECT to_char(m.planned_end, 'YYYY-MM-DD') FROM milestones m WHERE m.id = pe.baseline_milestone_id) AS baseline_milestone_end,
+        (SELECT m.progress_pct FROM milestones m WHERE m.id = pe.baseline_milestone_id) AS baseline_milestone_progress,
+        (SELECT m.title FROM additional_milestones m WHERE m.id = pe.additional_milestone_id) AS additional_milestone_title,
+        (SELECT to_char(m.planned_start, 'YYYY-MM-DD') FROM additional_milestones m WHERE m.id = pe.additional_milestone_id) AS additional_milestone_start,
+        (SELECT to_char(m.planned_end, 'YYYY-MM-DD') FROM additional_milestones m WHERE m.id = pe.additional_milestone_id) AS additional_milestone_end,
+        (SELECT m.progress_pct FROM additional_milestones m WHERE m.id = pe.additional_milestone_id) AS additional_milestone_progress,
+        (SELECT COUNT(*)::int FROM workspace_work_center w WHERE w.activity_id = pe.id) AS task_count,
+        (SELECT COUNT(*)::int
+         FROM workspace_work_center_progress p
+         JOIN workspace_work_center w ON w.id = p.task_id
+         WHERE w.activity_id = pe.id AND p.validation_status = 'pending') AS pending_report_count,
+        (SELECT COALESCE(SUM(p.quantity_done), 0)
+         FROM workspace_work_center_progress p
+         JOIN workspace_work_center w ON w.id = p.task_id
+         WHERE w.activity_id = pe.id AND p.validation_status = 'approved') AS approved_actual_quantity,
         CASE WHEN EXISTS (SELECT 1 FROM workspace_work_center wt WHERE wt.activity_id = pe.id) THEN pe.progress_pct
              ELSE COALESCE((SELECT t.progress_pct FROM planning_execution_tracking t WHERE t.activity_id = pe.id
                             ORDER BY t.report_date DESC, t.created_at DESC LIMIT 1), 0) END                                          AS avg_progress,
@@ -8611,11 +8634,34 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
             WHERE v.task_id = w.id AND v.viewer_id = $2
           )                                                          AS is_viewed,
           pe.title       AS activity_title,
+          pe.description AS activity_description,
           COALESCE(pe.status, 'not_yet_started') AS activity_status,
           pe.start_date  AS activity_start_date,
           pe.end_date    AS activity_end_date,
           COALESCE(w.activity_type, pe.activity_type)                AS activity_type,
           COALESCE(w.standalone_unit, pe.unit)                       AS activity_unit,
+          pe.planned_quantity AS activity_planned_quantity,
+          pe.done_when AS activity_done_when,
+          pe.planned_work AS activity_planned_work,
+          pe.planned_manpower AS activity_planned_manpower,
+          pe.planned_equipment AS activity_planned_equipment,
+          pe.planned_materials AS activity_planned_materials,
+          COALESCE(
+            (SELECT m.title FROM milestones m WHERE m.id = pe.baseline_milestone_id),
+            (SELECT am.title FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
+          ) AS activity_milestone_title,
+          COALESCE(
+            (SELECT to_char(m.planned_start, 'YYYY-MM-DD') FROM milestones m WHERE m.id = pe.baseline_milestone_id),
+            (SELECT to_char(am.planned_start, 'YYYY-MM-DD') FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
+          ) AS activity_milestone_start,
+          COALESCE(
+            (SELECT to_char(m.planned_end, 'YYYY-MM-DD') FROM milestones m WHERE m.id = pe.baseline_milestone_id),
+            (SELECT to_char(am.planned_end, 'YYYY-MM-DD') FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
+          ) AS activity_milestone_end,
+          (SELECT COUNT(*)::int FROM workspace_work_center_progress p
+           WHERE p.task_id = w.id AND p.validation_status = 'pending') AS pending_report_count,
+          (SELECT COUNT(*)::int FROM work_center_queries q
+           WHERE q.task_id = w.id AND q.status = 'open') AS open_query_count,
           pe.certified_progress_pct                                  AS activity_certified_progress,
           COALESCE((SELECT json_agg(json_build_object('id', s.id, 'seq', s.seq, 'title', s.title, 'weight_pct', s.weight_pct,
                       'is_hold_point', s.is_hold_point, 'completed_at', s.completed_at, 'hold_verified_at', s.hold_verified_at) ORDER BY s.seq)
@@ -8642,11 +8688,34 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
             WHERE v.task_id = w.id AND v.viewer_id = $2
           )                                                          AS is_viewed,
           pe.title       AS activity_title,
+          pe.description AS activity_description,
           COALESCE(pe.status, 'not_yet_started') AS activity_status,
           pe.start_date  AS activity_start_date,
           pe.end_date    AS activity_end_date,
           COALESCE(w.activity_type, pe.activity_type)                AS activity_type,
           COALESCE(w.standalone_unit, pe.unit)                       AS activity_unit,
+          pe.planned_quantity AS activity_planned_quantity,
+          pe.done_when AS activity_done_when,
+          pe.planned_work AS activity_planned_work,
+          pe.planned_manpower AS activity_planned_manpower,
+          pe.planned_equipment AS activity_planned_equipment,
+          pe.planned_materials AS activity_planned_materials,
+          COALESCE(
+            (SELECT m.title FROM milestones m WHERE m.id = pe.baseline_milestone_id),
+            (SELECT am.title FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
+          ) AS activity_milestone_title,
+          COALESCE(
+            (SELECT to_char(m.planned_start, 'YYYY-MM-DD') FROM milestones m WHERE m.id = pe.baseline_milestone_id),
+            (SELECT to_char(am.planned_start, 'YYYY-MM-DD') FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
+          ) AS activity_milestone_start,
+          COALESCE(
+            (SELECT to_char(m.planned_end, 'YYYY-MM-DD') FROM milestones m WHERE m.id = pe.baseline_milestone_id),
+            (SELECT to_char(am.planned_end, 'YYYY-MM-DD') FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
+          ) AS activity_milestone_end,
+          (SELECT COUNT(*)::int FROM workspace_work_center_progress p
+           WHERE p.task_id = w.id AND p.validation_status = 'pending') AS pending_report_count,
+          (SELECT COUNT(*)::int FROM work_center_queries q
+           WHERE q.task_id = w.id AND q.recipient_id = $2 AND q.status = 'open') AS open_query_count,
           pe.certified_progress_pct                                  AS activity_certified_progress,
           COALESCE((SELECT json_agg(json_build_object('id', s.id, 'seq', s.seq, 'title', s.title, 'weight_pct', s.weight_pct,
                       'is_hold_point', s.is_hold_point, 'completed_at', s.completed_at, 'hold_verified_at', s.hold_verified_at) ORDER BY s.seq)
@@ -8718,6 +8787,7 @@ app.post('/api/work-center', authenticateToken,
     const startDate = validDate(b.start_date);
     const endDate = validDate(b.end_date);
     const type = String(b.activity_type || '');
+    const priority = String(b.priority || 'normal');
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
     if (!title) return res.status(400).json({ error: 'title is required.' });
     if (!startDate || !endDate || endDate < startDate)
@@ -8730,6 +8800,8 @@ app.post('/api/work-center', authenticateToken,
     });
     if (!['quantity', 'count', 'stages', 'percentage'].includes(type))
       return res.status(400).json({ error: 'activity_type must be quantity, count, stages, or percentage.' });
+    if (!['low', 'normal', 'high'].includes(priority))
+      return res.status(400).json({ error: 'priority must be low, normal, or high.' });
 
     const planned = b.planned_quantity === '' || b.planned_quantity == null ? null : Number(b.planned_quantity);
     const unit = String(b.unit || '').trim() || null;
@@ -8778,9 +8850,9 @@ app.post('/api/work-center', authenticateToken,
         INSERT INTO workspace_work_center
           (project_id, title, description, assigned_members, priority, status, start_date, end_date,
            creator_id, creator_role, side, activity_id, activity_type, target_quantity, standalone_unit, weight_pct)
-        VALUES ($1,$2,$3,$4::jsonb,'normal','ongoing',$5,$6,$7,$8,$9,NULL,$10,$11,$12,100)
+        VALUES ($1,$2,$3,$4::jsonb,$5,'ongoing',$6,$7,$8,$9,$10,NULL,$11,$12,$13,100)
         RETURNING *`,
-      [projectId, title, String(b.description || ''), JSON.stringify(members), startDate, endDate,
+      [projectId, title, String(b.description || ''), JSON.stringify(members), priority, startDate, endDate,
        user_id, role, side, type, planned, unit]);
       const task = result.rows[0];
       for (let i = 0; i < stages.length; i++) {

@@ -28,6 +28,20 @@ export async function resolveNotificationTarget({ pool, projectId, entityType, e
     return row && permitted ? { tab: 'work-center', recordId: row.id } : null;
   }
 
+  if (entityType === 'work_center_query') {
+    const row = (await pool.query(
+      `SELECT q.task_id, q.recipient_id, w.side, w.assigned_members
+       FROM work_center_queries q
+       JOIN workspace_work_center w ON w.id = q.task_id
+       WHERE q.id = $1 AND q.project_id = $2`, [entityId, projectId],
+    )).rows[0];
+    if (!row) return null;
+    const permitted = role === 'TeamMember'
+      ? String(row.recipient_id) === String(userId)
+      : row.side === viewerSide;
+    return permitted ? { tab: 'work-center', recordId: row.task_id, type: 'query' } : null;
+  }
+
   if (entityType === 'activity_verification') {
     const row = (await pool.query(
       `SELECT v.activity_id, pe.side
@@ -43,10 +57,14 @@ export async function resolveNotificationTarget({ pool, projectId, entityType, e
            AND status = 'pending' LIMIT 1`,
         [entityId, role, userId],
       );
-      return signer.rows.length ? { tab: 'planning-execution', type: 'verification' } : null;
+      return signer.rows.length
+        ? { tab: 'planning-execution', type: 'verification', recordId: row.activity_id, verificationId: Number(entityId) }
+        : null;
     }
     if (viewerSide === 'Consultant')
-      return row.side === 'Contractor' ? { tab: 'planning-execution', type: 'verification' } : null;
+      return row.side === 'Contractor'
+        ? { tab: 'planning-execution', type: 'verification', recordId: row.activity_id, verificationId: Number(entityId) }
+        : null;
     if (viewerSide === 'Contractor' && row.side === 'Contractor')
       return { tab: 'planning-execution', type: 'activity', recordId: row.activity_id };
     return null;

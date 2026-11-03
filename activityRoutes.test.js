@@ -83,12 +83,13 @@ test('linking to a milestone with typed progress asks for confirmation and write
 
 test('confirmed: activity, two tasks with equal weights and targets, milestone switched to activities', async () => {
   const r = await call('POST', '/api/planning-execution/create-with-tasks', contractor, { ...base1, title: 'Excavation', baseline_milestone_id: 1, confirm_replace_manual: 'true', done_when: 'Levels confirmed',
-    tasks: [{ title: 'Block A', assigned_members: members }, { title: 'Block B', assigned_members: [{ id: 103 }] }] });
+    tasks: [{ title: 'Block A', priority: 'high', assigned_members: members }, { title: 'Block B', priority: 'low', assigned_members: [{ id: 103 }] }] });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   actA = r.body.activity;
   assert.equal(actA.milestone_weight_pct, '100.00');
   assert.equal(actA.milestone_name, 'Foundation');
   assert.deepEqual(r.body.tasks.map((t) => [Number(t.weight_pct), Number(t.target_quantity)]), [[50, 200], [50, 200]]);
+  assert.deepEqual(r.body.tasks.map((t) => t.priority), ['high', 'low']);
   const [m] = await q(`SELECT progress_source, progress_pct, derived_progress_pct FROM milestones WHERE id=1`);
   assert.equal(m.progress_source, 'activities');
   assert.equal(Number(m.progress_pct), 0);
