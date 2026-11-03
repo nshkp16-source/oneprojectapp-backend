@@ -263,7 +263,9 @@
   }
 
   window._peActivityCardHtml = function (card) {
-    const html = typeof originalActivityHtml === 'function' ? originalActivityHtml(card) : activityBaseHtml(card);
+    const html = typeof originalActivityHtml === 'function'
+      ? originalActivityHtml(card, { verifications: [], rework: [] }, 'overview')
+      : activityBaseHtml(card);
     if (!card?.can_edit_activity || typeof originalActivityHtml !== 'function') return html;
     return html.replace(/<div data-pe-pane="overview"[^>]*>/,
       openingTag => `${openingTag}${activityEditHtml(card.activity)}`);
