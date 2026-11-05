@@ -6,7 +6,7 @@ import * as acorn from 'acorn';
 
 const html = fs.readFileSync(new URL('../frontend/dashboard.html', import.meta.url), 'utf8');
 const scripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
-const names = ['_peDeriveStatus', '_peInfoCell', '_peCertificationPanel', '_peActivityCardHtml'];
+const names = ['_wcFmtDate', '_peDeriveStatus', '_peInfoCell', '_peCertificationPanel', '_peActivityCardHtml'];
 const source = scripts.map((script) => {
   const ast = acorn.parse(script, { ecmaVersion: 'latest', sourceType: 'script' });
   return ast.body.filter((node) => node.type === 'FunctionDeclaration' && names.includes(node.id.name))
@@ -42,6 +42,10 @@ test('activity tabs expose Certification only for milestone-driving activity', (
   assert.match(linked, /data-pe-tab="overview"/);
   assert.match(linked, /data-pe-tab="tasks"/);
   assert.match(linked, /data-pe-tab="progress"/);
+  assert.match(linked, /class="detail-tab"/);
+  assert.doesNotMatch(linked, /rc-btn--approve/);
+  assert.doesNotMatch(linked, /Activity dates|Created by|>Title</);
+  assert.doesNotMatch(linked, /Foundation/);
   assert.doesNotMatch(linked, /Save Execution Entry|pe-save-actual/);
   const wrapperContext = {
     window: { currentUserRole: 'ConsultantPM', currentUserId: 8 },

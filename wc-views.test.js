@@ -20,7 +20,7 @@ function extract(names) {
   return names.map((n) => found[n]).join('\n');
 }
 
-const HELPERS = ['_wcFmtDate', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
+const HELPERS = ['_wcFmtDate', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
   'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
   '_wcReportFieldsHtml', '_wcEntryFigure', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcQueryPanelHtml', '_wcTabifyDetail'];
 
@@ -36,6 +36,7 @@ function views() {
   }`, ctx);
   const render = (fn, task, entries) => { dom.window.__t = task; dom.window.__e = entries; dom.window.document.body.innerHTML = vm.runInContext(`${fn}(window.__t, window.__e)`, ctx); return dom.window.document; };
   return {
+    formatDate: (value) => { dom.window.__date = value; return vm.runInContext('_wcFmtDate(window.__date)', ctx); },
     member: (t, e) => render('_wcMemberView', t, e),
     leader: (t, e) => render('_wcPMView', t, e),
     tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
@@ -46,8 +47,8 @@ const task = { id: 5, title: 'Block A', assigned_members: [{ id: 101, email: 'a@
   activity_progress: 10, activity_type: 'quantity', activity_unit: 'm3', target_quantity: '200.000', weight_pct: '50.00', progress_pct: '20.00',
   start_date: '2026-03-01', end_date: '2026-04-30', status: 'ongoing' };
 const entries = [
-  { id: 1, report_date: '2026-03-10', member_id: 101, member_email: 'a@x', work_done: 'Dug', quantity_done: '40.000', progress_pct: 20, validation_status: 'pending' },
-  { id: 2, report_date: '2026-03-11', member_id: 101, member_email: 'a@x', work_done: 'Dug more', quantity_done: '30.000', progress_pct: 35, validation_status: 'approved', validation_notes: 'Good' },
+  { id: 1, report_date: '2026-03-10', member_id: 101, member_email: 'a@x', work_done: 'Dug', quantity_done: '40.000', progress_pct: 20, validation_status: 'pending', materials: 'Marker paint', notes: 'North trench completed' },
+  { id: 2, report_date: '2026-03-11', member_id: 101, member_email: 'a@x', work_done: 'Dug more', quantity_done: '30.000', progress_pct: 35, validation_status: 'approved', validation_notes: 'Good', materials: 'Survey stakes', notes: 'Levels checked' },
   { id: 3, report_date: '2026-03-12', member_id: 101, member_email: 'a@x', work_done: 'Overstated', quantity_done: '99.000', progress_pct: 99, validation_status: 'voided', void_reason: 'Measured wrongly' },
 ];
 
@@ -72,6 +73,12 @@ test('member view for a stages task offers a stage list', () => {
   const d = views().member(t, []);
   const opts = [...d.getElementById('wc-pr-stage-5').options].map((o) => o.textContent.trim());
   assert.deepEqual(opts, ['Select stage', 'Reinforcement (hold point)', 'Pour (locked: an earlier hold point is not verified yet)']);
+});
+
+test('task dates use one readable format and invalid values have a safe fallback', () => {
+  const view = views();
+  assert.equal(view.formatDate('2026-11-03'), '3 Nov 2026');
+  assert.equal(view.formatDate('not-a-date'), '—');
 });
 
 test('leader view: validate buttons only on pending reports, void button only on approved ones', () => {
@@ -103,16 +110,36 @@ test('expanded leader task uses summary and Details, Reports, Queries tabs with 
     question: 'Please explain the measurement.', answer: 'Measured from the drawing.', status: 'answered',
     created_at: '2026-03-10' }];
   const d = views().tabbed(t, entries, queries, true);
-  assert.deepEqual([...d.querySelectorAll('[role="tab"]')].map((tab) => tab.textContent.trim().replace(/\s+\d+$/, '')),
+  const tabs = [...d.querySelectorAll('[role="tab"]')];
+  assert.ok(tabs.every((tab) => tab.classList.contains('detail-tab')));
+  assert.deepEqual(tabs.map((tab) => tab.textContent.trim().replace(/\s+\d+$/, '')),
     ['Details', 'Reports', 'Queries']);
+  const summary = d.querySelector('[data-wc-card-summary]');
+  assert.match(summary.textContent, /Progress/);
+  assert.doesNotMatch(summary.textContent, /Excavate trenches|Created by|High|Ongoing|Start Date/);
+  const details = d.querySelector('#wc-read-5').textContent;
+  assert.doesNotMatch(details, /Start Date|End Date|Required priority|Excavate trenches/);
   assert.match(d.body.textContent, /20%/);
-  assert.match(d.body.textContent, /Required priorityHigh/);
+  assert.doesNotMatch(d.body.textContent, /Required priorityHigh/);
+  assert.match(d.body.textContent, /How to read this task/);
+  assert.match(d.body.textContent, /approved reports measured as quantity/);
+  assert.match(d.body.textContent, /Review each submission’s work description/);
+  assert.match(d.body.textContent, /Materials/);
+  assert.match(d.body.textContent, /Marker paint/);
+  assert.match(d.body.textContent, /North trench completed/);
   assert.match(d.body.textContent, /Foundation/);
   assert.match(d.body.textContent, /Formation levels confirmed/);
   assert.match(d.body.textContent, /Planned manpower6 workers/);
   assert.match(d.body.textContent, /Please explain the measurement/);
+  assert.match(d.body.textContent, /A query and its answer are kept with the task/);
   assert.ok(d.querySelector('[data-wc-pane="reports"]'));
   assert.ok(d.querySelector('[data-wc-pane="queries"]'));
+});
+
+test('expanded standalone task explains its progress source without implying an activity link', () => {
+  const d = views().tabbed({ ...task, activity_id: null, activity_title: null }, [], [], false);
+  assert.match(d.body.textContent, /This is a standalone task and is not included in an activity/);
+  assert.match(d.body.textContent, /approved reports measured as quantity/);
 });
 
 test('expanded member task separates progress, previous reports and queries; closed task hides progress', () => {
@@ -120,6 +147,10 @@ test('expanded member task separates progress, previous reports and queries; clo
   const tabs = [...d.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('data-wc-tab'));
   assert.deepEqual(tabs, ['details', 'progress', 'my-reports', 'queries']);
   assert.ok(d.querySelector('[data-wc-pane="my-reports"]')?.textContent.includes('My Previous Submissions'));
+  assert.match(d.body.textContent, /leader must approve the report before it changes task or activity progress/);
+  assert.match(d.body.textContent, /Pending reports are waiting for review/);
+  assert.match(d.body.textContent, /Survey stakes/);
+  assert.match(d.body.textContent, /Levels checked/);
   assert.ok(d.querySelector('[data-wc-pane="progress"]'));
 
   const closed = views().tabbed({ ...task, status: 'closed' }, [], [], false);

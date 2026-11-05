@@ -12,7 +12,11 @@ function setup({ legacyActivityCard = true } = {}) {
     _wcWireDetailButtons: () => {},
   };
   if (legacyActivityCard) {
-    window._peActivityCardHtml = () => '<main><div data-pe-pane="overview"></div></main>';
+    window._peActivityCardHtml = (_card, verificationData) => {
+      if (!verificationData || !Array.isArray(verificationData.verifications))
+        throw new TypeError('verification data is required');
+      return '<main><div data-pe-pane="overview"></div></main>';
+    };
     window._peWireActivityCard = () => {};
   }
   const context = {
