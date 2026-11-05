@@ -107,6 +107,7 @@ test('expanded leader task uses summary and Details, Reports, Queries tabs with 
     activity_milestone_start: '2026-03-01', activity_milestone_end: '2026-04-30',
     activity_start_date: '2026-03-05', activity_end_date: '2026-04-20' };
   const queries = [{ id: 21, asked_by_role: 'ContractorPM', recipient_email: 'a@x',
+    report_id: 2, report_date: '2026-03-11', report_work_done: 'Dug more',
     question: 'Please explain the measurement.', answer: 'Measured from the drawing.', status: 'answered',
     created_at: '2026-03-10' }];
   const d = views().tabbed(t, entries, queries, true);
@@ -131,6 +132,11 @@ test('expanded leader task uses summary and Details, Reports, Queries tabs with 
   assert.match(d.body.textContent, /Formation levels confirmed/);
   assert.match(d.body.textContent, /Planned manpower6 workers/);
   assert.match(d.body.textContent, /Please explain the measurement/);
+  assert.match(d.body.textContent, /Progress report/);
+  assert.match(d.body.textContent, /Choose a report/);
+  assert.match(d.querySelector('#wc-query-report-5').textContent, /a@x/);
+  assert.equal(d.querySelector('#wc-query-member-5'), null);
+  assert.match(d.body.textContent, /Dug more/);
   assert.match(d.body.textContent, /A query and its answer are kept with the task/);
   assert.ok(d.querySelector('[data-wc-pane="reports"]'));
   assert.ok(d.querySelector('[data-wc-pane="queries"]'));

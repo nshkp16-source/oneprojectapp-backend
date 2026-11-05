@@ -394,32 +394,32 @@ export function registerReportRoutes(app, deps) {
       const projectId = parseInt(req.query.projectId, 10);
       const audience = String(req.query.audience || 'side');
       if (!projectId) throw new HttpError(400, 'projectId is required.');
-      if (!['side', 'client'].includes(audience)) throw new HttpError(400, 'audience must be side or client.');
+      if (audience !== 'side') throw new HttpError(400, 'audience must be side.');
+      const reportSide = wcSide(role);
+      if (!['Contractor', 'Consultant', 'Client', 'ContractorPM', 'ConsultantPM', 'ClientPM',
+        'Contractor Project Manager', 'Consultant Project Manager', 'Client Project Manager'].includes(role)
+        || !['Contractor', 'Consultant', 'Client'].includes(reportSide))
+        throw new HttpError(403, 'Only project-side leaders and project managers can download this report.');
       if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
-      if (audience === 'client' && wcSide(role) !== 'Client') throw new HttpError(403, 'Only client-side users can download the client report.');
-      if (audience === 'side' && !['Contractor', 'Consultant'].includes(wcSide(role)))
-        throw new HttpError(403, 'This report is available to contractor and consultant project members.');
 
-      const reportSide = 'Contractor';
-      const clientReport = audience === 'client';
       const rows = (await pool.query(`
         SELECT pe.id AS activity_id, pe.title AS activity_title, pe.activity_type,
-               CASE WHEN $2::boolean THEN NULL ELSE pe.status END AS status,
+               pe.status,
                pe.status AS delay_status,
                to_char(pe.start_date, 'YYYY-MM-DD') AS start_date,
                to_char(pe.end_date, 'YYYY-MM-DD') AS end_date,
                to_char(pe.actual_end, 'YYYY-MM-DD') AS actual_end,
                pe.planned_quantity, pe.unit,
-               CASE WHEN $2::boolean THEN pe.certified_progress_pct ELSE pe.progress_pct END AS activity_progress_pct,
-               CASE WHEN $2::boolean THEN NULL ELSE w.title END AS task_title,
-               CASE WHEN $2::boolean THEN NULL ELSE w.weight_pct END AS task_weight_pct,
-               CASE WHEN $2::boolean THEN NULL ELSE w.target_quantity END AS task_target_quantity,
-               CASE WHEN $2::boolean THEN NULL ELSE w.progress_pct END AS task_progress_pct,
-               CASE WHEN $2::boolean THEN NULL ELSE p.approved_report_count END AS approved_report_count,
-               CASE WHEN $2::boolean THEN NULL ELSE p.approved_quantity END AS approved_quantity,
-               CASE WHEN $2::boolean THEN NULL ELSE v.pending_verifications END AS pending_verifications
+               pe.progress_pct AS activity_progress_pct,
+               w.title AS task_title,
+               w.weight_pct AS task_weight_pct,
+               w.target_quantity AS task_target_quantity,
+               w.progress_pct AS task_progress_pct,
+               p.approved_report_count,
+               p.approved_quantity,
+               v.pending_verifications
         FROM planning_execution pe
-        LEFT JOIN workspace_work_center w ON w.activity_id = pe.id AND NOT $2::boolean
+        LEFT JOIN workspace_work_center w ON w.activity_id = pe.id AND w.side = $2
         LEFT JOIN LATERAL (
           SELECT COUNT(*)::int AS approved_report_count,
                  COALESCE(SUM(quantity_done), 0) AS approved_quantity
@@ -431,8 +431,8 @@ export function registerReportRoutes(app, deps) {
           FROM activity_verifications
           WHERE activity_id = pe.id AND status = 'pending'
         ) v ON true
-        WHERE pe.project_id = $1 AND pe.side = $3
-        ORDER BY pe.start_date, pe.id, w.id`, [projectId, clientReport, reportSide])).rows;
+        WHERE pe.project_id = $1 AND pe.side = $2
+        ORDER BY pe.start_date, pe.id, w.id`, [projectId, reportSide])).rows;
       const reportRows = rows.map((row) => ({
         ...row,
         calculated_delay_days: delayDays({
@@ -459,7 +459,7 @@ export function registerReportRoutes(app, deps) {
         row.pending_verifications,
       ])].map((line) => line.map(quote).join(',')).join('\r\n');
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="oneproject-closeout-${clientReport ? 'client' : 'project'}-${projectId}.csv"`);
+      res.setHeader('Content-Disposition', `attachment; filename="oneproject-closeout-${reportSide.toLowerCase()}-${projectId}.csv"`);
       return res.status(200).send(`\uFEFF${csv}`);
     } catch (err) { return fail(res, err, 'GET /api/planning-execution/closeout-report:'); }
   });

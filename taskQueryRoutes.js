@@ -89,11 +89,14 @@ export function registerTaskQueryRoutes(app, deps) {
       const result = await pool.query(
         `SELECT q.id, q.task_id, q.project_id, q.asked_by_id, q.asked_by_role,
                 q.recipient_id, recipient.email AS recipient_email,
+                q.report_id, to_char(p.report_date, 'YYYY-MM-DD') AS report_date,
+                p.work_done AS report_work_done,
                 q.question, q.answer, q.status, q.created_at,
                 q.answered_at, q.answered_by_id, q.resolved_at,
                 q.resolved_by_id, q.resolved_by_role
          FROM work_center_queries q
          LEFT JOIN team_members recipient ON recipient.id = q.recipient_id
+         LEFT JOIN workspace_work_center_progress p ON p.id = q.report_id
          WHERE q.task_id = $1 AND q.project_id = $2 ${memberFilter}
          ORDER BY q.created_at DESC, q.id DESC`,
         params);
@@ -107,32 +110,39 @@ export function registerTaskQueryRoutes(app, deps) {
       const { user_id: userId, role } = req.user;
       const taskId = validId(req.params.taskId);
       const projectId = validId(req.body?.projectId);
-      const recipientId = validId(req.body?.memberId);
+      const reportId = validId(req.body?.reportId);
       const question = String(req.body?.question || '').trim();
       if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
-      if (!recipientId) throw new HttpError(400, 'Choose a team member to ask.');
+      if (!reportId) throw new HttpError(400, 'Choose a progress report to ask about.');
       if (!question) throw new HttpError(400, 'Enter a question.');
       if (question.length > 5000) throw new HttpError(400, 'The question cannot exceed 5000 characters.');
       const task = await loadTask(taskId, projectId);
       if (!task) throw new HttpError(404, 'Task not found.');
       await requireLeader(task, projectId, userId, role);
+      const report = (await pool.query(
+        `SELECT id, task_id, member_id
+         FROM workspace_work_center_progress
+         WHERE id = $1 AND task_id = $2`,
+        [reportId, taskId])).rows[0];
+      if (!report) throw new HttpError(400, 'Choose a report submitted for this task.');
+      const recipientId = Number(report.member_id);
       if (!isAssigned(task, recipientId))
-        throw new HttpError(400, 'Choose a team member assigned to this task.');
+        throw new HttpError(400, 'The report submitter is no longer assigned to this task.');
       const assignment = await pool.query(
         `SELECT 1 FROM team_member_assignments
          WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = $3 LIMIT 1`,
         [projectId, recipientId, task.side]);
       if (!assignment.rows.length)
-        throw new HttpError(400, 'The selected member is no longer assigned to this task’s side.');
+        throw new HttpError(400, 'The report submitter is no longer assigned to this task’s side.');
 
       const result = await pool.query(
         `INSERT INTO work_center_queries
-           (task_id, project_id, asked_by_id, asked_by_role, recipient_id, question)
-         VALUES ($1, $2, $3, $4, $5, $6)
+           (task_id, project_id, asked_by_id, asked_by_role, recipient_id, report_id, question)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id, task_id, project_id, asked_by_id, asked_by_role,
-                   recipient_id, question, answer, status, created_at,
+                   recipient_id, report_id, question, answer, status, created_at,
                    answered_at, answered_by_id, resolved_at, resolved_by_id, resolved_by_role`,
-        [taskId, projectId, userId, role, recipientId, question]);
+        [taskId, projectId, userId, role, recipientId, reportId, question]);
       await notify({
         projectId, entityId: result.rows[0].id, entityType: 'work_center_query',
         message: 'A task leader has asked you a question. Open Queries to respond.',
@@ -169,7 +179,7 @@ export function registerTaskQueryRoutes(app, deps) {
          SET answer = $2, status = 'answered', answered_at = NOW(), answered_by_id = $3
          WHERE id = $1 AND status = 'open'
          RETURNING id, task_id, project_id, asked_by_id, asked_by_role,
-                   recipient_id, question, answer, status, created_at,
+                   recipient_id, report_id, question, answer, status, created_at,
                    answered_at, answered_by_id, resolved_at, resolved_by_id, resolved_by_role`,
         [queryId, answer, userId]);
       if (!result.rows.length) throw new HttpError(409, 'This query has already been answered.');
@@ -203,7 +213,7 @@ export function registerTaskQueryRoutes(app, deps) {
          SET status = 'resolved', resolved_at = NOW(), resolved_by_id = $2, resolved_by_role = $3
          WHERE id = $1 AND status = 'answered'
          RETURNING id, task_id, project_id, asked_by_id, asked_by_role,
-                   recipient_id, question, answer, status, created_at,
+                   recipient_id, report_id, question, answer, status, created_at,
                    answered_at, answered_by_id, resolved_at, resolved_by_id, resolved_by_role`,
         [queryId, userId, role]);
       if (!result.rows.length) throw new HttpError(409, 'This query is no longer awaiting resolution.');

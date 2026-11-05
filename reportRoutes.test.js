@@ -32,6 +32,12 @@ async function call(method, path, user, body) {
   const r = await fetch(base + path, { method, headers: { 'content-type': 'application/json', 'x-user': JSON.stringify(user) }, body: JSON.stringify(body) });
   return { status: r.status, body: await r.json() };
 }
+async function downloadCloseout(user, query = 'audience=side') {
+  const r = await fetch(`${base}/api/planning-execution/closeout-report?projectId=1&${query}`, {
+    headers: { 'x-user': JSON.stringify(user) },
+  });
+  return { status: r.status, body: await r.text(), filename: r.headers.get('content-disposition') };
+}
 const q = async (sql, params) => (await pool.query(sql, params)).rows;
 const report = (user, o) => call('POST', '/api/work-center-progress', user, { projectId: 1, workDone: 'Work', ...o });
 const decide = (user, id, status, reason = '') => call('PUT', `/api/work-center-progress/${id}/validate`, user, { projectId: 1, validation_status: status, validation_notes: reason });
@@ -55,6 +61,46 @@ test('fixture: quantity activity with two tasks', async () => {
     tasks: [{ title: 'Block A', assigned_members: [{ id: 101 }] }, { title: 'Block B', assigned_members: [{ id: 102 }] }] });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   act = r.body.activity; [tA, tB] = r.body.tasks;
+});
+
+test('close-out export is limited to project-side leaders and PMs and only includes their own side', async () => {
+  const contractorReport = await downloadCloseout(leader);
+  assert.equal(contractorReport.status, 200);
+  assert.match(contractorReport.filename, /oneproject-closeout-contractor-1\.csv/);
+  assert.match(contractorReport.body, /Excavation/);
+
+  const contractorLeader = await downloadCloseout({ user_id: 5, role: 'Contractor' });
+  assert.equal(contractorLeader.status, 200);
+  assert.match(contractorLeader.filename, /oneproject-closeout-contractor-1\.csv/);
+  await pool.query(`UPDATE planning_execution SET side = 'Client' WHERE id = $1`, [act.id]);
+  try {
+    const clientPMReport = await downloadCloseout({ user_id: 5, role: 'ClientPM' });
+    assert.equal(clientPMReport.status, 200);
+    assert.match(clientPMReport.filename, /oneproject-closeout-client-1\.csv/);
+    assert.match(clientPMReport.body, /Excavation/);
+    const clientLeaderReport = await downloadCloseout({ user_id: 5, role: 'Client' });
+    assert.equal(clientLeaderReport.status, 200);
+    assert.match(clientLeaderReport.body, /Excavation/);
+    const contractorDoesNotSeeClient = await downloadCloseout(leader);
+    assert.doesNotMatch(contractorDoesNotSeeClient.body, /Excavation/);
+  } finally {
+    await pool.query(`UPDATE planning_execution SET side = 'Contractor' WHERE id = $1`, [act.id]);
+  }
+  const clientAudience = await downloadCloseout(leader, 'audience=client');
+  assert.equal(clientAudience.status, 400);
+
+  await pool.query(`UPDATE planning_execution SET side = 'Consultant' WHERE id = $1`, [act.id]);
+  try {
+    const consultantReport = await downloadCloseout(consultant);
+    assert.equal(consultantReport.status, 200);
+    assert.match(consultantReport.filename, /oneproject-closeout-consultant-1\.csv/);
+    assert.match(consultantReport.body, /Excavation/);
+    const contractorAfterMove = await downloadCloseout(leader);
+    assert.equal(contractorAfterMove.status, 200);
+    assert.doesNotMatch(contractorAfterMove.body, /Excavation/);
+  } finally {
+    await pool.query(`UPDATE planning_execution SET side = 'Contractor' WHERE id = $1`, [act.id]);
+  }
 });
 
 test('report checks: wrong member, missing quantity, future date, before task start', async () => {

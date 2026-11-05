@@ -110,6 +110,13 @@ test('pending verification navigation uses the activity card instead of a modal'
   assert.doesNotMatch(pendingWorkflow, /position:fixed|document\.createElement\('div'\)/);
 });
 
+test('close-out download is limited to project-side leaders and PMs and names the selected side', () => {
+  assert.match(source, /\['Contractor', 'Consultant', 'Client', 'ContractorPM', 'ConsultantPM', 'ClientPM',\s*'Contractor Project Manager', 'Consultant Project Manager', 'Client Project Manager'\]\.includes\(window\.currentUserRole\)/);
+  assert.match(source, /only project-side leaders and project managers can download this report/i);
+  assert.match(source, /oneproject-closeout-\$\{side\}-\$\{projectId\}\.csv/);
+  assert.doesNotMatch(source, /audience = wcSide\(window\.currentUserRole\) === 'Client'/);
+});
+
 test('activity cards also render when the deployed dashboard has no legacy card renderer', () => {
   const window = setup({ legacyActivityCard: false });
   const contractorCard = window._peActivityCardHtml({

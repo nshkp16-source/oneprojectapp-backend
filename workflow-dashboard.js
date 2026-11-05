@@ -306,7 +306,8 @@
       pending.textContent = 'Pending verifications';
       pending.addEventListener('click', () => window.openPendingVerifications());
       actions.appendChild(pending);
-      if (isWCLeader(window.currentUserRole) && ['Contractor', 'Consultant', 'Client'].includes(wcSide(window.currentUserRole))) {
+      if (['Contractor', 'Consultant', 'Client', 'ContractorPM', 'ConsultantPM', 'ClientPM',
+        'Contractor Project Manager', 'Consultant Project Manager', 'Client Project Manager'].includes(window.currentUserRole)) {
         const closeout = document.createElement('button');
         closeout.type = 'button';
         closeout.className = 'rc-btn rc-btn--sm';
@@ -633,11 +634,14 @@
 
   window.downloadCloseoutReport = async function () {
     try {
+      if (!['Contractor', 'Consultant', 'Client', 'ContractorPM', 'ConsultantPM', 'ClientPM',
+        'Contractor Project Manager', 'Consultant Project Manager', 'Client Project Manager'].includes(window.currentUserRole))
+        throw new Error('Only project-side leaders and project managers can download this report.');
       const projectId = await ensureActiveProjectId();
       if (!projectId) throw new Error('Select a project first.');
-      const audience = wcSide(window.currentUserRole) === 'Client' ? 'client' : 'side';
+      const side = wcSide(window.currentUserRole).toLowerCase();
       const response = await _wcFetch(
-        `${API}/planning-execution/closeout-report?projectId=${encodeURIComponent(projectId)}&audience=${audience}`,
+        `${API}/planning-execution/closeout-report?projectId=${encodeURIComponent(projectId)}&audience=side`,
       );
       if (!response.ok) {
         const error = await response.json().catch(() => ({}));
@@ -646,7 +650,7 @@
       const blob = await response.blob();
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
-      link.download = `oneproject-closeout-${audience}-${projectId}.csv`;
+      link.download = `oneproject-closeout-${side}-${projectId}.csv`;
       document.body.appendChild(link);
       link.click();
       link.remove();
