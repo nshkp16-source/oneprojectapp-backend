@@ -94,7 +94,7 @@ export async function syncMilestone(client, kind, milestoneId, actor = null) {
                    contributions        = EXCLUDED.contributions,
                    recomputed_at        = NOW()`,
     [Number(ms.project_id), milestoneId, derived, executed,
-     JSON.stringify(drivers.map((a) => ({ activity_id: a.id, weight_pct: Number(a.milestone_weight_pct), certified_progress_pct: Number(a.certified_progress_pct) })))]);
+     JSON.stringify(drivers.map((a) => ({ activity_id: a.id, title: a.title, weight_pct: Number(a.milestone_weight_pct), certified_progress_pct: Number(a.certified_progress_pct) })))]);
 
   return { derived, progress_pct: effective, executed, breakdown_open: !!open };
 }
@@ -263,13 +263,14 @@ export function registerActivityRoutes(app, deps) {
         throw new HttpError(403, 'You cannot view this activity.');
 
       const clientView = viewerSide === 'Client';
-      const taskRows = clientView ? [] : (await pool.query(
+      const consultantView = viewerSide === 'Consultant' && activity.side === 'Contractor';
+      const taskRows = clientView || consultantView ? [] : (await pool.query(
         `SELECT w.id, w.title, w.description, w.assigned_members, w.status, w.start_date, w.end_date,
                 w.weight_pct, w.target_quantity, w.progress_pct, w.priority,
                 (SELECT COUNT(*)::int FROM workspace_work_center_progress p
                  WHERE p.task_id = w.id AND p.validation_status = 'pending') AS pending_report_count
          FROM workspace_work_center w WHERE w.activity_id = $1 ORDER BY w.id`, [activityId])).rows;
-      const stages = clientView ? [] : (await pool.query(
+      const stages = clientView || consultantView ? [] : (await pool.query(
         `SELECT s.id, s.task_id, s.seq, s.title, s.weight_pct, s.is_hold_point,
                 s.completed_at, s.hold_verified_at
          FROM task_stages s JOIN workspace_work_center w ON w.id = s.task_id
@@ -279,7 +280,7 @@ export function registerActivityRoutes(app, deps) {
         if (!stagesByTask.has(stage.task_id)) stagesByTask.set(stage.task_id, []);
         stagesByTask.get(stage.task_id).push(stage);
       }
-      const progressReports = clientView || !taskRows.length ? [] : (await pool.query(
+      const progressReports = clientView || consultantView || !taskRows.length ? [] : (await pool.query(
         `SELECT p.id, p.task_id, w.title AS task_title, p.report_date, p.member_id,
                 tm.email AS member_email, p.work_done, p.quantity_done, p.quantity_failed,
                 p.progress_pct, p.stage_id, p.manpower, p.equipment, p.materials,
@@ -289,15 +290,58 @@ export function registerActivityRoutes(app, deps) {
          JOIN team_members tm ON tm.id = p.member_id
          WHERE w.activity_id = $1 AND p.validation_status = 'approved'
          ORDER BY p.report_date, p.submitted_at, p.id`, [activityId])).rows;
+      const activitySummary = consultantView ? (await pool.query(
+        `SELECT COUNT(*)::int AS task_count,
+                COUNT(*) FILTER (WHERE status = 'completed')::int AS completed_task_count,
+                COALESCE(SUM(target_quantity), 0)::numeric AS planned_quantity
+         FROM workspace_work_center WHERE activity_id = $1`, [activityId])).rows[0] : null;
+      const reportSummary = consultantView ? (await pool.query(
+        `SELECT COUNT(*)::int AS approved_report_count,
+                COALESCE(SUM(quantity_done), 0)::numeric AS approved_quantity,
+                MAX(report_date) AS latest_report_date
+         FROM workspace_work_center_progress p
+         JOIN workspace_work_center w ON w.id = p.task_id
+         WHERE w.activity_id = $1 AND p.validation_status = 'approved'`, [activityId])).rows[0] : null;
+      const visibleActivity = consultantView ? {
+        id: activity.id,
+        project_id: activity.project_id,
+        title: activity.title,
+        side: activity.side,
+        activity_type: activity.activity_type,
+        start_date: activity.start_date,
+        end_date: activity.end_date,
+        planned_quantity: activity.planned_quantity,
+        unit: activity.unit,
+        drives_milestone: activity.drives_milestone,
+        milestone_weight_pct: activity.milestone_weight_pct,
+        baseline_milestone_title: activity.baseline_milestone_title,
+        additional_milestone_title: activity.additional_milestone_title,
+        milestone_name: activity.milestone_name,
+        status: activity.status,
+        progress_pct: Number(activity.progress_pct) || 0,
+        claimed_progress_pct: Number(activity.progress_pct) || 0,
+        certified_progress_pct: Number(activity.certified_progress_pct) || 0,
+        baseline_milestone_id: activity.baseline_milestone_id,
+        additional_milestone_id: activity.additional_milestone_id,
+        calculated_delay_days: activity.calculated_delay_days,
+      } : {
+        ...activity,
+        progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
+        status: clientView ? null : activity.status,
+        claimed_progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
+        certified_progress_pct: Number(activity.certified_progress_pct) || 0,
+        client_view: clientView,
+      };
       return res.json({
-        activity: {
-          ...activity,
-          progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
-          status: clientView ? null : activity.status,
-          claimed_progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
-          certified_progress_pct: Number(activity.certified_progress_pct) || 0,
-          client_view: clientView,
-        },
+        activity: visibleActivity,
+        activity_summary: consultantView ? {
+          task_count: Number(activitySummary.task_count),
+          completed_task_count: Number(activitySummary.completed_task_count),
+          planned_quantity: Number(activitySummary.planned_quantity),
+          approved_report_count: Number(reportSummary.approved_report_count),
+          approved_quantity: Number(reportSummary.approved_quantity),
+          latest_report_date: reportSummary.latest_report_date,
+        } : null,
         tasks: taskRows.map((task) => ({
           ...task,
           assigned_members: parseJson(task.assigned_members, [], 'assigned_members'),
@@ -547,7 +591,7 @@ export function registerActivityRoutes(app, deps) {
            activity_type, done_when, baseline_milestone_id, additional_milestone_id, milestone_weight_pct)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'not_yet_started',$17,$18,$19,$20,$21,$22,$23)
         RETURNING *`,
-        [projectId, side, milestoneTitle || String(b.milestone_name || '').trim() || null,
+        [projectId, side, milestoneTitle,
          String(b.title).trim(), b.description || '', b.start_date, b.end_date,
          planned, unit, b.planned_work || '', b.planned_manpower || '', b.planned_equipment || '', b.planned_materials || '',
          file.name, file.id, file.url, userId, role,

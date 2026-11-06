@@ -2282,6 +2282,17 @@ function sideRoles(side) {
   return ['Client', 'ClientPM'];
 }
 
+async function projectHasSideMember(projectId, side) {
+  const result = await pool.query(
+    `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role = ANY($2::text[]) LIMIT 1`,
+    [projectId, sideRoles(side)]);
+  return result.rows.length > 0;
+}
+
+async function contractorMustUseConsultantProgress(projectId, role) {
+  return wcSide(role) === 'Contractor' && projectHasSideMember(projectId, 'Consultant');
+}
+
 // =============================================================================
 //  CHAT HELPERS
 // =============================================================================
@@ -7331,8 +7342,57 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
     const amRows = await pool.query(`SELECT am.*,COALESCE(json_agg(json_build_object('id',e.id,'date',e.report_date,'qty',e.qty_executed,'remarks',e.remarks,'cumulative',e.cumulative_after_entry) ORDER BY e.report_date) FILTER (WHERE e.id IS NOT NULL),'[]') AS entries,COALESCE(json_agg(DISTINCT jsonb_build_object('fileName',a.file_name,'url',a.cloudinary_url)) FILTER (WHERE a.id IS NOT NULL),'[]') AS attachments FROM additional_milestones am LEFT JOIN additional_milestone_progress_entries e ON e.additional_milestone_id=am.id LEFT JOIN additional_milestone_attachments a ON a.additional_milestone_id=am.id WHERE am.schedule_id=$1 GROUP BY am.id ORDER BY am.sort_order`, [sched.id]);
     
     const extRows = await pool.query(`SELECT id,extension_days,COALESCE(new_planned_start,new_planned_finish - (extension_days || ' days')::interval) as new_planned_start,new_planned_finish,reason,extension_type,status,created_at,supporting_file_name,supporting_file_url,supporting_file_mime,supporting_file_size FROM schedule_extensions WHERE schedule_id=$1 ORDER BY created_at ASC`, [sched.id]);
-    
-    const mapMs = (ms, isExt) => ({ id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,completed_at:ms.completed_at,entries:ms.entries,fileName:ms.attachments?.[0]?.fileName||null,attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt,extensionId:ms.schedule_extension_id||null });
+    const derivedRows = await pool.query(
+      `SELECT baseline_milestone_id, additional_milestone_id, report_date,
+              derived_progress_pct, executed_equivalent, contributions
+       FROM milestone_activity_progress WHERE project_id = $1 ORDER BY report_date, id`, [projectId]);
+    const derivedActivityIds = [...new Set(derivedRows.rows.flatMap((entry) =>
+      (Array.isArray(entry.contributions) ? entry.contributions : []).map((item) => Number(item.activity_id)).filter(Number.isInteger)))];
+    if (derivedActivityIds.length) {
+      const activityTitles = await pool.query(
+        `SELECT id, title FROM planning_execution WHERE id = ANY($1::int[])`, [derivedActivityIds]);
+      const titleById = new Map(activityTitles.rows.map((activity) => [Number(activity.id), activity.title]));
+      for (const entry of derivedRows.rows) {
+        entry.contributions = (Array.isArray(entry.contributions) ? entry.contributions : []).map((item) => ({
+          ...item,
+          title: item.title || titleById.get(Number(item.activity_id)) || null,
+        }));
+      }
+    }
+    const derivedByMilestone = new Map();
+    for (const entry of derivedRows.rows) {
+      const key = entry.baseline_milestone_id
+        ? `baseline:${entry.baseline_milestone_id}`
+        : `additional:${entry.additional_milestone_id}`;
+      if (!derivedByMilestone.has(key)) derivedByMilestone.set(key, []);
+      derivedByMilestone.get(key).push(entry);
+    }
+    const requestRows = await pool.query(
+      `SELECT baseline_milestone_id, additional_milestone_id, note, requested_at
+       FROM milestone_progress_requests WHERE project_id = $1 AND status = 'open'`, [projectId]);
+    const requestsByMilestone = new Map(requestRows.rows.map((request) => [
+      request.baseline_milestone_id
+        ? `baseline:${request.baseline_milestone_id}`
+        : `additional:${request.additional_milestone_id}`,
+      request,
+    ]));
+    const hasConsultant = await projectHasSideMember(projectId, 'Consultant');
+    const mapMs = (ms, isExt) => {
+      const kind = isExt ? 'additional' : 'baseline';
+      const key = `${kind}:${ms.id}`;
+      return {
+        id:ms.id,title:ms.title,description:ms.description,start:ms.planned_start,end:ms.planned_end,
+        quantity:ms.quantity,unit:ms.unit,dep:ms.depends_on||ms.depends_on_baseline||'None',
+        weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,
+        executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,
+        completed_at:ms.completed_at,entries:ms.entries,
+        activityEntries:derivedByMilestone.get(key)||[],
+        consultantProgressRequest:requestsByMilestone.get(key)||null,
+        hasConsultant,fileName:ms.attachments?.[0]?.fileName||null,
+        attachmentUrl:ms.attachments?.[0]?.url||null,isExtension:isExt,
+        extensionId:ms.schedule_extension_id||null,
+      };
+    };
     res.json({ schedule: { id:sched.id,timeline:{start:sched.planned_start,finish:sched.planned_finish,duration:sched.total_duration},location:sched.location||null,milestones:msRows.rows.map(ms=>mapMs(ms,false)),extension_milestones:amRows.rows.map(ms=>mapMs(ms,true)),extensions:extRows.rows,effective_today:scheduleClock?.effective_today||null,schedule_paused:scheduleClock?.paused||false,pause_started_at:scheduleClock?.pause_started_at||null } });
   } catch (err) { console.error('[GET /api/get-schedule]', err); res.status(500).json({ error: 'Failed to load schedule' }); }
 });
@@ -7483,6 +7543,10 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
     const msRes = await client.query('SELECT * FROM milestones WHERE id=$1 AND project_id=$2 FOR UPDATE', [milestoneId, projectId]);
     if (!msRes.rows.length) return res.status(404).json({ error: 'Milestone not found' });
     const ms = msRes.rows[0];
+    if (await contractorMustUseConsultantProgress(projectId, req.user.role)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Contractor progress is recorded through activities on this project. Ask the consultant to record milestone progress.' });
+    }
     const typedBlocked = await typedProgressBlockedReason(client, 'baseline', milestoneId);
     if (typedBlocked) { await client.query('ROLLBACK'); return res.status(409).json({ error: typedBlocked }); }
     if (ms.activity_status==='completed') return res.status(409).json({ error: 'Milestone is already completed' });
@@ -7491,6 +7555,7 @@ app.post('/api/report-progress', authenticateToken, upload.single('attachment'),
     const newPct = planned>0?Math.min(100,(newExecuted/planned)*100):0;
     const entryRes = await client.query(`INSERT INTO milestone_progress_entries (milestone_id,project_id,report_date,qty_executed,cumulative_after_entry,progress_pct_after_entry,remarks,reported_by_user_id,reported_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (milestone_id,report_date) DO UPDATE SET qty_executed=milestone_progress_entries.qty_executed+EXCLUDED.qty_executed,cumulative_after_entry=EXCLUDED.cumulative_after_entry,progress_pct_after_entry=EXCLUDED.progress_pct_after_entry,remarks=COALESCE(EXCLUDED.remarks,milestone_progress_entries.remarks),reported_by_user_id=EXCLUDED.reported_by_user_id,reported_by_role=EXCLUDED.reported_by_role RETURNING *`, [milestoneId,projectId,reportDate,qty,newExecuted,newPct.toFixed(2),remarks||null,req.user.user_id,req.user.role]);
     await client.query(`UPDATE milestones SET executed=$1,progress_pct=$2,activity_status='in_progress',updated_at=now() WHERE id=$3`, [newExecuted,newPct.toFixed(2),milestoneId]);
+    await client.query(`UPDATE milestone_progress_requests SET status='fulfilled', fulfilled_at=NOW() WHERE baseline_milestone_id=$1 AND status='open'`, [milestoneId]);
     if (req.file) {
       try { const cdResult=await scheduleCloudinaryUpload(req.file.buffer,req.file.originalname,`oneprojectapp/schedules/${projectId}/progress`); await client.query(`INSERT INTO progress_entry_attachments (progress_entry_id,file_name,file_size,mime_type,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [entryRes.rows[0].id,req.file.originalname,req.file.size,req.file.mimetype,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]); } catch(cdErr){console.error('[report-progress] Attachment upload failed:',cdErr);}
     }
@@ -7512,6 +7577,10 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
     const msRes=await client.query('SELECT * FROM additional_milestones WHERE id=$1 AND project_id=$2 FOR UPDATE',[milestoneId,projectId]);
     if (!msRes.rows.length) return res.status(404).json({ error: 'Additional milestone not found' });
     const ms=msRes.rows[0];
+    if (await contractorMustUseConsultantProgress(projectId, req.user.role)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Contractor progress is recorded through activities on this project. Ask the consultant to record milestone progress.' });
+    }
     const typedBlocked = await typedProgressBlockedReason(client, 'additional', milestoneId);
     if (typedBlocked) { await client.query('ROLLBACK'); return res.status(409).json({ error: typedBlocked }); }
     if (ms.activity_status==='completed') return res.status(409).json({ error: 'Milestone is already completed' });
@@ -7520,6 +7589,7 @@ app.post('/api/report-additional-progress', authenticateToken, upload.single('at
     const newPct=planned>0?Math.min(100,(newExecuted/planned)*100):0;
     const entryRes=await client.query(`INSERT INTO additional_milestone_progress_entries (additional_milestone_id,project_id,report_date,qty_executed,cumulative_after_entry,progress_pct_after_entry,remarks,reported_by_user_id,reported_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (additional_milestone_id,report_date) DO UPDATE SET qty_executed=additional_milestone_progress_entries.qty_executed+EXCLUDED.qty_executed,cumulative_after_entry=EXCLUDED.cumulative_after_entry,progress_pct_after_entry=EXCLUDED.progress_pct_after_entry,remarks=COALESCE(EXCLUDED.remarks,additional_milestone_progress_entries.remarks),reported_by_user_id=EXCLUDED.reported_by_user_id,reported_by_role=EXCLUDED.reported_by_role RETURNING id`,[milestoneId,projectId,reportDate,qty,newExecuted,newPct.toFixed(2),remarks||null,req.user.user_id,req.user.role]);
     await client.query(`UPDATE additional_milestones SET executed=$1,progress_pct=$2,activity_status='in_progress',updated_at=now() WHERE id=$3`,[newExecuted,newPct.toFixed(2),milestoneId]);
+    await client.query(`UPDATE milestone_progress_requests SET status='fulfilled', fulfilled_at=NOW() WHERE additional_milestone_id=$1 AND status='open'`, [milestoneId]);
     if (req.file) { try{const cdResult=await scheduleCloudinaryUpload(req.file.buffer,req.file.originalname,`oneprojectapp/schedules/${projectId}/additional-progress`);await client.query(`INSERT INTO additional_milestone_attachments (additional_milestone_id,file_name,file_size,mime_type,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,[milestoneId,req.file.originalname,req.file.size,req.file.mimetype,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]);}catch(cdErr){console.error('[report-additional-progress] Attachment upload failed:',cdErr);} }
     await client.query('COMMIT');
     const allEntries=await pool.query(`SELECT report_date AS date,qty_executed AS qty,remarks,cumulative_after_entry AS cumulative FROM additional_milestone_progress_entries WHERE additional_milestone_id=$1 ORDER BY report_date`,[milestoneId]);
@@ -7562,6 +7632,8 @@ app.delete('/api/schedule-progress/:entryId', authenticateToken, async (req, res
   if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
   const projectId = normalizeProjectId(req.body.projectId);
   if (!projectId) return res.status(400).json({ error: 'Valid projectId is required' });
+  if (await contractorMustUseConsultantProgress(projectId, req.user.role))
+    return res.status(403).json({ error: 'Contractors cannot edit manually entered milestone progress on a project with a consultant.' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -7585,6 +7657,8 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
   if (!projectId||!milestoneId) return res.status(400).json({ error: 'Valid projectId and milestoneId are required' });
   const isExt=isExtensionMilestone===true||isExtensionMilestone==='true';
   if (!canEditSchedule(req.user.role)) return res.status(403).json({ error: 'Schedule edit permission is required' });
+  if (await contractorMustUseConsultantProgress(projectId, req.user.role))
+    return res.status(403).json({ error: 'Contractors cannot complete milestones manually on a project with a consultant.' });
   const table=isExt?'additional_milestones':'milestones';
   const client=await pool.connect();
   try {
@@ -7598,6 +7672,11 @@ app.post('/api/complete-milestone', authenticateToken, async (req, res) => {
     const planned=parseFloat(ms.quantity)||0,exec=parseFloat(ms.executed)||0;
     if (planned>0&&exec<planned) return res.status(422).json({ error:`Cannot complete: only ${exec} of ${planned} ${ms.unit||''} executed` });
     await client.query(`UPDATE ${table} SET activity_status='completed',progress_pct=100,completed_at=now(),updated_at=now() WHERE id=$1`,[milestoneId]);
+    await client.query(
+      `UPDATE milestone_progress_requests
+       SET status='fulfilled', fulfilled_at=NOW()
+       WHERE ${isExt ? 'additional_milestone_id' : 'baseline_milestone_id'}=$1 AND status='open'`,
+      [milestoneId]);
     const notifMsg = `${isExt ? 'Additional milestone' : 'Milestone'} completed by ${req.user.role}: "${ms.title || `#${milestoneId}`}"`;
     console.log('[notifications] creating notification', { projectId, entity_id: milestoneId, entity_type: table, message: notifMsg, added_by_id: req.user.user_id, added_by_role: req.user.role });
     const notifRes = await client.query(

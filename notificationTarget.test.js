@@ -119,3 +119,26 @@ test('milestone override notifications open the additional milestone detail', as
     milestone: { kind: 'additional', id: 15, title: 'Extension work' },
   });
 });
+
+test('consultant milestone progress requests open the requested baseline milestone', async () => {
+  const pool = mockPool([
+    { sql: 'FROM milestone_progress_requests', rows: [{ baseline_milestone_id: 21, additional_milestone_id: null }] },
+    { sql: 'FROM milestones', rows: [{ title: 'Roof slab' }] },
+  ]);
+  assert.deepEqual(await resolveNotificationTarget({
+    pool, projectId: 2, entityType: 'milestone_progress_request', entityId: 44,
+    userId: 8, role: 'ConsultantPM', viewerSide: 'Consultant',
+  }), {
+    tab: 'planning-execution',
+    type: 'milestone',
+    milestone: { kind: 'baseline', id: 21, title: 'Roof slab' },
+  });
+});
+
+test('contractors cannot open consultant-only milestone progress request notifications', async () => {
+  const pool = mockPool([]);
+  assert.equal(await resolveNotificationTarget({
+    pool, projectId: 2, entityType: 'milestone_progress_request', entityId: 44,
+    userId: 5, role: 'ContractorPM', viewerSide: 'Contractor',
+  }), null);
+});

@@ -82,6 +82,17 @@ async function syncLinkedMilestone(client, act, actor) {
   return { kind, id, table, col };
 }
 
+async function certifiedProgressWithSnagCaps(client, activityId, proposedProgress) {
+  const { rows } = await client.query(
+    `SELECT MIN(certified_progress_pct) AS cap
+     FROM rework_items
+     WHERE activity_id = $1 AND kind = 'snag' AND status <> 'closed'
+       AND certified_progress_pct IS NOT NULL`, [activityId]);
+  return rows[0].cap == null
+    ? Number(proposedProgress)
+    : Math.min(Number(proposedProgress), Number(rows[0].cap));
+}
+
 export function registerVerificationRoutes(app, deps) {
   const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
   const leaderOn = (role, side) => isWCLeader(role) && wcSide(role) === side;
@@ -151,14 +162,34 @@ export function registerVerificationRoutes(app, deps) {
 
       const days = (await client.query(`SELECT verification_response_days AS d FROM projects WHERE id = $1`, [act.project_id])).rows[0]?.d || 7;
       const respondBy = respondByDate(today.d, days);
+      const requestNote = String(b.note || '').trim();
+      if (requestNote.length > 500) throw new HttpError(400, 'The note cannot exceed 500 characters.');
+      const shareActivitySummary = b.shareActivitySummary === true || String(b.shareActivitySummary) === 'true';
+      const sharedActivitySummary = shareActivitySummary ? {
+        title: act.title,
+        description: act.description,
+        done_when: act.done_when,
+        activity_type: act.activity_type,
+        planned_quantity: act.planned_quantity,
+        unit: act.unit,
+        start_date: dateOnly(act.start_date),
+        end_date: dateOnly(act.end_date),
+        planned_work: act.planned_work,
+        planned_manpower: act.planned_manpower,
+        planned_equipment: act.planned_equipment,
+        planned_materials: act.planned_materials,
+      } : null;
 
       const figures = (await client.query(
         `SELECT w.id AS task_id, w.title, w.weight_pct, w.progress_pct, w.target_quantity,
+                (SELECT COUNT(*)::int FROM workspace_work_center_progress p
+                 WHERE p.task_id = w.id AND p.validation_status = 'approved' AND p.report_date <= $2) AS approved_report_count,
                 COALESCE((SELECT SUM(p.quantity_done) FROM workspace_work_center_progress p
                           WHERE p.task_id = w.id AND p.validation_status = 'approved' AND p.report_date <= $2), 0) AS approved_quantity
          FROM workspace_work_center w WHERE w.activity_id = $1 ORDER BY w.id`, [act.id, cutOff])).rows
         .map((r) => ({ ...r, weight_pct: Number(r.weight_pct), progress_pct: Number(r.progress_pct),
-                       target_quantity: r.target_quantity == null ? null : Number(r.target_quantity), approved_quantity: Number(r.approved_quantity) }));
+                       target_quantity: r.target_quantity == null ? null : Number(r.target_quantity),
+                       approved_report_count: Number(r.approved_report_count), approved_quantity: Number(r.approved_quantity) }));
 
       let attachments = [];
       if (req.file) {
@@ -171,10 +202,12 @@ export function registerVerificationRoutes(app, deps) {
         ver = (await client.query(`
           INSERT INTO activity_verifications
             (project_id, activity_id, kind, stage_id, cut_off_date, claimed_progress_pct, claimed_figures,
-             requested_by_id, requested_by_role, request_note, attachments, respond_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
+             requested_by_id, requested_by_role, request_note, attachments, respond_by,
+             share_activity_summary, shared_activity_summary)
+          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb) RETURNING *`,
           [act.project_id, act.id, kind, stageId, cutOff, act.progress_pct, JSON.stringify(figures), userId, role,
-           String(b.note || '').trim() || null, JSON.stringify(attachments), respondBy])).rows[0];
+           requestNote || null, JSON.stringify(attachments), respondBy,
+           shareActivitySummary, sharedActivitySummary ? JSON.stringify(sharedActivitySummary) : null])).rows[0];
       } catch (err) {
         if (err.code === '23505') throw new HttpError(409, 'A request of this kind is already waiting for the consultant.');
         throw err;
@@ -285,6 +318,16 @@ export function registerVerificationRoutes(app, deps) {
       let rework = Array.isArray(b.rework) ? b.rework : (typeof b.rework === 'string' && b.rework ? JSON.parse(b.rework) : []);
       if (status === 'rejected' && !rework.length) rework = [{ reason }];
       if (rework.some((r) => !String(r.reason || '').trim())) throw new HttpError(400, 'Every rework or snag item needs a reason.');
+      if (v.kind === 'completion' && status !== 'rejected') {
+        const snagReason = String(b.snag_reason || '').trim();
+        if (snagReason) rework.push({ reason: snagReason, certified_progress_pct: b.snag_certified_progress_pct });
+        for (const item of rework) {
+          const progress = Number(item.certified_progress_pct ?? b.snag_certified_progress_pct ?? 99);
+          if (!Number.isFinite(progress) || progress < 0 || progress >= 100)
+            throw new HttpError(400, 'Each completion snag needs a certified progress percentage below 100.');
+          item.certified_progress_pct = progress;
+        }
+      }
 
       let attachments = [];
       if (req.file) {
@@ -312,11 +355,16 @@ export function registerVerificationRoutes(app, deps) {
         [v.id, v.project_id, role, userId, status, reason || null]);
 
       for (const item of rework) {
+        const itemKind = v.kind === 'completion' && status !== 'rejected' ? 'snag' : 'rework';
         await client.query(
-          `INSERT INTO rework_items (project_id, activity_id, task_id, verification_id, kind, reason, raised_by_id, raised_by_role)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [v.project_id, v.activity_id, item.task_id || null, v.id, v.kind === 'completion' && status !== 'rejected' ? 'snag' : 'rework',
-           String(item.reason).trim(), userId, role]);
+          `INSERT INTO rework_items
+             (project_id, activity_id, task_id, verification_id, kind, reason, raised_by_id, raised_by_role,
+              certified_progress_pct, previous_certified_progress_pct)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [v.project_id, v.activity_id, item.task_id || null, v.id, itemKind,
+           String(item.reason).trim(), userId, role,
+           itemKind === 'snag' ? item.certified_progress_pct : null,
+           itemKind === 'snag' ? certified : null]);
       }
 
       let closed = false, milestone = null;
@@ -324,9 +372,10 @@ export function registerVerificationRoutes(app, deps) {
         if (v.kind === 'hold_point') {
           await client.query(`UPDATE task_stages SET hold_verified_at = NOW() WHERE id = $1`, [v.stage_id]);
         } else {
+          const cappedCertified = await certifiedProgressWithSnagCaps(client, act.id, v.kind === 'completion' ? 100 : certified);
           await client.query(
             `UPDATE planning_execution SET certified_progress_pct = $2, certified_at = NOW(), updated_at = NOW() WHERE id = $1`,
-            [act.id, v.kind === 'completion' ? 100 : certified]);
+            [act.id, cappedCertified]);
         }
         // the consultant's temporary milestone value ends once corrected work is verified
         const link = await syncLinkedMilestone(client, act, actor);
@@ -368,6 +417,7 @@ export function registerVerificationRoutes(app, deps) {
 
   // ── 3. rework and snags ────────────────────────────────────────────────────
   app.post('/api/activities/:activityId/rework', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    let client;
     try {
       const { user_id: userId, role } = req.user;
       if (!leaderOn(role, 'Consultant')) throw new HttpError(403, 'Only consultant leaders and PMs can raise rework or snags.');
@@ -375,19 +425,38 @@ export function registerVerificationRoutes(app, deps) {
       if (!['rework', 'snag'].includes(kind)) throw new HttpError(400, 'kind must be rework or snag.');
       const reason = String(req.body?.reason || '').trim();
       if (!reason) throw new HttpError(400, 'A reason is required.');
-      const act = await loadActivity(pool, parseInt(req.params.activityId, 10));
+      const certifiedProgress = Number(req.body?.certified_progress_pct);
+      if (kind === 'snag' && (!Number.isFinite(certifiedProgress) || certifiedProgress < 0 || certifiedProgress >= 100))
+        throw new HttpError(400, 'A snag needs a certified progress percentage below 100.');
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const act = await loadActivity(client, parseInt(req.params.activityId, 10), true);
       if (!act || act.side !== 'Contractor') throw new HttpError(404, 'Contractor activity not found.');
       if (!(await isMember(deps, act.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
       if (act.status === 'closed') throw new HttpError(409, 'This activity is closed.');
-      const item = (await pool.query(
-        `INSERT INTO rework_items (project_id, activity_id, task_id, kind, reason, raised_by_id, raised_by_role)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-        [act.project_id, act.id, req.body?.task_id || null, kind, reason, userId, role])).rows[0];
+      const item = (await client.query(
+        `INSERT INTO rework_items
+           (project_id, activity_id, task_id, kind, reason, raised_by_id, raised_by_role,
+            certified_progress_pct, previous_certified_progress_pct)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [act.project_id, act.id, req.body?.task_id || null, kind, reason, userId, role,
+         kind === 'snag' ? certifiedProgress : null, kind === 'snag' ? act.certified_progress_pct : null])).rows[0];
+      let milestone = null;
+      if (kind === 'snag') {
+        const capped = await certifiedProgressWithSnagCaps(client, act.id, act.certified_progress_pct);
+        await client.query(`UPDATE planning_execution SET certified_progress_pct = $2, certified_at = NOW(), updated_at = NOW() WHERE id = $1`, [act.id, capped]);
+        const link = await syncLinkedMilestone(client, act, { id: userId, role });
+        if (link) milestone = await syncMilestone(client, link.kind, link.id, { id: userId, role });
+      }
+      await client.query('COMMIT');
       await notifySafe(deps, { projectId: act.project_id, entityId: item.id, entityType: 'rework_item',
         message: `A ${kind} item was raised on "${act.title}": ${reason}`, actorId: userId, actorRole: role,
         recipients: await leadersOf(deps, act.project_id, 'Contractor') });
-      return res.status(201).json({ success: true, item });
-    } catch (err) { return fail(res, err, 'POST /api/activities/:activityId/rework:'); }
+      return res.status(201).json({ success: true, item, milestone });
+    } catch (err) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, err, 'POST /api/activities/:activityId/rework:');
+    } finally { if (client) client.release(); }
   });
 
   app.put('/api/rework/:id/correct', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
@@ -416,18 +485,115 @@ export function registerVerificationRoutes(app, deps) {
         `UPDATE rework_items SET status = 'closed', closed_at = NOW(), closed_by_id = $2, closed_by_role = $3
          WHERE id = $1 AND status IN ('open','corrected') RETURNING *`, [req.params.id, userId, role]);
       if (!r.rows.length) throw new HttpError(409, 'This item is already closed.');
+      if (r.rows[0].kind === 'snag') {
+        const [progress] = (await client.query(
+          `SELECT MIN(certified_progress_pct) AS cap, MAX(previous_certified_progress_pct) AS previous
+           FROM rework_items WHERE activity_id = $1 AND kind = 'snag' AND status <> 'closed'`, [r.rows[0].activity_id])).rows;
+        const current = Number((await client.query(
+          `SELECT certified_progress_pct FROM planning_execution WHERE id = $1`, [r.rows[0].activity_id])).rows[0]?.certified_progress_pct || 0);
+        const restored = progress.cap == null
+          ? Math.max(current, Number(r.rows[0].previous_certified_progress_pct || progress.previous || 0))
+          : Math.min(current, Number(progress.cap));
+        await client.query(
+          `UPDATE planning_execution SET certified_progress_pct = $2, certified_at = NOW(), updated_at = NOW() WHERE id = $1`,
+          [r.rows[0].activity_id, restored]);
+      }
       const closed = await closeIfCertified(client, r.rows[0].activity_id, { id: userId, role });
       let milestone = null;
-      if (closed) {
-        const act = await loadActivity(client, r.rows[0].activity_id);
-        const link = await syncLinkedMilestone(client, act, { id: userId, role });
-        if (link) milestone = await syncMilestone(client, link.kind, link.id, { id: userId, role });
-      }
+      const act = await loadActivity(client, r.rows[0].activity_id);
+      const link = await syncLinkedMilestone(client, act, { id: userId, role });
+      if (link) milestone = await syncMilestone(client, link.kind, link.id, { id: userId, role });
       await client.query('COMMIT');
       return res.json({ success: true, item: r.rows[0], activity_closed: closed, milestone });
     } catch (err) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       return fail(res, err, 'PUT /api/rework/:id/close:');
+    } finally { if (client) client.release(); }
+  });
+
+  app.post('/api/verifications/:id/revise', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    try {
+      const { user_id: userId, role } = req.user;
+      if (!leaderOn(role, 'Consultant')) throw new HttpError(403, 'Only consultant leaders and PMs can revise a verification decision.');
+      const reason = String(req.body?.reason || '').trim();
+      const certifiedProgress = Number(req.body?.certified_progress_pct);
+      if (!reason) throw new HttpError(400, 'A reason is required to revise a decision.');
+      if (!Number.isFinite(certifiedProgress) || certifiedProgress < 0 || certifiedProgress > 100)
+        throw new HttpError(400, 'certified_progress_pct must be between 0 and 100.');
+
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const verification = (await client.query(
+        `SELECT * FROM activity_verifications WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+      if (!verification) throw new HttpError(404, 'Verification not found.');
+      if (!['verified', 'verified_with_changes'].includes(verification.status))
+        throw new HttpError(409, 'Only a verified decision can be revised.');
+      if (certifiedProgress > Number(verification.claimed_progress_pct))
+        throw new HttpError(400, 'Revised certified progress cannot exceed the contractor’s claimed progress.');
+      if (!(await isMember(deps, verification.project_id, userId, role)))
+        throw new HttpError(403, 'You are not a member of this project.');
+      const laterDecision = (await client.query(
+        `SELECT 1 FROM activity_verifications
+         WHERE activity_id = $1 AND id <> $2
+           AND status IN ('verified', 'verified_with_changes')
+           AND (decided_at > $3 OR (decided_at = $3 AND id > $2))
+         LIMIT 1`, [verification.activity_id, verification.id, verification.decided_at])).rows.length > 0;
+      if (laterDecision)
+        throw new HttpError(409, 'Revise the latest verified decision for this activity first.');
+
+      const activity = await loadActivity(client, verification.activity_id, true);
+      const priorRevision = (await client.query(
+        `SELECT revised_status, revised_certified_pct
+         FROM activity_verification_decision_revisions
+         WHERE verification_id = $1 ORDER BY changed_at DESC, id DESC LIMIT 1`, [verification.id])).rows[0];
+      const previousStatus = priorRevision?.revised_status || verification.status;
+      const previousCertified = priorRevision?.revised_certified_pct ?? verification.certified_progress_pct;
+      const revisedStatus = certifiedProgress < Number(verification.claimed_progress_pct)
+        ? 'verified_with_changes' : 'verified';
+      const revision = (await client.query(
+        `INSERT INTO activity_verification_decision_revisions
+           (project_id, verification_id, previous_status, previous_certified_pct, revised_status,
+            revised_certified_pct, reason, changed_by_id, changed_by_role)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [verification.project_id, verification.id, previousStatus, previousCertified, revisedStatus,
+         certifiedProgress, reason, userId, role])).rows[0];
+
+      if (certifiedProgress < 100) {
+        await client.query(
+          `INSERT INTO rework_items
+             (project_id, activity_id, verification_id, kind, reason, raised_by_id, raised_by_role,
+              certified_progress_pct, previous_certified_progress_pct)
+           VALUES ($1,$2,$3,'snag',$4,$5,$6,$7,$8)`,
+          [verification.project_id, activity.id, verification.id, reason, userId, role,
+             certifiedProgress, Number(activity.certified_progress_pct) || 0]);
+        if (activity.status === 'closed') {
+          await client.query(
+            `UPDATE planning_execution SET status = 'completed', closed_at = NULL, closed_by_id = NULL,
+                    closed_by_role = NULL, actual_end = NULL, updated_at = NOW() WHERE id = $1`, [activity.id]);
+        }
+      }
+      const effectiveProgress = await certifiedProgressWithSnagCaps(client, activity.id, certifiedProgress);
+      await client.query(
+        `UPDATE planning_execution SET certified_progress_pct = $2, certified_at = NOW(), updated_at = NOW() WHERE id = $1`,
+        [activity.id, effectiveProgress]);
+      const link = await syncLinkedMilestone(client, activity, { id: userId, role });
+      const milestone = link ? await syncMilestone(client, link.kind, link.id, { id: userId, role }) : null;
+      await client.query('COMMIT');
+
+      await notifySafe(deps, {
+        projectId: verification.project_id,
+        entityId: verification.id,
+        entityType: 'activity_verification',
+        message: `The consultant revised the certified progress for "${activity.title}" to ${effectiveProgress}%.`,
+        actorId: userId,
+        actorRole: role,
+        recipients: await leadersOf(deps, verification.project_id, 'Contractor'),
+      });
+      return res.json({ success: true, revision, certified_progress_pct: effectiveProgress, milestone });
+    } catch (err) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, err, 'POST /api/verifications/:id/revise:');
     } finally { if (client) client.release(); }
   });
 
@@ -443,10 +609,30 @@ export function registerVerificationRoutes(app, deps) {
       if (!(await isMember(deps, act.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
       const verifications = (await pool.query(
         `SELECT v.*, (v.status = 'pending' AND v.respond_by < CURRENT_DATE) AS overdue,
-                COALESCE((SELECT json_agg(s ORDER BY s.order_no) FROM verification_signers s WHERE s.verification_id = v.id), '[]') AS signers
+                COALESCE((SELECT json_agg(s ORDER BY s.order_no) FROM verification_signers s WHERE s.verification_id = v.id), '[]') AS signers,
+                COALESCE((SELECT json_agg(r ORDER BY r.changed_at) FROM activity_verification_decision_revisions r WHERE r.verification_id = v.id), '[]') AS decision_revisions
          FROM activity_verifications v WHERE v.activity_id = $1 ORDER BY v.id DESC`, [act.id])).rows;
       const rework = (await pool.query(`SELECT * FROM rework_items WHERE activity_id = $1 ORDER BY id DESC`, [act.id])).rows;
-      return res.json({ verifications, rework });
+      const consultantView = s === 'Consultant' || (member && (await pool.query(
+        `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
+        [act.project_id, userId])).rows.length > 0);
+      const visibleVerifications = consultantView ? verifications.map((verification) => {
+        const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
+        return {
+          ...verification,
+          activity_summary: {
+            task_count: figures.length,
+            approved_report_count: figures.reduce((total, figure) => total + Number(figure.approved_report_count || 0), 0),
+            approved_quantity: figures.reduce((total, figure) => total + Number(figure.approved_quantity || 0), 0),
+            planned_quantity: figures.reduce((total, figure) => total + Number(figure.target_quantity || 0), 0),
+          },
+          claimed_figures: [],
+          certified_figures: null,
+          shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
+        };
+      }) : verifications;
+      const visibleRework = consultantView ? rework.map(({ task_id, ...item }) => item) : rework;
+      return res.json({ verifications: visibleVerifications, rework: visibleRework });
     } catch (err) { return fail(res, err, 'GET /api/activities/:activityId/verifications:'); }
   });
 
@@ -465,7 +651,26 @@ export function registerVerificationRoutes(app, deps) {
            AND ($2 = 'Consultant' OR $2 = 'Contractor'
                 OR EXISTS (SELECT 1 FROM verification_signers x WHERE x.verification_id = v.id AND x.signer_role = 'TeamMember' AND x.signer_user_id = $3))
          ORDER BY v.respond_by, v.id`, [projectId, s || 'TeamMember', userId])).rows;
-      return res.json({ pending: rows });
+      const consultantView = s === 'Consultant' || (role === 'TeamMember' && (await pool.query(
+        `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
+        [projectId, userId])).rows.length > 0);
+      if (!consultantView) return res.json({ pending: rows });
+      const pending = rows.map((verification) => {
+        const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
+        return {
+          ...verification,
+          activity_summary: {
+            task_count: figures.length,
+            approved_report_count: figures.reduce((total, figure) => total + Number(figure.approved_report_count || 0), 0),
+            approved_quantity: figures.reduce((total, figure) => total + Number(figure.approved_quantity || 0), 0),
+            planned_quantity: figures.reduce((total, figure) => total + Number(figure.target_quantity || 0), 0),
+          },
+          claimed_figures: [],
+          certified_figures: null,
+          shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
+        };
+      });
+      return res.json({ pending });
     } catch (err) { return fail(res, err, 'GET /api/verifications/pending:'); }
   });
 }

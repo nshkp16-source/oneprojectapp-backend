@@ -99,6 +99,7 @@ test('consultant certification tab includes approved-work review evidence and ex
     id: 91, kind: 'progress', status: 'pending', cut_off_date: '2026-05-04',
     respond_by: '2026-05-11', claimed_progress_pct: 55,
     claimed_figures: [{ title: 'Block A', weight_pct: 100, progress_pct: 55, target_quantity: 200, approved_quantity: 110 }],
+    activity_summary: { task_count: 1, approved_report_count: 1, approved_quantity: 50, planned_quantity: 200 },
     signers: [], request_note: 'Please review this period.',
   };
   const context = {
@@ -115,9 +116,9 @@ test('consultant certification tab includes approved-work review evidence and ex
     Object.assign(context, { __activity: card.activity, __tasks: card.tasks, __reports: card.progress_reports, __verification: verification }),
   );
   assert.match(content, /Foundation/);
-  assert.match(content, /Block A/);
-  assert.match(content, /Excavated to formation level/);
-  assert.match(content, /5 workers/);
+  assert.match(content, /Activity tasks/);
+  assert.match(content, /Approved reports/);
+  assert.doesNotMatch(content, /Block A|Excavated to formation level|5 workers|engineer@example\.test|Excavator/);
   assert.match(content, /data-pe-form="decision"/);
   assert.match(content, /data-pe-decision-status/);
   assert.doesNotMatch(content, /data-action="certify"/);

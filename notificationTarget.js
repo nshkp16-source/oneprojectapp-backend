@@ -80,10 +80,14 @@ export async function resolveNotificationTarget({ pool, projectId, entityType, e
       : null;
   }
 
-  if (entityType === 'milestone_breakdown_request' || entityType === 'milestone_override') {
+  if (entityType === 'milestone_breakdown_request' || entityType === 'milestone_override'
+    || entityType === 'milestone_progress_request') {
+    if (entityType === 'milestone_progress_request' && viewerSide !== 'Consultant') return null;
     const table = entityType === 'milestone_override'
       ? 'milestone_progress_overrides'
-      : 'milestone_breakdown_requests';
+      : entityType === 'milestone_progress_request'
+        ? 'milestone_progress_requests'
+        : 'milestone_breakdown_requests';
     const row = (await pool.query(
       `SELECT baseline_milestone_id, additional_milestone_id
        FROM ${table} WHERE id = $1 AND project_id = $2`,

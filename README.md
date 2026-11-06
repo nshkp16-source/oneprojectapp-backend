@@ -10,8 +10,8 @@ This repository contains the backend application and the activity, task, report,
 | `progressRules.js` | Pure rules: weights, progress per activity type, claimed and certified progress, milestone derivation, delay. |
 | `activityRoutes.js` | Create/edit activities, create/add tasks with a weight preview, milestone sync. |
 | `reportRoutes.js` | Member reports, leader approval, rejection and voiding, automatic recompute, close-out export. |
-| `verificationRoutes.js` | Verification requests, inspector and leader answers, rework and snags, completion certification. |
-| `milestoneRoutes.js` | Breakdown request, consultant's temporary value, milestone progress detail, completion check. |
+| `verificationRoutes.js` | Verification requests, private-by-default consultant summaries, snag progress, decision revisions and completion certification. |
+| `milestoneRoutes.js` | Breakdown and progress requests, consultant's temporary value, milestone progress detail, completion check. |
 | `taskQueryRoutes.js` | Task questions from leaders, team-member answers and leader resolution. |
 | `notificationTarget.js` | Authenticated workflow notification target resolution. |
 | `verificationReminderJob.js` | Scheduled overdue verification notifications. |
@@ -26,11 +26,12 @@ This repository contains the backend application and the activity, task, report,
    `migrations/2026-11-01-activity-task-progress.sql`, `2026-11-02-verification-and-milestone-link.sql`,
    `2026-11-03-void-approved-reports.sql`, `migrations/2026-11-04-verification-reminders.sql`,
    `migrations/2026-11-05-standalone-work-center-tasks.sql`, then
-   `migrations/2026-11-06-work-center-queries.sql`.
+   `migrations/2026-11-06-work-center-queries.sql`, then
+   `migrations/2026-11-06-activity-milestone-workflow.sql`.
 3. Look at the notice printed by the first migration. It says how many tasks were moved under "General works (migrated)" and how many activities became the percentage type.
-4. Only when the copy looks right, apply the same six files to the real database.
+4. Only when the copy looks right, apply the same seven files to the real database.
 
-What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified. The fifth migration allows new Work Center tasks without a parent activity and stores their own progress type, target, unit, or stages. The sixth migration adds task queries: a side leader can ask an assigned member for an explanation independently of approving or rejecting a report; the member answers, and the leader resolves the thread.
+What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified. The fifth migration allows new Work Center tasks without a parent activity and stores their own progress type, target, unit, or stages. The sixth migration adds task queries. The seventh adds opt-in activity-plan sharing, progress-limited snags, auditable revisions of certification decisions, and consultant milestone-progress requests; it also prevents contractors on consultant projects from manually entering milestone progress.
 
 ## Step 2: run the tests
 

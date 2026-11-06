@@ -1,4 +1,4 @@
-// Needs a THROWAWAY PostgreSQL database with the base schema and the three 2026-11 migrations applied.
+// Needs a THROWAWAY PostgreSQL database with the base schema and all dated migrations applied.
 // It inserts fixtures, so never point it at real data.
 // Run:  TEST_DATABASE_URL=postgres://user:pass@localhost/scratch node --test milestoneRoutes.test.js
 // Needs the packages express, pg and multer (npm i -D express pg multer).
@@ -129,6 +129,16 @@ test('temporary value: consultant only, must lower and have a reason, replaces i
 test('typed entry is refused on a derived milestone and allowed on a typed one', async () => {
   await assert.rejects(assertTypedProgressAllowed(pool, 'baseline', 1), /takes its progress from its activities/);
   await assertTypedProgressAllowed(pool, 'baseline', 2);
+});
+
+test('contractor leaders can ask the consultant to record typed milestone progress once', async () => {
+  const requested = await call('POST', '/api/milestones/baseline/2/progress-request', leader, { note: "Please enter today's measurement." });
+  assert.equal(requested.status, 201, JSON.stringify(requested.body));
+  assert.equal(requested.body.request.status, 'open');
+  assert.equal(requested.body.request.note, "Please enter today's measurement.");
+  assert.equal(notes.at(-1).entityType, 'milestone_progress_request');
+  assert.equal((await call('POST', '/api/milestones/baseline/2/progress-request', leader, {})).status, 409);
+  assert.equal((await call('POST', '/api/milestones/baseline/1/progress-request', leader, {})).status, 409);
 });
 
 test('project milestone list for the activity form: both kinds, typed and completed flags, members only', async () => {

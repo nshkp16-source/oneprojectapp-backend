@@ -1,4 +1,4 @@
-// Needs a THROWAWAY PostgreSQL database with the base schema and the three 2026-11 migrations applied.
+// Needs a THROWAWAY PostgreSQL database with the base schema and all dated migrations applied.
 // It inserts fixtures, so never point it at real data.
 // Run:  TEST_DATABASE_URL=postgres://user:pass@localhost/scratch node --test verificationRoutes.test.js
 // Needs the packages express, pg and multer (npm i -D express pg multer).
@@ -75,12 +75,14 @@ test('request rules: only contractor leaders, and only when there is something n
 });
 
 test('a request freezes the claimed figures, sets the respond-by date and notifies the consultant side', async () => {
-  const r = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'Block A excavated', signers: [{ role: 'TeamMember', user_id: 201, position: 'Inspector' }] });
+  const r = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'Block A excavated', shareActivitySummary: true, signers: [{ role: 'TeamMember', user_id: 201, position: 'Inspector' }] });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   v1 = r.body.verification;
   assert.equal(Number(v1.claimed_progress_pct), 25);
   assert.equal(v1.claimed_figures.length, 2);
   assert.equal(v1.claimed_figures[0].approved_quantity, 100);
+  assert.equal(v1.share_activity_summary, true);
+  assert.equal(v1.shared_activity_summary.title, 'Excavation');
   assert.equal(String(v1.respond_by).slice(0, 10), today.d7);
   const n = notes.at(-1);
   assert.equal(n.entityType, 'activity_verification');
@@ -160,7 +162,16 @@ test('lists: contractor and consultant see requests with an overdue flag, the cl
   assert.equal(l.status, 200);
   assert.ok(l.body.verifications.length >= 4);
   assert.equal(l.body.verifications[0].overdue, false);
-  assert.equal((await call('GET', `/api/verifications/pending?projectId=1`, cons)).status, 200);
+  assert.deepEqual(l.body.verifications[0].claimed_figures, []);
+  assert.equal(l.body.verifications[0].activity_summary.task_count, 2);
+  const card = await call('GET', `/api/planning-execution/${act.id}/activity-card?projectId=1`, cons);
+  assert.equal(card.status, 200);
+  assert.deepEqual(card.body.tasks, []);
+  assert.equal(card.body.activity.description, undefined);
+  assert.equal(typeof card.body.activity_summary.approved_report_count, 'number');
+  const pending = await call('GET', `/api/verifications/pending?projectId=1`, cons);
+  assert.equal(pending.status, 200);
+  assert.deepEqual(pending.body.pending[0].claimed_figures, []);
   assert.equal((await call('GET', `/api/verifications/pending?projectId=1`, client)).status, 403);
 });
 
@@ -187,8 +198,9 @@ test('completion: needs 100% and no open rework; snags keep the activity open un
   await progressTo(tA, m(101), '2026-03-12', 100);
   await progressTo(tB, m(102), '2026-03-12', 100);
   assert.equal((await q(`SELECT status FROM planning_execution WHERE id=$1`, [act.id]))[0].status, 'completed');
-  const snag = await call('POST', `/api/activities/${act.id}/rework`, cons, { kind: 'snag', reason: 'Spoil heap not removed' });
+  const snag = await call('POST', `/api/activities/${act.id}/rework`, cons, { kind: 'snag', reason: 'Spoil heap not removed', certified_progress_pct: 40 });
   assert.equal(snag.status, 201);
+  assert.equal(Number((await q(`SELECT certified_progress_pct FROM planning_execution WHERE id=$1`, [act.id]))[0].certified_progress_pct), 40);
   assert.equal((await call('POST', `/api/activities/${act.id}/rework`, leader, { kind: 'snag', reason: 'x' })).status, 403);
   assert.equal((await call('POST', `/api/activities/${act.id}/verifications`, leader, { kind: 'completion' })).status, 409);   // open snag
   await call('PUT', `/api/rework/${snag.body.item.id}/close`, cons, {});
@@ -198,6 +210,7 @@ test('completion: needs 100% and no open rework; snags keep the activity open un
   const d = await call('PUT', `/api/verifications/${req.body.verification.id}/decide`, cons, { status: 'verified', reason: 'Complete, one snag to clear', rework: [{ reason: 'Touch up edge protection' }] });
   assert.equal(d.status, 200, JSON.stringify(d.body));
   assert.equal(d.body.activity_closed, false);                        // a snag is open
+  assert.equal(Number((await q(`SELECT certified_progress_pct FROM planning_execution WHERE id=$1`, [act.id]))[0].certified_progress_pct), 99);
   assert.equal((await q(`SELECT status FROM planning_execution WHERE id=$1`, [act.id]))[0].status, 'completed');
   const [open] = await q(`SELECT id, kind FROM rework_items WHERE activity_id=$1 AND status<>'closed'`, [act.id]);
   assert.equal(open.kind, 'snag');
@@ -208,4 +221,13 @@ test('completion: needs 100% and no open rework; snags keep the activity open un
   assert.deepEqual([a.status, Number(a.certified_progress_pct), a.closed_by_role, a.e], ['closed', 100, 'ConsultantPM', today.d]);
   assert.deepEqual((await q(`SELECT DISTINCT status FROM workspace_work_center WHERE activity_id=$1`, [act.id])).map((x) => x.status), ['closed']);
   assert.equal((await report(m(101), { taskId: tA.id, reportDate: '2026-03-13', quantityDone: 1 })).status, 409);   // closed
+  const revised = await call('POST', `/api/verifications/${req.body.verification.id}/revise`, cons, { certified_progress_pct: 90, reason: 'A final edge section still needs correction.' });
+  assert.equal(revised.status, 200, JSON.stringify(revised.body));
+  assert.equal(revised.body.certified_progress_pct, 90);
+  assert.equal((await q(`SELECT status FROM planning_execution WHERE id=$1`, [act.id]))[0].status, 'completed');
+  const [revisionSnag] = await q(`SELECT id FROM rework_items WHERE activity_id=$1 AND kind='snag' AND status='open' ORDER BY id DESC LIMIT 1`, [act.id]);
+  assert.equal((await call('PUT', `/api/rework/${revisionSnag.id}/correct`, leader, { note: 'Edge section corrected' })).status, 200);
+  const revisedClosed = await call('PUT', `/api/rework/${revisionSnag.id}/close`, cons, {});
+  assert.equal(revisedClosed.body.activity_closed, true);
+  assert.equal(Number((await q(`SELECT certified_progress_pct FROM planning_execution WHERE id=$1`, [act.id]))[0].certified_progress_pct), 100);
 });

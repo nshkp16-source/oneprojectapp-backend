@@ -68,6 +68,13 @@ export function registerMilestoneRoutes(app, deps) {
     const r = await pool.query(`SELECT role, role_id FROM assignments_view WHERE project_id = $1 AND role = ANY($2::text[])`, [projectId, deps.sideRoles(side)]);
     return r.rows.map((x) => deps.flowKey(x.role, x.role_id));
   }
+  async function hasConsultantSide(projectId) {
+    const roles = deps.sideRoles ? deps.sideRoles('Consultant') : ['Consultant', 'ConsultantPM'];
+    const result = await pool.query(
+      `SELECT 1 FROM assignments_view WHERE project_id = $1 AND role = ANY($2::text[]) LIMIT 1`,
+      [projectId, roles]);
+    return result.rows.length > 0;
+  }
   async function tell(projectId, entityId, entityType, message, actor, side) {
     if (!deps.notify) return;
     try {
@@ -169,6 +176,48 @@ export function registerMilestoneRoutes(app, deps) {
         await client.query(
           `UPDATE ${MILESTONE[kind].table} SET override_pct = NULL, override_reason = NULL, override_by_id = NULL, override_by_role = NULL, override_at = NULL WHERE id = $1`, [ms.id]);
         return { milestone: await syncMilestone(client, kind, ms.id, actor) };
+      });
+
+      app.post('/api/milestones/:kind/:id/progress-request', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+        try {
+          const { user_id: userId, role } = req.user;
+          if (!leaderOn(role, 'Contractor'))
+            throw new HttpError(403, 'Only contractor leaders and PMs can request consultant milestone progress.');
+          const kind = kindOf(req.params.kind);
+          const milestone = MILESTONE[kind];
+          const row = (await pool.query(
+            `SELECT id, project_id, title, progress_source FROM ${milestone.table} WHERE id = $1`,
+            [parseInt(req.params.id, 10)])).rows[0];
+          if (!row) throw new HttpError(404, 'Milestone not found.');
+          const projectId = parseInt(row.project_id, 10);
+          if (!(await isMember(projectId, userId, role)))
+            throw new HttpError(403, 'You are not a member of this project.');
+          if (!(await hasConsultantSide(projectId)))
+            throw new HttpError(409, 'This project has no consultant assigned.');
+          if (row.progress_source === 'activities')
+            throw new HttpError(409, 'This milestone already gets progress from its activities.');
+          const note = String(req.body?.note || '').trim();
+          if (note.length > 500) throw new HttpError(400, 'The note cannot exceed 500 characters.');
+          const recipients = await leadersOf(projectId, 'Consultant');
+          if (!recipients.length) throw new HttpError(409, 'No consultant leader is assigned to this project.');
+
+          let request;
+          try {
+            request = (await pool.query(
+              `INSERT INTO milestone_progress_requests
+                 (project_id, ${fkCol(kind)}, requested_by_id, requested_by_role, note)
+               VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+              [projectId, row.id, userId, role, note || null])).rows[0];
+          } catch (err) {
+            if (err.code === '23505') throw new HttpError(409, 'A consultant progress request is already open for this milestone.');
+            throw err;
+          }
+
+          await tell(projectId, request.id, 'milestone_progress_request',
+            `The contractor asked the consultant to record progress for milestone "${row.title}".${note ? ` Note: ${note}` : ''}`,
+            { id: userId, role }, 'Consultant');
+          return res.status(201).json({ success: true, request });
+        } catch (err) { return fail(res, err, 'POST milestone progress request:'); }
       });
       return res.json({ success: true, ...out });
     } catch (err) { return fail(res, err, 'PUT override/withdraw:'); }
