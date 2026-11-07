@@ -48,7 +48,7 @@ test('a team member cannot open another member work-center notification', async 
   }), null);
 });
 
-test('a task query notification opens the task queries for its addressed member', async () => {
+test('a task query notification resolves to its addressed member task', async () => {
   const pool = mockPool([{
     sql: 'FROM work_center_queries',
     rows: [{ task_id: 17, recipient_id: 8, side: 'Contractor', assigned_members: [{ id: 8 }] }],

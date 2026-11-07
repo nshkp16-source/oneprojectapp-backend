@@ -145,7 +145,7 @@ export function registerTaskQueryRoutes(app, deps) {
         [taskId, projectId, userId, role, recipientId, reportId, question]);
       await notify({
         projectId, entityId: result.rows[0].id, entityType: 'work_center_query',
-        message: 'A task leader has asked you a question. Open Queries to respond.',
+        message: 'A task leader has asked you a question. Open the task report to respond.',
         actorId: userId, actorRole: role,
         recipients: [deps.flowKey('TeamMember', recipientId)],
       });
@@ -185,7 +185,7 @@ export function registerTaskQueryRoutes(app, deps) {
       if (!result.rows.length) throw new HttpError(409, 'This query has already been answered.');
       await notify({
         projectId, entityId: queryId, entityType: 'work_center_query',
-        message: 'A team member answered your task question. Open Queries to review it.',
+        message: 'A team member answered a question. Open the task report to review it.',
         actorId: userId, actorRole: role,
         recipients: [deps.flowKey(query.asked_by_role, query.asked_by_id)],
       });

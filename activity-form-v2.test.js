@@ -8,7 +8,12 @@ import { JSDOM } from 'jsdom';
 
 // arrays made inside the simulated browser have another prototype, so compare plain copies
 const same = (actual, expected) => assert.deepStrictEqual(JSON.parse(JSON.stringify(actual)), expected);
-const code = fs.readFileSync(new URL('./activity-form-v2.js', import.meta.url), 'utf8');
+const html = fs.readFileSync(new URL('../dashboard.html', import.meta.url), 'utf8');
+const startMarker = '// ===== Activity form v2:';
+const codeStart = html.indexOf(startMarker);
+const codeEnd = html.indexOf('</script>', codeStart);
+assert.ok(codeStart >= 0 && codeEnd > codeStart, 'inline activity form was not found in dashboard.html');
+const code = html.slice(codeStart, codeEnd);
 const MILESTONES = { milestones: [
   { id: 1, kind: 'baseline', title: 'Foundation', progress_source: 'manual', progress_pct: 30, executed: 120, quantity: 400, unit: 'm3', typed_progress: true, completed: false },
   { id: 2, kind: 'baseline', title: 'Walls', progress_source: 'manual', progress_pct: 0, typed_progress: false, completed: false },

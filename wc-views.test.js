@@ -22,7 +22,7 @@ function extract(names) {
 
 const HELPERS = ['_wcFmtDate', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
   'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
-  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcQueryPanelHtml', '_wcTabifyDetail'];
+  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail'];
 
 function views() {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
@@ -88,6 +88,9 @@ test('leader view: validate buttons only on pending reports, void button only on
   assert.deepEqual(actions(2), ['voided']);
   assert.deepEqual(actions(3), []);                                                      // a voided report offers nothing
   assert.match(d.body.textContent, /Void this report/);
+  assert.ok(d.getElementById('wc-val-notes-2'));
+  assert.match(d.querySelector('label[for="wc-val-notes-2"]').textContent, /Reason for voiding \*/);
+  assert.doesNotMatch(d.body.textContent, /Correction audit/);
   assert.match(d.body.textContent, /Measured wrongly/);
   assert.match(d.body.textContent, /40 m3/);
   assert.match(d.body.textContent, /Share of the activity 50%/);
@@ -98,7 +101,7 @@ test('leader view: no void button once the task is closed', () => {
   assert.equal([...d.querySelectorAll('[data-validate-action="voided"]')].length, 0);
 });
 
-test('expanded leader task uses summary and Details, Reports, Queries tabs with the activity plan', () => {
+test('expanded leader task uses Details and Reports tabs, with queries inside their report', () => {
   const t = { ...task, title: 'Excavate trenches', priority: 'high', description: 'Dig to the levels on drawing S-04.',
     activity_description: 'Excavate grid B foundation.', activity_done_when: 'Formation levels confirmed.',
     activity_planned_quantity: 200, activity_planned_work: 'Excavate and remove spoil.',
@@ -114,17 +117,22 @@ test('expanded leader task uses summary and Details, Reports, Queries tabs with 
   const tabs = [...d.querySelectorAll('[role="tab"]')];
   assert.ok(tabs.every((tab) => tab.classList.contains('detail-tab')));
   assert.deepEqual(tabs.map((tab) => tab.textContent.trim().replace(/\s+\d+$/, '')),
-    ['Details', 'Reports', 'Queries']);
+    ['Details', 'Reports']);
   const summary = d.querySelector('[data-wc-card-summary]');
   assert.match(summary.textContent, /Progress/);
+  assert.match(summary.textContent, /30 m3 completed/);
+  assert.doesNotMatch(summary.textContent, /200 m3/);
   assert.doesNotMatch(summary.textContent, /Excavate trenches|Created by|High|Ongoing|Start Date/);
   const details = d.querySelector('#wc-read-5').textContent;
   assert.doesNotMatch(details, /Start Date|End Date|Required priority|Excavate trenches/);
   assert.match(d.body.textContent, /20%/);
   assert.doesNotMatch(d.body.textContent, /Required priorityHigh/);
-  assert.match(d.body.textContent, /How to read this task/);
-  assert.match(d.body.textContent, /approved reports measured as quantity/);
-  assert.match(d.body.textContent, /Review each submission’s work description/);
+  assert.doesNotMatch(d.body.textContent, /How to read this task/);
+  assert.match(d.body.textContent, /Files/);
+  assert.match(d.body.textContent, /No task file attached/);
+  assert.match(d.body.textContent, /Add file/);
+  assert.match(d.body.textContent, /All 3/);
+  assert.match(d.body.textContent, /Pending 1/);
   assert.match(d.body.textContent, /Materials/);
   assert.match(d.body.textContent, /Marker paint/);
   assert.match(d.body.textContent, /North trench completed/);
@@ -133,26 +141,31 @@ test('expanded leader task uses summary and Details, Reports, Queries tabs with 
   assert.match(d.body.textContent, /Planned manpower6 workers/);
   assert.match(d.body.textContent, /Please explain the measurement/);
   assert.match(d.body.textContent, /Progress report/);
-  assert.match(d.body.textContent, /Choose a report/);
-  assert.match(d.querySelector('#wc-query-report-5').textContent, /a@x/);
-  assert.equal(d.querySelector('#wc-query-member-5'), null);
+  assert.match(d.body.textContent, /Ask about this report/);
+  assert.equal(d.querySelector('#wc-query-question-5'), null);
+  assert.ok(d.querySelector('#wc-query-question-2'));
+  assert.match(d.querySelector('[data-wc-report-queries="2"]').textContent, /Please explain the measurement/);
   assert.match(d.body.textContent, /Dug more/);
-  assert.match(d.body.textContent, /A query and its answer are kept with the task/);
   assert.ok(d.querySelector('[data-wc-pane="reports"]'));
-  assert.ok(d.querySelector('[data-wc-pane="queries"]'));
+  assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
+  assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, true);
+  d.querySelector('[data-report-filter="all"]').click();
+  assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, false);
 });
 
-test('expanded standalone task explains its progress source without implying an activity link', () => {
+test('expanded standalone task does not show a task-level query tab', () => {
   const d = views().tabbed({ ...task, activity_id: null, activity_title: null }, [], [], false);
-  assert.match(d.body.textContent, /This is a standalone task and is not included in an activity/);
-  assert.match(d.body.textContent, /approved reports measured as quantity/);
+  assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
+  assert.match(d.body.textContent, /Files/);
 });
 
-test('expanded member task separates progress, previous reports and queries; closed task hides progress', () => {
+test('expanded member task separates progress and reports; closed task hides progress', () => {
   const d = views().tabbed(task, entries.filter((entry) => entry.member_id === 101), [], false);
   const tabs = [...d.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('data-wc-tab'));
-  assert.deepEqual(tabs, ['details', 'progress', 'my-reports', 'queries']);
+  assert.deepEqual(tabs, ['details', 'progress', 'my-reports']);
   assert.ok(d.querySelector('[data-wc-pane="my-reports"]')?.textContent.includes('My Previous Submissions'));
+  assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
+  assert.equal(d.querySelectorAll('[data-wc-report-queries]').length, entries.length);
   assert.match(d.body.textContent, /leader must approve the report before it changes task or activity progress/);
   assert.match(d.body.textContent, /Pending reports are waiting for review/);
   assert.match(d.body.textContent, /Survey stakes/);
@@ -161,6 +174,6 @@ test('expanded member task separates progress, previous reports and queries; clo
 
   const closed = views().tabbed({ ...task, status: 'closed' }, [], [], false);
   assert.deepEqual([...closed.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('data-wc-tab')),
-    ['details', 'my-reports', 'queries']);
+    ['details', 'my-reports']);
   assert.equal(closed.querySelector('[data-wc-pane="progress"]'), null);
 });

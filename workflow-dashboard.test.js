@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const source = fs.readFileSync(new URL('./workflow-dashboard.js', import.meta.url), 'utf8');
+const html = fs.readFileSync(new URL('../frontend/dashboard.html', import.meta.url), 'utf8');
+const marker = '// Activity reports, review, verification and milestone controls for the dashboard.';
+const sourceStart = html.indexOf(marker);
+assert.notEqual(sourceStart, -1, 'integrated workflow script not found in dashboard.html');
+const sourceEnd = html.indexOf('</script>', sourceStart);
+assert.notEqual(sourceEnd, -1, 'integrated workflow script is not closed');
+const source = html.slice(sourceStart, sourceEnd);
 
 function setup({ legacyActivityCard = true } = {}) {
   const window = {
@@ -30,41 +36,43 @@ function setup({ legacyActivityCard = true } = {}) {
   return window;
 }
 
-test('member report form renders controls according to activity type', () => {
+test('merged workflow leaves task view rendering to dashboard.html', () => {
   const window = setup();
-  const quantity = window._wcMemberView(
-    { id: 5, title: 'Excavation', activity_type: 'quantity', activity_unit: 'm3' }, [],
-  );
-  assert.match(quantity, /Quantity done \(m3\)/);
-  assert.match(quantity, /wf-quantity-5/);
-  assert.doesNotMatch(quantity, /wf-percentage-5/);
-
-  const count = window._wcMemberView({ id: 6, activity_type: 'count' }, []);
-  assert.match(count, /Items completed/);
-  assert.match(count, /wf-failed-6/);
-
-  const stages = window._wcMemberView({
-    id: 7,
-    activity_type: 'stages',
-    stages: [
-      { id: 1, title: 'Steel', seq: 1, is_hold_point: true },
-      { id: 2, title: 'Pour', seq: 2 },
-    ],
-  }, []);
-  assert.match(stages, /Steel \(hold point\)/);
-  assert.match(stages, /Pour \(locked until earlier hold point is verified\)/);
+  assert.equal(window._wcMemberView(), '<div>legacy member</div>');
 });
 
-test('leader view retains existing task controls and adds audited void controls', () => {
+test('integrated workflow does not replace task views or add a correction audit', () => {
   const window = setup();
-  const html = window._wcPMView(
-    { id: 9, activity_type: 'count', stages: [] },
-    [{ id: 22, member_email: 'member@example.test', report_date: '2026-03-10', validation_status: 'approved', quantity_done: 4, quantity_failed: 1 }],
-  );
-  assert.match(html, /legacy leader/);
-  assert.match(html, /Correction audit/);
-  assert.match(html, /Void report/);
-  assert.match(html, /4 completed, 1 failed/);
+  assert.equal(window._wcPMView(), '<div>legacy leader</div>');
+  assert.doesNotMatch(source, /Correction audit/);
+  assert.doesNotMatch(source, /window\._wcMemberView\s*=/);
+  assert.doesNotMatch(source, /window\._wcPMView\s*=/);
+  assert.doesNotMatch(source, /window\._wcWireDetailButtons\s*=/);
+});
+
+test('workflow code is inline and dashboards do not load a script from the backend folder', () => {
+  assert.match(html, /window\.downloadCloseoutReport/);
+  assert.doesNotMatch(html, /<script src=["']\.\/backend\/workflow-dashboard\.js/);
+});
+
+test('task-query notifications open the linked report instead of a removed Queries tab', () => {
+  const start = html.indexOf('async function _openTaskQueryNotification');
+  const end = html.indexOf('async function _openActivityVerificationNotification', start);
+  assert.ok(start >= 0 && end > start);
+  const handler = html.slice(start, end);
+  assert.match(handler, /query\.report_id/);
+  assert.match(handler, /data-wc-report-id/);
+  assert.doesNotMatch(handler, /data-wc-tab="queries"|setItem\([^;]*'queries'/);
+});
+
+test('voiding uses the reason field in the expanded report instead of a prompt', () => {
+  const start = html.indexOf('async function _wcHandleValidate');
+  const end = html.indexOf('async function _wcHandleDelete', start);
+  assert.ok(start >= 0 && end > start);
+  const handler = html.slice(start, end);
+  assert.match(handler, /validateAction === 'voided'/);
+  assert.match(handler, /Enter a reason for voiding this report/);
+  assert.doesNotMatch(handler, /prompt\(/);
 });
 
 test('activity workflow does not append duplicate verification controls to the tabbed card', () => {

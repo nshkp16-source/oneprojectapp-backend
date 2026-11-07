@@ -117,7 +117,7 @@ Use the JWT your app issues at login. Replace the ids and tokens.
 ## Dashboard status
 
 - Implemented in the dashboard: activity creation and task breakdown; activity cards with task weights/progress and Add Task; activity-type-specific member reports; leader approval/rejection and approved-report voiding; verification requests, inspector recommendations, consultant decisions, rework/snags; linked-milestone progress, breakdown requests and temporary values; activity-plan editing; client-safe activity views; side-specific close-out CSV download for Contractor, Consultant and Client side leaders and project managers; calculated delay; overdue verification reminders; and workflow notification deep links.
-- The member report and workflow screens use `workflow-dashboard.js`; frontend hosting and deployment are separate from this backend repository.
+- Dashboard task cards, activity workflow controls and notifications are inline in `../frontend/dashboard.html`; frontend hosting and deployment are separate from this backend repository.
 - Activity-driven milestones show certified activity breakdown, coverage, temporary values and breakdown requests in the schedule detail. Typed progress entry is disabled for those milestones.
 
 ## Not built yet
