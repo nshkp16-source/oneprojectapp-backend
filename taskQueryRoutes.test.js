@@ -4,7 +4,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import express from 'express';
 import pg from 'pg';
-import { registerTaskQueryRoutes } from './taskQueryRoutes.js';
+import { registerTaskQueryRoutes } from './workCenterRoutes.js';
 
 const pool = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
 const app = express();

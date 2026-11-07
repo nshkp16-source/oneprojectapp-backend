@@ -8,13 +8,10 @@ This repository contains the backend application and the activity, task, report,
 |---|---|
 | `server.js` | Backend application entry point. |
 | `progressRules.js` | Pure rules: weights, progress per activity type, claimed and certified progress, milestone derivation, delay. |
-| `activityRoutes.js` | Create/edit activities, create/add tasks with a weight preview, milestone sync. |
-| `reportRoutes.js` | Member reports, leader approval, rejection and voiding, automatic recompute, close-out export. |
+| `planningRoutes.js` | Activity and milestone routes, including linked milestone synchronization and completion checks. |
+| `workCenterRoutes.js` | Member reports, leader approval, rejection and voiding, automatic recompute, task questions and close-out export. |
 | `verificationRoutes.js` | Verification requests, private-by-default consultant summaries, snag progress, decision revisions and completion certification. |
-| `milestoneRoutes.js` | Breakdown and progress requests, consultant's temporary value, milestone progress detail, completion check. |
-| `taskQueryRoutes.js` | Task questions from leaders, team-member answers and leader resolution. |
-| `notificationTarget.js` | Authenticated workflow notification target resolution. |
-| `verificationReminderJob.js` | Scheduled overdue verification notifications. |
+| `notificationWorkflow.js` | Authenticated workflow notification target resolution and scheduled overdue verification notifications. |
 | `docRules.js`, `stamp-renderer.js` | Unchanged copies of your files, so this folder runs on its own. |
 | `migrations/` | The dated SQL migrations, in order. |
 | `*.test.js`, `run-tests.sh` | Backend tests and a script that runs them on a scratch database. |
@@ -26,12 +23,13 @@ This repository contains the backend application and the activity, task, report,
    `migrations/2026-11-01-activity-task-progress.sql`, `2026-11-02-verification-and-milestone-link.sql`,
    `2026-11-03-void-approved-reports.sql`, `migrations/2026-11-04-verification-reminders.sql`,
    `migrations/2026-11-05-standalone-work-center-tasks.sql`, then
+   `migrations/2026-11-06-activity-milestone-workflow.sql`,
    `migrations/2026-11-06-work-center-queries.sql`, then
-   `migrations/2026-11-06-activity-milestone-workflow.sql`.
+   `migrations/2026-11-07-link-task-queries-to-reports.sql`.
 3. Look at the notice printed by the first migration. It says how many tasks were moved under "General works (migrated)" and how many activities became the percentage type.
-4. Only when the copy looks right, apply the same seven files to the real database.
+4. Only when the copy looks right, apply the same eight files to the real database.
 
-What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified. The fifth migration allows new Work Center tasks without a parent activity and stores their own progress type, target, unit, or stages. The sixth migration adds task queries. The seventh adds opt-in activity-plan sharing, progress-limited snags, auditable revisions of certification decisions, and consultant milestone-progress requests; it also prevents contractors on consultant projects from manually entering milestone progress.
+What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified. The fifth migration allows new Work Center tasks without a parent activity and stores their own progress type, target, unit, or stages. The sixth adds opt-in activity-plan sharing, progress-limited snags, auditable revisions of certification decisions, and consultant milestone-progress requests; it also prevents contractors on consultant projects from manually entering milestone progress. The seventh adds task queries, and the eighth links questions to the reports they concern.
 
 ## Step 2: run the tests
 
@@ -42,6 +40,7 @@ The tests need a THROWAWAY PostgreSQL database. The script drops and recreates i
     bash ./run-tests.sh
 
 `SCHEMA_DIR` must contain `completely_schema.sql`, `run_after_completely.sql` and your dated migrations. Install this backend repository's dependencies first; `jsdom` and `acorn` are used by the dashboard tests. Expected last line: `ALL TESTS PASSED`.
+Dashboard tests consistently read `../frontend/dashboard.html`.
 
 ## Step 3: deploy the backend
 
@@ -52,7 +51,7 @@ Deploy this repository's `server.js` together with its imported route modules an
 1. Imports for the route modules.
 2. A registration block just before the first planning-execution route. Because it comes first, the new `POST /api/work-center-progress` and `PUT /api/work-center-progress/:progressId/validate` answer instead of the old ones (same paths).
 3. `POST /api/work-center` creates standalone tasks. Linked tasks are created with an activity or added through the activity task route.
-4. `taskQueryRoutes.js` supports a separate task-question workflow: only the same-side leader can ask an assigned member, only that member can answer, and the leader resolves answered queries.
+4. `workCenterRoutes.js` supports the task-question workflow: only the same-side leader can ask an assigned member, only that member can answer, and the leader resolves answered queries.
 5. Delete guards: an activity with tasks or verification history, and a task with approved reports, answer 409 with a clear message instead of a database error.
 6. `POST /api/report-progress` and `POST /api/report-additional-progress` now check `canEditSchedule` (they had no role check) and refuse typed entry on a milestone that takes its progress from activities.
 7. `POST /api/complete-milestone` also runs the new completion check for derived milestones.

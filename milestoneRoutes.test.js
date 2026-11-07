@@ -7,10 +7,9 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import multer from 'multer';
 import pg from 'pg';
-import { registerActivityRoutes } from './activityRoutes.js';
-import { registerReportRoutes } from './reportRoutes.js';
+import { registerActivityRoutes, registerMilestoneRoutes, milestoneCompletionCheck, assertTypedProgressAllowed } from './planningRoutes.js';
+import { registerReportRoutes } from './workCenterRoutes.js';
 import { registerVerificationRoutes } from './verificationRoutes.js';
-import { registerMilestoneRoutes, milestoneCompletionCheck, assertTypedProgressAllowed } from './milestoneRoutes.js';
 
 const pool = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
 const notes = [];

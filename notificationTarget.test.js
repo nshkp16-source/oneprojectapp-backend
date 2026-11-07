@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveNotificationTarget } from './notificationTarget.js';
+import { resolveNotificationTarget } from './notificationWorkflow.js';
 
 function mockPool(results) {
   const calls = [];

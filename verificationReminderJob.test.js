@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sendOverdueVerificationReminders } from './verificationReminderJob.js';
+import { sendOverdueVerificationReminders } from './notificationWorkflow.js';
 
 function reminderFixture({ locked = true } = {}) {
   const calls = [];

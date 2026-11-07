@@ -15,11 +15,11 @@
 //   import { registerVerificationRoutes } from './verificationRoutes.js';
 //   registerVerificationRoutes(app, {
 //     pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload,
-//     wcSide, isWCLeader, sideRoles, notify, flowKey,     // same dependencies as reportRoutes.js
+//     wcSide, isWCLeader, sideRoles, notify, flowKey,     // same dependencies as workCenterRoutes.js
 //   });
 
 import { certifiedAfterDecision, respondByDate } from './progressRules.js';
-import { syncMilestone } from './activityRoutes.js';
+import { syncMilestone } from './planningRoutes.js';
 
 class HttpError extends Error {
   constructor(status, message, extra = {}) { super(message); this.status = status; this.extra = extra; }

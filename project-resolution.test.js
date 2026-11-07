@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const html = fs.readFileSync(new URL('../dashboard.html', import.meta.url), 'utf8');
+const html = fs.readFileSync(new URL('../frontend/dashboard.html', import.meta.url), 'utf8');
 const start = html.indexOf('async function ensureActiveProjectId');
 const end = html.indexOf('// Project selector toggle', start);
 const fn = html.slice(start, end);

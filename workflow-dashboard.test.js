@@ -10,29 +10,68 @@ assert.notEqual(sourceStart, -1, 'integrated workflow script not found in dashbo
 const sourceEnd = html.indexOf('</script>', sourceStart);
 assert.notEqual(sourceEnd, -1, 'integrated workflow script is not closed');
 const source = html.slice(sourceStart, sourceEnd);
+const queryHandlerStart = html.indexOf('async function _openTaskQueryNotification');
+const queryHandlerEnd = html.indexOf('async function _openActivityVerificationNotification', queryHandlerStart);
+assert.ok(queryHandlerStart >= 0 && queryHandlerEnd > queryHandlerStart, 'task-query notification handler not found');
+const queryHandler = html.slice(queryHandlerStart, queryHandlerEnd);
 
-function setup({ legacyActivityCard = true } = {}) {
+function setup({ legacyActivityCard = true, queryNotification = null } = {}) {
   const window = {
     _wcMemberView: () => '<div>legacy member</div>',
     _wcPMView: () => '<div>legacy leader</div>',
     _wcWireDetailButtons: () => {},
   };
+  window.__activityCalls = {};
   if (legacyActivityCard) {
-    window._peActivityCardHtml = (_card, verificationData) => {
+    window._peActivityCardHtml = (_card, verificationData = { verifications: [], rework: [] }, selectedTab = 'overview') => {
       if (!verificationData || !Array.isArray(verificationData.verifications))
         throw new TypeError('verification data is required');
+      window.__activityCalls.html = [_card, verificationData, selectedTab];
       return '<main><div data-pe-pane="overview"></div></main>';
     };
-    window._peWireActivityCard = () => {};
+    window._peWireActivityCard = (...args) => { window.__activityCalls.wire = args; };
   }
   const context = {
     window,
+    document: { getElementById: () => null },
     escapeHtml: (value) => String(value).replace(/[&<>"']/g, (char) => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     })[char]),
   };
+  if (queryNotification) {
+    const report = queryNotification.query.report_id
+      ? { open: false }
+      : null;
+    const queryCard = {
+      closest: (selector) => selector === '[data-wc-report-card]' ? report : null,
+      scrollIntoView: () => { window.__queryNotificationLog.scrolled = true; },
+    };
+    window.__queryNotificationLog = { report, selectedTab: null, scrolled: false };
+    Object.assign(context, {
+      API: '/api',
+      URLSearchParams,
+      localStorage: { getItem: () => '7' },
+      sessionStorage: { setItem: (key, value) => { window.__queryNotificationLog[key] = value; } },
+      CSS: { escape: (value) => String(value) },
+      isWCLeader: () => queryNotification.leader,
+      authFetch: async (url) => ({
+        ok: true,
+        json: async () => url.includes('/notifications/target')
+          ? { target: { recordId: 5 } }
+          : { queries: [queryNotification.query] },
+      }),
+      _openRecordNotification: async () => true,
+      _waitForElement: async (selector) => selector.includes(`#wc-query-${queryNotification.query.id}`) ? queryCard : null,
+    });
+    context.document.querySelector = (selector) => ({
+      click: () => { window.__queryNotificationLog.selectedTab = selector; },
+    });
+    window.__runTaskQueryNotification = () =>
+      vm.runInContext(`_openTaskQueryNotification(${JSON.stringify(queryNotification.query.id)})`, context);
+  }
   vm.createContext(context);
   vm.runInContext(source, context);
+  if (queryNotification) vm.runInContext(queryHandler, context);
   return window;
 }
 
@@ -60,9 +99,25 @@ test('task-query notifications open the linked report instead of a removed Queri
   const end = html.indexOf('async function _openActivityVerificationNotification', start);
   assert.ok(start >= 0 && end > start);
   const handler = html.slice(start, end);
-  assert.match(handler, /query\.report_id/);
-  assert.match(handler, /data-wc-report-id/);
+  assert.match(handler, /#wc-query-\$\{CSS\.escape\(String\(queryId\)\)\}/);
+  assert.match(handler, /queryCard\.closest\('\[data-wc-report-card\]'\)/);
+  assert.doesNotMatch(handler, /if \(!query\?\.report_id\) return false/);
   assert.doesNotMatch(handler, /data-wc-tab="queries"|setItem\([^;]*'queries'/);
+});
+
+test('task-query notifications open both linked and unlinked questions', async () => {
+  for (const reportId of [42, null]) {
+    const window = setup({
+      queryNotification: {
+        leader: true,
+        query: { id: 31, report_id: reportId },
+      },
+    });
+    assert.equal(await window.__runTaskQueryNotification(), true);
+    assert.match(window.__queryNotificationLog.selectedTab, /data-wc-tab="reports"/);
+    assert.equal(window.__queryNotificationLog.scrolled, true);
+    assert.equal(window.__queryNotificationLog.report?.open ?? false, Boolean(reportId));
+  }
 });
 
 test('voiding uses the reason field in the expanded report instead of a prompt', () => {
@@ -92,6 +147,19 @@ test('activity workflow does not append duplicate verification controls to the t
   });
   assert.equal(html, '<main><div data-pe-pane="overview"></div></main>');
   assert.doesNotMatch(html, /wf-activity-controls|Request verification/);
+});
+
+test('activity workflow preserves verification data and card arguments', () => {
+  const window = setup();
+  const card = { can_edit_activity: false, activity: { id: 8 } };
+  const verificationData = { verifications: [{ id: 21 }], rework: [{ id: 22 }] };
+  const cachedRecord = { id: 8, side: 'Contractor' };
+  const html = window._peActivityCardHtml(card, verificationData, 'certification');
+  assert.equal(html, '<main><div data-pe-pane="overview"></div></main>');
+  assert.deepEqual(window.__activityCalls.html, [card, verificationData, 'certification']);
+
+  window._peWireActivityCard(8, card, cachedRecord, verificationData);
+  assert.deepEqual(window.__activityCalls.wire, [8, card, cachedRecord, verificationData]);
 });
 
 test('activity plan editing stays inside the Overview tab for its creator', () => {

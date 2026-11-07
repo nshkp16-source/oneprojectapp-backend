@@ -8,7 +8,7 @@ import { JSDOM } from 'jsdom';
 
 // arrays made inside the simulated browser have another prototype, so compare plain copies
 const same = (actual, expected) => assert.deepStrictEqual(JSON.parse(JSON.stringify(actual)), expected);
-const html = fs.readFileSync(new URL('../dashboard.html', import.meta.url), 'utf8');
+const html = fs.readFileSync(new URL('../frontend/dashboard.html', import.meta.url), 'utf8');
 const startMarker = '// ===== Activity form v2:';
 const codeStart = html.indexOf(startMarker);
 const codeEnd = html.indexOf('</script>', codeStart);
@@ -35,6 +35,7 @@ function setup(role = 'ContractorPM') {
     let projectLifecycleReadOnly = false; function showProjectLifecycleNotice() {}
     const recordsCache = { 'planning-execution': [1], 'work-center': [1] };
     function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function _wcFmtDate(value) { return value ? String(value).slice(0, 10) : '—'; }
     function wcSide(r) { return r.startsWith('Contractor') ? 'Contractor' : r.startsWith('Consultant') ? 'Consultant' : r.startsWith('Client') ? 'Client' : null; }
     function isWCLeader(r) { return wcSide(r) !== null; }
     function _peUnitOptions(sel) { return PE_UNITS.map(u => '<option value="' + u + '">' + u + '</option>').join(''); }
@@ -69,7 +70,7 @@ test('opens with a milestone list, a default type per side, and one task at 100%
   const s = setup(); await s.open();
   assert.equal(s.$('pe2-type').value, 'quantity');
   assert.equal(s.state().tasks.length, 1);
-  assert.equal(s.d.querySelector('[data-task-weight]'), null);                       // no weight box for a single task
+  assert.equal(s.d.querySelector('[data-task-weight]').readOnly, true);               // one task is fixed at 100%
   const opts = [...s.$('pe2-milestone').options].map((o) => o.textContent.trim());
   assert.ok(opts.some((t) => t.includes('Foundation') && t.includes('typed progress 30%')));
   assert.ok(opts.some((t) => t.includes('Old') && t.includes('completed')));
@@ -127,8 +128,8 @@ test('validation messages', async () => {
   s.set('pe2-end', '2026-06-01'); s.click(s.$('pe2-save')); assert.match(s.log.alerts.at(-1), /planned amount/);
   s.set('pe2-qty', '10'); s.click(s.$('pe2-save')); assert.match(s.log.alerts.at(-1), /select a unit/);
   s.set('pe2-unit', 'm3', 'change'); s.click(s.$('pe2-save')); assert.match(s.log.alerts.at(-1), /Task 1 needs a title/);
-  s.set('pe2-milestone', 'new', 'change'); s.click(s.$('pe2-save')); assert.match(s.log.alerts.at(-1), /standalone milestone name/);
-  s.set('pe2-milestone', '', 'change');
+  assert.equal([...s.$('pe2-milestone').options].some((option) => option.value === 'new'), false);
+  assert.equal(s.$('pe2-milestone-text'), null);
   s.d.querySelector('[data-task-title="0"]').value = 'T'; s.d.querySelector('[data-task-title="0"]').dispatchEvent(new s.w.Event('input', { bubbles: true }));
   s.click(s.$('pe2-save')); assert.match(s.log.alerts.at(-1), /assigned team member/);
   assert.equal(s.log.fetches.filter((f) => f.url.includes('create-with-tasks')).length, 0);   // nothing was sent
@@ -142,8 +143,7 @@ test('milestone choice sends the right field, and the note explains the effect',
   assert.match(s.$('pe2-milestone-note').textContent, /follow the consultant-certified/);
   const c = setup('ConsultantPM'); await c.open(); c.set('pe2-milestone', 'b:2', 'change');
   assert.match(c.$('pe2-milestone-note').textContent, /Reference only/);
-  s.set('pe2-milestone', 'new', 'change');
-  assert.equal(s.$('pe2-milestone-text').style.display, 'block');
+  assert.equal([...s.$('pe2-milestone').options].some((option) => option.value === 'new'), false);
 });
 
 test('submit builds the request, asks to confirm replacing typed progress, and refreshes the lists', async () => {
@@ -169,8 +169,8 @@ test('submit builds the request, asks to confirm replacing typed progress, and r
   assert.equal(first.get('done_when'), 'Levels confirmed');
   assert.equal(first.get('confirm_replace_manual'), null);
   assert.deepEqual(JSON.parse(first.get('tasks')), [
-    { title: 'Block A', assigned_members: [{ id: 101 }], weight_pct: 50 },
-    { title: 'Block B', assigned_members: [{ id: 102 }], weight_pct: 50 }]);
+    { title: 'Block A', description: '', start_date: '2026-03-01', end_date: '2026-04-30', priority: 'normal', assigned_members: [{ id: 101 }], weight_pct: 50 },
+    { title: 'Block B', description: '', start_date: '2026-03-01', end_date: '2026-04-30', priority: 'normal', assigned_members: [{ id: 102 }], weight_pct: 50 }]);
   assert.match(s.log.confirms[0], /typed progress: 30%.*120 of 400 m3.*0%/s);
   assert.equal(second.get('confirm_replace_manual'), 'true');
   assert.match(s.log.alerts.at(-1), /Activity created with 2 tasks/);

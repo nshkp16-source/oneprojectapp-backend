@@ -33,6 +33,9 @@ function views() {
     document.body.innerHTML = leader ? _wcPMView(task, entries) : _wcMemberView(task, entries);
     _wcTabifyDetail(document.body, task, entries, queries, leader, true);
     return document;
+  }
+  function saveReportFilter(taskId, filter) {
+    sessionStorage.setItem(\`wc-report-filter-\${taskId}\`, filter);
   }`, ctx);
   const render = (fn, task, entries) => { dom.window.__t = task; dom.window.__e = entries; dom.window.document.body.innerHTML = vm.runInContext(`${fn}(window.__t, window.__e)`, ctx); return dom.window.document; };
   return {
@@ -40,6 +43,7 @@ function views() {
     member: (t, e) => render('_wcMemberView', t, e),
     leader: (t, e) => render('_wcPMView', t, e),
     tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
+    saveReportFilter: (taskId, filter) => { dom.window.__taskId = taskId; dom.window.__filter = filter; vm.runInContext('saveReportFilter(window.__taskId, window.__filter)', ctx); },
   };
 }
 
@@ -157,6 +161,39 @@ test('expanded standalone task does not show a task-level query tab', () => {
   const d = views().tabbed({ ...task, activity_id: null, activity_title: null }, [], [], false);
   assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
   assert.match(d.body.textContent, /Files/);
+});
+
+test('leader reports default to All when there are no pending reports', () => {
+  const stalePending = views();
+  stalePending.saveReportFilter(task.id, 'pending');
+  const d = stalePending.tabbed(task, [{ ...entries[1], validation_status: 'approved' }], [], true);
+  assert.equal(d.querySelector('[data-report-filter="all"]').getAttribute('aria-pressed'), 'true');
+  assert.equal(d.querySelector('[data-report-filter="pending"]').getAttribute('aria-pressed'), 'false');
+  assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, false);
+
+  const withPending = views().tabbed(task, entries, [], true);
+  assert.equal(withPending.querySelector('[data-report-filter="pending"]').getAttribute('aria-pressed'), 'true');
+  assert.equal(withPending.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, true);
+});
+
+test('questions without a matching report appear in Other questions for leaders and members', () => {
+  const questions = [
+    { id: 31, report_id: null, question: 'Unlinked question', status: 'open', created_at: '2026-03-10' },
+    { id: 32, report_id: 999, question: 'Question for a deleted report', status: 'answered', created_at: '2026-03-11' },
+    { id: 33, report_id: 2, question: 'Question about a visible report', status: 'answered', created_at: '2026-03-12' },
+  ];
+  for (const leader of [true, false]) {
+    const d = views().tabbed(task, [entries[1]], questions, leader);
+    const paneKey = leader ? 'reports' : 'my-reports';
+    const orphanPanel = d.querySelector(`[data-wc-pane="${paneKey}"] [data-wc-orphan-queries]`);
+    assert.ok(orphanPanel);
+    assert.match(orphanPanel.textContent, /Other questions \(2\)/);
+    assert.match(orphanPanel.textContent, /Unlinked question/);
+    assert.match(orphanPanel.textContent, /Question for a deleted report/);
+    assert.equal(orphanPanel.querySelector('#wc-query-33'), null);
+    assert.ok(d.querySelector('[data-wc-report-queries="2"] #wc-query-33'));
+    assert.equal(orphanPanel.querySelector('[data-action="wc-query-create"]'), null);
+  }
 });
 
 test('expanded member task separates progress and reports; closed task hides progress', () => {
