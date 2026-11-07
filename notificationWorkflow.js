@@ -199,7 +199,7 @@ async function sendWorkCenterTaskReminders({ pool, notifyRecordUsers, flowKey, n
 
     const { rows } = await client.query(
       `SELECT w.id, w.project_id, w.side, w.title, w.assigned_members,
-              w.created_by_id, w.created_by_role, w.end_date,
+              w.creator_id AS created_by_id, w.creator_role AS created_by_role, w.end_date,
               CURRENT_DATE - w.end_date AS overdue_days
        FROM workspace_work_center w
        WHERE w.status NOT IN ('closed', 'completed') AND w.progress_pct < 100 AND w.end_date IS NOT NULL

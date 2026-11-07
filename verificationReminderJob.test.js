@@ -102,6 +102,8 @@ test('work-center task reminders include the assigned group and side leaders', a
   });
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].table, 'work_center_task');
+  assert.ok(calls.some((sql) => sql.includes('w.creator_id AS created_by_id')
+    && sql.includes('w.creator_role AS created_by_role')));
   assert.deepEqual(notifications[0].recipients.map((recipient) => recipient.id).sort((a, b) => a - b), [5, 14, 15]);
   assert.match(notifications[0].message, /overdue by 1 day/);
   assert.ok(calls.some((sql) => sql.includes("INTERVAL '1 day'")));
