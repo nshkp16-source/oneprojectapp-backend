@@ -171,12 +171,21 @@ async function insertTask(client, ctx, task, share, stages) {
   const row = (await client.query(`
     INSERT INTO workspace_work_center
       (project_id, title, description, work_package, assigned_members, priority, status,
-       start_date, end_date, creator_id, creator_role, side, activity_id, weight_pct, target_quantity)
-    VALUES ($1,$2,$3,$4,$5::jsonb,$6,'ongoing',$7,$8,$9,$10,$11,$12,$13,$14)
+       start_date, end_date, creator_id, creator_role, side, activity_id, weight_pct, target_quantity,
+       location_block, location_floor, location_zone, location_grid, location_drawing)
+    VALUES ($1,$2,$3,$4,$5::jsonb,$6,'ongoing',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
     RETURNING *`,
     [ctx.projectId, String(task.title).trim(), task.description || '', task.work_package || '',
      JSON.stringify(members), task.priority || 'normal', start, end,
-     ctx.userId, ctx.role, ctx.side, ctx.activityId, share.weight_pct, share.target_quantity])).rows[0];
+     ctx.userId, ctx.role, ctx.side, ctx.activityId, share.weight_pct, share.target_quantity,
+     task.location_block || null, task.location_floor || null, task.location_zone || null,
+     task.location_grid || null, task.location_drawing || null])).rows[0];
+
+  await client.query(
+    `INSERT INTO work_center_task_history
+       (task_id, project_id, actor_id, actor_role, action, detail)
+     VALUES ($1,$2,$3,$4,'task_created',$5::jsonb)`,
+    [row.id, ctx.projectId, ctx.userId, ctx.role, JSON.stringify({ title: row.title })]);
 
   if (ctx.type === 'stages') {
     let seq = 0;

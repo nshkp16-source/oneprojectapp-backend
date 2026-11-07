@@ -15,10 +15,10 @@ import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import { Readable } from 'stream';
 import { layoutStamp, drawStampOnPage, stampPdfBuffer, buildStampPreviewPdf, deriveStampId, pickMark, formatStampDate, clampStampScale } from './stamp-renderer.js';
 import { registerActivityRoutes, registerMilestoneRoutes, milestoneCompletionCheck, typedProgressBlockedReason } from './planningRoutes.js';
-import { registerReportRoutes, registerTaskQueryRoutes } from './workCenterRoutes.js';
+import { registerReportRoutes, registerTaskQueryRoutes, registerTaskCardRoutes } from './workCenterRoutes.js';
 import { registerVerificationRoutes } from './verificationRoutes.js';
 import { delayDays } from './progressRules.js';
-import { resolveNotificationTarget, sendOverdueVerificationReminders } from './notificationWorkflow.js';
+import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -53,6 +53,16 @@ const photoUpload = multer({
   fileFilter: (_req, file, cb) => {
     const ok = file.mimetype.startsWith('image/');
     cb(ok ? null : new Error('Images only'), ok);
+  },
+});
+
+const workCenterReportUpload = multer({
+  limits: { fileSize: 10 * 1024 * 1024, files: 11, fields: 50 },
+  storage: multer.memoryStorage(),
+  fileFilter: (_req, file, cb) => {
+    const imageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif']);
+    const isAllowed = file.fieldname === 'attachment' || imageTypes.has(file.mimetype);
+    cb(isAllowed ? null : new Error('Report photos must be images.'), isAllowed);
   },
 });
 
@@ -8061,7 +8071,8 @@ app.get('/api/notifications/target', authenticateToken, async (req, res) => {
 //  registered handler answers, so the new POST /api/work-center-progress and its /validate route win.
 // =============================================================================
 const progressModelDeps = {
-  pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload,
+  pool, authenticateToken, upload, reportUpload: workCenterReportUpload,
+  requireProjectLifecycleWrite, scheduleCloudinaryUpload,
   wcSide, isWCLeader, sideRoles, flowKey,
   notify: ({ projectId, entityId, entityType, message, actorId, actorRole, recipients }) =>
     notifyRecordUsers({ projectId, recordId: entityId, table: entityType, message, actorId, actorRole, recipients }),
@@ -8071,6 +8082,7 @@ registerReportRoutes(app, progressModelDeps);
 registerVerificationRoutes(app, progressModelDeps);
 registerMilestoneRoutes(app, progressModelDeps);
 registerTaskQueryRoutes(app, progressModelDeps);
+registerTaskCardRoutes(app, progressModelDeps);
 
 // Keep the later Work Center route available for standalone tasks.
 app.post('/api/work-center', authenticateToken, (_req, _res, next) => next());
@@ -8918,6 +8930,10 @@ app.post('/api/work-center', authenticateToken,
     } else if (stages.length) {
       return res.status(400).json({ error: 'Stages can only be supplied for a stages task.' });
     }
+    const locationValues = ['location_block','location_floor','location_zone','location_grid','location_drawing']
+      .map((key) => String(b[key] || '').trim());
+    if (locationValues.some((value) => value.length > 150))
+      return res.status(400).json({ error: 'Task location fields cannot exceed 150 characters.' });
 
     const client = await pool.connect();
     try {
@@ -8925,12 +8941,18 @@ app.post('/api/work-center', authenticateToken,
       const result = await client.query(`
         INSERT INTO workspace_work_center
           (project_id, title, description, assigned_members, priority, status, start_date, end_date,
-           creator_id, creator_role, side, activity_id, activity_type, target_quantity, standalone_unit, weight_pct)
-        VALUES ($1,$2,$3,$4::jsonb,$5,'ongoing',$6,$7,$8,$9,$10,NULL,$11,$12,$13,100)
+           creator_id, creator_role, side, activity_id, activity_type, target_quantity, standalone_unit, weight_pct,
+           location_block, location_floor, location_zone, location_grid, location_drawing)
+        VALUES ($1,$2,$3,$4::jsonb,$5,'ongoing',$6,$7,$8,$9,$10,NULL,$11,$12,$13,100,$14,$15,$16,$17,$18)
         RETURNING *`,
       [projectId, title, String(b.description || ''), JSON.stringify(members), priority, startDate, endDate,
-       user_id, role, side, type, planned, unit]);
+       user_id, role, side, type, planned, unit, ...locationValues.map((value) => value || null)]);
       const task = result.rows[0];
+      await client.query(
+        `INSERT INTO work_center_task_history
+           (task_id, project_id, actor_id, actor_role, action, detail)
+         VALUES ($1,$2,$3,$4,'task_created',$5::jsonb)`,
+        [task.id, projectId, user_id, role, JSON.stringify({ title: task.title })]);
       for (let i = 0; i < stages.length; i++) {
         const stage = stages[i];
         await client.query(
@@ -8953,6 +8975,7 @@ app.post('/api/work-center', authenticateToken,
 // ── Update task (same-side leader only) ──────────────────────────────────────
 app.put('/api/work-center/:taskId', authenticateToken,
   upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
+  let client;
   try {
     const { user_id, role } = req.user;
     const { taskId }        = req.params;
@@ -9030,16 +9053,29 @@ app.put('/api/work-center/:taskId', authenticateToken,
     if (!setClauses.length) return res.status(400).json({ error: 'No fields to update.' });
     values.push(taskId, projectId);
 
-    const updated = await pool.query(
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const updated = await client.query(
       `UPDATE workspace_work_center SET ${setClauses.join(', ')}
        WHERE id = $${idx} AND project_id = $${idx + 1} RETURNING *`,
       values
     );
+    await client.query(
+      `INSERT INTO work_center_task_history
+         (task_id, project_id, actor_id, actor_role, action, detail)
+       VALUES ($1,$2,$3,$4,'task_updated',$5::jsonb)`,
+      [taskId, projectId, user_id, role, JSON.stringify({
+        title: title ?? null, description: description ?? null, work_package: work_package ?? null,
+        assigned_members: members, priority: priority ?? null, status: status ?? null,
+        start_date: start_date ?? null, end_date: end_date ?? null,
+      })]);
+    await client.query('COMMIT');
     return res.json({ success: true, task: updated.rows[0] });
   } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('PUT /api/work-center/:taskId:', err);
     return res.status(500).json({ error: 'Server error.' });
-  }
+  } finally { if (client) client.release(); }
 });
 
 // ── Delete task (same-side leader only) ───────────────────────────────────────
@@ -9075,10 +9111,19 @@ app.delete('/api/work-center/:taskId', authenticateToken, async (req, res) => {
        WHERE task_id = $1 AND attachment_id IS NOT NULL`,
       [taskId]
     );
+    const reportPhotos = await pool.query(
+      `SELECT ph.file_id FROM work_center_report_photos ph
+       JOIN workspace_work_center_progress p ON p.id = ph.report_id
+       WHERE p.task_id = $1`,
+      [taskId]
+    );
     await Promise.allSettled(
-      progressFiles.rows.map(r =>
-        cloudinary.uploader.destroy(r.attachment_id, { resource_type: 'raw' })
-      )
+      [
+        ...progressFiles.rows.map((row) =>
+          cloudinary.uploader.destroy(row.attachment_id, { resource_type: 'raw' })),
+        ...reportPhotos.rows.map((photo) =>
+          cloudinary.uploader.destroy(photo.file_id, { resource_type: 'image' })),
+      ]
     );
 
     await pool.query(
@@ -9156,7 +9201,22 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
         SELECT p.*,
                t.email       AS member_email,
                tma.position  AS member_position,
-               tma.name      AS member_title
+               tma.name      AS member_title,
+               COALESCE((SELECT json_agg(json_build_object(
+                 'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
+                 'captured_at', ph.captured_at, 'latitude', ph.latitude,
+                 'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
+               ) ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
+               COALESCE((SELECT json_agg(json_build_object(
+                 'resource_type', rr.resource_type, 'name', rr.name, 'quantity', rr.quantity,
+                 'unit', rr.unit, 'hours', rr.hours, 'assigned_member_id', rr.assigned_member_id,
+                 'assigned_member_name', (SELECT COALESCE(NULLIF(rma.name, ''), rm.email)
+                   FROM team_members rm
+                   LEFT JOIN team_member_assignments rma
+                     ON rma.team_member_id = rm.id AND rma.project_id = rr.project_id
+                   WHERE rm.id = rr.assigned_member_id
+                   ORDER BY rma.id DESC LIMIT 1)
+               ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
         FROM   workspace_work_center_progress p
         JOIN   team_members t ON t.id = p.member_id
         LEFT JOIN LATERAL (
@@ -9177,7 +9237,23 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
       if (!assigned.some(m => String(m.id) === String(user_id)))
         return res.status(403).json({ error: 'You are not assigned to this task.' });
       const result = await pool.query(
-        `SELECT * FROM workspace_work_center_progress
+        `SELECT p.*,
+                COALESCE((SELECT json_agg(json_build_object(
+                  'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
+                  'captured_at', ph.captured_at, 'latitude', ph.latitude,
+                  'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
+                ) ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
+                COALESCE((SELECT json_agg(json_build_object(
+                  'resource_type', rr.resource_type, 'name', rr.name, 'quantity', rr.quantity,
+                  'unit', rr.unit, 'hours', rr.hours, 'assigned_member_id', rr.assigned_member_id,
+                  'assigned_member_name', (SELECT COALESCE(NULLIF(rma.name, ''), rm.email)
+                    FROM team_members rm
+                    LEFT JOIN team_member_assignments rma
+                      ON rma.team_member_id = rm.id AND rma.project_id = rr.project_id
+                    WHERE rm.id = rr.assigned_member_id
+                    ORDER BY rma.id DESC LIMIT 1)
+                ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
+         FROM workspace_work_center_progress p
          WHERE task_id = $1 AND member_id = $2 ORDER BY submitted_at DESC`,
         [taskId, user_id]
       );
@@ -11025,8 +11101,13 @@ setTimeout(() => {
   const runVerificationReminders = () => sendOverdueVerificationReminders({
     pool, notifyRecordUsers, flowKey, normalizeRole,
   });
+  const runWorkCenterTaskReminders = () => sendWorkCenterTaskReminders({
+    pool, notifyRecordUsers, flowKey, normalizeRole,
+  });
   runVerificationReminders();
   setInterval(runVerificationReminders, 15 * 60 * 1000);
+  runWorkCenterTaskReminders();
+  setInterval(runWorkCenterTaskReminders, 15 * 60 * 1000);
   sendDueMeetingReminders();
   setInterval(sendDueMeetingReminders, 15 * 60 * 1000);
 }, 30 * 1000);

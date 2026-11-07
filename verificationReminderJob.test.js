@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sendOverdueVerificationReminders } from './notificationWorkflow.js';
+import { sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
 
 function reminderFixture({ locked = true } = {}) {
   const calls = [];
@@ -71,4 +71,38 @@ test('only one server instance processes the overdue reminder job at a time', as
   assert.equal(fixture.notifications.length, 0);
   assert.equal(fixture.calls.length, 1);
   assert.equal(fixture.released(), true);
+});
+
+test('work-center task reminders include the assigned group and side leaders', async () => {
+  const calls = [];
+  const client = {
+    async query(sql) {
+      calls.push(sql);
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      if (sql.includes('SELECT w.id')) return { rows: [{
+        id: 33, project_id: 3, side: 'Contractor', title: 'Pour slab',
+        assigned_members: [{ id: 14 }, { id: 15 }], created_by_id: 5,
+        created_by_role: 'ContractorPM', overdue_days: 1,
+      }] };
+      if (sql.includes('FROM assignments_view')) return { rows: [
+        { role: 'ContractorPM', role_id: 5 },
+      ] };
+      if (sql.includes('UPDATE workspace_work_center')) return { rows: [] };
+      if (sql.includes('pg_advisory_unlock')) return { rows: [] };
+      throw new Error(`Unexpected query: ${sql}`);
+    },
+    release() {},
+  };
+  const notifications = [];
+  await sendWorkCenterTaskReminders({
+    pool: { connect: async () => client },
+    notifyRecordUsers: async (notification) => { notifications.push(notification); return 99; },
+    flowKey: (role, id) => ({ role, id: Number(id) }),
+    normalizeRole: (role) => role,
+  });
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].table, 'work_center_task');
+  assert.deepEqual(notifications[0].recipients.map((recipient) => recipient.id).sort((a, b) => a - b), [5, 14, 15]);
+  assert.match(notifications[0].message, /overdue by 1 day/);
+  assert.ok(calls.some((sql) => sql.includes("INTERVAL '1 day'")));
 });

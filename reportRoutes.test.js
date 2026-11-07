@@ -1,4 +1,4 @@
-// Needs a THROWAWAY PostgreSQL database with the base schema and the three 2026-11 migrations applied.
+// Needs a THROWAWAY PostgreSQL database with the base schema and migrations through 2026-11-07-work-center-task-card.sql.
 // It inserts fixtures, so never point it at real data.
 // Run:  TEST_DATABASE_URL=postgres://user:pass@localhost/scratch node --test reportRoutes.test.js
 // Needs the packages express, pg and multer (npm i -D express pg multer).
@@ -8,7 +8,7 @@ import express from 'express';
 import multer from 'multer';
 import pg from 'pg';
 import { registerActivityRoutes } from './planningRoutes.js';
-import { registerReportRoutes } from './workCenterRoutes.js';
+import { registerReportRoutes, registerTaskCardRoutes } from './workCenterRoutes.js';
 
 const pool = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
 const notes = [];
@@ -24,6 +24,7 @@ const deps = {
 };
 registerActivityRoutes(app, deps);
 registerReportRoutes(app, deps);
+registerTaskCardRoutes(app, deps);
 let server, base;
 const leader = { user_id: 5, role: 'ContractorPM' };
 const consultant = { user_id: 8, role: 'ConsultantPM' };
@@ -112,14 +113,76 @@ test('report checks: wrong member, missing quantity, future date, before task st
 });
 
 test('a report waits as pending, leaders are told, nothing is counted yet', async () => {
-  const r = await report(m(101), { taskId: tA.id, reportDate: '2026-03-10', quantityDone: 40, manpower: '6 workers', materials: 'none' });
+  const reportBody = {
+    taskId: tA.id, reportDate: '2026-03-10', quantityDone: 40, manpower: '6 workers',
+    materials: 'none', idempotencyKey: 'offline-report-101',
+    resources: [{ type: 'manpower', name: 'Carpenters', quantity: 6, unit: 'people', hours: 8, assignedMemberId: 101 }],
+    delayCause: 'weather', delayDays: 1, delayNote: 'Heavy rain in the afternoon.',
+  };
+  const r = await report(m(101), reportBody);
   assert.equal(r.status, 201, JSON.stringify(r.body));
   rA = r.body.entry;
   assert.equal(rA.validation_status, 'pending');
   assert.equal(Number(rA.progress_pct), 20);                         // what the task would show if approved
+  const retry = await report(m(101), reportBody);
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.duplicate, true);
+  assert.equal(retry.body.entry.id, rA.id);
+  assert.equal((await q(`SELECT COUNT(*)::int n FROM work_center_report_resources WHERE report_id=$1`, [rA.id]))[0].n, 1);
+  assert.equal((await q(`SELECT assigned_member_id FROM work_center_report_resources WHERE report_id=$1`, [rA.id]))[0].assigned_member_id, 101);
+  assert.equal((await q(`SELECT delay_cause, delay_days FROM workspace_work_center_progress WHERE id=$1`, [rA.id]))[0].delay_cause, 'weather');
   assert.equal((await q(`SELECT COUNT(*)::int n FROM planning_execution_tracking WHERE activity_id=$1`, [act.id]))[0].n, 0);
   assert.equal(notes.at(-1).entityType, 'work_center_progress');
   assert.deepEqual(notes.at(-1).recipients, [{ role: 'ContractorPM', id: 5 }]);
+});
+
+test('task card collaboration is visible to assigned members and same-side leaders only', async () => {
+  const memberComment = await call('POST', `/api/work-center/${tA.id}/comments`, m(101), {
+    projectId: 1, body: 'Formwork is ready.',
+  });
+  assert.equal(memberComment.status, 201, JSON.stringify(memberComment.body));
+  const memberCard = await call('GET', `/api/work-center/${tA.id}/card?projectId=1`, m(101));
+  assert.equal(memberCard.status, 200);
+  assert.equal(memberCard.body.comments[0].body, 'Formwork is ready.');
+  assert.equal((await call('GET', `/api/work-center/${tA.id}/card?projectId=1`, m(103))).status, 403);
+  assert.equal((await call('GET', `/api/work-center/${tA.id}/card?projectId=1`, consultant)).status, 403);
+
+  const checklist = await call('POST', `/api/work-center/${tA.id}/checklists`, leader, {
+    projectId: 1, title: 'Before approval', requiredBeforeApproval: true,
+    items: [{ title: 'Check measurements', assignedMemberId: 101 }],
+  });
+  assert.equal(checklist.status, 201, JSON.stringify(checklist.body));
+  const cardWithChecklist = await call('GET', `/api/work-center/${tA.id}/card?projectId=1`, m(101));
+  assert.equal(cardWithChecklist.body.checklists[0].required_before_approval, true);
+  assert.equal(cardWithChecklist.body.checklists[0].items[0].title, 'Check measurements');
+  const checklistItemId = cardWithChecklist.body.checklists[0].items[0].id;
+  assert.equal((await decide(leader, rA.id, 'approved')).status, 409);
+  const checked = await call('PATCH',
+    `/api/work-center/${tA.id}/checklist-items/${checklistItemId}`, m(101),
+    { projectId: 1, isComplete: true });
+  assert.equal(checked.status, 200, JSON.stringify(checked.body));
+
+  const location = await call('PATCH', `/api/work-center/${tA.id}/location`, leader, {
+    projectId: 1, block: 'B', floor: '2', zone: 'North',
+  });
+  assert.equal(location.status, 200, JSON.stringify(location.body));
+  const link = await call('POST', `/api/work-center/${tA.id}/links`, leader, {
+    projectId: 1, type: 'url', title: 'Updated drawing', url: 'https://example.test/drawing',
+  });
+  assert.equal(link.status, 201, JSON.stringify(link.body));
+  const dependency = await call('POST', `/api/work-center/${tB.id}/dependencies`, leader, {
+    projectId: 1, dependsOnTaskId: tA.id,
+  });
+  assert.equal(dependency.status, 201, JSON.stringify(dependency.body));
+  assert.equal(dependency.body.warningOnly, true);
+  const template = await call('POST', '/api/work-center/templates', leader, {
+    projectId: 1, taskId: tA.id, name: 'Standard block',
+  });
+  assert.equal(template.status, 201, JSON.stringify(template.body));
+  assert.equal((await call('GET', '/api/work-center/templates?projectId=1', leader)).body.templates.length, 1);
+  const completedCard = await call('GET', `/api/work-center/${tA.id}/card?projectId=1`, m(101));
+  assert.equal(completedCard.body.location.block, 'B');
+  assert.equal(completedCard.body.links[0].title, 'Updated drawing');
 });
 
 test('decision checks: other side refused, rejection needs a reason', async () => {

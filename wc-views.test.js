@@ -22,7 +22,7 @@ function extract(names) {
 
 const HELPERS = ['_wcFmtDate', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
   'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
-  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail'];
+  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail'];
 
 function views() {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
@@ -64,6 +64,20 @@ test('member view: quantity field instead of a bare percentage, share line, figu
   assert.match(d.body.textContent, /Target 200 m3/);
   assert.match(d.body.textContent, /40 m3/); assert.match(d.body.textContent, /30 m3/);
   assert.match(d.body.textContent, /Voided/); assert.match(d.body.textContent, /Measured wrongly/);
+});
+
+test('report cards render photo, structured resources and delay details safely', () => {
+  const d = views().member(task, [{
+    id: 21, report_date: '2026-03-10', member_id: 101, work_done: 'Poured',
+    quantity_done: 12, validation_status: 'pending', delay_cause: 'weather',
+    delay_days: 2, delay_note: 'Rain stopped the work.',
+    photos: [{ file_name: 'pour.jpg', file_url: 'https://images.example.test/pour.jpg' }],
+    resources: [{ resource_type: 'equipment', name: 'Pump', quantity: 1, unit: 'unit', hours: 3 }],
+  }]);
+  assert.equal(d.querySelectorAll('img[alt="pour.jpg"]').length, 1);
+  assert.match(d.body.textContent, /equipment: Pump · 1 unit · 3 hours/);
+  assert.match(d.body.textContent, /Delay: weather · 2 day\(s\)/);
+  assert.match(d.body.textContent, /Rain stopped the work\./);
 });
 
 test('member view of an old task (no activity type) still shows the percentage box', () => {

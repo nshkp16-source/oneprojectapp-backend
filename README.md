@@ -9,9 +9,9 @@ This repository contains the backend application and the activity, task, report,
 | `server.js` | Backend application entry point. |
 | `progressRules.js` | Pure rules: weights, progress per activity type, claimed and certified progress, milestone derivation, delay. |
 | `planningRoutes.js` | Activity and milestone routes, including linked milestone synchronization and completion checks. |
-| `workCenterRoutes.js` | Member reports, leader approval, rejection and voiding, automatic recompute, task questions and close-out export. |
+| `workCenterRoutes.js` | Member reports, leader decisions, task-card collaboration, checklists, links, dependencies, templates and task queries. |
 | `verificationRoutes.js` | Verification requests, private-by-default consultant summaries, snag progress, decision revisions and completion certification. |
-| `notificationWorkflow.js` | Authenticated workflow notification target resolution and scheduled overdue verification notifications. |
+| `notificationWorkflow.js` | Authenticated workflow notification target resolution plus task and verification reminders. |
 | `docRules.js`, `stamp-renderer.js` | Unchanged copies of your files, so this folder runs on its own. |
 | `migrations/` | The dated SQL migrations, in order. |
 | `*.test.js`, `run-tests.sh` | Backend tests and a script that runs them on a scratch database. |
@@ -25,11 +25,12 @@ This repository contains the backend application and the activity, task, report,
    `migrations/2026-11-05-standalone-work-center-tasks.sql`, then
    `migrations/2026-11-06-activity-milestone-workflow.sql`,
    `migrations/2026-11-06-work-center-queries.sql`, then
-   `migrations/2026-11-07-link-task-queries-to-reports.sql`.
+   `migrations/2026-11-07-link-task-queries-to-reports.sql`, then
+   `migrations/2026-11-07-work-center-task-card.sql`.
 3. Look at the notice printed by the first migration. It says how many tasks were moved under "General works (migrated)" and how many activities became the percentage type.
-4. Only when the copy looks right, apply the same eight files to the real database.
+4. Only when the copy looks right, apply the same nine files to the real database.
 
-What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified. The fifth migration allows new Work Center tasks without a parent activity and stores their own progress type, target, unit, or stages. The sixth adds opt-in activity-plan sharing, progress-limited snags, auditable revisions of certification decisions, and consultant milestone-progress requests; it also prevents contractors on consultant projects from manually entering milestone progress. The seventh adds task queries, and the eighth links questions to the reports they concern.
+What the first migration does to existing data: tasks without an activity go under one "General works (migrated)" activity per project and side. Activities that already have tasks become the percentage type. Task weights and milestone weights start equal. Task and activity progress are recalculated from approved reports only (weighted, no more averages). Existing contractor activities start at 0% certified. The fifth migration allows new Work Center tasks without a parent activity and stores their own progress type, target, unit, or stages. The sixth adds opt-in activity-plan sharing, progress-limited snags, auditable revisions of certification decisions, and consultant milestone-progress requests; it also prevents contractors on consultant projects from manually entering milestone progress. The seventh adds task queries, the eighth links questions to reports, and the ninth adds task-card details, report metadata and photos, offline-safe report retries, and task reminders.
 
 ## Step 2: run the tests
 

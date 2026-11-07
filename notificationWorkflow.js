@@ -187,5 +187,92 @@ async function sendOverdueVerificationReminders({ pool, notifyRecordUsers, flowK
 return { sendOverdueVerificationReminders };
 })();
 
+const taskReminderJob = (function () {
+async function sendWorkCenterTaskReminders({ pool, notifyRecordUsers, flowKey, normalizeRole }) {
+  let client;
+  let locked = false;
+  try {
+    client = await pool.connect();
+    const lockResult = await client.query('SELECT pg_try_advisory_lock(71022, 2) AS locked');
+    locked = lockResult.rows[0].locked;
+    if (!locked) return;
+
+    const { rows } = await client.query(
+      `SELECT w.id, w.project_id, w.side, w.title, w.assigned_members,
+              w.created_by_id, w.created_by_role, w.end_date,
+              CURRENT_DATE - w.end_date AS overdue_days
+       FROM workspace_work_center w
+       WHERE w.status NOT IN ('closed', 'completed') AND w.progress_pct < 100 AND w.end_date IS NOT NULL
+         AND (
+           (w.end_date = CURRENT_DATE + 2 AND w.reminder_sent_at IS NULL)
+           OR (w.end_date < CURRENT_DATE
+               AND (w.reminder_sent_at IS NULL OR w.reminder_sent_at <= NOW() - INTERVAL '1 day'))
+         )
+       ORDER BY w.end_date, w.id LIMIT 100`
+    );
+
+    for (const task of rows) {
+      const recipientsByKey = new Map();
+      const assignees = typeof task.assigned_members === 'string'
+        ? JSON.parse(task.assigned_members) : task.assigned_members;
+      for (const member of Array.isArray(assignees) ? assignees : []) {
+        const key = `TeamMember:${member.id}`;
+        recipientsByKey.set(key, flowKey('TeamMember', member.id));
+      }
+      const leaderRoles = task.side === 'Contractor'
+        ? ['Contractor', 'ContractorPM', 'Contractor Project Manager']
+        : task.side === 'Consultant'
+          ? ['Consultant', 'ConsultantPM', 'Consultant Project Manager']
+          : ['Client', 'ClientPM', 'Client Project Manager'];
+      const { rows: leaders } = await client.query(
+        `SELECT role, role_id FROM assignments_view
+         WHERE project_id = $1 AND role = ANY($2::text[])`,
+        [task.project_id, leaderRoles]
+      );
+      for (const recipient of leaders) {
+        const key = `${normalizeRole(recipient.role)}:${recipient.role_id}`;
+        recipientsByKey.set(key, flowKey(recipient.role, recipient.role_id));
+      }
+      if (!recipientsByKey.size) continue;
+
+      const isOverdue = Number(task.overdue_days) > 0;
+      const message = isOverdue
+        ? `"${task.title}" is overdue by ${task.overdue_days} day${Number(task.overdue_days) === 1 ? '' : 's'}. Please review the task.`
+        : `"${task.title}" is due in two days. Please review the task.`;
+      const notificationId = await notifyRecordUsers({
+        projectId: task.project_id,
+        recordId: task.id,
+        table: 'work_center_task',
+        message,
+        actorId: task.created_by_id,
+        actorRole: task.created_by_role,
+        recipients: [...recipientsByKey.values()],
+      });
+      if (notificationId) {
+        await client.query(
+          `UPDATE workspace_work_center SET reminder_sent_at = NOW()
+           WHERE id = $1 AND (
+             (end_date = CURRENT_DATE + 2 AND reminder_sent_at IS NULL)
+             OR (end_date < CURRENT_DATE
+                 AND (reminder_sent_at IS NULL OR reminder_sent_at <= NOW() - INTERVAL '1 day'))
+           )`,
+          [task.id]
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Work Center task reminder job failed:', error);
+  } finally {
+    if (client && locked) {
+      await client.query('SELECT pg_advisory_unlock(71022, 2)').catch((error) =>
+        console.error('Unable to release task reminder lock:', error));
+    }
+    if (client) client.release();
+  }
+}
+return { sendWorkCenterTaskReminders };
+})();
+
 export const { resolveNotificationTarget } = targetResolution;
 export const { sendOverdueVerificationReminders } = reminderJob;
+export const { sendWorkCenterTaskReminders } = taskReminderJob;

@@ -42,6 +42,44 @@ function fail(res, err, label) {
   return res.status(500).json({ error: 'Server error.' });
 }
 
+function parseOptionalCoordinate(value, minimum, maximum) {
+  if (value == null || value === '') return null;
+  const coordinate = Number(value);
+  if (!Number.isFinite(coordinate) || coordinate < minimum || coordinate > maximum)
+    throw new HttpError(400, 'Photo location metadata is invalid.');
+  return coordinate;
+}
+
+function parseReportResources(value, assignedMembers = []) {
+  if (!value) return [];
+  let rows = value;
+  if (typeof value === 'string') {
+    try { rows = JSON.parse(value); }
+    catch { throw new HttpError(400, 'Resource details are invalid.'); }
+  }
+  if (!Array.isArray(rows) || rows.length > 60)
+    throw new HttpError(400, 'A report can include at most 60 resource entries.');
+  return rows.map((row) => {
+    const type = String(row?.type || '');
+    const name = String(row?.name || '').trim();
+    const quantity = row?.quantity === '' || row?.quantity == null ? null : Number(row.quantity);
+    const hours = row?.hours === '' || row?.hours == null ? null : Number(row.hours);
+    const unit = String(row?.unit || '').trim() || null;
+    const assignedMemberId = row?.assignedMemberId == null || row.assignedMemberId === ''
+      ? null : Number(row.assignedMemberId);
+    if (!['manpower', 'equipment', 'material'].includes(type) || !name || name.length > 200)
+      throw new HttpError(400, 'Each resource needs a valid type and name.');
+    if (assignedMemberId != null && (!Number.isSafeInteger(assignedMemberId)
+      || !assignedMembers.some((member) => String(member.id) === String(assignedMemberId))))
+      throw new HttpError(400, 'Resource attribution must be an assigned member on this task.');
+    if ((quantity != null && (!Number.isFinite(quantity) || quantity < 0))
+      || (hours != null && (!Number.isFinite(hours) || hours < 0)))
+      throw new HttpError(400, 'Resource quantities and hours must be zero or more.');
+    if (unit && unit.length > 60) throw new HttpError(400, 'Resource units cannot exceed 60 characters.');
+    return { type, name, quantity, unit, hours, assignedMemberId };
+  });
+}
+
 // ── recompute ────────────────────────────────────────────────────────────────
 
 /**
@@ -202,11 +240,14 @@ async function notifySafe(deps, args) {
 
 function registerReportRoutes(app, deps) {
   const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
+  const reportUpload = deps.reportUpload || upload;
 
   // Member report. What the member fills in depends on the activity type:
   //   quantity: quantityDone   count: quantityDone and quantityFailed   stages: stageId   percentage: progressPct
   app.post('/api/work-center-progress', authenticateToken,
-    upload.single('attachment'), requireProjectLifecycleWrite, async (req, res) => {
+    reportUpload.fields([{ name: 'attachment', maxCount: 1 }, { name: 'photos', maxCount: 10 }]),
+    requireProjectLifecycleWrite, async (req, res) => {
+    let client;
     try {
       const { user_id: userId, role } = req.user;
       if (role !== 'TeamMember') throw new HttpError(403, 'Only assigned team members can submit progress reports.');
@@ -228,6 +269,45 @@ function registerReportRoutes(app, deps) {
       const assigned = Array.isArray(task.assigned_members) ? task.assigned_members : [];
       if (!assigned.some((m) => String(m.id) === String(userId))) throw new HttpError(403, 'You are not assigned to this task.');
       if (task.status === 'closed' || task.activity_status === 'closed') throw new HttpError(409, 'This task is closed. Reports can no longer be added.');
+      const idempotencyKey = String(b.idempotencyKey || '').trim();
+      if (idempotencyKey && (idempotencyKey.length > 100 || !/^[\w-]+$/.test(idempotencyKey)))
+        throw new HttpError(400, 'idempotencyKey is invalid.');
+      if (idempotencyKey) {
+        const existing = (await pool.query(
+          `SELECT * FROM workspace_work_center_progress
+           WHERE task_id = $1 AND member_id = $2 AND idempotency_key = $3`,
+          [taskId, userId, idempotencyKey])).rows[0];
+        if (existing) return res.status(200).json({ success: true, entry: existing, duplicate: true });
+      }
+
+      const photos = req.files?.photos || [];
+      if (photos.length > 10) throw new HttpError(400, 'A report can include at most 10 photos.');
+      let photoMeta = [];
+      if (b.photoMeta) {
+        try { photoMeta = JSON.parse(b.photoMeta); }
+        catch { throw new HttpError(400, 'Photo metadata is invalid.'); }
+      }
+      if (!Array.isArray(photoMeta) || photoMeta.length !== photos.length)
+        throw new HttpError(400, 'Photo metadata does not match the selected photos.');
+      photoMeta = photoMeta.map((meta) => ({
+        latitude: parseOptionalCoordinate(meta?.latitude, -90, 90),
+        longitude: parseOptionalCoordinate(meta?.longitude, -180, 180),
+        accuracy: meta?.accuracy === '' || meta?.accuracy == null ? null : Number(meta.accuracy),
+        capturedAt: meta?.capturedAt && !Number.isNaN(Date.parse(meta.capturedAt)) ? new Date(meta.capturedAt) : null,
+      }));
+      if (photoMeta.some((meta) => meta.accuracy != null && (!Number.isFinite(meta.accuracy) || meta.accuracy < 0)))
+        throw new HttpError(400, 'Photo accuracy metadata is invalid.');
+      const resources = parseReportResources(b.resources, assigned);
+      const delayCause = String(b.delayCause || '').trim() || null;
+      const delayNote = String(b.delayNote || '').trim();
+      const delayDaysCount = Number(b.delayDays || 0);
+      if (delayCause && !['weather', 'materials', 'equipment', 'access', 'design', 'labor', 'other'].includes(delayCause))
+        throw new HttpError(400, 'Choose a valid delay cause.');
+      if (!Number.isInteger(delayDaysCount) || delayDaysCount < 0 || delayDaysCount > 365)
+        throw new HttpError(400, 'Delay days must be a whole number from 0 to 365.');
+      if (delayNote.length > 2000) throw new HttpError(400, 'The delay note cannot exceed 2000 characters.');
+      if ((delayCause || delayNote || delayDaysCount) && !delayCause)
+        throw new HttpError(400, 'Choose a delay cause when reporting a delay.');
 
       const today = (await pool.query(`SELECT to_char(CURRENT_DATE + 1, 'YYYY-MM-DD') AS d`)).rows[0].d;   // one day of tolerance for time zones
       if (b.reportDate > today) throw new HttpError(400, 'The report date cannot be in the future.');
@@ -281,19 +361,75 @@ function registerReportRoutes(app, deps) {
       const stored = Math.round(projected);
 
       let file = { name: null, id: null, url: null };
-      if (req.file) {
-        const up = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'work_center/progress');
-        file = { name: req.file.originalname, id: up.public_id, url: up.secure_url };
-      }
-
-      const entry = (await pool.query(`
+      client = await pool.connect();
+      await client.query('BEGIN');
+      let entry = (await client.query(`
         INSERT INTO workspace_work_center_progress
           (task_id, report_date, member_id, member_role, work_done, manpower, equipment, materials,
            progress_pct, issues, notes, attachment_name, attachment_id, attachment_url,
-           quantity_done, quantity_failed, stage_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+           quantity_done, quantity_failed, stage_id, delay_cause, delay_note, delay_days, idempotency_key)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,NULL,$12,$13,$14,$15,$16,$17,$18)
+        ON CONFLICT (task_id, member_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+        DO NOTHING RETURNING *`,
         [taskId, b.reportDate, userId, role, String(b.workDone).trim(), b.manpower || '', b.equipment || '', b.materials || '',
-         stored, b.issues || '', b.notes || '', file.name, file.id, file.url, quantityDone, quantityFailed, stageId])).rows[0];
+         stored, b.issues || '', b.notes || '', quantityDone, quantityFailed, stageId,
+         delayCause, delayNote || null, delayDaysCount, idempotencyKey || null])).rows[0];
+      if (!entry) {
+        await client.query('ROLLBACK');
+        const existing = (await pool.query(
+          `SELECT * FROM workspace_work_center_progress
+           WHERE task_id = $1 AND member_id = $2 AND idempotency_key = $3`,
+          [taskId, userId, idempotencyKey])).rows[0];
+        if (existing) return res.status(200).json({ success: true, entry: existing, duplicate: true });
+        throw new HttpError(409, 'This report was already submitted.');
+      }
+
+      const attachment = req.files?.attachment?.[0];
+      if (attachment) {
+        const up = await scheduleCloudinaryUpload(attachment.buffer, attachment.originalname, 'work_center/progress');
+        file = { name: attachment.originalname, id: up.public_id, url: up.secure_url };
+        entry = (await client.query(
+          `UPDATE workspace_work_center_progress
+           SET attachment_name=$1, attachment_id=$2, attachment_url=$3 WHERE id=$4 RETURNING *`,
+          [file.name, file.id, file.url, entry.id])).rows[0];
+      }
+
+      for (let i = 0; i < photos.length; i++) {
+        const photo = photos[i];
+        const meta = photoMeta[i];
+        const up = await scheduleCloudinaryUpload(photo.buffer, `report-${entry.id}-photo-${i + 1}`, 'work_center/progress');
+        await client.query(
+          `INSERT INTO work_center_report_photos
+             (report_id, project_id, seq, file_name, file_id, file_url, captured_at, latitude, longitude, accuracy_m)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [entry.id, projectId, i + 1, photo.originalname, up.public_id, up.secure_url, meta.capturedAt,
+            meta.latitude, meta.longitude, meta.accuracy]);
+      }
+      for (const resource of resources) {
+        await client.query(
+          `INSERT INTO work_center_report_resources
+             (report_id, project_id, resource_type, name, quantity, unit, hours, assigned_member_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [entry.id, projectId, resource.type, resource.name, resource.quantity, resource.unit,
+            resource.hours, resource.assignedMemberId]);
+      }
+      await client.query(
+        `INSERT INTO work_center_task_history
+           (task_id, project_id, actor_id, actor_role, action, detail)
+         VALUES ($1,$2,$3,$4,'report_submitted',$5::jsonb)`,
+        [taskId, projectId, userId, role, JSON.stringify({ reportId: entry.id })]);
+      await client.query('COMMIT');
+
+      const blockedDependencies = (await pool.query(
+        `SELECT d.depends_on_task_id, predecessor.title
+         FROM work_center_task_dependencies d
+         JOIN workspace_work_center predecessor ON predecessor.id = d.depends_on_task_id
+         WHERE d.task_id = $1 AND predecessor.progress_pct < 100`,
+        [taskId])).rows;
+      if (blockedDependencies.length) {
+        const warningText = `Earlier task${blockedDependencies.length === 1 ? '' : 's'} not yet complete: ${blockedDependencies.map((x) => x.title).join(', ')}.`;
+        warning = warning ? `${warning} ${warningText}` : warningText;
+      }
 
       await notifySafe(deps, {
         projectId, entityId: entry.id, entityType: 'work_center_progress',
@@ -301,7 +437,10 @@ function registerReportRoutes(app, deps) {
         actorId: userId, actorRole: role, recipients: await leadersOf(deps, projectId, task.side),
       });
       return res.status(201).json({ success: true, entry, warning });
-    } catch (err) { return fail(res, err, 'POST /api/work-center-progress:'); }
+    } catch (err) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, err, 'POST /api/work-center-progress:');
+    } finally { if (client) client.release(); }
   });
 
   // Leader decision: approved, rejected, voided (an approved report, with a reason) or comment_only.
@@ -335,9 +474,29 @@ function registerReportRoutes(app, deps) {
         FOR UPDATE OF p`, [req.params.progressId, projectId])).rows[0];
       if (!row) throw new HttpError(404, 'Progress entry not found.');
       if (row.side !== wcSide(role)) throw new HttpError(403, 'You cannot validate progress from another side.');
+      if (decision === 'approved') {
+        const incomplete = await client.query(
+          `SELECT c.title, COUNT(i.id)::int AS incomplete_count
+           FROM work_center_checklists c
+           JOIN work_center_checklist_items i ON i.checklist_id = c.id
+           WHERE c.task_id = $1 AND c.project_id = $2 AND i.project_id = $2
+             AND c.required_before_approval
+             AND NOT i.is_complete
+           GROUP BY c.id, c.title`,
+          [row.task_id, projectId]);
+        if (incomplete.rows.length) {
+          const names = incomplete.rows.map((item) => item.title).join(', ');
+          throw new HttpError(409, `Complete the required checklist items before approving: ${names}.`);
+        }
+      }
 
       if (decision === 'comment_only') {
         const u = await client.query(`UPDATE workspace_work_center_progress SET validation_notes = $1 WHERE id = $2 RETURNING *`, [notes, row.id]);
+        await client.query(
+          `INSERT INTO work_center_task_history
+             (task_id, project_id, actor_id, actor_role, action, detail)
+           VALUES ($1,$2,$3,$4,'report_note_added',$5::jsonb)`,
+          [row.task_id, projectId, userId, role, JSON.stringify({ reportId: row.id })]);
         await client.query('COMMIT');
         return res.json({ success: true, entry: u.rows[0] });
       }
@@ -364,6 +523,11 @@ function registerReportRoutes(app, deps) {
            SET validation_status = $1, validation_notes = $2, validated_by = $3, validated_by_role = $4, validated_at = NOW()
            WHERE id = $5 RETURNING *`, [decision, notes, userId, role, row.id]);
       }
+      await client.query(
+        `INSERT INTO work_center_task_history
+            (task_id, project_id, actor_id, actor_role, action, detail)
+         VALUES ($1,$2,$3,$4,'report_decision',$5::jsonb)`,
+        [row.task_id, projectId, userId, role, JSON.stringify({ reportId: row.id, decision })]);
 
       let result = null;
       if (decision !== 'rejected') {
@@ -704,5 +868,373 @@ function registerTaskQueryRoutes(app, deps) {
 return { registerTaskQueryRoutes };
 })();
 
+const taskCards = (function () {
+  class HttpError extends Error {
+    constructor(status, message) { super(message); this.status = status; }
+  }
+  const validId = (value) => {
+    const id = Number(value);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+  };
+  const fail = (res, error, label) => {
+    if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
+    console.error(label, error);
+    return res.status(500).json({ error: 'Server error.' });
+  };
+
+  function registerTaskCardRoutes(app, deps) {
+    const { pool, authenticateToken, requireProjectLifecycleWrite, wcSide, isWCLeader } = deps;
+    async function isProjectMember(projectId, userId, role) {
+      if (deps.isProjectMember) return deps.isProjectMember(projectId, userId, role);
+      const result = await pool.query(
+        `SELECT 1 FROM assignments_view
+         WHERE project_id = $1 AND role_id = $2 AND role = $3 LIMIT 1`,
+        [projectId, userId, role]);
+      return result.rows.length > 0;
+    }
+    async function sideLeaders(projectId, side) {
+      if (deps.leadersOf) return deps.leadersOf(projectId, side);
+      if (!deps.sideRoles) return [];
+      const result = await pool.query(
+        `SELECT role, role_id FROM assignments_view
+         WHERE project_id = $1 AND role = ANY($2::text[])`,
+        [projectId, deps.sideRoles(side)]);
+      return result.rows.map((row) => deps.flowKey(row.role, row.role_id));
+    }
+    const member = (task, userId) => {
+      const assigned = Array.isArray(task.assigned_members) ? task.assigned_members : [];
+      return assigned.some((item) => String(item.id) === String(userId));
+    };
+    async function loadTask(taskId, projectId) {
+      return (await pool.query(
+        `SELECT * FROM workspace_work_center WHERE id = $1 AND project_id = $2`,
+        [taskId, projectId])).rows[0] || null;
+    }
+    async function authorize(task, projectId, userId, role, leadersOnly = false) {
+      if (!task) throw new HttpError(404, 'Task not found.');
+      if (!(await isProjectMember(projectId, userId, role)))
+        throw new HttpError(403, 'You are not a member of this project.');
+      if (isWCLeader(role) && wcSide(role) === task.side) return 'leader';
+      if (!leadersOnly && role === 'TeamMember' && member(task, userId)) {
+        const sideAssignment = await pool.query(
+          `SELECT 1 FROM team_member_assignments
+           WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = $3 LIMIT 1`,
+          [projectId, userId, task.side]);
+        if (sideAssignment.rows.length) return 'member';
+      }
+      throw new HttpError(403, leadersOnly
+        ? 'Only a leader on this task’s side can manage these details.'
+        : 'You are not assigned to this task.');
+    }
+    async function audit(task, projectId, userId, role, action, detail = {}) {
+      await pool.query(
+        `INSERT INTO work_center_task_history
+           (task_id, project_id, actor_id, actor_role, action, detail)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+        [task.id, projectId, userId, role, action, JSON.stringify(detail)]);
+    }
+    async function notifyTask(task, projectId, userId, role, message) {
+      if (!deps.notify) return;
+      const recipients = [];
+      for (const assigned of Array.isArray(task.assigned_members) ? task.assigned_members : []) {
+        if (String(assigned.id) !== String(userId)) recipients.push(deps.flowKey('TeamMember', assigned.id));
+      }
+      const leaders = await sideLeaders(projectId, task.side);
+      recipients.push(...leaders.filter((recipient) =>
+        !(String(recipient.id) === String(userId) && recipient.role === role)));
+      const unique = [...new Map(recipients.map((recipient) =>
+        [`${recipient.role}:${recipient.id}`, recipient])).values()];
+      if (unique.length) {
+        try {
+          await deps.notify({
+            projectId, entityId: task.id, entityType: 'work_center_task',
+            message, actorId: userId, actorRole: role, recipients: unique,
+          });
+        } catch (error) {
+          console.error('[task card] notification failed (non-fatal):', error.message);
+        }
+      }
+    }
+    const bodyId = (body, key) => validId(body?.[key]);
+
+    app.get('/api/work-center/:taskId/card', authenticateToken, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), projectId = validId(req.query.projectId);
+        if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role);
+        const [comments, history, checklists, links, dependencies] = await Promise.all([
+          pool.query(
+            `SELECT id, author_id, author_role, body, created_at
+             FROM work_center_task_comments WHERE task_id = $1 AND project_id = $2
+             ORDER BY created_at, id`, [taskId, projectId]),
+          pool.query(
+            `SELECT id, actor_id, actor_role, action, detail, created_at
+             FROM work_center_task_history WHERE task_id = $1 AND project_id = $2
+             ORDER BY created_at DESC, id DESC LIMIT 100`, [taskId, projectId]),
+          pool.query(
+            `SELECT c.id, c.title, c.required_before_approval,
+                    COALESCE(json_agg(json_build_object(
+                      'id', i.id, 'title', i.title, 'assigned_member_id', i.assigned_member_id,
+                      'is_complete', i.is_complete, 'completed_at', i.completed_at
+                    ) ORDER BY i.seq, i.id) FILTER (WHERE i.id IS NOT NULL), '[]'::json) AS items
+             FROM work_center_checklists c LEFT JOIN work_center_checklist_items i ON i.checklist_id = c.id
+             WHERE c.task_id = $1 AND c.project_id = $2
+             GROUP BY c.id ORDER BY c.id`, [taskId, projectId]),
+          pool.query(
+            `SELECT id, link_type, target_id, title, url, created_at
+             FROM work_center_task_links WHERE task_id = $1 AND project_id = $2 ORDER BY id`,
+            [taskId, projectId]),
+          pool.query(
+            `SELECT d.depends_on_task_id AS id, w.title, w.progress_pct
+             FROM work_center_task_dependencies d
+             JOIN workspace_work_center w ON w.id = d.depends_on_task_id
+             WHERE d.task_id = $1 AND d.project_id = $2 ORDER BY w.id`,
+            [taskId, projectId]),
+        ]);
+        return res.json({
+          location: {
+            block: task.location_block, floor: task.location_floor, zone: task.location_zone,
+            grid: task.location_grid, drawing: task.location_drawing,
+          },
+          comments: comments.rows, history: history.rows, checklists: checklists.rows,
+          links: links.rows, dependencies: dependencies.rows,
+        });
+      } catch (error) { return fail(res, error, 'GET /api/work-center/:taskId/card:'); }
+    });
+
+    app.post('/api/work-center/:taskId/comments', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
+        const body = String(req.body?.body || '').trim();
+        if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
+        if (!body || body.length > 5000) throw new HttpError(400, 'Comments must be between 1 and 5000 characters.');
+        const task = await loadTask(taskId, projectId);
+        const access = await authorize(task, projectId, req.user.user_id, req.user.role);
+        const result = await pool.query(
+          `INSERT INTO work_center_task_comments (task_id, project_id, author_id, author_role, body)
+           VALUES ($1,$2,$3,$4,$5) RETURNING id, author_id, author_role, body, created_at`,
+          [taskId, projectId, req.user.user_id, req.user.role, body]);
+        await audit(task, projectId, req.user.user_id, req.user.role, 'comment_added');
+        await notifyTask(task, projectId, req.user.user_id, req.user.role,
+          `${access === 'leader' ? 'A task leader' : 'A team member'} added a comment to "${task.title}".`);
+        return res.status(201).json({ comment: result.rows[0] });
+      } catch (error) { return fail(res, error, 'POST /api/work-center/:taskId/comments:'); }
+    });
+
+    app.patch('/api/work-center/:taskId/location', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
+        if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const values = ['block', 'floor', 'zone', 'grid', 'drawing'].map((key) => {
+          const value = String(req.body?.[key] || '').trim();
+          if (value.length > 150) throw new HttpError(400, `Location ${key} cannot exceed 150 characters.`);
+          return value || null;
+        });
+        const updated = await pool.query(
+          `UPDATE workspace_work_center SET
+             location_block=$1, location_floor=$2, location_zone=$3, location_grid=$4,
+             location_drawing=$5, updated_at=NOW()
+           WHERE id=$6 AND project_id=$7
+           RETURNING location_block AS block, location_floor AS floor, location_zone AS zone,
+                     location_grid AS grid, location_drawing AS drawing`,
+          [...values, taskId, projectId]);
+        await audit(task, projectId, req.user.user_id, req.user.role, 'location_updated', updated.rows[0]);
+        return res.json({ location: updated.rows[0] });
+      } catch (error) { return fail(res, error, 'PATCH /api/work-center/:taskId/location:'); }
+    });
+
+    app.post('/api/work-center/:taskId/checklists', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+      let client;
+      try {
+        const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
+        const title = String(req.body?.title || '').trim();
+        const items = req.body?.items;
+        if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
+        if (!title || title.length > 200 || !Array.isArray(items) || items.length > 100)
+          throw new HttpError(400, 'A checklist needs a title and no more than 100 items.');
+        if (items.some((item) => !String(item?.title || '').trim() || String(item.title).trim().length > 500))
+          throw new HttpError(400, 'Each checklist item needs a title of 1 to 500 characters.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const assignedIds = new Set((Array.isArray(task.assigned_members) ? task.assigned_members : []).map((item) => String(item.id)));
+        for (const item of items) {
+          if (item.assignedMemberId != null && !assignedIds.has(String(item.assignedMemberId)))
+            throw new HttpError(400, 'Checklist assignments must be selected from members assigned to this task.');
+        }
+        client = await pool.connect();
+        await client.query('BEGIN');
+        const checklist = (await client.query(
+          `INSERT INTO work_center_checklists
+             (task_id, project_id, title, required_before_approval, created_by_id, created_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, title, required_before_approval`,
+          [taskId, projectId, title, Boolean(req.body.requiredBeforeApproval), req.user.user_id, req.user.role])).rows[0];
+        for (let seq = 0; seq < items.length; seq++) {
+          const item = items[seq];
+          await client.query(
+            `INSERT INTO work_center_checklist_items
+               (checklist_id, project_id, title, assigned_member_id, seq)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [checklist.id, projectId, String(item.title).trim(), item.assignedMemberId || null, seq]);
+        }
+        await client.query('COMMIT');
+        await audit(task, projectId, req.user.user_id, req.user.role, 'checklist_created', { title });
+        return res.status(201).json({ checklist });
+      } catch (error) {
+        if (client) await client.query('ROLLBACK').catch(() => {});
+        return fail(res, error, 'POST /api/work-center/:taskId/checklists:');
+      } finally { if (client) client.release(); }
+    });
+
+    app.patch('/api/work-center/:taskId/checklist-items/:itemId', authenticateToken,
+      requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), itemId = validId(req.params.itemId);
+        const projectId = bodyId(req.body, 'projectId');
+        if (!taskId || !itemId || !projectId) throw new HttpError(400, 'taskId, itemId and projectId are required.');
+        const task = await loadTask(taskId, projectId);
+        const access = await authorize(task, projectId, req.user.user_id, req.user.role);
+        const row = (await pool.query(
+          `SELECT i.* FROM work_center_checklist_items i
+           JOIN work_center_checklists c ON c.id = i.checklist_id
+           WHERE i.id=$1 AND c.task_id=$2 AND i.project_id=$3`,
+          [itemId, taskId, projectId])).rows[0];
+        if (!row) throw new HttpError(404, 'Checklist item not found.');
+        if (access === 'member' && row.assigned_member_id != null
+          && String(row.assigned_member_id) !== String(req.user.user_id))
+          throw new HttpError(403, 'This checklist item is assigned to another member.');
+        const complete = Boolean(req.body?.isComplete);
+        const updated = await pool.query(
+          `UPDATE work_center_checklist_items
+           SET is_complete=$1, completed_by_id=CASE WHEN $1 THEN $2 ELSE NULL END,
+               completed_by_role=CASE WHEN $1 THEN $3 ELSE NULL END,
+               completed_at=CASE WHEN $1 THEN NOW() ELSE NULL END
+           WHERE id=$4 RETURNING id, title, is_complete, completed_at`,
+          [complete, req.user.user_id, req.user.role, itemId]);
+        await audit(task, projectId, req.user.user_id, req.user.role, 'checklist_item_updated',
+          { itemId, isComplete: complete });
+        return res.json({ item: updated.rows[0] });
+      } catch (error) { return fail(res, error, 'PATCH /api/work-center/:taskId/checklist-items/:itemId:'); }
+    });
+
+    app.post('/api/work-center/:taskId/links', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
+        const type = String(req.body?.type || '');
+        const title = String(req.body?.title || '').trim();
+        const targetId = String(req.body?.targetId || '').trim() || null;
+        const url = String(req.body?.url || '').trim() || null;
+        if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
+        if (!['drawing', 'record', 'query', 'task', 'url'].includes(type) || !title || title.length > 300)
+          throw new HttpError(400, 'Choose a link type and enter a title.');
+        if (type === 'url' && (!url || !/^https?:\/\//i.test(url)))
+          throw new HttpError(400, 'Links must use a valid http or https address.');
+        if (type !== 'url' && !targetId)
+          throw new HttpError(400, 'Choose an existing item to link.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const result = await pool.query(
+          `INSERT INTO work_center_task_links
+             (task_id, project_id, link_type, target_id, title, url, created_by_id, created_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, link_type, target_id, title, url`,
+          [taskId, projectId, type, targetId, title, url, req.user.user_id, req.user.role]);
+        await audit(task, projectId, req.user.user_id, req.user.role, 'link_added', { title, type });
+        return res.status(201).json({ link: result.rows[0] });
+      } catch (error) { return fail(res, error, 'POST /api/work-center/:taskId/links:'); }
+    });
+
+    app.post('/api/work-center/:taskId/dependencies', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
+        const predecessorId = bodyId(req.body, 'dependsOnTaskId');
+        if (!taskId || !projectId || !predecessorId) throw new HttpError(400, 'Task, project and earlier task are required.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const predecessor = await loadTask(predecessorId, projectId);
+        if (!predecessor || predecessor.side !== task.side)
+          throw new HttpError(400, 'Dependencies must link tasks on the same project side.');
+        const cycle = await pool.query(
+          `WITH RECURSIVE successors(id) AS (
+             SELECT task_id FROM work_center_task_dependencies WHERE depends_on_task_id = $1
+             UNION
+             SELECT d.task_id FROM work_center_task_dependencies d JOIN successors s ON d.depends_on_task_id = s.id
+           ) SELECT 1 FROM successors WHERE id = $2 LIMIT 1`,
+          [taskId, predecessorId]);
+        if (cycle.rows.length) throw new HttpError(409, 'This dependency would create a cycle.');
+        await pool.query(
+          `INSERT INTO work_center_task_dependencies
+             (task_id, depends_on_task_id, project_id, created_by_id, created_by_role)
+           VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
+          [taskId, predecessorId, projectId, req.user.user_id, req.user.role]);
+        await audit(task, projectId, req.user.user_id, req.user.role, 'dependency_added',
+          { dependsOnTaskId: predecessorId, title: predecessor.title });
+        return res.status(201).json({ success: true, warningOnly: true });
+      } catch (error) { return fail(res, error, 'POST /api/work-center/:taskId/dependencies:'); }
+    });
+
+    app.get('/api/work-center/templates', authenticateToken, async (req, res) => {
+      try {
+        const projectId = validId(req.query.projectId);
+        if (!projectId) throw new HttpError(400, 'projectId is required.');
+        if (!(await isProjectMember(projectId, req.user.user_id, req.user.role)))
+          throw new HttpError(403, 'You are not a member of this project.');
+        const side = wcSide(req.user.role);
+        const result = await pool.query(
+          `SELECT id, side, name, task_data, created_at FROM work_center_task_templates
+           WHERE project_id=$1 AND side=$2 ORDER BY lower(name), id`, [projectId, side]);
+        return res.json({ templates: result.rows });
+      } catch (error) { return fail(res, error, 'GET /api/work-center/templates:'); }
+    });
+
+    app.post('/api/work-center/templates', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const projectId = bodyId(req.body, 'projectId'), taskId = bodyId(req.body, 'taskId');
+        const name = String(req.body?.name || '').trim();
+        if (!projectId || !taskId || !name || name.length > 200)
+          throw new HttpError(400, 'projectId, taskId and a template name are required.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const stages = (await pool.query(
+          `SELECT title, weight_pct, is_hold_point FROM task_stages
+           WHERE task_id = $1 ORDER BY seq`,
+          [taskId])).rows;
+        const measure = (await pool.query(
+          `SELECT COALESCE(w.activity_type, pe.activity_type) AS activity_type,
+                  COALESCE(w.standalone_unit, pe.unit) AS activity_unit
+           FROM workspace_work_center w
+           LEFT JOIN planning_execution pe ON pe.id = w.activity_id
+           WHERE w.id = $1`,
+          [taskId])).rows[0];
+        const taskData = {
+          title: task.title, description: task.description, work_package: task.work_package,
+          activity_type: measure.activity_type, target_quantity: task.target_quantity,
+          activity_unit: measure.activity_unit, weight_pct: task.weight_pct,
+          stages,
+          assigned_members: Array.isArray(task.assigned_members) ? task.assigned_members : [],
+          location: {
+            block: task.location_block, floor: task.location_floor, zone: task.location_zone,
+            grid: task.location_grid, drawing: task.location_drawing,
+          },
+        };
+        const template = await pool.query(
+          `INSERT INTO work_center_task_templates
+             (project_id, side, name, created_by_id, created_by_role, task_data)
+           VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+           ON CONFLICT (project_id, side, lower(name))
+           DO UPDATE SET task_data=EXCLUDED.task_data, created_by_id=EXCLUDED.created_by_id,
+             created_by_role=EXCLUDED.created_by_role, created_at=NOW()
+           RETURNING id, name, side, task_data`,
+          [projectId, task.side, name, req.user.user_id, req.user.role, JSON.stringify(taskData)]);
+        return res.status(201).json({ template: template.rows[0] });
+      } catch (error) { return fail(res, error, 'POST /api/work-center/templates:'); }
+    });
+  }
+
+  return { registerTaskCardRoutes };
+})();
+
 export const { recomputeActivity, registerReportRoutes } = reports;
 export const { registerTaskQueryRoutes } = queries;
+export const { registerTaskCardRoutes } = taskCards;
