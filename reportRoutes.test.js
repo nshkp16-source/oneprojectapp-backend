@@ -166,6 +166,27 @@ test('task card collaboration is visible to assigned members and same-side leade
     projectId: 1, block: 'B', floor: '2', zone: 'North',
   });
   assert.equal(location.status, 200, JSON.stringify(location.body));
+  const question = await call('POST', `/api/work-center/${tA.id}/queries`, leader, {
+    projectId: 1, reportId: rA.id, question: 'Confirm the trench depth.',
+  });
+  assert.equal(question.status, 201, JSON.stringify(question.body));
+  const linkOptions = await call('GET', `/api/work-center/${tA.id}/link-options?projectId=1`, leader);
+  assert.equal(linkOptions.status, 200, JSON.stringify(linkOptions.body));
+  assert.ok(linkOptions.body.tasks.some((option) => option.targetId === String(tB.id)));
+  assert.ok(linkOptions.body.queries.some((option) => option.targetId === `${tA.id}:${question.body.query.id}`));
+  const taskLink = await call('POST', `/api/work-center/${tA.id}/links`, leader, {
+    projectId: 1, type: 'task', targetId: String(tB.id),
+  });
+  assert.equal(taskLink.status, 201, JSON.stringify(taskLink.body));
+  assert.equal(taskLink.body.link.title, 'Block B');
+  const queryLink = await call('POST', `/api/work-center/${tA.id}/links`, leader, {
+    projectId: 1, type: 'query', targetId: `${tA.id}:${question.body.query.id}`,
+  });
+  assert.equal(queryLink.status, 201, JSON.stringify(queryLink.body));
+  assert.match(queryLink.body.link.title, /Confirm the trench depth/);
+  assert.equal((await call('POST', `/api/work-center/${tA.id}/links`, leader, {
+    projectId: 1, type: 'task', targetId: '999999',
+  })).status, 400);
   const link = await call('POST', `/api/work-center/${tA.id}/links`, leader, {
     projectId: 1, type: 'url', title: 'Updated drawing', url: 'https://example.test/drawing',
   });
@@ -182,7 +203,9 @@ test('task card collaboration is visible to assigned members and same-side leade
   assert.equal((await call('GET', '/api/work-center/templates?projectId=1', leader)).body.templates.length, 1);
   const completedCard = await call('GET', `/api/work-center/${tA.id}/card?projectId=1`, m(101));
   assert.equal(completedCard.body.location.block, 'B');
-  assert.equal(completedCard.body.links[0].title, 'Updated drawing');
+  assert.equal(completedCard.body.links.find((item) => item.link_type === 'url').title, 'Updated drawing');
+  assert.equal(completedCard.body.links.some((item) => item.title === 'Block B'), false);
+  assert.equal(completedCard.body.links.some((item) => item.link_type === 'query'), true);
 });
 
 test('decision checks: other side refused, rejection needs a reason', async () => {

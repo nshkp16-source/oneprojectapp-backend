@@ -8748,6 +8748,11 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
           ) AS activity_milestone_end,
           (SELECT COUNT(*)::int FROM workspace_work_center_progress p
            WHERE p.task_id = w.id AND p.validation_status = 'pending') AS pending_report_count,
+          (SELECT COUNT(*)::int FROM workspace_work_center_progress p
+           WHERE p.task_id = w.id) AS total_report_count,
+          (SELECT COALESCE(SUM(p.quantity_done), 0)::numeric
+           FROM workspace_work_center_progress p
+           WHERE p.task_id = w.id AND p.validation_status = 'approved') AS approved_quantity_done,
           (SELECT COUNT(*)::int FROM work_center_queries q
            WHERE q.task_id = w.id AND q.status = 'open') AS open_query_count,
           pe.certified_progress_pct                                  AS activity_certified_progress,
@@ -8802,6 +8807,11 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
           ) AS activity_milestone_end,
           (SELECT COUNT(*)::int FROM workspace_work_center_progress p
            WHERE p.task_id = w.id AND p.validation_status = 'pending') AS pending_report_count,
+          (SELECT COUNT(*)::int FROM workspace_work_center_progress p
+           WHERE p.task_id = w.id) AS total_report_count,
+          (SELECT COALESCE(SUM(p.quantity_done), 0)::numeric
+           FROM workspace_work_center_progress p
+           WHERE p.task_id = w.id AND p.validation_status = 'approved') AS approved_quantity_done,
           (SELECT COUNT(*)::int FROM work_center_queries q
            WHERE q.task_id = w.id AND q.recipient_id = $2 AND q.status = 'open') AS open_query_count,
           pe.certified_progress_pct                                  AS activity_certified_progress,

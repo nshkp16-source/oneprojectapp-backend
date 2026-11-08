@@ -992,15 +992,98 @@ const taskCards = (function () {
              WHERE d.task_id = $1 AND d.project_id = $2 ORDER BY w.id`,
             [taskId, projectId]),
         ]);
+        let visibleLinks = links.rows;
+        if (req.user.role === 'TeamMember') {
+          const accessChecks = await Promise.all(visibleLinks.map(async (link) => {
+            if (link.link_type === 'task') {
+              const linkedTask = await loadTask(validId(link.target_id), projectId);
+              return Boolean(linkedTask && linkedTask.side === task.side && member(linkedTask, req.user.user_id));
+            }
+            if (link.link_type === 'query') {
+              const match = /^(\d+):(\d+)$/.exec(String(link.target_id || ''));
+              if (!match) return false;
+              const linked = (await pool.query(
+                `SELECT 1 FROM work_center_queries q
+                 JOIN workspace_work_center w ON w.id = q.task_id
+                 WHERE q.task_id = $1 AND q.id = $2 AND q.project_id = $3
+                   AND q.recipient_id = $4 AND w.side = $5
+                   AND EXISTS (SELECT 1 FROM jsonb_array_elements(w.assigned_members) am
+                               WHERE am->>'id' = $4::text)`,
+                [Number(match[1]), Number(match[2]), projectId, req.user.user_id, task.side]));
+              return linked.rows.length > 0;
+            }
+            return true;
+          }));
+          visibleLinks = visibleLinks.filter((_link, index) => accessChecks[index]);
+        }
         return res.json({
           location: {
             block: task.location_block, floor: task.location_floor, zone: task.location_zone,
             grid: task.location_grid, drawing: task.location_drawing,
           },
           comments: comments.rows, history: history.rows, checklists: checklists.rows,
-          links: links.rows, dependencies: dependencies.rows,
+          links: visibleLinks, dependencies: dependencies.rows,
         });
       } catch (error) { return fail(res, error, 'GET /api/work-center/:taskId/card:'); }
+    });
+
+    app.get('/api/work-center/:taskId/link-options', authenticateToken, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), projectId = validId(req.query.projectId);
+        if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+
+        const [tasks, queries] = await Promise.all([
+          pool.query(
+            `SELECT id, title FROM workspace_work_center
+             WHERE project_id = $1 AND side = $2 AND id <> $3
+             ORDER BY lower(title), id LIMIT 200`,
+            [projectId, task.side, taskId]),
+          pool.query(
+            `SELECT q.id, q.task_id, q.question, w.title AS task_title
+             FROM work_center_queries q
+             JOIN workspace_work_center w ON w.id = q.task_id
+             WHERE q.project_id = $1 AND w.side = $2
+             ORDER BY q.created_at DESC, q.id DESC LIMIT 200`,
+            [projectId, task.side]),
+        ]);
+        const recordTables = [
+          ['contractual_records', 'Contractual'],
+          ['administrative_records', 'Administrative'],
+          ['safety_records', 'Safety'],
+          ['operational_records', 'Operational'],
+          ['financial_records', 'Financial'],
+        ];
+        const records = [];
+        for (const [table, label] of recordTables) {
+          const result = await pool.query(
+            `SELECT id, title FROM ${table} WHERE project_id = $1 ORDER BY issued_date DESC, id DESC LIMIT 100`,
+            [projectId]);
+          records.push(...result.rows.map((row) => ({
+            targetId: `${table}:${row.id}`,
+            title: `${label}: ${row.title}`,
+          })));
+        }
+        const drawingRows = await pool.query(
+          `SELECT id, title FROM operational_records
+           WHERE project_id = $1
+             AND (record_kind::text ILIKE '%drawing%' OR title ILIKE '%drawing%')
+           ORDER BY issued_date DESC, id DESC LIMIT 100`,
+          [projectId]);
+        return res.json({
+          tasks: tasks.rows.map((row) => ({ targetId: String(row.id), title: row.title })),
+          queries: queries.rows.map((row) => ({
+            targetId: `${row.task_id}:${row.id}`,
+            title: `${row.task_title}: ${row.question}`,
+          })),
+          records,
+          drawings: drawingRows.rows.map((row) => ({
+            targetId: `operational_records:${row.id}`,
+            title: row.title,
+          })),
+        });
+      } catch (error) { return fail(res, error, 'GET /api/work-center/:taskId/link-options:'); }
     });
 
     app.post('/api/work-center/:taskId/comments', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
@@ -1123,18 +1206,58 @@ const taskCards = (function () {
       try {
         const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
         const type = String(req.body?.type || '');
-        const title = String(req.body?.title || '').trim();
-        const targetId = String(req.body?.targetId || '').trim() || null;
+        const targetId = type === 'url' ? null : String(req.body?.targetId || '').trim() || null;
         const url = String(req.body?.url || '').trim() || null;
         if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
-        if (!['drawing', 'record', 'query', 'task', 'url'].includes(type) || !title || title.length > 300)
+        if (!['drawing', 'record', 'query', 'task', 'url'].includes(type))
           throw new HttpError(400, 'Choose a link type and enter a title.');
-        if (type === 'url' && (!url || !/^https?:\/\//i.test(url)))
-          throw new HttpError(400, 'Links must use a valid http or https address.');
-        if (type !== 'url' && !targetId)
-          throw new HttpError(400, 'Choose an existing item to link.');
         const task = await loadTask(taskId, projectId);
         await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        let title = '';
+        if (type === 'url') {
+          title = String(req.body?.title || '').trim();
+          if (!title || title.length > 300 || !url || !/^https?:\/\//i.test(url))
+            throw new HttpError(400, 'Enter a title and a valid http or https address.');
+        } else if (type === 'task') {
+          const linkedTaskId = validId(targetId);
+          if (!linkedTaskId || linkedTaskId === taskId)
+            throw new HttpError(400, 'Choose another task in this project.');
+          const linkedTask = await loadTask(linkedTaskId, projectId);
+          if (!linkedTask || linkedTask.side !== task.side)
+            throw new HttpError(400, 'Choose a task on the same project side.');
+          title = linkedTask.title;
+        } else if (type === 'query') {
+          const match = /^(\d+):(\d+)$/.exec(targetId || '');
+          if (!match) throw new HttpError(400, 'Choose an existing task question.');
+          const linkedTaskId = validId(match[1]), queryId = validId(match[2]);
+          if (!linkedTaskId || !queryId) throw new HttpError(400, 'Choose an existing task question.');
+          const linkedQuery = (await pool.query(
+            `SELECT q.question, w.title AS task_title
+             FROM work_center_queries q
+             JOIN workspace_work_center w ON w.id = q.task_id
+             WHERE q.id = $1 AND q.task_id = $2 AND q.project_id = $3 AND w.side = $4`,
+            [queryId, linkedTaskId, projectId, task.side])).rows[0];
+          if (!linkedQuery) throw new HttpError(400, 'Choose a question from this project side.');
+          title = `${linkedQuery.task_title}: ${linkedQuery.question}`;
+        } else {
+          const match = /^([a-z_]+):(\d+)$/.exec(targetId || '');
+          const recordTables = new Set([
+            'contractual_records', 'administrative_records', 'safety_records',
+            'operational_records', 'financial_records',
+          ]);
+          if (!match || !recordTables.has(match[1]) || (type === 'drawing' && match[1] !== 'operational_records'))
+            throw new HttpError(400, 'Choose an existing project record.');
+          const recordId = validId(match[2]);
+          if (!recordId) throw new HttpError(400, 'Choose an existing project record.');
+          const recordSql = type === 'drawing'
+            ? `SELECT title FROM operational_records
+               WHERE id = $1 AND project_id = $2
+                 AND (record_kind::text ILIKE '%drawing%' OR title ILIKE '%drawing%')`
+            : `SELECT title FROM ${match[1]} WHERE id = $1 AND project_id = $2`;
+          const record = (await pool.query(recordSql, [recordId, projectId])).rows[0];
+          if (!record) throw new HttpError(400, 'That record is not available in this project.');
+          title = record.title;
+        }
         const result = await pool.query(
           `INSERT INTO work_center_task_links
              (task_id, project_id, link_type, target_id, title, url, created_by_id, created_by_role)

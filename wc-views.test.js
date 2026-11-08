@@ -22,7 +22,8 @@ function extract(names) {
 
 const HELPERS = ['_wcFmtDate', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
   'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
-  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail'];
+  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
+  '_wcCardHeaderHtml', '_wcCardTilesHtml'];
 
 function views() {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
@@ -42,6 +43,16 @@ function views() {
     formatDate: (value) => { dom.window.__date = value; return vm.runInContext('_wcFmtDate(window.__date)', ctx); },
     member: (t, e) => render('_wcMemberView', t, e),
     leader: (t, e) => render('_wcPMView', t, e),
+    cardTiles: (t, e, c = []) => {
+      dom.window.__t = t; dom.window.__e = e; dom.window.__c = c;
+      dom.window.document.body.innerHTML = vm.runInContext('_wcCardTilesHtml(window.__t, window.__e, window.__c)', ctx);
+      return dom.window.document;
+    },
+    cardHeader: (t, location) => {
+      dom.window.__t = t; dom.window.__location = location;
+      dom.window.document.body.innerHTML = vm.runInContext('_wcCardHeaderHtml(window.__t, window.__location)', ctx);
+      return dom.window.document;
+    },
     tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
     saveReportFilter: (taskId, filter) => { dom.window.__taskId = taskId; dom.window.__filter = filter; vm.runInContext('saveReportFilter(window.__taskId, window.__filter)', ctx); },
   };
@@ -137,13 +148,10 @@ test('expanded leader task uses Details and Reports tabs, with queries inside th
   assert.deepEqual(tabs.map((tab) => tab.textContent.trim().replace(/\s+\d+$/, '')),
     ['Details', 'Reports']);
   const summary = d.querySelector('[data-wc-card-summary]');
-  assert.match(summary.textContent, /Progress/);
-  assert.match(summary.textContent, /30 m3 completed/);
-  assert.doesNotMatch(summary.textContent, /200 m3/);
+  assert.doesNotMatch(summary.textContent, /Progress|30 m3 completed|200 m3/);
   assert.doesNotMatch(summary.textContent, /Excavate trenches|Created by|High|Ongoing|Start Date/);
   const details = d.querySelector('#wc-read-5').textContent;
   assert.doesNotMatch(details, /Start Date|End Date|Required priority|Excavate trenches/);
-  assert.match(d.body.textContent, /20%/);
   assert.doesNotMatch(d.body.textContent, /Required priorityHigh/);
   assert.doesNotMatch(d.body.textContent, /How to read this task/);
   assert.match(d.body.textContent, /Files/);
@@ -169,6 +177,100 @@ test('expanded leader task uses Details and Reports tabs, with queries inside th
   assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, true);
   d.querySelector('[data-report-filter="all"]').click();
   assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, false);
+});
+
+test('task card tiles show team-wide totals, pending reports and task progress', () => {
+  const taskTotals = {
+    ...task, progress_pct: 35, pending_report_count: 2, total_report_count: 5,
+    approved_quantity_done: 70,
+  };
+  const d = views().cardTiles(taskTotals, [
+    { validation_status: 'approved', quantity_done: 30 },
+    { validation_status: 'pending', quantity_done: 40 },
+  ]);
+  const text = d.body.textContent.replace(/\s+/g, ' ');
+  assert.match(text, /Task progress 35%/);
+  assert.match(text, /Quantity done 70 of 200 m3/);
+  assert.match(text, /Share of activity 50%/);
+  assert.match(text, /Reports 5 2 pending/);
+  assert.doesNotMatch(text, /Checklist/);
+});
+
+test('card hierarchy chips show activity, location, dates and drawing', () => {
+  const d = views().cardHeader(task, {
+    block: 'Block A', floor: '2', grid: 'C-4', drawing: 'S-04',
+  });
+  assert.match(d.body.textContent, /Activity Excavation/);
+  assert.match(d.body.textContent, /Location Block A · 2 · C-4/);
+  assert.match(d.body.textContent, /Dates 1 Mar 2026 to 30 Apr 2026/);
+  assert.match(d.body.textContent, /Drawing S-04/);
+});
+
+test('internal task-card links are buttons and leader choices are selected from project items', async () => {
+  const dom = new JSDOM('<!doctype html><body><div id="wc-detail-5"><div id="card"><div role="tablist"></div><div data-wc-pane="details"></div></div></div></body>',
+    { runScripts: 'outside-only', url: 'http://localhost/' });
+  const ctx = dom.getInternalVMContext();
+  const cardData = {
+    location: {},
+    comments: [], history: [], checklists: [],
+    links: [
+      { id: 1, link_type: 'task', target_id: '22', title: 'Block B' },
+      { id: 2, link_type: 'query', target_id: '5:31', title: 'Block A: Confirm the depth' },
+      { id: 3, link_type: 'record', target_id: 'operational_records:42', title: 'Drawing S-04' },
+      { id: 4, link_type: 'url', target_id: null, title: 'External spec', url: 'https://example.test/spec' },
+    ],
+  };
+  dom.window.__cardData = cardData;
+  vm.runInContext(`function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    const API = '/api'; const recordsCache = { 'work-center': [] };
+    const CSS = { escape: (value) => String(value) };
+    async function _openRecordNotification(type, id) { window.__navigation.push([type, String(id)]); return true; }
+    async function _waitForElement(selector) { return document.querySelector(selector); }
+    function isWCLeader() { return true; }
+    window.HTMLElement.prototype.scrollIntoView = function() {};
+    async function _wcFetch(url) {
+      if (url.includes('/link-options?')) return { ok: true, json: async () => ({
+        tasks: [{ targetId: '22', title: 'Block B' }],
+        queries: [{ targetId: '5:31', title: 'Block A: Confirm the depth' }],
+        records: [{ targetId: 'operational_records:42', title: 'Operational: Drawing S-04' }],
+        drawings: [{ targetId: 'operational_records:42', title: 'Drawing S-04' }],
+      }) };
+      return { ok: true, json: async () => window.__cardData };
+    }`, ctx);
+  vm.runInContext(extract([
+    '_wcFmtDate', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcHistoryText',
+    '_wcCardHeaderHtml', '_wcCardTilesHtml', '_wcRenderTaskCardExtras', '_wcOpenInternalTaskLink',
+  ]), ctx);
+  dom.window.__navigation = [];
+  dom.window.__task = { ...task, activity_title: 'Excavation' };
+  await vm.runInContext(`_wcRenderTaskCardExtras(window.__task, document.getElementById('card'), true, [])`, ctx);
+  const d = dom.window.document;
+  assert.equal(d.querySelectorAll('[data-card-operation="link-open"]').length, 3);
+  assert.equal(d.querySelector('a[href="https://example.test/spec"]')?.textContent, 'External spec');
+  const typeSelect = d.querySelector('[data-card-field="link-type"]');
+  const targetSelect = d.querySelector('[data-card-field="link-target"]');
+  assert.equal(targetSelect.options[1].value, '22');
+  typeSelect.value = 'query';
+  typeSelect.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+  assert.equal(targetSelect.options[1].value, '5:31');
+  typeSelect.value = 'drawing';
+  typeSelect.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+  assert.equal(targetSelect.options[1].value, 'operational_records:42');
+  const report = d.createElement('details');
+  report.setAttribute('data-wc-report-card', '');
+  const queryCard = d.createElement('article');
+  queryCard.id = 'wc-query-31';
+  report.appendChild(queryCard);
+  d.getElementById('wc-detail-5').appendChild(report);
+  const reportsTab = d.createElement('button');
+  reportsTab.setAttribute('data-wc-tab', 'reports');
+  d.getElementById('wc-detail-5').appendChild(reportsTab);
+  assert.equal(await vm.runInContext(`_wcOpenInternalTaskLink('task', '22')`, ctx), true);
+  assert.equal(await vm.runInContext(`_wcOpenInternalTaskLink('record', 'operational_records:42')`, ctx), true);
+  assert.equal(await vm.runInContext(`_wcOpenInternalTaskLink('query', '5:31')`, ctx), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(dom.window.__navigation)), [
+    ['work_center_task', '22'], ['operational_records', '42'], ['work_center_task', '5'],
+  ]);
 });
 
 test('expanded standalone task does not show a task-level query tab', () => {
