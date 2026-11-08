@@ -157,7 +157,7 @@ function validateStages(stages) {
   return list;
 }
 
-async function insertTask(client, ctx, task, share, stages) {
+async function insertTask(client, ctx, task, share, stages, file = null) {
   const members = parseJson(task.assigned_members, [], 'assigned_members');
   await assertTeamMembers(client, ctx.projectId, ctx.side, members);
   const start = task.start_date || ctx.start_date;
@@ -172,12 +172,14 @@ async function insertTask(client, ctx, task, share, stages) {
     INSERT INTO workspace_work_center
       (project_id, title, description, work_package, assigned_members, priority, status,
        start_date, end_date, creator_id, creator_role, side, activity_id, weight_pct, target_quantity,
+       linked_file_name, linked_file_id, linked_file_url,
        location_block, location_floor, location_zone, location_grid, location_drawing)
-    VALUES ($1,$2,$3,$4,$5::jsonb,$6,'ongoing',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+    VALUES ($1,$2,$3,$4,$5::jsonb,$6,'ongoing',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
     RETURNING *`,
     [ctx.projectId, String(task.title).trim(), task.description || '', task.work_package || '',
      JSON.stringify(members), task.priority || 'normal', start, end,
      ctx.userId, ctx.role, ctx.side, ctx.activityId, share.weight_pct, share.target_quantity,
+     file?.name || null, file?.id || null, file?.url || null,
      task.location_block || null, task.location_floor || null, task.location_zone || null,
      task.location_grid || null, task.location_drawing || null])).rows[0];
 
@@ -232,6 +234,82 @@ function fail(res, err, label) {
 
 function registerActivityRoutes(app, deps) {
   const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
+  const attachmentFiles = (req) => req.files?.attachments || [];
+  const legacyFile = (req) => req.files?.linked_file?.[0] || null;
+
+  async function saveAttachments(db, files, { projectId, entityType, entityId, userId, role }) {
+    const saved = [];
+    for (const file of files) {
+      const uploaded = await scheduleCloudinaryUpload(file.buffer, file.originalname, 'planning_execution/attachments');
+      const row = (await db.query(
+        `INSERT INTO card_attachments
+           (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
+            resource_type, uploaded_by_id, uploaded_by_role)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         RETURNING id, file_name, file_id, file_url, mime_type, created_at`,
+        [projectId, entityType, entityId, file.originalname, uploaded.public_id, uploaded.secure_url,
+         file.mimetype || null, uploaded.resource_type || 'raw', userId, role])).rows[0];
+      saved.push(row);
+    }
+    return saved;
+  }
+
+  app.post('/api/planning-execution/:activityId/attachments', authenticateToken,
+    upload.array('attachments', 20), requireProjectLifecycleWrite, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.body?.projectId, 10);
+      const activityId = parseInt(req.params.activityId, 10);
+      if (!projectId || !activityId) throw new HttpError(400, 'projectId and activityId are required.');
+      if (!isWCLeader(role)) throw new HttpError(403, 'Only leaders and PMs can add activity attachments.');
+      if (!req.files?.length) throw new HttpError(400, 'Choose at least one attachment.');
+      const activity = (await pool.query(
+        `SELECT id, side, creator_id, status FROM planning_execution WHERE id = $1 AND project_id = $2`,
+        [activityId, projectId])).rows[0];
+      if (!activity) throw new HttpError(404, 'Activity not found.');
+      if (activity.side !== wcSide(role)) throw new HttpError(403, 'You cannot edit an activity from the other side.');
+      if (String(activity.creator_id) !== String(userId)) throw new HttpError(403, 'Only the creating leader can edit this activity.');
+      if (activity.status === 'closed') throw new HttpError(409, 'A closed activity cannot be edited.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const attachments = await saveAttachments(pool, req.files, {
+        projectId, entityType: 'planning_activity', entityId: activityId, userId, role,
+      });
+      return res.status(201).json({ attachments });
+    } catch (err) { return fail(res, err, 'POST /api/planning-execution/:activityId/attachments:'); }
+  });
+
+  app.delete('/api/planning-execution/:activityId/attachments/:attachmentId', authenticateToken,
+    requireProjectLifecycleWrite, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.body?.projectId || req.query.projectId, 10);
+      const activityId = parseInt(req.params.activityId, 10);
+      const attachmentId = parseInt(req.params.attachmentId, 10);
+      if (!projectId || !activityId || !attachmentId) throw new HttpError(400, 'projectId, activityId and attachmentId are required.');
+      if (!isWCLeader(role)) throw new HttpError(403, 'Only leaders and PMs can remove activity attachments.');
+      const activity = (await pool.query(
+        `SELECT id, side, creator_id, status FROM planning_execution WHERE id = $1 AND project_id = $2`,
+        [activityId, projectId])).rows[0];
+      if (!activity) throw new HttpError(404, 'Activity not found.');
+      if (activity.side !== wcSide(role) || String(activity.creator_id) !== String(userId))
+        throw new HttpError(403, 'Only the creating leader on this activity’s side can remove attachments.');
+      if (activity.status === 'closed') throw new HttpError(409, 'A closed activity cannot be edited.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const attachment = (await pool.query(
+        `SELECT id, file_id, resource_type FROM card_attachments
+         WHERE id = $1 AND project_id = $2 AND entity_type = 'planning_activity' AND entity_id = $3`,
+        [attachmentId, projectId, activityId])).rows[0];
+      if (!attachment) throw new HttpError(404, 'Attachment not found.');
+      if (!deps.cloudinary?.uploader) throw new HttpError(503, 'File storage is unavailable.');
+      const result = await deps.cloudinary.uploader.destroy(attachment.file_id, {
+        resource_type: attachment.resource_type || 'raw',
+      });
+      if (!['ok', 'not found'].includes(result?.result))
+        throw new HttpError(502, 'The file could not be removed from storage.');
+      await pool.query(`DELETE FROM card_attachments WHERE id = $1`, [attachmentId]);
+      return res.json({ success: true });
+    } catch (err) { return fail(res, err, 'DELETE /api/planning-execution/:activityId/attachments:'); }
+  });
 
   app.get('/api/planning-execution/:activityId/activity-card', authenticateToken, async (req, res) => {
     try {
@@ -249,6 +327,7 @@ function registerActivityRoutes(app, deps) {
                 planned_manpower, planned_equipment, planned_materials, progress_pct,
                 certified_progress_pct, certified_at, baseline_milestone_id, additional_milestone_id,
                 drives_milestone, milestone_weight_pct, actual_end, linked_file_name,
+                linked_file_id, linked_file_url,
                 (SELECT title FROM milestones WHERE id = planning_execution.baseline_milestone_id) AS baseline_milestone_title,
                 (SELECT to_char(planned_start, 'YYYY-MM-DD') FROM milestones WHERE id = planning_execution.baseline_milestone_id) AS baseline_milestone_start,
                 (SELECT to_char(planned_end, 'YYYY-MM-DD') FROM milestones WHERE id = planning_execution.baseline_milestone_id) AS baseline_milestone_end,
@@ -337,6 +416,9 @@ function registerActivityRoutes(app, deps) {
         baseline_milestone_id: activity.baseline_milestone_id,
         additional_milestone_id: activity.additional_milestone_id,
         calculated_delay_days: activity.calculated_delay_days,
+        linked_file_name: activity.linked_file_name,
+        linked_file_id: activity.linked_file_id,
+        linked_file_url: activity.linked_file_url,
       } : {
         ...activity,
         progress_pct: clientView ? null : Number(activity.progress_pct) || 0,
@@ -345,8 +427,14 @@ function registerActivityRoutes(app, deps) {
         certified_progress_pct: Number(activity.certified_progress_pct) || 0,
         client_view: clientView,
       };
+      const attachments = (await pool.query(
+        `SELECT id, file_name, file_id, file_url, mime_type, created_at
+         FROM card_attachments
+         WHERE project_id = $1 AND entity_type = 'planning_activity' AND entity_id = $2
+         ORDER BY created_at, id`, [projectId, activityId])).rows;
       return res.json({
         activity: visibleActivity,
+        attachments,
         activity_summary: consultantView ? {
           task_count: Number(activitySummary.task_count),
           completed_task_count: Number(activitySummary.completed_task_count),
@@ -503,7 +591,8 @@ function registerActivityRoutes(app, deps) {
 
   // Create an activity, its tasks (with weights and stages) and the milestone link in one transaction.
   app.post('/api/planning-execution/create-with-tasks', authenticateToken,
-    upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
+    upload.fields([{ name: 'linked_file', maxCount: 1 }, { name: 'attachments', maxCount: 20 }]),
+    requireProjectLifecycleWrite, async (req, res) => {
     let client;
     try {
       const { user_id: userId, role } = req.user;
@@ -540,9 +629,10 @@ function registerActivityRoutes(app, deps) {
       const milestoneId = baselineId || additionalId || null;
 
       let file = { name: null, id: null, url: null };
-      if (req.file) {
-        const up = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'planning_execution/plans');
-        file = { name: req.file.originalname, id: up.public_id, url: up.secure_url };
+      const planFile = legacyFile(req);
+      if (planFile) {
+        const up = await scheduleCloudinaryUpload(planFile.buffer, planFile.originalname, 'planning_execution/plans');
+        file = { name: planFile.originalname, id: up.public_id, url: up.secure_url };
       }
 
       client = await pool.connect();
@@ -609,6 +699,9 @@ function registerActivityRoutes(app, deps) {
          planned, unit, b.planned_work || '', b.planned_manpower || '', b.planned_equipment || '', b.planned_materials || '',
          file.name, file.id, file.url, userId, role,
          type, String(b.done_when || '').trim() || null, baselineId, additionalId, milestoneWeight])).rows[0];
+      if (attachmentFiles(req).length) await saveAttachments(client, attachmentFiles(req), {
+        projectId, entityType: 'planning_activity', entityId: activity.id, userId, role,
+      });
 
       const ctx = { projectId, side, userId, role, activityId: activity.id, type, start_date: b.start_date, end_date: b.end_date };
       const tasks = [];
@@ -640,6 +733,7 @@ function registerActivityRoutes(app, deps) {
   // Add a task to an existing activity. With preview=true nothing is written: the response shows the
   // weights and the activity progress before and after, so the leader can confirm.
   app.post('/api/planning-execution/:activityId/tasks', authenticateToken,
+    upload.fields([{ name: 'linked_file', maxCount: 1 }, { name: 'attachments', maxCount: 20 }]),
     requireProjectLifecycleWrite, async (req, res) => {
     let client;
     try {
@@ -648,7 +742,10 @@ function registerActivityRoutes(app, deps) {
       const side = wcSide(role);
       const activityId = parseInt(req.params.activityId, 10);
       const b = req.body || {};
-      const task = b.task || {};
+      let task = b.task || {};
+      if (typeof task === 'string') {
+        try { task = JSON.parse(task); } catch { task = {}; }
+      }
       if (!String(task.title || '').trim()) throw new HttpError(400, 'The task needs a title.');
       const preview = b.preview === true || b.preview === 'true';
 
@@ -692,6 +789,11 @@ function registerActivityRoutes(app, deps) {
       const needsTarget = act.activity_type === 'quantity' || act.activity_type === 'count';
       const planned = Number(act.planned_quantity);
       const stages = act.activity_type === 'stages' ? validateStages(task.stages) : [];
+      let linkedFile = null;
+      const file = legacyFile(req);
+      if (file) {
+        linkedFile = await scheduleCloudinaryUpload(file.buffer, file.originalname, 'planning_execution/tasks');
+      }
       for (let i = 0; i < existing.length; i++) {
         await client.query(
           `UPDATE workspace_work_center SET weight_pct = $2, target_quantity = $3, updated_at = NOW() WHERE id = $1`,
@@ -701,7 +803,11 @@ function registerActivityRoutes(app, deps) {
       const ctx = { projectId: act.project_id, side, userId, role, activityId, type: act.activity_type,
                     start_date: dateOnly(act.start_date), end_date: dateOnly(act.end_date) };
       const created = await insertTask(client, ctx, task,
-        { weight_pct: newWeight, target_quantity: needsTarget ? round3((planned * newWeight) / 100) : null }, stages);
+        { weight_pct: newWeight, target_quantity: needsTarget ? round3((planned * newWeight) / 100) : null }, stages,
+        linkedFile ? { name: file.originalname, id: linkedFile.public_id, url: linkedFile.secure_url } : null);
+      if (attachmentFiles(req).length) await saveAttachments(client, attachmentFiles(req), {
+        projectId: act.project_id, entityType: 'work_center_task', entityId: created.id, userId, role,
+      });
 
       await client.query(
         `INSERT INTO activity_weight_changes

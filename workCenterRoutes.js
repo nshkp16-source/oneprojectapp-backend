@@ -27,6 +27,13 @@ const reports = (function () {
 
 
 const DAY = (v) => String(v || '').slice(0, 10);
+function reportDelayDays(reportDate, plannedEndDate) {
+  const reportDay = DAY(reportDate), endDay = DAY(plannedEndDate);
+  if (!isDate(reportDay) || !isDate(endDay) || reportDay <= endDay) return 0;
+  const reportTime = Date.parse(`${reportDay}T00:00:00Z`);
+  const endTime = Date.parse(`${endDay}T00:00:00Z`);
+  return Math.floor((reportTime - endTime) / 86400000);
+}
 const DATE = (v) => v instanceof Date
   ? `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, '0')}-${String(v.getDate()).padStart(2, '0')}`
   : DAY(v);
@@ -300,13 +307,13 @@ function registerReportRoutes(app, deps) {
       const resources = parseReportResources(b.resources, assigned);
       const delayCause = String(b.delayCause || '').trim() || null;
       const delayNote = String(b.delayNote || '').trim();
-      const delayDaysCount = Number(b.delayDays || 0);
+      const delayDaysCount = reportDelayDays(b.reportDate, task.end_date);
       if (delayCause && !['weather', 'materials', 'equipment', 'access', 'design', 'labor', 'other'].includes(delayCause))
         throw new HttpError(400, 'Choose a valid delay cause.');
       if (!Number.isInteger(delayDaysCount) || delayDaysCount < 0 || delayDaysCount > 365)
         throw new HttpError(400, 'Delay days must be a whole number from 0 to 365.');
       if (delayNote.length > 2000) throw new HttpError(400, 'The delay note cannot exceed 2000 characters.');
-      if ((delayCause || delayNote || delayDaysCount) && !delayCause)
+      if (delayNote && !delayCause)
         throw new HttpError(400, 'Choose a delay cause when reporting a delay.');
 
       const today = (await pool.query(`SELECT to_char(CURRENT_DATE + 1, 'YYYY-MM-DD') AS d`)).rows[0].d;   // one day of tolerance for time zones
@@ -883,7 +890,7 @@ const taskCards = (function () {
   };
 
   function registerTaskCardRoutes(app, deps) {
-    const { pool, authenticateToken, requireProjectLifecycleWrite, wcSide, isWCLeader } = deps;
+    const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, cloudinary, wcSide, isWCLeader } = deps;
     async function isProjectMember(projectId, userId, role) {
       if (deps.isProjectMember) return deps.isProjectMember(projectId, userId, role);
       const result = await pool.query(
@@ -963,7 +970,7 @@ const taskCards = (function () {
         if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
         const task = await loadTask(taskId, projectId);
         await authorize(task, projectId, req.user.user_id, req.user.role);
-        const [comments, history, checklists, links, dependencies] = await Promise.all([
+        const [comments, history, checklists, links, dependencies, attachments] = await Promise.all([
           pool.query(
             `SELECT id, author_id, author_role, body, created_at
              FROM work_center_task_comments WHERE task_id = $1 AND project_id = $2
@@ -991,6 +998,11 @@ const taskCards = (function () {
              JOIN workspace_work_center w ON w.id = d.depends_on_task_id
              WHERE d.task_id = $1 AND d.project_id = $2 ORDER BY w.id`,
             [taskId, projectId]),
+          pool.query(
+            `SELECT id, file_name, file_id, file_url, mime_type, created_at
+             FROM card_attachments
+             WHERE project_id = $1 AND entity_type = 'work_center_task' AND entity_id = $2
+             ORDER BY created_at, id`, [projectId, taskId]),
         ]);
         let visibleLinks = links.rows;
         if (req.user.role === 'TeamMember') {
@@ -1022,9 +1034,63 @@ const taskCards = (function () {
             grid: task.location_grid, drawing: task.location_drawing,
           },
           comments: comments.rows, history: history.rows, checklists: checklists.rows,
-          links: visibleLinks, dependencies: dependencies.rows,
+          links: visibleLinks, dependencies: dependencies.rows, attachments: attachments.rows,
         });
       } catch (error) { return fail(res, error, 'GET /api/work-center/:taskId/card:'); }
+    });
+
+    app.post('/api/work-center/:taskId/attachments', authenticateToken,
+      upload.array('attachments', 20), requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
+        if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
+        if (!req.files?.length) throw new HttpError(400, 'Choose at least one attachment.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const saved = [];
+        for (const file of req.files) {
+          const uploaded = await scheduleCloudinaryUpload(file.buffer, file.originalname, 'work_center/attachments');
+          const attachment = (await pool.query(
+            `INSERT INTO card_attachments
+               (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
+                resource_type, uploaded_by_id, uploaded_by_role)
+             VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9)
+             RETURNING id, file_name, file_id, file_url, mime_type, created_at`,
+            [projectId, taskId, file.originalname, uploaded.public_id, uploaded.secure_url,
+              file.mimetype || null, uploaded.resource_type || 'raw', req.user.user_id, req.user.role])).rows[0];
+          saved.push(attachment);
+        }
+        await audit(task, projectId, req.user.user_id, req.user.role, 'attachments_added',
+          { attachment_ids: saved.map((item) => item.id) });
+        return res.status(201).json({ attachments: saved });
+      } catch (error) { return fail(res, error, 'POST /api/work-center/:taskId/attachments:'); }
+    });
+
+    app.delete('/api/work-center/:taskId/attachments/:attachmentId', authenticateToken,
+      requireProjectLifecycleWrite, async (req, res) => {
+      try {
+        const taskId = validId(req.params.taskId), attachmentId = validId(req.params.attachmentId);
+        const projectId = bodyId(req.body, 'projectId') || validId(req.query.projectId);
+        if (!taskId || !attachmentId || !projectId)
+          throw new HttpError(400, 'taskId, projectId and attachmentId are required.');
+        const task = await loadTask(taskId, projectId);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const attachment = (await pool.query(
+          `SELECT id, file_id, resource_type FROM card_attachments
+           WHERE id = $1 AND project_id = $2 AND entity_type = 'work_center_task' AND entity_id = $3`,
+          [attachmentId, projectId, taskId])).rows[0];
+        if (!attachment) throw new HttpError(404, 'Attachment not found.');
+        if (!cloudinary?.uploader) throw new HttpError(503, 'File storage is unavailable.');
+        const result = await cloudinary.uploader.destroy(attachment.file_id, {
+          resource_type: attachment.resource_type || 'raw',
+        });
+        if (!['ok', 'not found'].includes(result?.result))
+          throw new HttpError(502, 'The file could not be removed from storage.');
+        await pool.query(`DELETE FROM card_attachments WHERE id = $1`, [attachmentId]);
+        await audit(task, projectId, req.user.user_id, req.user.role, 'attachment_removed',
+          { attachment_id: attachmentId });
+        return res.json({ success: true });
+      } catch (error) { return fail(res, error, 'DELETE /api/work-center/:taskId/attachments:'); }
     });
 
     app.get('/api/work-center/:taskId/link-options', authenticateToken, async (req, res) => {
