@@ -93,6 +93,57 @@ async function certifiedProgressWithSnagCaps(client, activityId, proposedProgres
     : Math.min(Number(proposedProgress), Number(rows[0].cap));
 }
 
+const MAX_SHARED_EVIDENCE_REPORTS = 200;
+
+/** Frozen copy of the approved reports of an activity up to the cut-off date, limited to fields a reviewer needs.
+ *  No member identity, no private notes, no task ids. */
+async function buildSharedEvidence(client, activityId, cutOff) {
+  const { rows } = await client.query(
+    `SELECT p.id, w.title AS task_title, p.report_date, p.work_done, p.quantity_done, p.quantity_failed,
+            p.progress_pct, p.manpower, p.equipment, p.materials, p.issues, s.title AS stage_title,
+            COALESCE((SELECT json_agg(json_build_object('file_name', ph.file_name, 'file_url', ph.file_url, 'captured_at', ph.captured_at)
+                      ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
+            COALESCE((SELECT json_agg(json_build_object('resource_type', rr.resource_type, 'name', rr.name,
+                      'quantity', rr.quantity, 'unit', rr.unit, 'hours', rr.hours) ORDER BY rr.id)
+                      FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
+     FROM workspace_work_center_progress p
+     JOIN workspace_work_center w ON w.id = p.task_id
+     LEFT JOIN task_stages s ON s.id = p.stage_id
+     WHERE w.activity_id = $1 AND p.validation_status = 'approved' AND p.report_date <= $2
+     ORDER BY p.report_date DESC, p.id DESC LIMIT $3`, [activityId, cutOff, MAX_SHARED_EVIDENCE_REPORTS]);
+  return rows.map((r) => ({
+    report_id: Number(r.id),
+    task_title: r.task_title,
+    report_date: dateOnly(r.report_date),
+    work_done: r.work_done || '',
+    quantity_done: r.quantity_done == null ? null : Number(r.quantity_done),
+    quantity_failed: r.quantity_failed == null ? null : Number(r.quantity_failed),
+    progress_pct: r.progress_pct == null ? null : Number(r.progress_pct),
+    stage_title: r.stage_title || null,
+    manpower: r.manpower || '', equipment: r.equipment || '', materials: r.materials || '', issues: r.issues || '',
+    photos: r.photos, resources: r.resources,
+  }));
+}
+
+/** What a consultant is allowed to read of a verification request: totals, the plan summary and the evidence
+ *  only when the contractor chose to share them. Task level figures stay private. */
+function consultantProjection(verification) {
+  const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
+  return {
+    ...verification,
+    activity_summary: {
+      task_count: figures.length,
+      approved_report_count: figures.reduce((total, figure) => total + Number(figure.approved_report_count || 0), 0),
+      approved_quantity: figures.reduce((total, figure) => total + Number(figure.approved_quantity || 0), 0),
+      planned_quantity: figures.reduce((total, figure) => total + Number(figure.target_quantity || 0), 0),
+    },
+    claimed_figures: [],
+    certified_figures: null,
+    shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
+    shared_evidence: verification.share_evidence ? verification.shared_evidence : null,
+  };
+}
+
 export function registerVerificationRoutes(app, deps) {
   const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
   const leaderOn = (role, side) => isWCLeader(role) && wcSide(role) === side;
@@ -191,6 +242,9 @@ export function registerVerificationRoutes(app, deps) {
                        target_quantity: r.target_quantity == null ? null : Number(r.target_quantity),
                        approved_report_count: Number(r.approved_report_count), approved_quantity: Number(r.approved_quantity) }));
 
+      const shareEvidence = b.shareEvidence === true || String(b.shareEvidence) === 'true';
+      const sharedEvidence = shareEvidence ? await buildSharedEvidence(client, act.id, cutOff) : null;
+
       let attachments = [];
       if (req.file) {
         const up = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'verifications/requests');
@@ -203,11 +257,12 @@ export function registerVerificationRoutes(app, deps) {
           INSERT INTO activity_verifications
             (project_id, activity_id, kind, stage_id, cut_off_date, claimed_progress_pct, claimed_figures,
              requested_by_id, requested_by_role, request_note, attachments, respond_by,
-             share_activity_summary, shared_activity_summary)
-          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb) RETURNING *`,
+             share_activity_summary, shared_activity_summary, share_evidence, shared_evidence)
+          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb,$15,$16::jsonb) RETURNING *`,
           [act.project_id, act.id, kind, stageId, cutOff, act.progress_pct, JSON.stringify(figures), userId, role,
            requestNote || null, JSON.stringify(attachments), respondBy,
-           shareActivitySummary, sharedActivitySummary ? JSON.stringify(sharedActivitySummary) : null])).rows[0];
+           shareActivitySummary, sharedActivitySummary ? JSON.stringify(sharedActivitySummary) : null,
+           shareEvidence, sharedEvidence ? JSON.stringify(sharedEvidence) : null])).rows[0];
       } catch (err) {
         if (err.code === '23505') throw new HttpError(409, 'A request of this kind is already waiting for the consultant.');
         throw err;
@@ -616,21 +671,7 @@ export function registerVerificationRoutes(app, deps) {
       const consultantView = s === 'Consultant' || (member && (await pool.query(
         `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
         [act.project_id, userId])).rows.length > 0);
-      const visibleVerifications = consultantView ? verifications.map((verification) => {
-        const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
-        return {
-          ...verification,
-          activity_summary: {
-            task_count: figures.length,
-            approved_report_count: figures.reduce((total, figure) => total + Number(figure.approved_report_count || 0), 0),
-            approved_quantity: figures.reduce((total, figure) => total + Number(figure.approved_quantity || 0), 0),
-            planned_quantity: figures.reduce((total, figure) => total + Number(figure.target_quantity || 0), 0),
-          },
-          claimed_figures: [],
-          certified_figures: null,
-          shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
-        };
-      }) : verifications;
+      const visibleVerifications = consultantView ? verifications.map(consultantProjection) : verifications;
       const visibleRework = consultantView ? rework.map(({ task_id, ...item }) => item) : rework;
       return res.json({ verifications: visibleVerifications, rework: visibleRework });
     } catch (err) { return fail(res, err, 'GET /api/activities/:activityId/verifications:'); }
@@ -645,8 +686,14 @@ export function registerVerificationRoutes(app, deps) {
       if (s !== 'Contractor' && s !== 'Consultant' && role !== 'TeamMember') throw new HttpError(403, 'You cannot see verification requests.');
       if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
       const rows = (await pool.query(
-        `SELECT v.*, pe.title AS activity_title, (v.respond_by < CURRENT_DATE) AS overdue
+        `SELECT v.*, pe.title AS activity_title, pe.unit AS activity_unit,
+                pe.certified_progress_pct AS activity_certified_progress_pct,
+                st.title AS stage_title, (v.respond_by < CURRENT_DATE) AS overdue,
+                (v.respond_by - CURRENT_DATE)::int AS days_left,
+                (SELECT COUNT(*)::int FROM verification_signers x
+                  WHERE x.verification_id = v.id AND x.is_team_member AND x.status = 'pending') AS pending_inspectors
          FROM activity_verifications v JOIN planning_execution pe ON pe.id = v.activity_id
+         LEFT JOIN task_stages st ON st.id = v.stage_id
          WHERE v.project_id = $1 AND v.status = 'pending'
            AND ($2 = 'Consultant' OR $2 = 'Contractor'
                 OR EXISTS (SELECT 1 FROM verification_signers x WHERE x.verification_id = v.id AND x.signer_role = 'TeamMember' AND x.signer_user_id = $3))
@@ -655,21 +702,7 @@ export function registerVerificationRoutes(app, deps) {
         `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
         [projectId, userId])).rows.length > 0);
       if (!consultantView) return res.json({ pending: rows });
-      const pending = rows.map((verification) => {
-        const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
-        return {
-          ...verification,
-          activity_summary: {
-            task_count: figures.length,
-            approved_report_count: figures.reduce((total, figure) => total + Number(figure.approved_report_count || 0), 0),
-            approved_quantity: figures.reduce((total, figure) => total + Number(figure.approved_quantity || 0), 0),
-            planned_quantity: figures.reduce((total, figure) => total + Number(figure.target_quantity || 0), 0),
-          },
-          claimed_figures: [],
-          certified_figures: null,
-          shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
-        };
-      });
+      const pending = rows.map(consultantProjection);
       return res.json({ pending });
     } catch (err) { return fail(res, err, 'GET /api/verifications/pending:'); }
   });

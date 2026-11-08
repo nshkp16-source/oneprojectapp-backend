@@ -90,6 +90,58 @@ test('a request freezes the claimed figures, sets the respond-by date and notifi
   assert.equal((await call('POST', `/api/activities/${act.id}/verifications`, leader, {})).status, 409);   // one pending of this kind
 });
 
+test('shared evidence: opt-in, approved reports only, up to the cut-off, no identities, frozen copy', async () => {
+  // a rejected report, a pending report and an approved report dated after the cut-off: none may reach the consultant
+  const rejected = await report(m(101), { taskId: tA.id, reportDate: '2026-03-11', quantityDone: 7, manpower: '4 workers', issues: 'Rain' });
+  assert.equal(rejected.status, 201, JSON.stringify(rejected.body));
+  await call('PUT', `/api/work-center-progress/${rejected.body.entry.id}/validate`, leader, { projectId: 1, validation_status: 'rejected', validation_notes: 'Not on site' });
+  const pendingReport = await report(m(101), { taskId: tA.id, reportDate: '2026-03-12', quantityDone: 9 });
+  assert.equal(pendingReport.status, 201);
+  // inserted directly so that claimed progress, which the later tests rely on, does not move
+  const [late] = await q(`INSERT INTO workspace_work_center_progress (task_id, report_date, member_id, member_role, work_done, quantity_done, validation_status)
+    VALUES ($1,'2026-03-13',102,'TeamMember','Late work',20,'approved') RETURNING id`, [tB.id]);
+  const cleanup = async () => { await q(`DELETE FROM workspace_work_center_progress WHERE id = ANY($1::int[])`, [[late.id, rejected.body.entry.id, pendingReport.body.entry.id]]); };
+  try {
+    // 1. not shared: the consultant gets totals only
+    const [row] = await q(`SELECT share_evidence, shared_evidence FROM activity_verifications WHERE id = $1`, [v1.id]);
+    assert.equal(row.share_evidence, false);
+    assert.equal(row.shared_evidence, null);
+    const listed = await call('GET', `/api/activities/${act.id}/verifications`, cons);
+    assert.equal(listed.status, 200);
+    const first = listed.body.verifications.find((v) => v.id === v1.id);
+    assert.equal(first.shared_evidence, null);
+    assert.deepEqual(first.claimed_figures, []);
+
+    // 2. shared: withdraw v1, then request again with shareEvidence and a cut-off before the late report
+    assert.equal((await call('PUT', `/api/verifications/${v1.id}/withdraw`, leader, {})).status, 200);
+    const shared = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'With evidence', cutOffDate: '2026-03-12', shareEvidence: true });
+    assert.equal(shared.status, 201, JSON.stringify(shared.body));
+    const ev = shared.body.verification;
+    assert.equal(ev.share_evidence, true);
+    assert.equal(ev.shared_evidence.length, 1);                         // only the approved report of 10 March
+    assert.equal(ev.shared_evidence[0].report_date, '2026-03-10');
+    assert.equal(ev.shared_evidence[0].quantity_done, 100);
+
+    // the consultant reads the frozen copy, with no member identity, task id, rejection note or unapproved figure
+    const seen = (await call('GET', `/api/activities/${act.id}/verifications`, cons)).body.verifications.find((v) => v.id === ev.id);
+    assert.equal(seen.shared_evidence.length, 1);
+    assert.doesNotMatch(JSON.stringify(seen.shared_evidence), /a@x|b@x|member_id|task_id|Not on site|Rain|"quantity_done":(7|9|20)\b/);
+    const pend = await call('GET', '/api/verifications/pending?projectId=1', cons);
+    const row2 = pend.body.pending.find((v) => v.id === ev.id);
+    assert.equal(row2.shared_evidence.length, 1);
+    assert.ok('days_left' in row2 && 'activity_certified_progress_pct' in row2 && 'pending_inspectors' in row2);
+
+    // the consultant still cannot read the contractor's task reports directly
+    assert.equal((await call('GET', `/api/work-center-progress/${tA.id}?projectId=1`, cons)).status, 403);
+
+    // restore what the next tests expect: one pending request (v1) with the named inspector
+    assert.equal((await call('PUT', `/api/verifications/${ev.id}/withdraw`, leader, {})).status, 200);
+    const again = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'Block A excavated', shareActivitySummary: true, signers: [{ role: 'TeamMember', user_id: 201, position: 'Inspector' }] });
+    assert.equal(again.status, 201, JSON.stringify(again.body));
+    v1 = again.body.verification;
+  } finally { await cleanup(); }
+});
+
 test('decision rules: inspector first, reason for changes, other roles refused', async () => {
   assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, leader, { status: 'verified' })).status, 403);
   assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, client, { status: 'verified' })).status, 403);
