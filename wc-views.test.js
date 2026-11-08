@@ -20,6 +20,20 @@ function extract(names) {
   return names.map((n) => found[n]).join('\n');
 }
 
+function extractWindowFunction(name) {
+  for (const src of scripts) {
+    const ast = acorn.parse(src, { ecmaVersion: 'latest', sourceType: 'script' });
+    for (const node of ast.body) {
+      if (node.type !== 'ExpressionStatement' || node.expression.type !== 'AssignmentExpression') continue;
+      const { left, right } = node.expression;
+      if (left.type === 'MemberExpression' && left.object.name === 'window'
+        && left.property.name === name && right.type === 'FunctionExpression')
+        return src.slice(node.start, node.end);
+    }
+  }
+  assert.fail(`window.${name} not found in dashboard.html`);
+}
+
 const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
   'wcPriorityBadge', '_cardAttachmentTypeOptions', '_cardAttachmentTypeFields', '_cardAttachmentTypeValue',
   '_appendCardAttachmentType', '_cardAttachmentTypeLabel',
@@ -32,6 +46,7 @@ function views() {
   const ctx = dom.getInternalVMContext();
   vm.runInContext(`function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
   vm.runInContext(extract(HELPERS), ctx);
+  vm.runInContext(extractWindowFunction('_peSharedEvidenceHtml'), ctx);
   vm.runInContext(`function tabbed(task, entries, queries, leader) {
     document.body.innerHTML = leader ? _wcPMView(task, entries) : _wcMemberView(task, entries);
     _wcTabifyDetail(document.body, task, entries, queries, leader, true);
@@ -71,6 +86,13 @@ function views() {
         vm.runInContext('_appendCardAttachmentType(window.__form, "test")', ctx);
         return dom.window.__form.values;
       } catch (error) { return error.message; }
+    },
+    sharedEvidence: (evidence, unit) => {
+      dom.window.__evidence = evidence;
+      dom.window.__unit = unit;
+      dom.window.document.body.innerHTML = vm.runInContext(
+        'window._peSharedEvidenceHtml(window.__evidence, window.__unit)', ctx);
+      return dom.window.document;
     },
     tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
     saveReportFilter: (taskId, filter) => { dom.window.__taskId = taskId; dom.window.__filter = filter; vm.runInContext('saveReportFilter(window.__taskId, window.__filter)', ctx); },
@@ -242,6 +264,11 @@ test('task attachment tab lists legacy and multiple files and offers upload/remo
   assert.match(d.body.textContent, /drawing\.dwg/);
   assert.match(d.body.textContent, /Site photos \/ field evidence/);
   assert.match(d.body.textContent, /report\.jpg/);
+  assert.ok(d.querySelector('[data-wc-attachment-filter] option[value="site_photos"]'));
+  assert.equal(d.querySelector('[data-wc-attachment-preview]').dataset.wcAttachmentName, 'drawing.dwg');
+  const legacyRow = [...d.querySelectorAll('[data-wc-task-attachment-row]')]
+    .find((row) => row.textContent.includes('legacy.pdf'));
+  assert.equal(legacyRow?.dataset.wcAttachmentType, 'other');
   assert.ok(d.querySelector('[data-wc-attachment-input][multiple]'));
   assert.ok(d.querySelector('#wc-card-attachment-type-type option[value="other"]'));
   assert.ok(d.querySelector('[data-wc-attachment-delete="9"]'));
@@ -259,6 +286,21 @@ test('card attachment upload includes a custom label only when Other is selected
   assert.match(view.attachmentType('other', ''), /Enter a custom attachment type/);
 });
 
+test('consultant shared evidence shows task attachment original names and evidence types', () => {
+  const d = views().sharedEvidence({
+    reports: [],
+    task_attachments: [{
+      task_title: 'Concrete pour',
+      file_name: 'Cube test results.pdf',
+      file_url: 'https://files.test/Cube-test-results.pdf',
+      attachment_type: 'quality_test',
+    }],
+  }, 'm3');
+  assert.match(d.body.textContent, /Task execution attachments \(1\)/);
+  assert.equal(d.querySelector('a[href="https://files.test/Cube-test-results.pdf"]').textContent, 'Cube test results.pdf');
+  assert.match(d.body.textContent, /Quality \/ test results/);
+});
+
 test('internal task-card links are buttons and leader choices are selected from project items', async () => {
   const dom = new JSDOM('<!doctype html><body><div id="wc-detail-5"><div id="card"><div role="tablist"></div><div data-wc-pane="details"></div></div></div></body>',
     { runScripts: 'outside-only', url: 'http://localhost/' });
@@ -266,6 +308,10 @@ test('internal task-card links are buttons and leader choices are selected from 
   const cardData = {
     location: {},
     comments: [], history: [], checklists: [],
+    attachments: [
+      { id: 11, file_name: 'daily.jpg', file_url: 'https://files.test/daily.jpg', attachment_type: 'daily_progress' },
+      { id: 12, file_name: 'plant.pdf', file_url: 'https://files.test/plant.pdf', attachment_type: 'equipment' },
+    ],
     links: [
       { id: 1, link_type: 'task', target_id: '22', title: 'Block B' },
       { id: 2, link_type: 'query', target_id: '5:31', title: 'Block A: Confirm the depth' },
@@ -302,6 +348,14 @@ test('internal task-card links are buttons and leader choices are selected from 
   assert.equal(d.querySelectorAll('[data-card-operation="link-open"]').length, 3);
   assert.ok(d.querySelector('[data-wc-tab="attachments"]'));
   assert.ok(d.querySelector('[data-wc-pane="attachments"] input[type="file"][multiple]'));
+  const attachmentFilter = d.querySelector('[data-wc-attachment-filter]');
+  attachmentFilter.value = 'daily_progress';
+  attachmentFilter.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+  assert.equal(d.querySelector('[data-wc-attachment-name="daily.jpg"]').parentElement.style.display, 'flex');
+  assert.equal(d.querySelector('[data-wc-attachment-name="plant.pdf"]').parentElement.style.display, 'none',
+    JSON.stringify([...d.querySelectorAll('[data-wc-task-attachment-row]')].map((row) => ({
+      type: row.dataset.wcAttachmentType, display: row.style.display,
+    }))));
   assert.equal(d.querySelector('a[href="https://example.test/spec"]')?.textContent, 'External spec');
   const typeSelect = d.querySelector('[data-card-field="link-type"]');
   const targetSelect = d.querySelector('[data-card-field="link-target"]');

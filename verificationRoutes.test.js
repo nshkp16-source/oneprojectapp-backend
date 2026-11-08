@@ -100,7 +100,11 @@ test('shared evidence: opt-in, approved reports only, up to the cut-off, no iden
   // inserted directly so that claimed progress, which the later tests rely on, does not move
   const [late] = await q(`INSERT INTO workspace_work_center_progress (task_id, report_date, member_id, member_role, work_done, quantity_done, validation_status)
     VALUES ($1,'2026-03-13',102,'TeamMember','Late work',20,'approved') RETURNING id`, [tB.id]);
-  const cleanup = async () => { await q(`DELETE FROM workspace_work_center_progress WHERE id = ANY($1::int[])`, [[late.id, rejected.body.entry.id, pendingReport.body.entry.id]]); };
+  const attachmentIds = [];
+  const cleanup = async () => {
+    await q(`DELETE FROM card_attachments WHERE id = ANY($1::bigint[])`, [attachmentIds]);
+    await q(`DELETE FROM workspace_work_center_progress WHERE id = ANY($1::int[])`, [[late.id, rejected.body.entry.id, pendingReport.body.entry.id]]);
+  };
   try {
     // 1. not shared: the consultant gets totals only
     const [row] = await q(`SELECT share_evidence, shared_evidence FROM activity_verifications WHERE id = $1`, [v1.id]);
@@ -114,28 +118,64 @@ test('shared evidence: opt-in, approved reports only, up to the cut-off, no iden
 
     // 2. shared: withdraw v1, then request again with shareEvidence and a cut-off before the late report
     assert.equal((await call('PUT', `/api/verifications/${v1.id}/withdraw`, leader, {})).status, 200);
+    const [testAttachment] = await q(
+      `INSERT INTO card_attachments
+         (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
+          resource_type, attachment_type, uploaded_by_id, uploaded_by_role, created_at)
+       VALUES (1, 'work_center_task', $1, 'Cube test results.pdf', 'test-results',
+               'https://files.test/Cube-test-results.pdf', 'application/pdf', 'raw',
+               'quality_test', 5, 'ContractorPM', '2026-03-12 12:00:00+00')
+       RETURNING id`, [tA.id]);
+    attachmentIds.push(testAttachment.id);
     const shared = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'With evidence', cutOffDate: '2026-03-12', shareEvidence: true });
     assert.equal(shared.status, 201, JSON.stringify(shared.body));
     const ev = shared.body.verification;
     assert.equal(ev.share_evidence, true);
-    assert.equal(ev.shared_evidence.length, 1);                         // only the approved report of 10 March
-    assert.equal(ev.shared_evidence[0].report_date, '2026-03-10');
-    assert.equal(ev.shared_evidence[0].quantity_done, 100);
+    assert.equal(ev.shared_evidence.reports.length, 1);                 // only the approved report of 10 March
+    assert.equal(ev.shared_evidence.reports[0].report_date, '2026-03-10');
+    assert.equal(ev.shared_evidence.reports[0].quantity_done, 100);
+    assert.equal(ev.shared_evidence.task_attachments.length, 1);
+    assert.equal(ev.shared_evidence.task_attachments[0].file_name, 'Cube test results.pdf');
+    assert.equal(ev.shared_evidence.task_attachments[0].attachment_type, 'quality_test');
+    const [uploadedLater] = await q(
+      `INSERT INTO card_attachments
+         (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
+          resource_type, attachment_type, uploaded_by_id, uploaded_by_role)
+       VALUES (1, 'work_center_task', $1, 'Later file.pdf', 'later-file',
+               'https://files.test/Later-file.pdf', 'application/pdf', 'raw',
+               'other', 5, 'ContractorPM')
+       RETURNING id`, [tB.id]);
+    attachmentIds.push(uploadedLater.id);
 
     // the consultant reads the frozen copy, with no member identity, task id, rejection note or unapproved figure
     const seen = (await call('GET', `/api/activities/${act.id}/verifications`, cons)).body.verifications.find((v) => v.id === ev.id);
-    assert.equal(seen.shared_evidence.length, 1);
+    assert.equal(seen.shared_evidence.reports.length, 1);
+    assert.equal(seen.shared_evidence.task_attachments.length, 1);
     assert.doesNotMatch(JSON.stringify(seen.shared_evidence), /a@x|b@x|member_id|task_id|Not on site|Rain|"quantity_done":(7|9|20)\b/);
     const pend = await call('GET', '/api/verifications/pending?projectId=1', cons);
     const row2 = pend.body.pending.find((v) => v.id === ev.id);
-    assert.equal(row2.shared_evidence.length, 1);
+    assert.equal(row2.shared_evidence.reports.length, 1);
+    assert.equal(row2.shared_evidence.task_attachments.length, 1);
     assert.ok('days_left' in row2 && 'activity_certified_progress_pct' in row2 && 'pending_inspectors' in row2);
 
     // the consultant still cannot read the contractor's task reports directly
     assert.equal((await call('GET', `/api/work-center-progress/${tA.id}?projectId=1`, cons)).status, 403);
 
-    // restore what the next tests expect: one pending request (v1) with the named inspector
     assert.equal((await call('PUT', `/api/verifications/${ev.id}/withdraw`, leader, {})).status, 200);
+    const filesOnly = await call('POST', `/api/activities/${act.id}/verifications`, leader, {
+      note: 'Review test attachment', cutOffDate: '2026-03-15',
+    });
+    assert.equal(filesOnly.status, 201, JSON.stringify(filesOnly.body));
+    assert.equal(filesOnly.body.verification.share_evidence, false);
+    assert.deepEqual(filesOnly.body.verification.shared_evidence.reports, []);
+    assert.equal(filesOnly.body.verification.shared_evidence.task_attachments.length, 1);
+    const filesOnlyView = (await call('GET', `/api/activities/${act.id}/verifications`, cons)).body.verifications
+      .find((v) => v.id === filesOnly.body.verification.id);
+    assert.equal(filesOnlyView.shared_evidence.task_attachments[0].file_name, 'Cube test results.pdf');
+    assert.doesNotMatch(JSON.stringify(filesOnlyView.shared_evidence), /Later file/);
+
+    // restore what the next tests expect: one pending request (v1) with the named inspector
+    assert.equal((await call('PUT', `/api/verifications/${filesOnly.body.verification.id}/withdraw`, leader, {})).status, 200);
     const again = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'Block A excavated', shareActivitySummary: true, signers: [{ role: 'TeamMember', user_id: 201, position: 'Inspector' }] });
     assert.equal(again.status, 201, JSON.stringify(again.body));
     v1 = again.body.verification;
