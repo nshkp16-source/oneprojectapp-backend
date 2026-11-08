@@ -20,8 +20,10 @@ function extract(names) {
   return names.map((n) => found[n]).join('\n');
 }
 
-const HELPERS = ['_wcFmtDate', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
-  'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
+const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
+  'wcPriorityBadge', '_cardAttachmentTypeOptions', '_cardAttachmentTypeFields', '_cardAttachmentTypeValue',
+  '_appendCardAttachmentType', '_cardAttachmentTypeLabel',
+  '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
   '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
   '_wcCardHeaderHtml', '_wcCardTilesHtml'];
 
@@ -41,6 +43,10 @@ function views() {
   const render = (fn, task, entries) => { dom.window.__t = task; dom.window.__e = entries; dom.window.document.body.innerHTML = vm.runInContext(`${fn}(window.__t, window.__e)`, ctx); return dom.window.document; };
   return {
     formatDate: (value) => { dom.window.__date = value; return vm.runInContext('_wcFmtDate(window.__date)', ctx); },
+    reportDelayDays: (reportDate, plannedEndDate) => {
+      dom.window.__reportDate = reportDate; dom.window.__plannedEndDate = plannedEndDate;
+      return vm.runInContext('_wcReportDelayDays(window.__reportDate, window.__plannedEndDate)', ctx);
+    },
     member: (t, e) => render('_wcMemberView', t, e),
     leader: (t, e) => render('_wcPMView', t, e),
     cardTiles: (t, e, c = []) => {
@@ -52,6 +58,19 @@ function views() {
       dom.window.__t = t; dom.window.__location = location;
       dom.window.document.body.innerHTML = vm.runInContext('_wcCardHeaderHtml(window.__t, window.__location)', ctx);
       return dom.window.document;
+    },
+    attachments: (t, e, files, leader) => {
+      dom.window.__t = t; dom.window.__e = e; dom.window.__files = files;
+      dom.window.document.body.innerHTML = vm.runInContext('_wcFilesHtml(window.__t, window.__e, window.__files, ' + leader + ')', ctx);
+      return dom.window.document;
+    },
+    attachmentType: (type, custom) => {
+      dom.window.document.body.innerHTML = `<select id="test-type"><option value="${type}" selected>${type}</option></select><input id="test-custom" value="${custom}"/>`;
+      dom.window.__form = { values: [], append(name, value) { this.values.push([name, value]); } };
+      try {
+        vm.runInContext('_appendCardAttachmentType(window.__form, "test")', ctx);
+        return dom.window.__form.values;
+      } catch (error) { return error.message; }
     },
     tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
     saveReportFilter: (taskId, filter) => { dom.window.__taskId = taskId; dom.window.__filter = filter; vm.runInContext('saveReportFilter(window.__taskId, window.__filter)', ctx); },
@@ -77,6 +96,14 @@ test('member view: quantity field instead of a bare percentage, share line, figu
   assert.match(d.body.textContent, /Voided/); assert.match(d.body.textContent, /Measured wrongly/);
 });
 
+test('report delay days count dates after the planned task end only', () => {
+  const view = views();
+  assert.equal(view.reportDelayDays('2026-03-10', '2026-03-09'), 1);
+  assert.equal(view.reportDelayDays('2026-03-09', '2026-03-09'), 0);
+  assert.equal(view.reportDelayDays('2026-03-08', '2026-03-09'), 0);
+  assert.equal(view.reportDelayDays('invalid', '2026-03-09'), 0);
+});
+
 test('report cards render photo, structured resources and delay details safely', () => {
   const d = views().member(task, [{
     id: 21, report_date: '2026-03-10', member_id: 101, work_done: 'Poured',
@@ -87,7 +114,7 @@ test('report cards render photo, structured resources and delay details safely',
   }]);
   assert.equal(d.querySelectorAll('img[alt="pour.jpg"]').length, 1);
   assert.match(d.body.textContent, /equipment: Pump · 1 unit · 3 hours/);
-  assert.match(d.body.textContent, /Delay: weather · 2 day\(s\)/);
+  assert.match(d.body.textContent.replace(/\s+/g, ' '), /Delay: weather · 2 day\(s\) past planned end/);
   assert.match(d.body.textContent, /Rain stopped the work\./);
 });
 
@@ -154,9 +181,6 @@ test('expanded leader task uses Details and Reports tabs, with queries inside th
   assert.doesNotMatch(details, /Start Date|End Date|Required priority|Excavate trenches/);
   assert.doesNotMatch(d.body.textContent, /Required priorityHigh/);
   assert.doesNotMatch(d.body.textContent, /How to read this task/);
-  assert.match(d.body.textContent, /Files/);
-  assert.match(d.body.textContent, /No task file attached/);
-  assert.match(d.body.textContent, /Add file/);
   assert.match(d.body.textContent, /All 3/);
   assert.match(d.body.textContent, /Pending 1/);
   assert.match(d.body.textContent, /Materials/);
@@ -206,6 +230,35 @@ test('card hierarchy chips show activity, location, dates and drawing', () => {
   assert.match(d.body.textContent, /Drawing S-04/);
 });
 
+test('task attachment tab lists legacy and multiple files and offers upload/removal to leaders', () => {
+  const d = views().attachments(
+    { ...task, linked_file_name: 'legacy.pdf' },
+    [{ id: 2, attachment_name: 'report.jpg', report_date: '2026-03-10' }],
+    [{ id: 9, file_name: 'drawing.dwg', file_url: 'https://files.test/drawing.dwg',
+      attachment_type: 'site_photos' }],
+    true,
+  );
+  assert.match(d.body.textContent, /legacy\.pdf/);
+  assert.match(d.body.textContent, /drawing\.dwg/);
+  assert.match(d.body.textContent, /Site photos \/ field evidence/);
+  assert.match(d.body.textContent, /report\.jpg/);
+  assert.ok(d.querySelector('[data-wc-attachment-input][multiple]'));
+  assert.ok(d.querySelector('#wc-card-attachment-type-type option[value="other"]'));
+  assert.ok(d.querySelector('[data-wc-attachment-delete="9"]'));
+});
+
+test('card attachment upload includes a custom label only when Other is selected', () => {
+  const view = views();
+  assert.deepEqual(view.attachmentType('daily_progress', ''), [
+    ['attachmentType', 'daily_progress'], ['customAttachmentType', ''],
+  ]);
+  assert.deepEqual(view.attachmentType('other', 'Calibration certificate'), [
+    ['attachmentType', 'other'], ['customAttachmentType', 'Calibration certificate'],
+  ]);
+  assert.match(view.attachmentType('', ''), /Choose an attachment type/);
+  assert.match(view.attachmentType('other', ''), /Enter a custom attachment type/);
+});
+
 test('internal task-card links are buttons and leader choices are selected from project items', async () => {
   const dom = new JSDOM('<!doctype html><body><div id="wc-detail-5"><div id="card"><div role="tablist"></div><div data-wc-pane="details"></div></div></div></body>',
     { runScripts: 'outside-only', url: 'http://localhost/' });
@@ -239,13 +292,16 @@ test('internal task-card links are buttons and leader choices are selected from 
     }`, ctx);
   vm.runInContext(extract([
     '_wcFmtDate', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcHistoryText',
-    '_wcCardHeaderHtml', '_wcCardTilesHtml', '_wcRenderTaskCardExtras', '_wcOpenInternalTaskLink',
+    '_cardAttachmentTypeOptions', '_cardAttachmentTypeFields', '_cardAttachmentTypeLabel',
+    '_wcCardHeaderHtml', '_wcCardTilesHtml', '_wcFilesHtml', '_wcRenderTaskCardExtras', '_wcOpenInternalTaskLink',
   ]), ctx);
   dom.window.__navigation = [];
   dom.window.__task = { ...task, activity_title: 'Excavation' };
   await vm.runInContext(`_wcRenderTaskCardExtras(window.__task, document.getElementById('card'), true, [])`, ctx);
   const d = dom.window.document;
   assert.equal(d.querySelectorAll('[data-card-operation="link-open"]').length, 3);
+  assert.ok(d.querySelector('[data-wc-tab="attachments"]'));
+  assert.ok(d.querySelector('[data-wc-pane="attachments"] input[type="file"][multiple]'));
   assert.equal(d.querySelector('a[href="https://example.test/spec"]')?.textContent, 'External spec');
   const typeSelect = d.querySelector('[data-card-field="link-type"]');
   const targetSelect = d.querySelector('[data-card-field="link-target"]');
@@ -276,7 +332,7 @@ test('internal task-card links are buttons and leader choices are selected from 
 test('expanded standalone task does not show a task-level query tab', () => {
   const d = views().tabbed({ ...task, activity_id: null, activity_title: null }, [], [], false);
   assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
-  assert.match(d.body.textContent, /Files/);
+  assert.match(d.body.textContent, /Task plan/);
 });
 
 test('leader reports default to All when there are no pending reports', () => {
