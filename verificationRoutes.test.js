@@ -283,3 +283,93 @@ test('completion: needs 100% and no open rework; snags keep the activity open un
   assert.equal(revisedClosed.body.activity_closed, true);
   assert.equal(Number((await q(`SELECT certified_progress_pct FROM planning_execution WHERE id=$1`, [act.id]))[0].certified_progress_pct), 100);
 });
+
+test('read receipts, unread markers and history', async () => {
+  const c = await call('POST', '/api/planning-execution/create-with-tasks', leader, { ...common, title: 'Receipt check', activity_type: 'percentage',
+    tasks: [{ title: 'Receipt task', assigned_members: [{ id: 101 }] }] });
+  assert.equal(c.status, 201, JSON.stringify(c.body));
+  const a = c.body.activity, t1 = c.body.tasks[0];
+  const claim = async (date, pct) => { const r = await report(m(101), { taskId: t1.id, reportDate: date, progressPct: pct }); assert.equal(r.status, 201, JSON.stringify(r.body)); await approve(r.body.entry.id); };
+  await claim('2026-03-10', 30);
+  const req1 = await call('POST', `/api/activities/${a.id}/verifications`, leader, { note: 'Receipt request', signers: [{ role: 'TeamMember', user_id: 201, position: 'Inspector' }] });
+  assert.equal(req1.status, 201, JSON.stringify(req1.body));
+  const id = req1.body.verification.id;
+  const pendingRow = async (user) => (await call('GET', '/api/verifications/pending?projectId=1', user)).body.pending.find((v) => v.id === id);
+
+  // nobody has opened it: unread for the consultant side, "not opened" for the contractor
+  const unread = await pendingRow(cons);
+  assert.equal(unread.is_unread, true);
+  assert.equal(unread.seen_at, null);
+  assert.equal((await pendingRow(leader)).seen_at, null);
+  assert.equal((await pendingRow(leader)).is_unread, false);               // the marker is for the consultant side only
+
+  // only the consultant side can record a read
+  assert.equal((await call('POST', `/api/verifications/${id}/read`, leader, {})).status, 403);
+  assert.equal((await call('POST', `/api/verifications/${id}/read`, m(102), {})).status, 403);   // contractor member
+  assert.equal((await call('POST', `/api/verifications/${id}/read`, client, {})).status, 403);
+  assert.equal((await call('POST', '/api/verifications/999999/read', cons, {})).status, 404);
+  const first = await call('POST', `/api/verifications/${id}/read`, cons, {});
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  const second = await call('POST', `/api/verifications/${id}/read`, cons, {});
+  assert.equal(second.body.first_read_at, first.body.first_read_at);        // the first opening is kept
+
+  // read for the leader who opened it, still unread for the named inspector, and the contractor sees "opened"
+  assert.equal((await pendingRow(cons)).is_unread, false);
+  assert.equal((await pendingRow(m(201))).is_unread, true);
+  assert.equal((await call('POST', `/api/verifications/${id}/read`, m(201), {})).status, 200);
+  assert.equal((await pendingRow(m(201))).is_unread, false);
+  const seen = await pendingRow(leader);
+  assert.ok(seen.seen_at);
+  assert.equal(seen.seen_by_role, 'ConsultantPM');
+  assert.ok(!('reader_id' in seen));                                         // the contractor learns that it was opened, not by whom
+  const onCard = (await call('GET', `/api/activities/${a.id}/verifications`, leader)).body.verifications.find((v) => v.id === id);
+  assert.ok(onCard.seen_at);
+
+  // decide, then the request moves to history; pending no longer lists it
+  const decided = await call('PUT', `/api/verifications/${id}/decide`, cons, { status: 'verified', skip_inspectors: 'true' });
+  assert.equal(decided.status, 200, JSON.stringify(decided.body));
+  assert.equal(await pendingRow(cons), undefined);
+  const hist = (user, query = '') => call('GET', `/api/verifications/history?projectId=1${query}`, user);
+  const h = (await hist(cons)).body.history.find((v) => v.id === id);
+  assert.equal(h.status, 'verified');
+  assert.equal(h.activity_title, 'Receipt check');
+  assert.ok(h.seen_at);
+  assert.ok(!('shared_evidence' in h) && !('claimed_figures' in h));         // heavy fields stay on the activity card
+  assert.ok((await hist(leader)).body.history.some((v) => v.id === id));
+  assert.ok((await hist(m(201))).body.history.some((v) => v.id === id));     // the named inspector
+  assert.ok(!(await hist(m(102))).body.history.some((v) => v.id === id));    // a contractor member who is no signer
+  assert.equal((await hist(client)).status, 403);
+
+  // outcome filter, search (a typed % is not a wildcard) and paging
+  const has = async (query) => (await hist(cons, query)).body.history.some((v) => v.id === id);
+  assert.equal(await has('&status=verified'), true);
+  assert.equal(await has('&status=rejected'), false);
+  assert.equal((await hist(cons, '&status=maybe')).status, 400);
+  assert.equal(await has('&q=receipt'), true);
+  assert.equal(await has('&q=Receipt%20request'), true);                     // request note
+  assert.equal(await has('&q=zzzz-no-match'), false);
+  assert.equal(await has('&q=%25'), false);
+  const paged = (await hist(cons, '&limit=1')).body;
+  assert.equal(paged.history.length, 1);
+  assert.equal(paged.has_more, true);
+  const next = (await hist(cons, '&limit=1&offset=1')).body;
+  assert.notEqual(next.history[0]?.id, paged.history[0].id);
+
+  // a request decided without a separate "open" still counts as opened by the decider
+  await claim('2026-03-11', 50);
+  const req2 = await call('POST', `/api/activities/${a.id}/verifications`, leader, { note: 'Second request' });
+  assert.equal(req2.status, 201, JSON.stringify(req2.body));
+  const rejected = await call('PUT', `/api/verifications/${req2.body.verification.id}/decide`, cons, { status: 'rejected', reason: 'Not measured yet' });
+  assert.equal(rejected.status, 200, JSON.stringify(rejected.body));
+  const h2 = (await hist(leader, '&status=rejected')).body.history.find((v) => v.id === req2.body.verification.id);
+  assert.ok(h2.seen_at);
+  assert.equal(h2.decision_reason, 'Not measured yet');
+
+  // a withdrawn request that nobody opened says so
+  const req3 = await call('POST', `/api/activities/${a.id}/verifications`, leader, { note: 'Third request' });
+  assert.equal(req3.status, 201, JSON.stringify(req3.body));
+  assert.equal((await call('PUT', `/api/verifications/${req3.body.verification.id}/withdraw`, leader, {})).status, 200);
+  const h3 = (await hist(leader, '&status=withdrawn')).body.history.find((v) => v.id === req3.body.verification.id);
+  assert.equal(h3.status, 'withdrawn');
+  assert.equal(h3.seen_at, null);
+});

@@ -95,6 +95,16 @@ async function certifiedProgressWithSnagCaps(client, activityId, proposedProgres
 
 const MAX_SHARED_EVIDENCE_REPORTS = 200;
 
+// Read receipt columns for a verification row aliased "v": when the consultant side first opened it, and by which role.
+const SEEN_SQL = `(SELECT MIN(rd.first_read_at) FROM verification_reads rd WHERE rd.verification_id = v.id) AS seen_at,
+                (SELECT rd.reader_role FROM verification_reads rd WHERE rd.verification_id = v.id
+                  ORDER BY rd.first_read_at, rd.reader_id LIMIT 1) AS seen_by_role`;
+
+const markRead = (db, verificationId, projectId, role, userId) => db.query(
+  `INSERT INTO verification_reads (verification_id, project_id, reader_role, reader_id) VALUES ($1,$2,$3,$4)
+   ON CONFLICT (verification_id, reader_role, reader_id) DO UPDATE SET last_read_at = NOW()
+   RETURNING first_read_at, last_read_at`, [verificationId, projectId, role, userId]);
+
 /** Frozen copy of the approved reports of an activity up to the cut-off date, limited to fields a reviewer needs.
  *  No member identity, no private notes, no task ids. */
 async function buildSharedEvidence(client, activityId, cutOff) {
@@ -401,6 +411,7 @@ export function registerVerificationRoutes(app, deps) {
          WHERE id = $1 RETURNING *`,
         [v.id, status, certified, certifiedFigures ? JSON.stringify(certifiedFigures) : null, reason || null,
          JSON.stringify(attachments), userId, role])).rows[0];
+      await markRead(client, v.id, v.project_id, role, userId);
 
       await client.query(
         `INSERT INTO verification_signers (verification_id, project_id, signer_role, signer_user_id, is_decider, order_no, status, outcome, note, signed_at)
@@ -663,7 +674,7 @@ export function registerVerificationRoutes(app, deps) {
       if (!act) throw new HttpError(404, 'Activity not found.');
       if (!(await isMember(deps, act.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
       const verifications = (await pool.query(
-        `SELECT v.*, (v.status = 'pending' AND v.respond_by < CURRENT_DATE) AS overdue,
+        `SELECT v.*, (v.status = 'pending' AND v.respond_by < CURRENT_DATE) AS overdue, ${SEEN_SQL},
                 COALESCE((SELECT json_agg(s ORDER BY s.order_no) FROM verification_signers s WHERE s.verification_id = v.id), '[]') AS signers,
                 COALESCE((SELECT json_agg(r ORDER BY r.changed_at) FROM activity_verification_decision_revisions r WHERE r.verification_id = v.id), '[]') AS decision_revisions
          FROM activity_verifications v WHERE v.activity_id = $1 ORDER BY v.id DESC`, [act.id])).rows;
@@ -691,19 +702,80 @@ export function registerVerificationRoutes(app, deps) {
                 st.title AS stage_title, (v.respond_by < CURRENT_DATE) AS overdue,
                 (v.respond_by - CURRENT_DATE)::int AS days_left,
                 (SELECT COUNT(*)::int FROM verification_signers x
-                  WHERE x.verification_id = v.id AND x.is_team_member AND x.status = 'pending') AS pending_inspectors
+                  WHERE x.verification_id = v.id AND x.is_team_member AND x.status = 'pending') AS pending_inspectors,
+                NOT EXISTS (SELECT 1 FROM verification_reads me WHERE me.verification_id = v.id
+                  AND me.reader_id = $3 AND me.reader_role = $4) AS is_unread, ${SEEN_SQL}
          FROM activity_verifications v JOIN planning_execution pe ON pe.id = v.activity_id
          LEFT JOIN task_stages st ON st.id = v.stage_id
          WHERE v.project_id = $1 AND v.status = 'pending'
            AND ($2 = 'Consultant' OR $2 = 'Contractor'
                 OR EXISTS (SELECT 1 FROM verification_signers x WHERE x.verification_id = v.id AND x.signer_role = 'TeamMember' AND x.signer_user_id = $3))
-         ORDER BY v.respond_by, v.id`, [projectId, s || 'TeamMember', userId])).rows;
+         ORDER BY v.respond_by, v.id`, [projectId, s || 'TeamMember', userId, role])).rows;
       const consultantView = s === 'Consultant' || (role === 'TeamMember' && (await pool.query(
         `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
         [projectId, userId])).rows.length > 0);
-      if (!consultantView) return res.json({ pending: rows });
+      if (!consultantView) return res.json({ pending: rows.map((row) => ({ ...row, is_unread: false })) });
       const pending = rows.map(consultantProjection);
       return res.json({ pending });
     } catch (err) { return fail(res, err, 'GET /api/verifications/pending:'); }
+  });
+
+  // Earlier requests (decided or withdrawn), newest first, with search and an outcome filter.
+  // Visible to the same people who can see pending requests. Heavy fields are left out: the activity card has them.
+  app.get('/api/verifications/history', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.query.projectId, 10);
+      if (!projectId) throw new HttpError(400, 'projectId is required.');
+      const s = isWCLeader(role) ? wcSide(role) : null;
+      if (s !== 'Contractor' && s !== 'Consultant' && role !== 'TeamMember') throw new HttpError(403, 'You cannot see verification requests.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const status = String(req.query.status || '').trim();
+      if (status && !['verified', 'verified_with_changes', 'rejected', 'withdrawn'].includes(status))
+        throw new HttpError(400, 'status must be verified, verified_with_changes, rejected, or withdrawn.');
+      const text = String(req.query.q || '').trim().slice(0, 100);
+      const like = text ? `%${text.replace(/[\\%_]/g, '\\$&')}%` : null;
+      const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 25));
+      const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+      const rows = (await pool.query(
+        `SELECT v.*, pe.title AS activity_title, pe.unit AS activity_unit, st.title AS stage_title, ${SEEN_SQL}
+         FROM activity_verifications v JOIN planning_execution pe ON pe.id = v.activity_id
+         LEFT JOIN task_stages st ON st.id = v.stage_id
+         WHERE v.project_id = $1 AND v.status <> 'pending'
+           AND ($2 = 'Consultant' OR $2 = 'Contractor'
+                OR EXISTS (SELECT 1 FROM verification_signers x WHERE x.verification_id = v.id AND x.signer_role = 'TeamMember' AND x.signer_user_id = $3))
+           AND ($4::text IS NULL OR v.status = $4::text)
+           AND ($5::text IS NULL OR pe.title ILIKE $5::text OR v.request_note ILIKE $5::text
+                OR v.decision_reason ILIKE $5::text OR REPLACE(v.kind, '_', ' ') ILIKE $5::text)
+         ORDER BY COALESCE(v.decided_at, v.requested_at) DESC, v.id DESC
+         LIMIT $6 OFFSET $7`, [projectId, s || 'TeamMember', userId, status || null, like, limit + 1, offset])).rows;
+      const consultantView = s === 'Consultant' || (role === 'TeamMember' && (await pool.query(
+        `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
+        [projectId, userId])).rows.length > 0);
+      const slim = ({ shared_evidence, shared_activity_summary, claimed_figures, ...rest }) => rest;
+      const page = rows.slice(0, limit).map((row) => slim(consultantView ? consultantProjection(row) : row));
+      return res.json({ history: page, has_more: rows.length > limit });
+    } catch (err) { return fail(res, err, 'GET /api/verifications/history:'); }
+  });
+
+  // Read receipt: the first time a consultant-side reader opens a request, it is recorded. Opening again only moves last_read_at.
+  app.post('/api/verifications/:id/read', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const id = parseInt(req.params.id, 10);
+      if (!id) throw new HttpError(400, 'A verification id is required.');
+      const v = (await pool.query(`SELECT id, project_id FROM activity_verifications WHERE id = $1`, [id])).rows[0];
+      if (!v) throw new HttpError(404, 'Verification not found.');
+      if (!(await isMember(deps, v.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      let allowed = leaderOn(role, 'Consultant');
+      if (!allowed && role === 'TeamMember') {
+        allowed = (await pool.query(
+          `SELECT 1 FROM verification_signers WHERE verification_id = $1 AND signer_role = 'TeamMember' AND signer_user_id = $2 LIMIT 1`,
+          [id, userId])).rows.length > 0;
+      }
+      if (!allowed) throw new HttpError(403, 'Only the consultant side can mark a request as read.');
+      const r = (await markRead(pool, v.id, v.project_id, role, userId)).rows[0];
+      return res.json({ success: true, first_read_at: r.first_read_at, last_read_at: r.last_read_at });
+    } catch (err) { return fail(res, err, 'POST /api/verifications/:id/read:'); }
   });
 }

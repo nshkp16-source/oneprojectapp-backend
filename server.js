@@ -7393,6 +7393,8 @@ app.get('/api/get-schedule', authenticateToken, async (req, res) => {
         weight_pct:ms.weight_pct,float_days:ms.float_days,is_critical:ms.is_critical,
         executed:ms.executed,progress_pct:ms.progress_pct,activity_status:ms.activity_status,
         completed_at:ms.completed_at,entries:ms.entries,
+        // the milestone card decides between the typed log and the certified activity log from this field
+        progress_source:ms.progress_source||'manual',
         activityEntries:derivedByMilestone.get(key)||[],
         consultantProgressRequest:requestsByMilestone.get(key)||null,
         hasConsultant,fileName:ms.attachments?.[0]?.fileName||null,
@@ -8072,7 +8074,7 @@ app.get('/api/notifications/target', authenticateToken, async (req, res) => {
 // =============================================================================
 const progressModelDeps = {
   pool, authenticateToken, upload, reportUpload: workCenterReportUpload,
-  requireProjectLifecycleWrite, scheduleCloudinaryUpload,
+  requireProjectLifecycleWrite, scheduleCloudinaryUpload, cloudinary,
   wcSide, isWCLeader, sideRoles, flowKey,
   notify: ({ projectId, entityId, entityType, message, actorId, actorRole, recipients }) =>
     notifyRecordUsers({ projectId, recordId: entityId, table: entityType, message, actorId, actorRole, recipients }),
@@ -8872,7 +8874,8 @@ app.get('/api/work-center/team-members', authenticateToken, async (req, res) => 
 
 // ── Create task (leaders/PMs only) ────────────────────────────────────────────
 app.post('/api/work-center', authenticateToken,
-  upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
+  upload.fields([{ name: 'linked_file', maxCount: 1 }, { name: 'attachments', maxCount: 20 }]),
+  requireProjectLifecycleWrite, async (req, res) => {
   try {
     const { user_id, role } = req.user;
     if (!isWCLeader(role))
@@ -8946,6 +8949,7 @@ app.post('/api/work-center', authenticateToken,
       return res.status(400).json({ error: 'Task location fields cannot exceed 150 characters.' });
 
     const client = await pool.connect();
+    const uploadedAttachmentIds = [];
     try {
       await client.query('BEGIN');
       const result = await client.query(`
@@ -8970,10 +8974,34 @@ app.post('/api/work-center', authenticateToken,
            VALUES ($1,$2,$3,$4,$5,$6)`,
           [task.id, projectId, i + 1, String(stage.title).trim(), Number(stage.weight_pct), !!stage.is_hold_point]);
       }
+      const attachmentFiles = [
+        ...(req.files?.attachments || []),
+        ...(req.files?.linked_file || []),
+      ];
+      for (const file of attachmentFiles) {
+        const uploaded = await scheduleCloudinaryUpload(file.buffer, file.originalname, 'work_center/attachments');
+        uploadedAttachmentIds.push({ id: uploaded.public_id, resourceType: uploaded.resource_type || 'raw' });
+        await client.query(
+          `INSERT INTO card_attachments
+             (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
+              resource_type, uploaded_by_id, uploaded_by_role)
+           VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [projectId, task.id, file.originalname, uploaded.public_id, uploaded.secure_url,
+            file.mimetype || null, uploaded.resource_type || 'raw', user_id, role]);
+      }
       await client.query('COMMIT');
       return res.status(201).json({ success: true, task });
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
+      for (const uploaded of uploadedAttachmentIds) {
+        try {
+          const result = await cloudinary.uploader.destroy(uploaded.id, { resource_type: uploaded.resourceType });
+          if (!['ok', 'not found'].includes(result?.result))
+            console.error('POST /api/work-center: attachment cleanup failed', uploaded.id, result?.result);
+        } catch (cleanupError) {
+          console.error('POST /api/work-center: attachment cleanup failed', uploaded.id, cleanupError);
+        }
+      }
       throw err;
     } finally { client.release(); }
   } catch (err) {
@@ -9209,6 +9237,7 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
         return res.status(403).json({ error: 'Access denied.' });
       const result = await pool.query(`
         SELECT p.*,
+               COALESCE(GREATEST(p.report_date - w.end_date, 0), 0)::int AS schedule_delay_days,
                t.email       AS member_email,
                tma.position  AS member_position,
                tma.name      AS member_title,
@@ -9228,6 +9257,7 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                    ORDER BY rma.id DESC LIMIT 1)
                ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
         FROM   workspace_work_center_progress p
+        JOIN   workspace_work_center w ON w.id = p.task_id
         JOIN   team_members t ON t.id = p.member_id
         LEFT JOIN LATERAL (
                SELECT position, name
@@ -9248,7 +9278,8 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
         return res.status(403).json({ error: 'You are not assigned to this task.' });
       const result = await pool.query(
         `SELECT p.*,
-                COALESCE((SELECT json_agg(json_build_object(
+                COALESCE(GREATEST(p.report_date - w.end_date, 0), 0)::int AS schedule_delay_days,
+        COALESCE((SELECT json_agg(json_build_object(
                   'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
                   'captured_at', ph.captured_at, 'latitude', ph.latitude,
                   'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
@@ -9264,7 +9295,8 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                     ORDER BY rma.id DESC LIMIT 1)
                 ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
          FROM workspace_work_center_progress p
-         WHERE task_id = $1 AND member_id = $2 ORDER BY submitted_at DESC`,
+         JOIN workspace_work_center w ON w.id = p.task_id
+         WHERE p.task_id = $1 AND p.member_id = $2 ORDER BY p.submitted_at DESC`,
         [taskId, user_id]
       );
       return res.json({ entries: result.rows });
