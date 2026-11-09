@@ -87,10 +87,10 @@ function uploadToCloudinary(buffer, folder, resourceType = 'auto') {
   });
 }
 
-function scheduleCloudinaryUpload(buffer, originalName, folder) {
+function scheduleCloudinaryUpload(buffer, _originalName, folder) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
-      { folder, resource_type: 'auto', public_id: `${Date.now()}_${originalName}` },
+      { folder, resource_type: 'auto', public_id: `${Date.now()}_${uuidv4()}` },
       (err, result) => (err ? reject(err) : resolve(result))
     );
     Readable.from(buffer).pipe(stream);
