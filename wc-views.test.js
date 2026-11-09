@@ -23,7 +23,7 @@ function extract(names) {
 const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
   'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
   '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow',
-  '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_wcSupportingAttachmentGroupHtml',
+  '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_wcUpdateSupportingAttachmentGroup', '_wcSupportingAttachmentGroupHtml',
   '_wcReportSupportingAttachmentsHtml', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
   '_wcCardHeaderHtml', '_wcCardTilesHtml'];
 
@@ -49,6 +49,12 @@ function views() {
     },
     member: (t, e) => render('_wcMemberView', t, e),
     leader: (t, e) => render('_wcPMView', t, e),
+    updateSupportingGroup: (group, type) => {
+      dom.window.__group = group;
+      dom.window.__type = type;
+      vm.runInContext(`window.__group.querySelector('[data-supporting-type]').value = window.__type;
+        _wcUpdateSupportingAttachmentGroup(window.__group)`, ctx);
+    },
     cardTiles: (t, e, c = []) => {
       dom.window.__t = t; dom.window.__e = e; dom.window.__c = c;
       dom.window.document.body.innerHTML = vm.runInContext('_wcCardTilesHtml(window.__t, window.__e, window.__c)', ctx);
@@ -237,7 +243,8 @@ test('task attachment tab lists legacy and multiple files and offers upload/remo
 });
 
 test('progress report has exactly Photos and type-first Supporting attachments', () => {
-  const d = views().member(task, entries);
+  const view = views();
+  const d = view.member(task, entries);
   assert.equal(d.querySelectorAll('input[type="file"]').length, 2);
   assert.ok(d.querySelector(`#wc-pr-photos-${task.id}[multiple][accept="image/*"]`));
   const supportingFiles = [...d.querySelectorAll('input[type="file"]')]
@@ -248,9 +255,20 @@ test('progress report has exactly Photos and type-first Supporting attachments',
   assert.equal(d.querySelector(`#wc-pr-file-${task.id}`), null);
   const group = d.querySelector('[data-wc-supporting-group]');
   assert.ok(group.querySelector('[data-supporting-type]'));
-  assert.ok(group.querySelector('[data-supporting-custom][disabled]'));
+  const customWrap = group.querySelector('[data-supporting-custom-wrap]');
+  assert.equal(customWrap.hidden, true);
+  assert.equal(customWrap.style.display, 'none');
+  assert.ok(customWrap.querySelector('[data-supporting-custom][disabled]'));
   assert.match(group.textContent, /Evidence title/);
-  assert.match(group.textContent, /Custom title \(required for Other\)/);
+  assert.match(customWrap.textContent, /Custom title \(required for Other\)/);
+  view.updateSupportingGroup(group, 'other');
+  assert.equal(customWrap.hidden, false);
+  assert.equal(customWrap.style.display, 'block');
+  assert.equal(customWrap.querySelector('[data-supporting-custom]').disabled, false);
+  assert.equal(customWrap.querySelector('[data-supporting-custom]').required, true);
+  view.updateSupportingGroup(group, 'daily_progress');
+  assert.equal(customWrap.hidden, true);
+  assert.equal(customWrap.style.display, 'none');
 });
 
 test('progress submission pairs each supporting file with its chosen title', async () => {
