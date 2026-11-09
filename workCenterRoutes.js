@@ -306,7 +306,7 @@ function registerReportRoutes(app, deps) {
           return parsed;
         });
       } else if (b.supportingAttachmentMetadata) {
-        throw new HttpError(400, 'Choose supporting files before setting their evidence types.');
+        throw new HttpError(400, 'Choose supporting files before setting their titles.');
       }
       if (photos.length > 10) throw new HttpError(400, 'A report can include at most 10 photos.');
       let photoMeta = [];
@@ -1034,7 +1034,7 @@ const taskCards = (function () {
              WHERE d.task_id = $1 AND d.project_id = $2 ORDER BY w.id`,
             [taskId, projectId]),
           pool.query(
-            `SELECT id, file_name, file_id, file_url, mime_type, attachment_type, custom_attachment_type, created_at
+            `SELECT id, file_name, file_id, file_url, mime_type, created_at
              FROM card_attachments
              WHERE project_id = $1 AND entity_type = 'work_center_task' AND entity_id = $2
              ORDER BY created_at, id`, [projectId, taskId]),
@@ -1088,12 +1088,11 @@ const taskCards = (function () {
           const attachment = (await pool.query(
             `INSERT INTO card_attachments
                (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
-                resource_type, attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role)
-             VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-             RETURNING id, file_name, file_id, file_url, mime_type, attachment_type, custom_attachment_type, created_at`,
+                resource_type, uploaded_by_id, uploaded_by_role)
+             VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9)
+             RETURNING id, file_name, file_id, file_url, mime_type, created_at`,
             [projectId, taskId, file.originalname, uploaded.public_id, uploaded.secure_url,
-              file.mimetype || null, uploaded.resource_type || 'raw', 'other',
-              null, req.user.user_id, req.user.role])).rows[0];
+              file.mimetype || null, uploaded.resource_type || 'raw', req.user.user_id, req.user.role])).rows[0];
           saved.push(attachment);
         }
         await audit(task, projectId, req.user.user_id, req.user.role, 'attachments_added',

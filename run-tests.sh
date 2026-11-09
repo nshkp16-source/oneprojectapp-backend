@@ -30,7 +30,8 @@ load() {
            "$HERE/migrations/2026-11-07-work-center-task-card.sql" \
            "$HERE/migrations/2026-11-08-card-attachments.sql" \
            "$HERE/migrations/2026-11-09-verification-shared-evidence.sql" \
-           "$HERE/migrations/2026-11-10-verification-read-receipts.sql"; do
+           "$HERE/migrations/2026-11-10-verification-read-receipts.sql" \
+           "$HERE/migrations/2026-11-11-report-supporting-attachments.sql"; do
     $PSQL -d "$DB" -f "$f" > /dev/null 2>/tmp/run-tests-load.err || { echo "Failed loading $f"; cat /tmp/run-tests-load.err; exit 1; }
   done
 }
@@ -40,7 +41,7 @@ node --test \
   "$HERE/progressRules.test.js" "$HERE/workflow-dashboard.test.js" \
   "$HERE/activity-card-ui.test.js" \
   "$HERE/project-resolution.test.js" "$HERE/activity-form-v2.test.js" \
-  "$HERE/wc-reports-v2.test.js" "$HERE/wc-views.test.js" \
+  "$HERE/wc-reports-v2.test.js" "$HERE/wc-views.test.js" "$HERE/supportingAttachmentTypes.test.js" \
   "$HERE/notificationTarget.test.js" "$HERE/verificationReminderJob.test.js" \
   "$HERE/pending-list.test.js" || FAILED=1
 for t in activityRoutes reportRoutes verificationRoutes milestoneRoutes taskQueryRoutes; do

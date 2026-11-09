@@ -61,9 +61,8 @@ const workCenterReportUpload = multer({
   storage: multer.memoryStorage(),
   fileFilter: (_req, file, cb) => {
     const imageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif']);
-    const isImage = imageTypes.has(file.mimetype);
     const isAllowed = file.fieldname === 'attachment' || file.fieldname === 'supporting_attachments'
-      || (file.fieldname === 'photos' && isImage);
+      || imageTypes.has(file.mimetype);
     cb(isAllowed ? null : new Error('Report photos must be images.'), isAllowed);
   },
 });
@@ -8885,10 +8884,6 @@ app.post('/api/work-center', authenticateToken,
 
     const side = wcSide(role);
     const b = req.body || {};
-    const attachmentFiles = [
-      ...(req.files?.attachments || []),
-      ...(req.files?.linked_file || []),
-    ];
     const projectId = parseInt(b.projectId, 10);
     const title = String(b.title || '').trim();
     const startDate = validDate(b.start_date);
@@ -8980,17 +8975,20 @@ app.post('/api/work-center', authenticateToken,
            VALUES ($1,$2,$3,$4,$5,$6)`,
           [task.id, projectId, i + 1, String(stage.title).trim(), Number(stage.weight_pct), !!stage.is_hold_point]);
       }
+      const attachmentFiles = [
+        ...(req.files?.attachments || []),
+        ...(req.files?.linked_file || []),
+      ];
       for (const file of attachmentFiles) {
         const uploaded = await scheduleCloudinaryUpload(file.buffer, file.originalname, 'work_center/attachments');
         uploadedAttachmentIds.push({ id: uploaded.public_id, resourceType: uploaded.resource_type || 'raw' });
         await client.query(
           `INSERT INTO card_attachments
              (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
-              resource_type, attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role)
-           VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+              resource_type, uploaded_by_id, uploaded_by_role)
+           VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9)`,
           [projectId, task.id, file.originalname, uploaded.public_id, uploaded.secure_url,
-            file.mimetype || null, uploaded.resource_type || 'raw', 'other',
-            null, user_id, role]);
+            file.mimetype || null, uploaded.resource_type || 'raw', user_id, role]);
       }
       await client.query('COMMIT');
       return res.status(201).json({ success: true, task });

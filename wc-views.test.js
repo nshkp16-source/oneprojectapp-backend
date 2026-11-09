@@ -20,25 +20,11 @@ function extract(names) {
   return names.map((n) => found[n]).join('\n');
 }
 
-function extractWindowFunction(name) {
-  for (const src of scripts) {
-    const ast = acorn.parse(src, { ecmaVersion: 'latest', sourceType: 'script' });
-    for (const node of ast.body) {
-      if (node.type !== 'ExpressionStatement' || node.expression.type !== 'AssignmentExpression') continue;
-      const { left, right } = node.expression;
-      if (left.type === 'MemberExpression' && left.object.name === 'window'
-        && left.property.name === name && right.type === 'FunctionExpression')
-        return src.slice(node.start, node.end);
-    }
-  }
-  assert.fail(`window.${name} not found in dashboard.html`);
-}
-
 const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
-  'wcPriorityBadge', '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel',
-  '_wcReportSupportingAttachmentsHtml', '_wcSupportingAttachmentGroupHtml',
-  '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
-  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
+  'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
+  '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow',
+  '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_wcSupportingAttachmentGroupHtml',
+  '_wcReportSupportingAttachmentsHtml', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
   '_wcCardHeaderHtml', '_wcCardTilesHtml'];
 
 function views() {
@@ -46,7 +32,6 @@ function views() {
   const ctx = dom.getInternalVMContext();
   vm.runInContext(`function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
   vm.runInContext(extract(HELPERS), ctx);
-  vm.runInContext(extractWindowFunction('_peSharedEvidenceHtml'), ctx);
   vm.runInContext(`function tabbed(task, entries, queries, leader) {
     document.body.innerHTML = leader ? _wcPMView(task, entries) : _wcMemberView(task, entries);
     _wcTabifyDetail(document.body, task, entries, queries, leader, true);
@@ -77,13 +62,6 @@ function views() {
     attachments: (t, e, files, leader) => {
       dom.window.__t = t; dom.window.__e = e; dom.window.__files = files;
       dom.window.document.body.innerHTML = vm.runInContext('_wcFilesHtml(window.__t, window.__e, window.__files, ' + leader + ')', ctx);
-      return dom.window.document;
-    },
-    sharedEvidence: (evidence, unit) => {
-      dom.window.__evidence = evidence;
-      dom.window.__unit = unit;
-      dom.window.document.body.innerHTML = vm.runInContext(
-        'window._peSharedEvidenceHtml(window.__evidence, window.__unit)', ctx);
       return dom.window.document;
     },
     tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
@@ -244,49 +222,49 @@ test('card hierarchy chips show activity, location, dates and drawing', () => {
   assert.match(d.body.textContent, /Drawing S-04/);
 });
 
-test('task attachment tab lists generic task files and report supporting attachments', () => {
+test('task attachment tab lists legacy and multiple files and offers upload/removal to leaders', () => {
   const d = views().attachments(
     { ...task, linked_file_name: 'legacy.pdf' },
-    [{ id: 2, attachment_name: 'report.jpg', report_date: '2026-03-10',
-      supporting_attachments: [{ file_name: 'Cube test results.pdf', file_url: 'https://files.test/Cube-test-results.pdf',
-        attachment_type: 'quality_test' }] }],
-    [{ id: 9, file_name: 'drawing.dwg', file_url: 'https://files.test/drawing.dwg',
-      attachment_type: 'other' }],
+    [{ id: 2, attachment_name: 'report.jpg', report_date: '2026-03-10' }],
+    [{ id: 9, file_name: 'drawing.dwg', file_url: 'https://files.test/drawing.dwg' }],
     true,
   );
   assert.match(d.body.textContent, /legacy\.pdf/);
   assert.match(d.body.textContent, /drawing\.dwg/);
   assert.match(d.body.textContent, /report\.jpg/);
-  assert.match(d.body.textContent, /Cube test results\.pdf/);
-  assert.match(d.body.textContent, /Quality \/ test results/);
-  assert.equal(d.querySelector('[data-wc-attachment-filter]'), null);
-  assert.equal(d.querySelector('[data-wc-attachment-preview]').dataset.wcAttachmentName, 'drawing.dwg');
   assert.ok(d.querySelector('[data-wc-attachment-input][multiple]'));
   assert.ok(d.querySelector('[data-wc-attachment-delete="9"]'));
 });
 
-test('progress report has type-first, repeatable supporting attachment groups', () => {
+test('progress report has exactly Photos and type-first Supporting attachments', () => {
   const d = views().member(task, entries);
-  assert.ok(d.querySelector('[data-wc-supporting-groups]'));
+  assert.equal(d.querySelectorAll('input[type="file"]').length, 2);
+  assert.ok(d.querySelector(`#wc-pr-photos-${task.id}[multiple][accept="image/*"]`));
+  const supportingFiles = [...d.querySelectorAll('input[type="file"]')]
+    .find((input) => input.hasAttribute('data-supporting-files'));
+  assert.ok(supportingFiles);
+  assert.equal(supportingFiles.multiple, true);
+  assert.equal(supportingFiles.disabled, true);
+  assert.equal(d.querySelector(`#wc-pr-file-${task.id}`), null);
   const group = d.querySelector('[data-wc-supporting-group]');
   assert.ok(group.querySelector('[data-supporting-type]'));
-  assert.ok(group.querySelector('[data-supporting-files][multiple][disabled]'));
-  assert.ok(d.querySelector('[data-action="wc-add-supporting-attachment"]'));
+  assert.ok(group.querySelector('[data-supporting-custom][disabled]'));
   assert.match(group.textContent, /Evidence title/);
   assert.match(group.textContent, /Custom title \(required for Other\)/);
 });
 
-test('progress submission sends each supporting file beside its matching evidence title', async () => {
+test('progress submission pairs each supporting file with its chosen title', async () => {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
   const ctx = dom.getInternalVMContext();
+  dom.window.__form = null;
   vm.runInContext(`
     const API = '/api';
-    const recordsCache = { 'work-center': [{ id: 5, activity_type: 'quantity', end_date: '2026-03-10' }] };
+    const recordsCache = { 'work-center': [{ id: 5, activity_type: 'percentage', end_date: '2026-03-10' }] };
     async function ensureActiveProjectId() { return '1'; }
     function _wcTypeOf(task) { return task.activity_type; }
     function _wcReportDelayDays() { return 0; }
     async function _wcReadPhotoMetadata() { return {}; }
-    async function _wcFetch(_url, options) { window.__body = options.body; return { ok: true, json: async () => ({}) }; }
+    async function _wcFetch(_url, options) { window.__form = options.body; return { ok: true, json: async () => ({}) }; }
     async function _wcRefreshTaskCard() {}
     window._wcReportLocationByTask = {};
     window.alert = (message) => { throw new Error(message); };
@@ -294,7 +272,7 @@ test('progress submission sends each supporting file beside its matching evidenc
   vm.runInContext(extract(['_wcHandleSubmitProgress']), ctx);
   const d = dom.window.document;
   d.body.innerHTML = `
-    <input id="wc-pr-date-5" value="2026-03-10"/><input id="wc-pr-qty-5" value="2"/>
+    <input id="wc-pr-date-5" value="2026-03-10"/><input id="wc-pr-pct-5" value="20"/>
     <textarea id="wc-pr-work-5">Installed pipes</textarea>
     <input id="wc-pr-manpower-5"/><input id="wc-pr-equipment-5"/><input id="wc-pr-materials-5"/>
     <input id="wc-pr-issues-5"/><textarea id="wc-pr-notes-5"></textarea>
@@ -306,18 +284,17 @@ test('progress submission sends each supporting file beside its matching evidenc
       <div data-wc-supporting-group><select data-supporting-type><option value="other" selected></option></select>
         <input data-supporting-custom value="Calibration records"/><input data-supporting-files type="file" multiple/></div>
     </div>`;
-  const fileInputs = d.querySelectorAll('[data-supporting-files]');
-  const firstFiles = [
+  const inputs = d.querySelectorAll('[data-supporting-files]');
+  Object.defineProperty(inputs[0], 'files', { configurable: true, value: [
     new dom.window.File(['a'], 'daily-1.pdf', { type: 'application/pdf' }),
     new dom.window.File(['b'], 'daily-2.pdf', { type: 'application/pdf' }),
-  ];
-  Object.defineProperty(fileInputs[0], 'files', { configurable: true, value: firstFiles });
-  Object.defineProperty(fileInputs[1], 'files', { configurable: true, value: [
+  ] });
+  Object.defineProperty(inputs[1], 'files', { configurable: true, value: [
     new dom.window.File(['c'], 'calibration.pdf', { type: 'application/pdf' }),
   ] });
 
   await vm.runInContext(`_wcHandleSubmitProgress(5, 'work-center')`, ctx);
-  const body = dom.window.__body;
+  const body = dom.window.__form;
   assert.deepEqual(body.getAll('supporting_attachments').map((file) => file.name), [
     'daily-1.pdf', 'daily-2.pdf', 'calibration.pdf',
   ]);
@@ -328,26 +305,10 @@ test('progress submission sends each supporting file beside its matching evidenc
   ]);
 });
 
-test('task and activity creation retain generic multiple-file attachments', () => {
+test('task creation forms keep ordinary multiple-file inputs without evidence type selectors', () => {
   assert.match(html, /id="wc-cr-attachments" type="file" multiple/);
   assert.match(html, /id="pe2-attachments" type="file" multiple/);
   assert.doesNotMatch(html, /wc-create-attachment-type|wc-card-attachment-type|_appendCardAttachmentType/);
-});
-
-test('consultant shared evidence shows report supporting attachment names and evidence types', () => {
-  const d = views().sharedEvidence({
-    reports: [],
-    supporting_attachments: [{
-      task_title: 'Concrete pour',
-      report_date: '2026-03-10',
-      file_name: 'Cube test results.pdf',
-      file_url: 'https://files.test/Cube-test-results.pdf',
-      attachment_type: 'quality_test',
-    }],
-  }, 'm3');
-  assert.match(d.body.textContent, /Report supporting attachments \(1\)/);
-  assert.equal(d.querySelector('a[href="https://files.test/Cube-test-results.pdf"]').textContent, 'Cube test results.pdf');
-  assert.match(d.body.textContent, /Quality \/ test results/);
 });
 
 test('internal task-card links are buttons and leader choices are selected from project items', async () => {
@@ -357,10 +318,6 @@ test('internal task-card links are buttons and leader choices are selected from 
   const cardData = {
     location: {},
     comments: [], history: [], checklists: [],
-    attachments: [
-      { id: 11, file_name: 'daily.jpg', file_url: 'https://files.test/daily.jpg', attachment_type: 'daily_progress' },
-      { id: 12, file_name: 'plant.pdf', file_url: 'https://files.test/plant.pdf', attachment_type: 'equipment' },
-    ],
     links: [
       { id: 1, link_type: 'task', target_id: '22', title: 'Block B' },
       { id: 2, link_type: 'query', target_id: '5:31', title: 'Block A: Confirm the depth' },
@@ -396,8 +353,6 @@ test('internal task-card links are buttons and leader choices are selected from 
   assert.equal(d.querySelectorAll('[data-card-operation="link-open"]').length, 3);
   assert.ok(d.querySelector('[data-wc-tab="attachments"]'));
   assert.ok(d.querySelector('[data-wc-pane="attachments"] input[type="file"][multiple]'));
-  assert.equal(d.querySelector('[data-wc-attachment-filter]'), null);
-  assert.equal(d.querySelector('[data-wc-card-attachment-type]'), null);
   assert.equal(d.querySelector('a[href="https://example.test/spec"]')?.textContent, 'External spec');
   const typeSelect = d.querySelector('[data-card-field="link-type"]');
   const targetSelect = d.querySelector('[data-card-field="link-target"]');

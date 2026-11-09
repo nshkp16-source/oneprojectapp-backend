@@ -105,10 +105,10 @@ const markRead = (db, verificationId, projectId, role, userId) => db.query(
    ON CONFLICT (verification_id, reader_role, reader_id) DO UPDATE SET last_read_at = NOW()
    RETURNING first_read_at, last_read_at`, [verificationId, projectId, role, userId]);
 
-/** Frozen copy of approved report details and supporting attachments for consultant review.
+/** Frozen report details (when selected) and supporting files from approved reports.
  *  No member identity, private notes, or task ids are included. */
-async function buildSharedEvidence(client, activityId, cutOff, includeReports) {
-  const rows = (await client.query(
+async function buildSharedEvidence(client, activityId, cutOff, includeReportDetails) {
+  const { rows } = await client.query(
     `SELECT p.id, w.title AS task_title, p.report_date, p.work_done, p.quantity_done, p.quantity_failed,
             p.progress_pct, p.manpower, p.equipment, p.materials, p.issues, s.title AS stage_title,
             p.attachment_name, p.attachment_url,
@@ -126,18 +126,21 @@ async function buildSharedEvidence(client, activityId, cutOff, includeReports) {
      JOIN workspace_work_center w ON w.id = p.task_id
      LEFT JOIN task_stages s ON s.id = p.stage_id
      WHERE w.activity_id = $1 AND p.validation_status = 'approved' AND p.report_date <= $2
-     ORDER BY p.report_date DESC, p.id DESC LIMIT $3`, [activityId, cutOff, MAX_SHARED_EVIDENCE_REPORTS])).rows;
+     ORDER BY p.report_date DESC, p.id DESC LIMIT $3`, [activityId, cutOff, MAX_SHARED_EVIDENCE_REPORTS]);
   const supportingAttachments = rows.flatMap((r) => [
     ...(r.attachment_name ? [{
-      task_title: r.task_title, report_date: dateOnly(r.report_date),
-      file_name: r.attachment_name, file_url: r.attachment_url,
-      attachment_type: 'other', custom_attachment_type: null,
+      task_title: r.task_title,
+      report_date: dateOnly(r.report_date),
+      file_name: r.attachment_name,
+      file_url: r.attachment_url,
+      attachment_type: 'other',
+      custom_attachment_type: 'Legacy progress report attachment',
     }] : []),
-    ...(Array.isArray(r.supporting_attachments) ? r.supporting_attachments : []).map((attachment) => ({
+    ...(Array.isArray(r.supporting_attachments) ? r.supporting_attachments.map((attachment) => ({
       task_title: r.task_title,
       report_date: dateOnly(r.report_date),
       ...attachment,
-    })),
+    })) : []),
   ]);
   const reports = rows.map((r) => ({
     report_id: Number(r.id),
@@ -150,18 +153,14 @@ async function buildSharedEvidence(client, activityId, cutOff, includeReports) {
     stage_title: r.stage_title || null,
     manpower: r.manpower || '', equipment: r.equipment || '', materials: r.materials || '', issues: r.issues || '',
     photos: r.photos, resources: r.resources,
-    attachment_name: r.attachment_name || null,
-    attachment_url: r.attachment_url || null,
-    supporting_attachments: r.supporting_attachments,
   }));
   return {
-    reports: includeReports ? reports : [],
+    reports: includeReportDetails ? reports : [],
     supporting_attachments: supportingAttachments,
   };
 }
 
-/** What a consultant is allowed to read of a verification request. Report supporting attachments are included
- *  for review; approved report details and the activity plan remain opt-in. */
+/** Consultants always receive the approved reports' supporting files; report details remain opt-in. */
 function consultantProjection(verification) {
   const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
   const evidence = verification.shared_evidence;
