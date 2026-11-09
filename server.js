@@ -57,11 +57,13 @@ const photoUpload = multer({
 });
 
 const workCenterReportUpload = multer({
-  limits: { fileSize: 10 * 1024 * 1024, files: 11, fields: 50 },
+  limits: { fileSize: 10 * 1024 * 1024, files: 31, fields: 50 },
   storage: multer.memoryStorage(),
   fileFilter: (_req, file, cb) => {
     const imageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif']);
-    const isAllowed = file.fieldname === 'attachment' || imageTypes.has(file.mimetype);
+    const isImage = imageTypes.has(file.mimetype);
+    const isAllowed = file.fieldname === 'attachment' || file.fieldname === 'supporting_attachments'
+      || (file.fieldname === 'photos' && isImage);
     cb(isAllowed ? null : new Error('Report photos must be images.'), isAllowed);
   },
 });
@@ -8883,6 +8885,10 @@ app.post('/api/work-center', authenticateToken,
 
     const side = wcSide(role);
     const b = req.body || {};
+    const attachmentFiles = [
+      ...(req.files?.attachments || []),
+      ...(req.files?.linked_file || []),
+    ];
     const projectId = parseInt(b.projectId, 10);
     const title = String(b.title || '').trim();
     const startDate = validDate(b.start_date);
@@ -8974,20 +8980,17 @@ app.post('/api/work-center', authenticateToken,
            VALUES ($1,$2,$3,$4,$5,$6)`,
           [task.id, projectId, i + 1, String(stage.title).trim(), Number(stage.weight_pct), !!stage.is_hold_point]);
       }
-      const attachmentFiles = [
-        ...(req.files?.attachments || []),
-        ...(req.files?.linked_file || []),
-      ];
       for (const file of attachmentFiles) {
         const uploaded = await scheduleCloudinaryUpload(file.buffer, file.originalname, 'work_center/attachments');
         uploadedAttachmentIds.push({ id: uploaded.public_id, resourceType: uploaded.resource_type || 'raw' });
         await client.query(
           `INSERT INTO card_attachments
              (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
-              resource_type, uploaded_by_id, uploaded_by_role)
-           VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9)`,
+              resource_type, attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role)
+           VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
           [projectId, task.id, file.originalname, uploaded.public_id, uploaded.secure_url,
-            file.mimetype || null, uploaded.resource_type || 'raw', user_id, role]);
+            file.mimetype || null, uploaded.resource_type || 'raw', 'other',
+            null, user_id, role]);
       }
       await client.query('COMMIT');
       return res.status(201).json({ success: true, task });
@@ -9256,6 +9259,11 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                    WHERE rm.id = rr.assigned_member_id
                    ORDER BY rma.id DESC LIMIT 1)
                ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
+               ,COALESCE((SELECT json_agg(json_build_object(
+                 'id', ra.id, 'file_name', ra.file_name, 'file_url', ra.file_url, 'mime_type', ra.mime_type,
+                 'attachment_type', ra.attachment_type, 'custom_attachment_type', ra.custom_attachment_type
+               ) ORDER BY ra.created_at, ra.id)
+                 FROM work_center_report_attachments ra WHERE ra.report_id = p.id AND ra.project_id = $2), '[]'::json) AS supporting_attachments
         FROM   workspace_work_center_progress p
         JOIN   workspace_work_center w ON w.id = p.task_id
         JOIN   team_members t ON t.id = p.member_id
@@ -9294,6 +9302,11 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                     WHERE rm.id = rr.assigned_member_id
                     ORDER BY rma.id DESC LIMIT 1)
                 ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
+                ,COALESCE((SELECT json_agg(json_build_object(
+                  'id', ra.id, 'file_name', ra.file_name, 'file_url', ra.file_url, 'mime_type', ra.mime_type,
+                  'attachment_type', ra.attachment_type, 'custom_attachment_type', ra.custom_attachment_type
+                ) ORDER BY ra.created_at, ra.id)
+                  FROM work_center_report_attachments ra WHERE ra.report_id = p.id AND ra.project_id = w.project_id), '[]'::json) AS supporting_attachments
          FROM workspace_work_center_progress p
          JOIN workspace_work_center w ON w.id = p.task_id
          WHERE p.task_id = $1 AND p.member_id = $2 ORDER BY p.submitted_at DESC`,
