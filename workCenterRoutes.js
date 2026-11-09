@@ -2,6 +2,7 @@
 import {
   taskProgress, activityProgress, buildDailyEntry, checkPercentageReport, stageUnlocked, delayDays,
 } from './progressRules.js';
+import { parseSupportingAttachmentType } from './supportingAttachmentTypes.js';
 
 const reports = (function () {
 // Member reports and leader approval, with the recompute that fills the activity automatically.
@@ -252,7 +253,11 @@ function registerReportRoutes(app, deps) {
   // Member report. What the member fills in depends on the activity type:
   //   quantity: quantityDone   count: quantityDone and quantityFailed   stages: stageId   percentage: progressPct
   app.post('/api/work-center-progress', authenticateToken,
-    reportUpload.fields([{ name: 'attachment', maxCount: 1 }, { name: 'photos', maxCount: 10 }]),
+    reportUpload.fields([
+      { name: 'attachment', maxCount: 1 },
+      { name: 'photos', maxCount: 10 },
+      { name: 'supporting_attachments', maxCount: 20 },
+    ]),
     requireProjectLifecycleWrite, async (req, res) => {
     let client;
     try {
@@ -288,6 +293,21 @@ function registerReportRoutes(app, deps) {
       }
 
       const photos = req.files?.photos || [];
+      const supportingFiles = req.files?.supporting_attachments || [];
+      let supportingMetadata = [];
+      if (supportingFiles.length) {
+        try { supportingMetadata = JSON.parse(b.supportingAttachmentMetadata || ''); }
+        catch { throw new HttpError(400, 'Supporting attachment details are invalid.'); }
+        if (!Array.isArray(supportingMetadata) || supportingMetadata.length !== supportingFiles.length)
+          throw new HttpError(400, 'Supporting attachment details do not match the selected files.');
+        supportingMetadata = supportingMetadata.map((metadata) => {
+          const parsed = parseSupportingAttachmentType(metadata);
+          if (parsed.error) throw new HttpError(400, parsed.error);
+          return parsed;
+        });
+      } else if (b.supportingAttachmentMetadata) {
+        throw new HttpError(400, 'Choose supporting files before setting their evidence types.');
+      }
       if (photos.length > 10) throw new HttpError(400, 'A report can include at most 10 photos.');
       let photoMeta = [];
       if (b.photoMeta) {
@@ -399,6 +419,21 @@ function registerReportRoutes(app, deps) {
           `UPDATE workspace_work_center_progress
            SET attachment_name=$1, attachment_id=$2, attachment_url=$3 WHERE id=$4 RETURNING *`,
           [file.name, file.id, file.url, entry.id])).rows[0];
+      }
+
+      for (let i = 0; i < supportingFiles.length; i++) {
+        const supportingFile = supportingFiles[i];
+        const metadata = supportingMetadata[i];
+        const up = await scheduleCloudinaryUpload(
+          supportingFile.buffer, supportingFile.originalname, 'work_center/progress-supporting-attachments');
+        await client.query(
+          `INSERT INTO work_center_report_attachments
+             (report_id, project_id, file_name, file_id, file_url, mime_type,
+              attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+          [entry.id, projectId, supportingFile.originalname, up.public_id, up.secure_url,
+            supportingFile.mimetype || null, metadata.attachmentType, metadata.customAttachmentType,
+            userId, role]);
       }
 
       for (let i = 0; i < photos.length; i++) {
@@ -999,7 +1034,7 @@ const taskCards = (function () {
              WHERE d.task_id = $1 AND d.project_id = $2 ORDER BY w.id`,
             [taskId, projectId]),
           pool.query(
-            `SELECT id, file_name, file_id, file_url, mime_type, created_at
+            `SELECT id, file_name, file_id, file_url, mime_type, attachment_type, custom_attachment_type, created_at
              FROM card_attachments
              WHERE project_id = $1 AND entity_type = 'work_center_task' AND entity_id = $2
              ORDER BY created_at, id`, [projectId, taskId]),
@@ -1053,11 +1088,12 @@ const taskCards = (function () {
           const attachment = (await pool.query(
             `INSERT INTO card_attachments
                (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
-                resource_type, uploaded_by_id, uploaded_by_role)
-             VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9)
-             RETURNING id, file_name, file_id, file_url, mime_type, created_at`,
+                resource_type, attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role)
+             VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             RETURNING id, file_name, file_id, file_url, mime_type, attachment_type, custom_attachment_type, created_at`,
             [projectId, taskId, file.originalname, uploaded.public_id, uploaded.secure_url,
-              file.mimetype || null, uploaded.resource_type || 'raw', req.user.user_id, req.user.role])).rows[0];
+              file.mimetype || null, uploaded.resource_type || 'raw', 'other',
+              null, req.user.user_id, req.user.role])).rows[0];
           saved.push(attachment);
         }
         await audit(task, projectId, req.user.user_id, req.user.role, 'attachments_added',

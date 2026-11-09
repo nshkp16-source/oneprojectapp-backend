@@ -105,22 +105,40 @@ const markRead = (db, verificationId, projectId, role, userId) => db.query(
    ON CONFLICT (verification_id, reader_role, reader_id) DO UPDATE SET last_read_at = NOW()
    RETURNING first_read_at, last_read_at`, [verificationId, projectId, role, userId]);
 
-/** Frozen copy of approved reports and task execution attachments for consultant review.
+/** Frozen copy of approved report details and supporting attachments for consultant review.
  *  No member identity, private notes, or task ids are included. */
 async function buildSharedEvidence(client, activityId, cutOff, includeReports) {
-  const rows = includeReports ? (await client.query(
+  const rows = (await client.query(
     `SELECT p.id, w.title AS task_title, p.report_date, p.work_done, p.quantity_done, p.quantity_failed,
             p.progress_pct, p.manpower, p.equipment, p.materials, p.issues, s.title AS stage_title,
+            p.attachment_name, p.attachment_url,
             COALESCE((SELECT json_agg(json_build_object('file_name', ph.file_name, 'file_url', ph.file_url, 'captured_at', ph.captured_at)
                       ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
             COALESCE((SELECT json_agg(json_build_object('resource_type', rr.resource_type, 'name', rr.name,
                       'quantity', rr.quantity, 'unit', rr.unit, 'hours', rr.hours) ORDER BY rr.id)
-                      FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
+                      FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources,
+            COALESCE((SELECT json_agg(json_build_object(
+              'file_name', a.file_name, 'file_url', a.file_url, 'mime_type', a.mime_type,
+              'attachment_type', a.attachment_type, 'custom_attachment_type', a.custom_attachment_type
+            ) ORDER BY a.created_at, a.id) FROM work_center_report_attachments a
+              WHERE a.report_id = p.id AND a.project_id = w.project_id), '[]'::json) AS supporting_attachments
      FROM workspace_work_center_progress p
      JOIN workspace_work_center w ON w.id = p.task_id
      LEFT JOIN task_stages s ON s.id = p.stage_id
      WHERE w.activity_id = $1 AND p.validation_status = 'approved' AND p.report_date <= $2
-     ORDER BY p.report_date DESC, p.id DESC LIMIT $3`, [activityId, cutOff, MAX_SHARED_EVIDENCE_REPORTS])).rows : [];
+     ORDER BY p.report_date DESC, p.id DESC LIMIT $3`, [activityId, cutOff, MAX_SHARED_EVIDENCE_REPORTS])).rows;
+  const supportingAttachments = rows.flatMap((r) => [
+    ...(r.attachment_name ? [{
+      task_title: r.task_title, report_date: dateOnly(r.report_date),
+      file_name: r.attachment_name, file_url: r.attachment_url,
+      attachment_type: 'other', custom_attachment_type: null,
+    }] : []),
+    ...(Array.isArray(r.supporting_attachments) ? r.supporting_attachments : []).map((attachment) => ({
+      task_title: r.task_title,
+      report_date: dateOnly(r.report_date),
+      ...attachment,
+    })),
+  ]);
   const reports = rows.map((r) => ({
     report_id: Number(r.id),
     task_title: r.task_title,
@@ -132,34 +150,17 @@ async function buildSharedEvidence(client, activityId, cutOff, includeReports) {
     stage_title: r.stage_title || null,
     manpower: r.manpower || '', equipment: r.equipment || '', materials: r.materials || '', issues: r.issues || '',
     photos: r.photos, resources: r.resources,
+    attachment_name: r.attachment_name || null,
+    attachment_url: r.attachment_url || null,
+    supporting_attachments: r.supporting_attachments,
   }));
-  const taskAttachments = (await client.query(
-    `SELECT w.title AS task_title, a.file_name, a.file_url, a.mime_type,
-            a.attachment_type, a.custom_attachment_type, a.created_at
-     FROM card_attachments a
-     JOIN workspace_work_center w ON w.id = a.entity_id
-     WHERE a.project_id = w.project_id AND a.entity_type = 'work_center_task'
-       AND w.activity_id = $1 AND a.created_at < ($2::date + INTERVAL '1 day')
-     UNION ALL
-     SELECT w.title AS task_title, w.linked_file_name AS file_name, w.linked_file_url AS file_url,
-            NULL::text AS mime_type, 'other'::text AS attachment_type, NULL::text AS custom_attachment_type,
-            w.created_at
-     FROM workspace_work_center w
-     WHERE w.activity_id = $1 AND w.linked_file_name IS NOT NULL
-       AND w.created_at < ($2::date + INTERVAL '1 day')
-     ORDER BY created_at, file_name`, [activityId, cutOff])).rows.map((attachment) => ({
-    task_title: attachment.task_title,
-    file_name: attachment.file_name,
-    file_url: attachment.file_url,
-    mime_type: attachment.mime_type || null,
-    attachment_type: attachment.attachment_type || 'other',
-    custom_attachment_type: attachment.custom_attachment_type || null,
-    created_at: attachment.created_at,
-  }));
-  return { reports, task_attachments: taskAttachments };
+  return {
+    reports: includeReports ? reports : [],
+    supporting_attachments: supportingAttachments,
+  };
 }
 
-/** What a consultant is allowed to read of a verification request. Task attachment evidence is included
+/** What a consultant is allowed to read of a verification request. Report supporting attachments are included
  *  for review; approved report details and the activity plan remain opt-in. */
 function consultantProjection(verification) {
   const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
@@ -167,7 +168,7 @@ function consultantProjection(verification) {
   const sharedEvidence = evidence && !Array.isArray(evidence) && typeof evidence === 'object'
     ? {
       reports: verification.share_evidence && Array.isArray(evidence.reports) ? evidence.reports : [],
-      task_attachments: Array.isArray(evidence.task_attachments) ? evidence.task_attachments : [],
+      supporting_attachments: Array.isArray(evidence.supporting_attachments) ? evidence.supporting_attachments : [],
     }
     : (verification.share_evidence ? evidence : null);
   return {
@@ -181,7 +182,7 @@ function consultantProjection(verification) {
     claimed_figures: [],
     certified_figures: null,
     shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
-    shared_evidence: verification.share_evidence || sharedEvidence?.task_attachments?.length
+    shared_evidence: verification.share_evidence || sharedEvidence?.supporting_attachments?.length
       ? sharedEvidence : null,
   };
 }
@@ -286,7 +287,7 @@ export function registerVerificationRoutes(app, deps) {
 
       const shareEvidence = b.shareEvidence === true || String(b.shareEvidence) === 'true';
       const evidenceSnapshot = await buildSharedEvidence(client, act.id, cutOff, shareEvidence);
-      const sharedEvidence = shareEvidence || evidenceSnapshot.task_attachments.length
+      const sharedEvidence = shareEvidence || evidenceSnapshot.supporting_attachments.length
         ? evidenceSnapshot : null;
 
       let attachments = [];
