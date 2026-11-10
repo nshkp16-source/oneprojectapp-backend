@@ -130,10 +130,39 @@ test('a report waits as pending, leaders are told, nothing is counted yet', asyn
   assert.equal(retry.body.entry.id, rA.id);
   assert.equal((await q(`SELECT COUNT(*)::int n FROM work_center_report_resources WHERE report_id=$1`, [rA.id]))[0].n, 1);
   assert.equal((await q(`SELECT assigned_member_id FROM work_center_report_resources WHERE report_id=$1`, [rA.id]))[0].assigned_member_id, 101);
-  assert.equal((await q(`SELECT delay_cause, delay_days FROM workspace_work_center_progress WHERE id=$1`, [rA.id]))[0].delay_cause, 'weather');
+  const [storedDelay] = await q(`SELECT delay_cause, delay_days FROM workspace_work_center_progress WHERE id=$1`, [rA.id]);
+  assert.equal(storedDelay.delay_cause, 'weather');
+  assert.equal(storedDelay.delay_days, 0); // Report date is before the task's planned end; submitted delayDays is ignored.
   assert.equal((await q(`SELECT COUNT(*)::int n FROM planning_execution_tracking WHERE activity_id=$1`, [act.id]))[0].n, 0);
   assert.equal(notes.at(-1).entityType, 'work_center_progress');
   assert.deepEqual(notes.at(-1).recipients, [{ role: 'ContractorPM', id: 5 }]);
+});
+
+test('report delay days are calculated from report date and planned task end date', async () => {
+  const [task] = await q(`
+    INSERT INTO workspace_work_center
+      (project_id, title, description, assigned_members, priority, status, start_date, end_date,
+       creator_id, creator_role, side, activity_id, activity_type, target_quantity, standalone_unit, weight_pct)
+    VALUES (1,'Late report task','', '[{"id":101}]'::jsonb, 'normal', 'ongoing',
+       '2026-03-01','2026-03-09',5,'ContractorPM','Contractor',NULL,'quantity',20,'m3',100)
+    RETURNING id`);
+  const response = await report(m(101), {
+    taskId: task.id, reportDate: '2026-03-10', quantityDone: 1,
+    delayCause: 'weather', delayDays: 0,
+  });
+  assert.equal(response.status, 201, JSON.stringify(response.body));
+  assert.equal(response.body.entry.delay_days, 1);
+
+  const leaderView = await fetch(`${base}/api/work-center-progress/${task.id}?projectId=1`, {
+    headers: { 'x-user': JSON.stringify(leader) },
+  });
+  assert.equal(leaderView.status, 200);
+  assert.equal((await leaderView.json()).entries[0].schedule_delay_days, 1);
+  const memberView = await fetch(`${base}/api/work-center-progress/${task.id}?projectId=1`, {
+    headers: { 'x-user': JSON.stringify(m(101)) },
+  });
+  assert.equal(memberView.status, 200);
+  assert.equal((await memberView.json()).entries[0].schedule_delay_days, 1);
 });
 
 test('task card collaboration is visible to assigned members and same-side leaders only', async () => {

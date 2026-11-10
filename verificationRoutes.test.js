@@ -109,6 +109,24 @@ test('shared evidence: opt-in, approved reports only, up to the cut-off, no iden
      VALUES ($1,1,'Cube test results.pdf','test-results','https://files.test/Cube-test-results.pdf',
        'application/pdf','quality_test',5,'ContractorPM') RETURNING id`,
     [approvedReport.id]);
+  const [privateAttachment] = await q(
+    `INSERT INTO work_center_report_attachments
+        (report_id, project_id, file_name, file_id, file_url, mime_type, attachment_type, uploaded_by_id, uploaded_by_role)
+     VALUES ($1,1,'Private field note.pdf','private-field-note','https://files.test/Private-field-note.pdf',
+        'application/pdf','other',5,'ContractorPM') RETURNING id`,
+    [approvedReport.id]);
+  const [onTimePhoto] = await q(
+    `INSERT INTO work_center_report_photos
+       (report_id, project_id, seq, file_name, file_id, file_url)
+     VALUES ($1,1,1,'Foundation photo.jpg','foundation-photo','https://files.test/Foundation-photo.jpg')
+     RETURNING id`,
+    [approvedReport.id]);
+  const [privatePhoto] = await q(
+    `INSERT INTO work_center_report_photos
+       (report_id, project_id, seq, file_name, file_id, file_url)
+     VALUES ($1,1,2,'Private detail.jpg','private-photo','https://files.test/Private-detail.jpg')
+     RETURNING id`,
+    [approvedReport.id]);
   const [lateAttachment] = await q(
     `INSERT INTO work_center_report_attachments
        (report_id, project_id, file_name, file_id, file_url, mime_type, attachment_type,
@@ -117,7 +135,8 @@ test('shared evidence: opt-in, approved reports only, up to the cut-off, no iden
        'application/pdf','other','Later evidence',5,'ContractorPM') RETURNING id`,
     [late.id]);
   const cleanup = async () => {
-    await q(`DELETE FROM work_center_report_attachments WHERE id = ANY($1::bigint[])`, [[onTimeAttachment.id, lateAttachment.id]]);
+    await q(`DELETE FROM work_center_report_photos WHERE id = ANY($1::bigint[])`, [[onTimePhoto.id, privatePhoto.id]]);
+    await q(`DELETE FROM work_center_report_attachments WHERE id = ANY($1::bigint[])`, [[onTimeAttachment.id, privateAttachment.id, lateAttachment.id]]);
     await q(`DELETE FROM workspace_work_center_progress WHERE id = ANY($1::int[])`, [[late.id, rejected.body.entry.id, pendingReport.body.entry.id]]);
   };
   try {
@@ -131,28 +150,46 @@ test('shared evidence: opt-in, approved reports only, up to the cut-off, no iden
     assert.equal(first.shared_evidence, null);
     assert.deepEqual(first.claimed_figures, []);
 
-    // 2. shared: withdraw v1, then request again with shareEvidence and a cut-off before the late report
+    // 2. Evidence must be selected by the contractor; details are a separate opt-in.
     assert.equal((await call('PUT', `/api/verifications/${v1.id}/withdraw`, leader, {})).status, 200);
-    const shared = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'With evidence', cutOffDate: '2026-03-12', shareEvidence: true });
+    const invalidSelection = await call('POST', `/api/activities/${act.id}/verifications`, leader, {
+      note: 'Invalid file', cutOffDate: '2026-03-12',
+      selectedEvidence: [{ type: 'supporting_attachment', id: String(lateAttachment.id) }],
+    });
+    assert.equal(invalidSelection.status, 400);
+    const shared = await call('POST', `/api/activities/${act.id}/verifications`, leader, {
+      note: 'With evidence', cutOffDate: '2026-03-12', shareEvidence: true,
+      selectedEvidence: [
+        { type: 'supporting_attachment', id: String(onTimeAttachment.id) },
+        { type: 'photo', id: String(onTimePhoto.id) },
+      ],
+    });
     assert.equal(shared.status, 201, JSON.stringify(shared.body));
     const ev = shared.body.verification;
     assert.equal(ev.share_evidence, true);
     assert.equal(ev.shared_evidence.reports.length, 1);                 // only the approved report of 10 March
     assert.equal(ev.shared_evidence.reports[0].report_date, '2026-03-10');
     assert.equal(ev.shared_evidence.reports[0].quantity_done, 100);
+    assert.deepEqual(ev.shared_evidence.reports[0].photos, []);
     assert.equal(ev.shared_evidence.supporting_attachments.length, 1);
     assert.equal(ev.shared_evidence.supporting_attachments[0].file_name, 'Cube test results.pdf');
     assert.equal(ev.shared_evidence.supporting_attachments[0].attachment_type, 'quality_test');
+    assert.equal(ev.shared_evidence.selected_evidence.length, 2);
+    assert.deepEqual(ev.shared_evidence.selected_evidence.map((file) => file.type).sort(), ['photo', 'supporting_attachment']);
+    assert.equal(ev.shared_evidence.selected_evidence.find((file) => file.type === 'photo').file_name, 'Foundation photo.jpg');
+    assert.doesNotMatch(JSON.stringify(ev.shared_evidence), /Private field note|Private detail\.jpg/);
 
     // the consultant reads the frozen copy, with no member identity, task id, rejection note or unapproved figure
     const seen = (await call('GET', `/api/activities/${act.id}/verifications`, cons)).body.verifications.find((v) => v.id === ev.id);
     assert.equal(seen.shared_evidence.reports.length, 1);
     assert.equal(seen.shared_evidence.supporting_attachments.length, 1);
+    assert.equal(seen.shared_evidence.selected_evidence.length, 2);
     assert.doesNotMatch(JSON.stringify(seen.shared_evidence), /a@x|b@x|member_id|task_id|Not on site|Rain|"quantity_done":(7|9|20)\b/);
     const pend = await call('GET', '/api/verifications/pending?projectId=1', cons);
     const row2 = pend.body.pending.find((v) => v.id === ev.id);
     assert.equal(row2.shared_evidence.reports.length, 1);
     assert.equal(row2.shared_evidence.supporting_attachments.length, 1);
+    assert.equal(row2.shared_evidence.selected_evidence.length, 2);
     assert.ok('days_left' in row2 && 'activity_certified_progress_pct' in row2 && 'pending_inspectors' in row2);
 
     // the consultant still cannot read the contractor's task reports directly
@@ -160,17 +197,27 @@ test('shared evidence: opt-in, approved reports only, up to the cut-off, no iden
 
     assert.equal((await call('PUT', `/api/verifications/${ev.id}/withdraw`, leader, {})).status, 200);
     const filesOnly = await call('POST', `/api/activities/${act.id}/verifications`, leader, {
-      note: 'Review supporting attachments', cutOffDate: '2026-03-15',
+      note: 'Share report details only', cutOffDate: '2026-03-15', shareEvidence: true,
     });
     assert.equal(filesOnly.status, 201, JSON.stringify(filesOnly.body));
-    assert.equal(filesOnly.body.verification.share_evidence, false);
-    assert.deepEqual(filesOnly.body.verification.shared_evidence.reports, []);
-    assert.equal(filesOnly.body.verification.shared_evidence.supporting_attachments.length, 2);
+    assert.equal(filesOnly.body.verification.share_evidence, true);
+    assert.equal(filesOnly.body.verification.shared_evidence.reports.length, 2);
+    assert.deepEqual(filesOnly.body.verification.shared_evidence.selected_evidence, []);
+    assert.deepEqual(filesOnly.body.verification.shared_evidence.supporting_attachments, []);
+    await call('PUT', `/api/verifications/${filesOnly.body.verification.id}/withdraw`, leader, {});
+    const selectedFileOnly = await call('POST', `/api/activities/${act.id}/verifications`, leader, {
+      note: 'Selected supporting attachment', cutOffDate: '2026-03-12',
+      selectedEvidence: [{ type: 'supporting_attachment', id: String(onTimeAttachment.id) }],
+    });
+    assert.equal(selectedFileOnly.status, 201, JSON.stringify(selectedFileOnly.body));
+    assert.equal(selectedFileOnly.body.verification.share_evidence, false);
+    assert.deepEqual(selectedFileOnly.body.verification.shared_evidence.reports, []);
+    assert.equal(selectedFileOnly.body.verification.shared_evidence.supporting_attachments.length, 1);
     assert.equal((await call('GET', `/api/activities/${act.id}/verifications`, cons)).body.verifications
-      .find((v) => v.id === filesOnly.body.verification.id).shared_evidence.supporting_attachments.length, 2);
+      .find((v) => v.id === selectedFileOnly.body.verification.id).shared_evidence.supporting_attachments.length, 1);
 
     // restore what the next tests expect: one pending request (v1) with the named inspector
-    assert.equal((await call('PUT', `/api/verifications/${filesOnly.body.verification.id}/withdraw`, leader, {})).status, 200);
+    assert.equal((await call('PUT', `/api/verifications/${selectedFileOnly.body.verification.id}/withdraw`, leader, {})).status, 200);
     const again = await call('POST', `/api/activities/${act.id}/verifications`, leader, { note: 'Block A excavated', shareActivitySummary: true, signers: [{ role: 'TeamMember', user_id: 201, position: 'Inspector' }] });
     assert.equal(again.status, 201, JSON.stringify(again.body));
     v1 = again.body.verification;

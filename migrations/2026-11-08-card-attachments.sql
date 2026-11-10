@@ -28,37 +28,20 @@ ALTER TABLE card_attachments
   ADD COLUMN IF NOT EXISTS uploaded_by_id INTEGER,
   ADD COLUMN IF NOT EXISTS uploaded_by_role TEXT;
 
-ALTER TABLE card_attachments DROP CONSTRAINT IF EXISTS card_attachments_type_check;
-
-UPDATE card_attachments
-SET attachment_type = 'other',
-    custom_attachment_type = COALESCE(
-      custom_attachment_type,
-      CASE attachment_type
-        WHEN 'programme' THEN 'Programme'
-        WHEN 'method_statement' THEN 'Method Statement'
-        WHEN 'monthly_progress_report' THEN 'Monthly Progress Report'
-        WHEN 'inspection_request' THEN 'Request for Inspection'
-        WHEN 'claim' THEN 'Claim'
-        WHEN 'site_diary' THEN 'Site Diary'
-        WHEN 'test_record' THEN 'Test Record'
-        WHEN 'as_built_information' THEN 'As-Built Information'
-      END
-    )
-WHERE attachment_type IN (
-  'programme', 'method_statement', 'monthly_progress_report', 'inspection_request',
-  'claim', 'site_diary', 'test_record', 'as_built_information'
-);
-
-ALTER TABLE card_attachments
-  ADD CONSTRAINT card_attachments_type_check
-  CHECK (attachment_type IN (
-    'site_photos', 'daily_progress', 'materials_delivery', 'equipment', 'manpower',
-    'quality_test', 'inspection_hold_point', 'issue_delay', 'other'
-  ));
-
 DO $$
 BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'card_attachments_type_check'
+      AND conrelid = 'card_attachments'::regclass
+  ) THEN
+    ALTER TABLE card_attachments
+      ADD CONSTRAINT card_attachments_type_check
+      CHECK (attachment_type IN (
+        'programme', 'method_statement', 'monthly_progress_report', 'inspection_request',
+        'claim', 'site_diary', 'test_record', 'as_built_information', 'other'
+      ));
+  END IF;
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conname = 'card_attachments_custom_type_check'

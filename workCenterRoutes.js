@@ -3,6 +3,7 @@ import {
   taskProgress, activityProgress, buildDailyEntry, checkPercentageReport, stageUnlocked, delayDays,
 } from './progressRules.js';
 import { parseSupportingAttachmentType } from './supportingAttachmentTypes.js';
+import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
 
 const reports = (function () {
 // Member reports and leader approval, with the recompute that fills the activity automatically.
@@ -247,7 +248,7 @@ async function notifySafe(deps, args) {
 // ── routes ───────────────────────────────────────────────────────────────────
 
 function registerReportRoutes(app, deps) {
-  const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
+  const { pool, authenticateToken, upload, requireProjectLifecycleWrite, wcSide, isWCLeader } = deps;
   const reportUpload = deps.reportUpload || upload;
 
   // Member report. What the member fills in depends on the activity type:
@@ -260,6 +261,7 @@ function registerReportRoutes(app, deps) {
     ]),
     requireProjectLifecycleWrite, async (req, res) => {
     let client;
+    const uploads = createCloudinaryUploadTracker(deps);
     try {
       const { user_id: userId, role } = req.user;
       if (role !== 'TeamMember') throw new HttpError(403, 'Only assigned team members can submit progress reports.');
@@ -280,6 +282,12 @@ function registerReportRoutes(app, deps) {
       if (!task) throw new HttpError(404, 'Task not found.');
       const assigned = Array.isArray(task.assigned_members) ? task.assigned_members : [];
       if (!assigned.some((m) => String(m.id) === String(userId))) throw new HttpError(403, 'You are not assigned to this task.');
+      if (!(await isMember(deps, projectId, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
+      const sideAssignment = await pool.query(
+        `SELECT 1 FROM team_member_assignments
+         WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = $3 LIMIT 1`,
+        [projectId, userId, task.side]);
+      if (!sideAssignment.rows.length) throw new HttpError(403, 'You are not assigned to this task.');
       if (task.status === 'closed' || task.activity_status === 'closed') throw new HttpError(409, 'This task is closed. Reports can no longer be added.');
       const idempotencyKey = String(b.idempotencyKey || '').trim();
       if (idempotencyKey && (idempotencyKey.length > 100 || !/^[\w-]+$/.test(idempotencyKey)))
@@ -413,7 +421,7 @@ function registerReportRoutes(app, deps) {
 
       const attachment = req.files?.attachment?.[0];
       if (attachment) {
-        const up = await scheduleCloudinaryUpload(attachment.buffer, attachment.originalname, 'work_center/progress');
+        const up = await uploads.upload(attachment.buffer, attachment.originalname, 'work_center/progress');
         file = { name: attachment.originalname, id: up.public_id, url: up.secure_url };
         entry = (await client.query(
           `UPDATE workspace_work_center_progress
@@ -424,7 +432,7 @@ function registerReportRoutes(app, deps) {
       for (let i = 0; i < supportingFiles.length; i++) {
         const supportingFile = supportingFiles[i];
         const metadata = supportingMetadata[i];
-        const up = await scheduleCloudinaryUpload(
+        const up = await uploads.upload(
           supportingFile.buffer, supportingFile.originalname, 'work_center/progress-supporting-attachments');
         await client.query(
           `INSERT INTO work_center_report_attachments
@@ -439,7 +447,7 @@ function registerReportRoutes(app, deps) {
       for (let i = 0; i < photos.length; i++) {
         const photo = photos[i];
         const meta = photoMeta[i];
-        const up = await scheduleCloudinaryUpload(photo.buffer, `report-${entry.id}-photo-${i + 1}`, 'work_center/progress');
+        const up = await uploads.upload(photo.buffer, `report-${entry.id}-photo-${i + 1}`, 'work_center/progress');
         await client.query(
           `INSERT INTO work_center_report_photos
              (report_id, project_id, seq, file_name, file_id, file_url, captured_at, latitude, longitude, accuracy_m)
@@ -461,6 +469,7 @@ function registerReportRoutes(app, deps) {
          VALUES ($1,$2,$3,$4,'report_submitted',$5::jsonb)`,
         [taskId, projectId, userId, role, JSON.stringify({ reportId: entry.id })]);
       await client.query('COMMIT');
+      uploads.keepAll();
 
       const blockedDependencies = (await pool.query(
         `SELECT d.depends_on_task_id, predecessor.title
@@ -481,6 +490,7 @@ function registerReportRoutes(app, deps) {
       return res.status(201).json({ success: true, entry, warning });
     } catch (err) {
       if (client) await client.query('ROLLBACK').catch(() => {});
+      await uploads.discard();
       return fail(res, err, 'POST /api/work-center-progress:');
     } finally { if (client) client.release(); }
   });
@@ -925,7 +935,7 @@ const taskCards = (function () {
   };
 
   function registerTaskCardRoutes(app, deps) {
-    const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, cloudinary, wcSide, isWCLeader } = deps;
+    const { pool, authenticateToken, upload, requireProjectLifecycleWrite, cloudinary, wcSide, isWCLeader } = deps;
     async function isProjectMember(projectId, userId, role) {
       if (deps.isProjectMember) return deps.isProjectMember(projectId, userId, role);
       const result = await pool.query(
@@ -1076,6 +1086,7 @@ const taskCards = (function () {
 
     app.post('/api/work-center/:taskId/attachments', authenticateToken,
       upload.array('attachments', 20), requireProjectLifecycleWrite, async (req, res) => {
+      const uploads = createCloudinaryUploadTracker(deps);
       try {
         const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
         if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
@@ -1084,7 +1095,7 @@ const taskCards = (function () {
         await authorize(task, projectId, req.user.user_id, req.user.role, true);
         const saved = [];
         for (const file of req.files) {
-          const uploaded = await scheduleCloudinaryUpload(file.buffer, file.originalname, 'work_center/attachments');
+          const uploaded = await uploads.upload(file.buffer, file.originalname, 'work_center/attachments');
           const attachment = (await pool.query(
             `INSERT INTO card_attachments
                (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
@@ -1094,11 +1105,15 @@ const taskCards = (function () {
             [projectId, taskId, file.originalname, uploaded.public_id, uploaded.secure_url,
               file.mimetype || null, uploaded.resource_type || 'raw', req.user.user_id, req.user.role])).rows[0];
           saved.push(attachment);
+          uploads.keep(uploaded);
         }
         await audit(task, projectId, req.user.user_id, req.user.role, 'attachments_added',
           { attachment_ids: saved.map((item) => item.id) });
         return res.status(201).json({ attachments: saved });
-      } catch (error) { return fail(res, error, 'POST /api/work-center/:taskId/attachments:'); }
+      } catch (error) {
+        await uploads.discard();
+        return fail(res, error, 'POST /api/work-center/:taskId/attachments:');
+      }
     });
 
     app.delete('/api/work-center/:taskId/attachments/:attachmentId', authenticateToken,

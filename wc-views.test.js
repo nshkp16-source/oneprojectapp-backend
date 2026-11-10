@@ -25,7 +25,8 @@ const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadFi
   '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow',
   '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_wcUpdateSupportingAttachmentGroup', '_wcSupportingAttachmentGroupHtml',
   '_wcReportSupportingAttachmentsHtml', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
-  '_wcCardHeaderHtml', '_wcCardTilesHtml'];
+  '_wcCardHeaderHtml', '_wcCardTilesHtml',
+  '_safeHttpsUrl', '_fileDisplayName', '_thumbUrl', '_evidenceFileAttrs', '_evidenceFileRowHtml', '_evidencePhotosHtml', '_evidenceFilesHtml'];
 
 function views() {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
@@ -111,6 +112,10 @@ test('report cards render photo, structured resources and delay details safely',
     resources: [{ resource_type: 'equipment', name: 'Pump', quantity: 1, unit: 'unit', hours: 3 }],
   }]);
   assert.equal(d.querySelectorAll('img[alt="pour.jpg"]').length, 1);
+  const photoButton = d.querySelector('button[data-ev-preview][data-ev-name="pour.jpg"]');
+  assert.ok(photoButton, 'the photo opens in the preview window');
+  assert.equal(photoButton.dataset.evUrl, 'https://images.example.test/pour.jpg');
+  assert.equal(d.querySelectorAll('a[href="https://images.example.test/pour.jpg"]').length, 0);   // no direct link to the storage file
   assert.match(d.body.textContent, /equipment: Pump · 1 unit · 3 hours/);
   assert.match(d.body.textContent.replace(/\s+/g, ' '), /Delay: weather · 2 day\(s\) past planned end/);
   assert.match(d.body.textContent, /Rain stopped the work\./);
@@ -238,6 +243,9 @@ test('task attachment tab lists legacy and multiple files and offers upload/remo
   assert.match(d.body.textContent, /legacy\.pdf/);
   assert.match(d.body.textContent, /drawing\.dwg/);
   assert.match(d.body.textContent, /report\.jpg/);
+  const download = d.querySelector('[data-ev-download][data-ev-name="drawing.dwg"]');
+  assert.ok(download, 'each task file has a Download control that saves it under its real name');
+  assert.equal(download.dataset.evUrl, 'https://files.test/drawing.dwg');
   assert.ok(d.querySelector('[data-wc-attachment-input][multiple]'));
   assert.ok(d.querySelector('[data-wc-attachment-delete="9"]'));
 });

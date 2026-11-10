@@ -195,6 +195,27 @@ test('declining the confirmation sends nothing more; a server error is shown and
   assert.equal(s.$('pe2-save').disabled, false);
 });
 
+test('attachments chosen in the form are listed by their real names, can be removed, and are all sent', async () => {
+  const s = setup(); await s.open(); s.fill();
+  const drawing = new s.w.File(['dwg'], 'Foundation drawing rev B.dwg', { lastModified: 1 });
+  const spec = new s.w.File(['pdf'], 'Concrete specification.pdf', { lastModified: 2 });
+  const input = s.$('pe2-attachments');
+  Object.defineProperty(input, 'files', { value: [drawing, spec, drawing], configurable: true });   // the same file chosen twice
+  input.dispatchEvent(new s.w.Event('change', { bubbles: true }));
+  const listed = s.$('pe2-files').textContent;
+  assert.match(listed, /Foundation drawing rev B\.dwg/);
+  assert.match(listed, /Concrete specification\.pdf/);
+  assert.equal(s.state().files.length, 2);                                   // a duplicate is not added twice
+  s.click(s.d.querySelector('[data-pe2-file-remove="1"]'));
+  assert.equal(s.state().files.length, 1);
+  assert.doesNotMatch(s.$('pe2-files').textContent, /Concrete specification/);
+  s.d.querySelector('[data-task-title="0"]').value = 'T'; s.d.querySelector('[data-task-title="0"]').dispatchEvent(new s.w.Event('input', { bubbles: true }));
+  s.check(s.d.querySelector('[data-task="0"][data-member="101"]'));
+  s.click(s.$('pe2-save')); await new Promise((r) => setTimeout(r, 30));
+  const body = s.log.fetches.find((f) => f.url.includes('create-with-tasks')).opts.body;
+  assert.deepEqual(body.getAll('attachments').map((file) => file.name), ['Foundation drawing rev B.dwg']);
+});
+
 test('stages activity sends stages with hold points and refuses stage weights that do not total 100', async () => {
   const s = setup('ClientPM'); await s.open();
   s.set('pe2-title', 'Valuation'); s.set('pe2-start', '2026-03-01'); s.set('pe2-end', '2026-04-30');

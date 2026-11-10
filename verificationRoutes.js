@@ -20,6 +20,7 @@
 
 import { certifiedAfterDecision, respondByDate } from './progressRules.js';
 import { syncMilestone } from './planningRoutes.js';
+import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
 
 class HttpError extends Error {
   constructor(status, message, extra = {}) { super(message); this.status = status; this.extra = extra; }
@@ -105,20 +106,20 @@ const markRead = (db, verificationId, projectId, role, userId) => db.query(
    ON CONFLICT (verification_id, reader_role, reader_id) DO UPDATE SET last_read_at = NOW()
    RETURNING first_read_at, last_read_at`, [verificationId, projectId, role, userId]);
 
-/** Frozen report details (when selected) and supporting files from approved reports.
+/** Frozen report details (when selected) and explicitly selected files from approved reports.
  *  No member identity, private notes, or task ids are included. */
-async function buildSharedEvidence(client, activityId, cutOff, includeReportDetails) {
+async function buildSharedEvidence(client, activityId, cutOff, includeReportDetails, selectedEvidence) {
   const { rows } = await client.query(
     `SELECT p.id, w.title AS task_title, p.report_date, p.work_done, p.quantity_done, p.quantity_failed,
             p.progress_pct, p.manpower, p.equipment, p.materials, p.issues, s.title AS stage_title,
             p.attachment_name, p.attachment_url,
-            COALESCE((SELECT json_agg(json_build_object('file_name', ph.file_name, 'file_url', ph.file_url, 'captured_at', ph.captured_at)
+            COALESCE((SELECT json_agg(json_build_object('id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url, 'captured_at', ph.captured_at)
                       ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
             COALESCE((SELECT json_agg(json_build_object('resource_type', rr.resource_type, 'name', rr.name,
                       'quantity', rr.quantity, 'unit', rr.unit, 'hours', rr.hours) ORDER BY rr.id)
                       FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources,
             COALESCE((SELECT json_agg(json_build_object(
-              'file_name', a.file_name, 'file_url', a.file_url, 'mime_type', a.mime_type,
+              'id', a.id, 'file_name', a.file_name, 'file_url', a.file_url, 'mime_type', a.mime_type,
               'attachment_type', a.attachment_type, 'custom_attachment_type', a.custom_attachment_type
             ) ORDER BY a.created_at, a.id) FROM work_center_report_attachments a
               WHERE a.report_id = p.id AND a.project_id = w.project_id), '[]'::json) AS supporting_attachments
@@ -127,21 +128,50 @@ async function buildSharedEvidence(client, activityId, cutOff, includeReportDeta
      LEFT JOIN task_stages s ON s.id = p.stage_id
      WHERE w.activity_id = $1 AND p.validation_status = 'approved' AND p.report_date <= $2
      ORDER BY p.report_date DESC, p.id DESC LIMIT $3`, [activityId, cutOff, MAX_SHARED_EVIDENCE_REPORTS]);
-  const supportingAttachments = rows.flatMap((r) => [
-    ...(r.attachment_name ? [{
+  const candidates = rows.flatMap((r) => [
+    ...(r.attachment_name && r.attachment_url ? [{
+      type: 'legacy_attachment',
+      id: String(r.id),
       task_title: r.task_title,
       report_date: dateOnly(r.report_date),
       file_name: r.attachment_name,
       file_url: r.attachment_url,
+      mime_type: null,
       attachment_type: 'other',
       custom_attachment_type: 'Legacy progress report attachment',
     }] : []),
     ...(Array.isArray(r.supporting_attachments) ? r.supporting_attachments.map((attachment) => ({
+      ...attachment,
+      type: 'supporting_attachment',
+      id: String(attachment.id),
       task_title: r.task_title,
       report_date: dateOnly(r.report_date),
-      ...attachment,
+    })) : []),
+    ...(Array.isArray(r.photos) ? r.photos.map((photo) => ({
+      ...photo,
+      type: 'photo',
+      id: String(photo.id),
+      task_title: r.task_title,
+      report_date: dateOnly(r.report_date),
+      mime_type: 'image/*',
     })) : []),
   ]);
+  const candidateByKey = new Map(candidates.map((item) => [`${item.type}:${item.id}`, item]));
+  const selectedFiles = [];
+  const seenSelection = new Set();
+  for (const selection of selectedEvidence) {
+    const type = String(selection?.type || '');
+    const id = String(selection?.id || '');
+    const key = `${type}:${id}`;
+    if (!['photo', 'supporting_attachment', 'legacy_attachment'].includes(type) || !/^\d+$/.test(id) || !candidateByKey.has(key))
+      throw new HttpError(400, 'Choose evidence only from approved reports on or before the cut-off date.');
+    if (seenSelection.has(key)) continue;
+    seenSelection.add(key);
+    const { id: _id, ...file } = candidateByKey.get(key);
+    selectedFiles.push(file);
+  }
+  const supportingAttachments = selectedFiles.filter((file) => file.type !== 'photo')
+    .map(({ type: _type, ...file }) => file);
   const reports = rows.map((r) => ({
     report_id: Number(r.id),
     task_title: r.task_title,
@@ -152,24 +182,29 @@ async function buildSharedEvidence(client, activityId, cutOff, includeReportDeta
     progress_pct: r.progress_pct == null ? null : Number(r.progress_pct),
     stage_title: r.stage_title || null,
     manpower: r.manpower || '', equipment: r.equipment || '', materials: r.materials || '', issues: r.issues || '',
-    photos: r.photos, resources: r.resources,
+    photos: [], resources: r.resources,
   }));
   return {
     reports: includeReportDetails ? reports : [],
     supporting_attachments: supportingAttachments,
+    selected_evidence: selectedFiles,
   };
 }
 
-/** Consultants always receive the approved reports' supporting files; report details remain opt-in. */
+/** Consultants receive only the report details and evidence frozen on this request. */
 function consultantProjection(verification) {
   const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
   const evidence = verification.shared_evidence;
+  const hasExplicitSelection = evidence && !Array.isArray(evidence) && Array.isArray(evidence.selected_evidence);
   const sharedEvidence = evidence && !Array.isArray(evidence) && typeof evidence === 'object'
     ? {
-      reports: verification.share_evidence && Array.isArray(evidence.reports) ? evidence.reports : [],
-      supporting_attachments: Array.isArray(evidence.supporting_attachments) ? evidence.supporting_attachments : [],
+      reports: verification.share_evidence && Array.isArray(evidence.reports)
+        ? evidence.reports.map((report) => hasExplicitSelection ? report : { ...report, photos: [] }) : [],
+      supporting_attachments: hasExplicitSelection && Array.isArray(evidence.supporting_attachments)
+        ? evidence.supporting_attachments : [],
+      selected_evidence: hasExplicitSelection ? evidence.selected_evidence : [],
     }
-    : (verification.share_evidence ? evidence : null);
+    : null;
   return {
     ...verification,
     activity_summary: {
@@ -181,13 +216,13 @@ function consultantProjection(verification) {
     claimed_figures: [],
     certified_figures: null,
     shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
-    shared_evidence: verification.share_evidence || sharedEvidence?.supporting_attachments?.length
+    shared_evidence: verification.share_evidence || sharedEvidence?.selected_evidence?.length
       ? sharedEvidence : null,
   };
 }
 
 export function registerVerificationRoutes(app, deps) {
-  const { pool, authenticateToken, upload, requireProjectLifecycleWrite, scheduleCloudinaryUpload, wcSide, isWCLeader } = deps;
+  const { pool, authenticateToken, upload, requireProjectLifecycleWrite, wcSide, isWCLeader } = deps;
   const leaderOn = (role, side) => isWCLeader(role) && wcSide(role) === side;
 
   app.get('/api/verification-inspectors', authenticateToken, async (req, res) => {
@@ -215,6 +250,7 @@ export function registerVerificationRoutes(app, deps) {
   app.post('/api/activities/:activityId/verifications', authenticateToken,
     upload.single('attachment'), requireProjectLifecycleWrite, async (req, res) => {
     let client;
+    const uploads = createCloudinaryUploadTracker(deps);
     try {
       const { user_id: userId, role } = req.user;
       if (!leaderOn(role, 'Contractor')) throw new HttpError(403, 'Only contractor leaders and PMs can request verification.');
@@ -285,13 +321,20 @@ export function registerVerificationRoutes(app, deps) {
                        approved_report_count: Number(r.approved_report_count), approved_quantity: Number(r.approved_quantity) }));
 
       const shareEvidence = b.shareEvidence === true || String(b.shareEvidence) === 'true';
-      const evidenceSnapshot = await buildSharedEvidence(client, act.id, cutOff, shareEvidence);
-      const sharedEvidence = shareEvidence || evidenceSnapshot.supporting_attachments.length
+      let selectedEvidence = b.selectedEvidence;
+      if (typeof selectedEvidence === 'string') {
+        try { selectedEvidence = selectedEvidence ? JSON.parse(selectedEvidence) : []; }
+        catch { throw new HttpError(400, 'selectedEvidence must be a valid list of evidence selections.'); }
+      }
+      if (selectedEvidence == null) selectedEvidence = [];
+      if (!Array.isArray(selectedEvidence)) throw new HttpError(400, 'selectedEvidence must be a list.');
+      const evidenceSnapshot = await buildSharedEvidence(client, act.id, cutOff, shareEvidence, selectedEvidence);
+      const sharedEvidence = shareEvidence || evidenceSnapshot.selected_evidence.length
         ? evidenceSnapshot : null;
 
       let attachments = [];
       if (req.file) {
-        const up = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'verifications/requests');
+        const up = await uploads.upload(req.file.buffer, req.file.originalname, 'verifications/requests');
         attachments = [{ name: req.file.originalname, id: up.public_id, url: up.secure_url }];
       }
 
@@ -333,6 +376,7 @@ export function registerVerificationRoutes(app, deps) {
         order += 1;
       }
       await client.query('COMMIT');
+      uploads.keepAll();
 
       const recipients = [...(await leadersOf(deps, act.project_id, 'Consultant')),
         ...named.filter((s) => s.role === 'TeamMember').map((s) => deps.flowKey('TeamMember', parseInt(s.user_id, 10)))];
@@ -343,6 +387,7 @@ export function registerVerificationRoutes(app, deps) {
       return res.status(201).json({ success: true, verification: ver });
     } catch (err) {
       if (client) await client.query('ROLLBACK').catch(() => {});
+      await uploads.discard();
       return fail(res, err, 'POST /api/activities/:activityId/verifications:');
     } finally { if (client) client.release(); }
   });
@@ -374,6 +419,7 @@ export function registerVerificationRoutes(app, deps) {
   app.put('/api/verifications/:id/decide', authenticateToken, upload.single('attachment'),
     requireProjectLifecycleWrite, async (req, res) => {
     let client;
+    const uploads = createCloudinaryUploadTracker(deps);
     try {
       const { user_id: userId, role } = req.user;
       if (!leaderOn(role, 'Consultant')) throw new HttpError(403, 'Only consultant leaders and PMs can decide on a verification.');
@@ -430,7 +476,7 @@ export function registerVerificationRoutes(app, deps) {
 
       let attachments = [];
       if (req.file) {
-        const up = await scheduleCloudinaryUpload(req.file.buffer, req.file.originalname, 'verifications/decisions');
+        const up = await uploads.upload(req.file.buffer, req.file.originalname, 'verifications/decisions');
         attachments = [{ name: req.file.originalname, id: up.public_id, url: up.secure_url }];
       }
 
@@ -490,6 +536,7 @@ export function registerVerificationRoutes(app, deps) {
         if (link && v.kind !== 'hold_point') milestone = await syncMilestone(client, link.kind, link.id, actor);
       }
       await client.query('COMMIT');
+      uploads.keepAll();
 
       const label = { verified: 'verified', verified_with_changes: 'verified with changes', rejected: 'rejected' }[status];
       await notifySafe(deps, { projectId: v.project_id, entityId: v.id, entityType: 'activity_verification',
@@ -499,6 +546,7 @@ export function registerVerificationRoutes(app, deps) {
       return res.json({ success: true, verification: decided, certified_progress_pct: certified, activity_closed: closed, milestone, rework_items: rework.length });
     } catch (err) {
       if (client) await client.query('ROLLBACK').catch(() => {});
+      await uploads.discard();
       return fail(res, err, 'PUT /api/verifications/:id/decide:');
     } finally { if (client) client.release(); }
   });
@@ -549,6 +597,7 @@ export function registerVerificationRoutes(app, deps) {
         if (link) milestone = await syncMilestone(client, link.kind, link.id, { id: userId, role });
       }
       await client.query('COMMIT');
+
       await notifySafe(deps, { projectId: act.project_id, entityId: item.id, entityType: 'rework_item',
         message: `A ${kind} item was raised on "${act.title}": ${reason}`, actorId: userId, actorRole: role,
         recipients: await leadersOf(deps, act.project_id, 'Contractor') });

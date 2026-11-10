@@ -41,8 +41,10 @@ cloudinary.config({
 });
 
 // ─── Multer ───────────────────────────────────────────────────────────────────
+// Files are held in memory while they are uploaded, so the limit protects the server when many users upload at once.
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 50;
 const upload = multer({
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB — supports video attachments
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 },
   storage: multer.memoryStorage(),
   fileFilter: (_req, _file, cb) => cb(null, true),
 });
@@ -117,7 +119,29 @@ function authenticateToken(req, res, next) {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  max: Number(process.env.PG_POOL_MAX) || 10,
+  idleTimeoutMillis: 30 * 1000,
+  // Fail with an error after 10 s instead of queueing a request forever when every connection is busy.
+  connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS) || 10 * 1000,
 });
+pool.on('error', (err) => console.error('[pool] idle client error:', err.message));
+
+// Runs a periodic job on one instance at a time (a Postgres advisory lock), so running several
+// server instances does not send the same reminders more than once.
+async function runExclusiveJob(name, job) {
+  let client;
+  try {
+    client = await pool.connect();
+    const { rows } = await client.query('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [`oneproject:${name}`]);
+    if (!rows[0].locked) return;
+    try { await job(); }
+    finally { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [`oneproject:${name}`]).catch(() => {}); }
+  } catch (err) {
+    console.error(`[job ${name}] failed:`, err.message);
+  } finally {
+    if (client) client.release();
+  }
+}
 
 async function ensureStampStatusColumns() {
   const recordTables = [
@@ -1772,7 +1796,6 @@ async function resolveLifecycleProjectId(req) {
 
   const idOnlyRoutes = [
     [/^\/api\/milestone-photos\/(\d+)$/, 'SELECT project_id FROM milestone_photos WHERE id=$1'],
-    [/^\/api\/planning-execution-tracking\/(\d+)$/, 'SELECT pe.project_id FROM planning_execution_tracking t JOIN planning_execution pe ON pe.id=t.activity_id WHERE t.id=$1'],
     [/^\/chat\/messages\/(\d+)$/, 'SELECT project_id FROM project_chat_messages WHERE id=$1'],
   ];
   for (const [pattern, query] of idOnlyRoutes) {
@@ -2263,7 +2286,7 @@ async function processProjectLifecycleJobs() {
   }
 }
 
-setInterval(processProjectLifecycleJobs, 60 * 1000);
+setInterval(() => runExclusiveJob('project-lifecycle', processProjectLifecycleJobs), 60 * 1000);
 
 // =============================================================================
 //  WORK CENTER & PLANNING HELPERS
@@ -8087,9 +8110,6 @@ registerMilestoneRoutes(app, progressModelDeps);
 registerTaskQueryRoutes(app, progressModelDeps);
 registerTaskCardRoutes(app, progressModelDeps);
 
-// Keep the later Work Center route available for standalone tasks.
-app.post('/api/work-center', authenticateToken, (_req, _res, next) => next());
-
 // Friendly refusals instead of database errors. next() hands over to the original handler when nothing blocks.
 app.delete('/api/planning-execution/:activityId', authenticateToken, async (req, res, next) => {
   try {
@@ -8216,157 +8236,6 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Create activity (leaders/PMs only) ───────────────────────────────────────
-app.post('/api/planning-execution/create', authenticateToken,
-  upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
-  try {
-    const { user_id, role } = req.user;
-    if (!isWCLeader(role))
-      return res.status(403).json({ error: 'Only leaders and PMs can create activities.' });
-
-    const {
-      projectId,
-      milestone_name    = '',
-      title,
-      description       = '',
-      start_date,
-      end_date,
-      planned_quantity,
-      unit,
-      planned_work      = '',
-      planned_manpower  = '',
-      planned_equipment = '',
-      planned_materials = '',
-    } = req.body;
-
-    if (!projectId)        return res.status(400).json({ error: 'projectId is required.' });
-    if (!title?.trim())    return res.status(400).json({ error: 'title is required.' });
-    if (!start_date)       return res.status(400).json({ error: 'start_date is required.' });
-    if (!end_date)         return res.status(400).json({ error: 'end_date is required.' });
-    if (!planned_quantity) return res.status(400).json({ error: 'planned_quantity is required.' });
-    if (!unit?.trim())     return res.status(400).json({ error: 'unit is required.' });
-
-    // side from JWT role — leaders always have a direct side
-    const side = wcSide(role);
-    if (!side) return res.status(403).json({ error: 'Cannot determine your side.' });
-
-    // Verify membership in this project
-    const projCheck = await pool.query(
-      `SELECT 1 FROM assignments_view
-       WHERE project_id = $1 AND role_id = $2 LIMIT 1`,
-      [projectId, user_id]
-    );
-    if (!projCheck.rows.length)
-      return res.status(403).json({ error: 'You are not a member of this project.' });
-
-    let linkedFileName = null, linkedFileId = null, linkedFileUrl = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(
-        req.file.buffer, req.file.originalname, 'planning_execution/plans'
-      );
-      linkedFileName = req.file.originalname;
-      linkedFileId   = uploaded.public_id;
-      linkedFileUrl  = uploaded.secure_url;
-    }
-
-    const result = await pool.query(`
-      INSERT INTO planning_execution
-        (project_id, side, milestone_name, title, description,
-         start_date, end_date, planned_quantity, unit,
-         planned_work, planned_manpower, planned_equipment, planned_materials,
-         linked_file_name, linked_file_id, linked_file_url,
-         status, creator_id, creator_role)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-              'not_yet_started',$17,$18)
-      RETURNING *
-    `, [
-      projectId, side, milestone_name.trim(), title.trim(), description,
-      start_date, end_date, planned_quantity, unit.trim(),
-      planned_work, planned_manpower, planned_equipment, planned_materials,
-      linkedFileName, linkedFileId, linkedFileUrl,
-      user_id, role,
-    ]);
-
-    return res.status(201).json({ success: true, record: result.rows[0] });
-  } catch (err) {
-    console.error('POST /api/planning-execution/create:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
-// ── Update activity plan fields (creating leader only) ───────────────────────
-app.put('/api/planning-execution', authenticateToken,
-  upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
-  try {
-    const { user_id, role } = req.user;
-    if (!isWCLeader(role))
-      return res.status(403).json({ error: 'Only leaders and PMs can update activities.' });
-
-    const { id, projectId } = req.body;
-    if (!id)        return res.status(400).json({ error: 'Activity id is required.' });
-    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
-
-    const actCheck = await pool.query(
-      `SELECT id, creator_id, linked_file_id
-       FROM planning_execution WHERE id = $1 AND project_id = $2`,
-      [id, projectId]
-    );
-    if (!actCheck.rows.length)
-      return res.status(404).json({ error: 'Activity not found.' });
-    if (String(actCheck.rows[0].creator_id) !== String(user_id))
-      return res.status(403).json({ error: 'Only the creating leader can edit this activity.' });
-
-    const {
-      milestone_name, title, description,
-      start_date, end_date, planned_quantity, unit,
-      planned_work, planned_manpower, planned_equipment, planned_materials,
-    } = req.body;
-    // NOTE: status and side are NOT editable here — status is tracking-driven.
-
-    const setClauses = [], values = []; let idx = 1;
-    const push = (col, val) => { setClauses.push(`${col} = $${idx++}`); values.push(val); };
-
-    if (milestone_name   !== undefined) push('milestone_name',    milestone_name.trim());
-    if (title            !== undefined) push('title',             title.trim());
-    if (description      !== undefined) push('description',       description);
-    if (start_date       !== undefined) push('start_date',        start_date);
-    if (end_date         !== undefined) push('end_date',          end_date);
-    if (planned_quantity !== undefined) push('planned_quantity',  planned_quantity);
-    if (unit             !== undefined) push('unit',              unit.trim());
-    if (planned_work     !== undefined) push('planned_work',      planned_work);
-    if (planned_manpower !== undefined) push('planned_manpower',  planned_manpower);
-    if (planned_equipment!== undefined) push('planned_equipment', planned_equipment);
-    if (planned_materials!== undefined) push('planned_materials', planned_materials);
-
-    if (req.file) {
-      if (actCheck.rows[0].linked_file_id)
-        await cloudinary.uploader.destroy(
-          actCheck.rows[0].linked_file_id, { resource_type: 'raw' }
-        ).catch(() => {});
-      const uploaded = await scheduleCloudinaryUpload(
-        req.file.buffer, req.file.originalname, 'planning_execution/plans'
-      );
-      push('linked_file_name', req.file.originalname);
-      push('linked_file_id',   uploaded.public_id);
-      push('linked_file_url',  uploaded.secure_url);
-    }
-
-    if (!setClauses.length) return res.status(400).json({ error: 'No fields to update.' });
-    values.push(id, projectId);
-
-    const updated = await pool.query(
-      `UPDATE planning_execution SET ${setClauses.join(', ')}
-       WHERE id = $${idx} AND project_id = $${idx + 1} RETURNING *`,
-      values
-    );
-    return res.json({ success: true, record: updated.rows[0] });
-  } catch (err) {
-    if (err && err.code === '55000') return res.status(409).json({ error: err.message });
-    console.error('PUT /api/planning-execution:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
 // ── Delete activity (creating leader only) ────────────────────────────────────
 app.delete('/api/planning-execution/:activityId', authenticateToken, async (req, res) => {
   try {
@@ -8450,254 +8319,6 @@ app.get('/api/planning-execution/:activityId/download', authenticateToken, async
     return res.status(500).json({ error: 'Server error.' });
   }
 });
-
-// ── Get tracking entries (leaders + PMs + TeamMembers, same side) ─────────────
-app.get('/api/planning-execution-tracking', authenticateToken, async (req, res) => {
-  try {
-    const { user_id, role }         = req.user;
-    const { activityId, projectId } = req.query;
-    if (!activityId) return res.status(400).json({ error: 'activityId is required.' });
-    if (!projectId)  return res.status(400).json({ error: 'projectId is required.' });
-
-    const actCheck = await pool.query(
-      `SELECT id, side FROM planning_execution WHERE id = $1 AND project_id = $2`,
-      [activityId, projectId]
-    );
-    if (!actCheck.rows.length)
-      return res.status(404).json({ error: 'Activity not found.' });
-
-    const userSide = await resolveSide(role, user_id, projectId);
-    if (!userSide || userSide !== actCheck.rows[0].side)
-      return res.status(403).json({ error: 'Access denied.' });
-
-    const result = await pool.query(`
-      SELECT
-        t.*,
-        to_char(pe.end_date, 'YYYY-MM-DD') AS planned_end,
-        to_char(pe.actual_end, 'YYYY-MM-DD') AS actual_end,
-        pe.status AS activity_status,
-        CASE WHEN pe.planned_quantity > 0
-          THEN LEAST(100, (t.actual_quantity / pe.planned_quantity) * 100)
-          ELSE 0 END AS daily_progress_pct,
-        SUM(t.actual_quantity) OVER (
-          ORDER BY t.report_date ASC, t.created_at ASC
-          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-        ) AS cumulative_quantity
-      FROM planning_execution_tracking t
-      JOIN planning_execution pe ON pe.id = t.activity_id
-      WHERE t.activity_id = $1
-      ORDER BY t.report_date ASC, t.created_at ASC
-    `, [activityId]);
-
-    const entries = result.rows.map((row) => {
-      const { planned_end, actual_end, activity_status, delay_reason: _legacyDelayReason, ...entry } = row;
-      entry.delay_days = delayDays({
-        plannedEnd: planned_end,
-        actualEnd: actual_end,
-        status: activity_status,
-      });
-      return entry;
-    });
-    return res.json({ entries });
-  } catch (err) {
-    console.error('GET /api/planning-execution-tracking:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
-// ── Log execution entry (creating leader only) ────────────────────────────────
-app.post('/api/planning-execution-tracking', authenticateToken,
-  upload.single('attachment'), requireProjectLifecycleWrite, async (req, res) => {
-  try {
-    const { user_id, role } = req.user;
-    if (!isWCLeader(role))
-      return res.status(403).json({ error: 'Only leaders and PMs can log execution entries.' });
-
-    const {
-      projectId,
-      activity_id,
-      report_date,
-      actual_quantity,
-      unit                    = '',
-      manpower_used           = '',
-      equipment_used          = '',
-      materials_used          = '',
-      progress_pct            = '0',
-      day_remark              = '',
-      issues                  = '',
-      status_change_to_closed = '0',
-    } = req.body;
-
-    if (!projectId)           return res.status(400).json({ error: 'projectId is required.' });
-    if (!activity_id)         return res.status(400).json({ error: 'activity_id is required.' });
-    if (!report_date)         return res.status(400).json({ error: 'report_date is required.' });
-    const normalizedReportDate = validDate(report_date);
-    if (!normalizedReportDate) return res.status(400).json({ error: 'report_date must be a valid date.' });
-    if (!actual_quantity)     return res.status(400).json({ error: 'actual_quantity is required.' });
-    if (!day_remark.trim())   return res.status(400).json({ error: 'day_remark is required.' });
-
-    const pct   = parseFloat(progress_pct);
-    if (isNaN(pct) || pct < 0 || pct > 100)
-      return res.status(400).json({ error: 'progress_pct must be 0–100.' });
-
-    const actCheck = await pool.query(
-      `SELECT id, creator_id, unit AS planned_unit, status,
-              to_char(end_date, 'YYYY-MM-DD') AS planned_end,
-              to_char(actual_end, 'YYYY-MM-DD') AS actual_end
-       FROM planning_execution WHERE id = $1 AND project_id = $2`,
-      [activity_id, projectId]
-    );
-    if (!actCheck.rows.length)
-      return res.status(404).json({ error: 'Activity not found.' });
-    if (String(actCheck.rows[0].creator_id) !== String(user_id))
-      return res.status(403).json({
-        error: 'Only the creating leader can log execution entries.'
-      });
-    const markClosed = status_change_to_closed === '1' || status_change_to_closed === true;
-    const delay = delayDays({
-      plannedEnd: actCheck.rows[0].planned_end,
-      actualEnd: markClosed ? normalizedReportDate : actCheck.rows[0].actual_end,
-      status: markClosed ? 'closed' : actCheck.rows[0].status,
-    });
-    const existingEntry = await pool.query(
-      `SELECT id FROM planning_execution_tracking
-       WHERE activity_id=$1 AND report_date=$2 LIMIT 1`,
-      [activity_id, report_date]
-    );
-    if (existingEntry.rows.length)
-      return res.status(409).json({ error: 'An execution entry already exists for this activity and date.' });
-
-    let attachmentName = null, attachmentId = null, attachmentUrl = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(
-        req.file.buffer, req.file.originalname, 'planning_execution/tracking'
-      );
-      attachmentName = req.file.originalname;
-      attachmentId   = uploaded.public_id;
-      attachmentUrl  = uploaded.secure_url;
-    }
-
-    const result = await pool.query(`
-      INSERT INTO planning_execution_tracking
-        (activity_id, report_date, actual_quantity, unit,
-         manpower_used, equipment_used, materials_used,
-         progress_pct, day_remark, issues,
-         delay_days, delay_reason, status_change_to_closed,
-         attachment_name, attachment_id, attachment_url,
-         logged_by, logged_by_role)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,$12,$13,$14,$15,$16,$17)
-      RETURNING *
-    `, [
-      activity_id, normalizedReportDate, actual_quantity,
-      unit || actCheck.rows[0].planned_unit,
-      manpower_used, equipment_used, materials_used,
-      pct, day_remark.trim(), issues, delay, markClosed,
-      attachmentName, attachmentId, attachmentUrl,
-      user_id, role,
-    ]);
-
-    // ── Auto-update activity status based on entry ────────────────────────────
-    if (markClosed) {
-      await pool.query(
-        `UPDATE planning_execution SET status = 'closed', actual_end = COALESCE(actual_end, $2) WHERE id = $1`,
-        [activity_id, normalizedReportDate]
-      );
-    } else if (pct >= 100) {
-      await pool.query(
-        `UPDATE planning_execution SET status = 'completed' WHERE id = $1`,
-        [activity_id]
-      );
-    } else {
-      // First entry transitions not_yet_started → ongoing
-      await pool.query(
-        `UPDATE planning_execution SET status = 'ongoing'
-         WHERE id = $1 AND status = 'not_yet_started'`,
-        [activity_id]
-      );
-    }
-
-    return res.status(201).json({ success: true, entry: result.rows[0] });
-  } catch (err) {
-    if (err && err.code === '55000') return res.status(409).json({ error: err.message });
-    console.error('POST /api/planning-execution-tracking:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
-// ── Delete tracking entry (creating leader only) ──────────────────────────────
-app.delete('/api/planning-execution-tracking/:entryId', authenticateToken, async (req, res) => {
-  try {
-    const { user_id, role } = req.user;
-    const { entryId }       = req.params;
-    const { projectId }     = req.body;
-
-    if (!isWCLeader(role))
-      return res.status(403).json({ error: 'Only leaders and PMs can delete tracking entries.' });
-    if (!projectId)
-      return res.status(400).json({ error: 'projectId is required.' });
-
-    const entryCheck = await pool.query(`
-      SELECT t.id, t.attachment_id, pe.creator_id
-      FROM   planning_execution_tracking t
-      JOIN   planning_execution pe ON pe.id = t.activity_id
-      WHERE  t.id = $1 AND pe.project_id = $2
-    `, [entryId, projectId]);
-
-    if (!entryCheck.rows.length)
-      return res.status(404).json({ error: 'Entry not found.' });
-    if (String(entryCheck.rows[0].creator_id) !== String(user_id))
-      return res.status(403).json({ error: 'Only the activity creator can delete entries.' });
-
-    if (entryCheck.rows[0].attachment_id)
-      await cloudinary.uploader.destroy(
-        entryCheck.rows[0].attachment_id, { resource_type: 'raw' }
-      ).catch(() => {});
-
-    await pool.query(
-      `DELETE FROM planning_execution_tracking WHERE id = $1`, [entryId]
-    );
-    return res.json({ success: true, message: 'Entry deleted.' });
-  } catch (err) {
-    console.error('DELETE /api/planning-execution-tracking/:entryId:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
-// ── Download tracking attachment (same side) ──────────────────────────────────
-app.get('/api/planning-execution-tracking/download/:entryId',
-  authenticateToken, async (req, res) => {
-  try {
-    const { user_id, role } = req.user;
-    const { entryId }       = req.params;
-    const { projectId }     = req.query;
-    if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
-
-    const result = await pool.query(`
-      SELECT t.attachment_id, t.attachment_url, t.attachment_name, pe.side
-      FROM   planning_execution_tracking t
-      JOIN   planning_execution pe ON pe.id = t.activity_id
-      WHERE  t.id = $1 AND pe.project_id = $2
-    `, [entryId, projectId]);
-
-    if (!result.rows.length)
-      return res.status(404).json({ error: 'Entry not found.' });
-
-    const userSide = await resolveSide(role, user_id, projectId);
-    if (!userSide || userSide !== result.rows[0].side)
-      return res.status(403).json({ error: 'Access denied.' });
-    if (!result.rows[0].attachment_id)
-      return res.status(404).json({ error: 'No attachment on this entry.' });
-
-    return res.json({
-      url:      result.rows[0].attachment_url,
-      filename: result.rows[0].attachment_name,
-    });
-  } catch (err) {
-    console.error('GET /api/planning-execution-tracking/download/:entryId:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
 
 // =============================================================================
 //  WORK CENTER ROUTES
@@ -11151,18 +10772,19 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
 
 setTimeout(() => {
-  const runVerificationReminders = () => sendOverdueVerificationReminders({
+  const runVerificationReminders = () => runExclusiveJob('verification-reminders', () => sendOverdueVerificationReminders({
     pool, notifyRecordUsers, flowKey, normalizeRole,
-  });
-  const runWorkCenterTaskReminders = () => sendWorkCenterTaskReminders({
+  }));
+  const runWorkCenterTaskReminders = () => runExclusiveJob('work-center-task-reminders', () => sendWorkCenterTaskReminders({
     pool, notifyRecordUsers, flowKey, normalizeRole,
-  });
+  }));
+  const runMeetingReminders = () => runExclusiveJob('meeting-reminders', () => sendDueMeetingReminders());
   runVerificationReminders();
   setInterval(runVerificationReminders, 15 * 60 * 1000);
   runWorkCenterTaskReminders();
   setInterval(runWorkCenterTaskReminders, 15 * 60 * 1000);
-  sendDueMeetingReminders();
-  setInterval(sendDueMeetingReminders, 15 * 60 * 1000);
+  runMeetingReminders();
+  setInterval(runMeetingReminders, 15 * 60 * 1000);
 }, 30 * 1000);
 
 setInterval(() => {
