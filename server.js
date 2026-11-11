@@ -8355,6 +8355,11 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
           pe.planned_manpower AS activity_planned_manpower,
           pe.planned_equipment AS activity_planned_equipment,
           pe.planned_materials AS activity_planned_materials,
+          COALESCE((SELECT json_agg(json_build_object(
+            'id', pr.id, 'type', pr.resource_type, 'name', pr.name,
+            'planned_quantity', pr.planned_quantity, 'unit', pr.unit, 'planned_hours', pr.planned_hours
+          ) ORDER BY pr.id) FROM planned_resources pr
+            WHERE pr.activity_id = pe.id AND (pr.task_id IS NULL OR pr.task_id = w.id)), '[]'::json) AS planned_resources,
           COALESCE(
             (SELECT m.title FROM milestones m WHERE m.id = pe.baseline_milestone_id),
             (SELECT am.title FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
@@ -8414,6 +8419,11 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
           pe.planned_manpower AS activity_planned_manpower,
           pe.planned_equipment AS activity_planned_equipment,
           pe.planned_materials AS activity_planned_materials,
+          COALESCE((SELECT json_agg(json_build_object(
+            'id', pr.id, 'type', pr.resource_type, 'name', pr.name,
+            'planned_quantity', pr.planned_quantity, 'unit', pr.unit, 'planned_hours', pr.planned_hours
+          ) ORDER BY pr.id) FROM planned_resources pr
+            WHERE pr.activity_id = pe.id AND (pr.task_id IS NULL OR pr.task_id = w.id)), '[]'::json) AS planned_resources,
           COALESCE(
             (SELECT m.title FROM milestones m WHERE m.id = pe.baseline_milestone_id),
             (SELECT am.title FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
