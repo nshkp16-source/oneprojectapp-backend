@@ -56,6 +56,22 @@ export function rebalanceForNew(existing, newWeight) {
   return [...scaled.map(fromCents), fromCents(newC)];
 }
 
+/** Reallocate the remaining positive weights to 100 after an item is removed. */
+export function rebalanceAfterRemoval(remaining) {
+  if (!Array.isArray(remaining)) throw new Error('Remaining weights must be a list.');
+  if (!remaining.length) return [];
+  const weights = remaining.map(Number);
+  if (weights.some((weight) => !Number.isFinite(weight) || weight <= 0 || weight > 100))
+    throw new Error('Remaining weights must be above 0 and no greater than 100.');
+  const total = weights.reduce((sum, weight) => sum + cents(weight), 0);
+  if (!(total > 0)) throw new Error('Remaining weights must have a positive total.');
+  const scaled = weights.map((weight) => Math.max(1, Math.round((cents(weight) * 10000) / total)));
+  const difference = 10000 - scaled.reduce((sum, weight) => sum + weight, 0);
+  const largest = scaled.indexOf(Math.max(...scaled));
+  scaled[largest] += difference;
+  return scaled.map(fromCents);
+}
+
 /**
  * Default activity weights inside a milestone. When every activity uses the same unit as the milestone,
  * weights follow the planned quantities. Otherwise they are split equally.
