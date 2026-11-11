@@ -6,7 +6,7 @@ import * as acorn from 'acorn';
 
 const html = fs.readFileSync(new URL('../frontend/dashboard.html', import.meta.url), 'utf8');
 const scripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
-const names = ['_wcFmtDate', '_peDeriveStatus', '_peCertificationPanel', '_peActivityCardHtml',
+const names = ['_wcFmtDate', '_peDeriveStatus', '_peCertificationPanel', '_peActivityCardHtml', '_peReportPanelLine', '_peActivityReportHtml',
   '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_safeHttpsUrl', '_fileDisplayName', '_thumbUrl',
   '_evidenceFileAttrs', '_evidenceFileRowHtml', '_evidencePhotosHtml', '_evidenceFilesHtml', '_peRequestEvidencePickerHtml',
   '_peWorkByTaskHtml'];
@@ -17,7 +17,7 @@ const source = scripts.map((script) => {
 }).join('\n');
 for (const name of names) assert.match(source, new RegExp(`function ${name}\\(`), `${name} was not found`);
 
-function render(card, viewerRole = 'ConsultantPM') {
+function render(card, viewerRole = 'ConsultantPM', verificationData = { verifications: [], rework: [] }) {
   const context = {
     window: { currentUserRole: viewerRole, currentUserId: 8 },
     isWCLeader: () => true,
@@ -29,11 +29,11 @@ function render(card, viewerRole = 'ConsultantPM') {
   vm.runInContext(source, context);
   return vm.runInContext(
     `_peActivityCardHtml(__card, __verificationData, 'overview')`,
-    Object.assign(context, { __card: card, __verificationData: { verifications: [], rework: [] } }),
+    Object.assign(context, { __card: card, __verificationData: verificationData }),
   );
 }
 
-test('activity tabs expose Certification only for milestone-driving activity', () => {
+test('activity tabs expose Verify only for milestone-driving activity with a pending request', () => {
   const linkedCard = {
     viewer_side: 'Consultant',
     activity: { id: 1, title: 'Foundation', side: 'Contractor', drives_milestone: true, activity_type: 'quantity', planned_quantity: 200, unit: 'm3' },
@@ -41,16 +41,38 @@ test('activity tabs expose Certification only for milestone-driving activity', (
     progress_reports: [],
   };
   const linked = render(linkedCard);
-  assert.match(linked, /data-pe-tab="certification"/);
+  assert.doesNotMatch(linked, /data-pe-tab="certification"|data-pe-tab="verify-work"/);
   assert.match(linked, /data-pe-tab="overview"/);
   assert.doesNotMatch(linked, /data-pe-tab="tasks"/);   // a consultant does not get the contractor's internal task breakdown
-  assert.match(linked, /data-pe-tab="progress"/);
+  assert.match(linked, /data-pe-tab="work"/);   // Tasks and Progress now live together in the Work tab
   assert.match(linked, /data-pe-tab="attachments"/);
   assert.match(linked, /class="detail-tab"/);
   assert.doesNotMatch(linked, /rc-btn--approve/);
   assert.doesNotMatch(linked, /Activity dates|Created by|>Title</);
-  assert.doesNotMatch(linked, /Foundation/);
+  // the breadcrumb now names the activity, so its title is no longer hidden from the consultant
   assert.doesNotMatch(linked, /Save Execution Entry|pe-save-actual/);
+  const pendingVerification = render(linkedCard, 'ConsultantPM', {
+    verifications: [{ id: 21, status: 'pending', kind: 'progress', claimed_progress_pct: 50 }],
+    rework: [],
+  });
+  assert.match(pendingVerification, /data-pe-tab="verify-work"/);
+  assert.doesNotMatch(pendingVerification, /data-pe-tab="certification"/);
+  assert.match(pendingVerification, /name="certification_note"/);
+  assert.match(pendingVerification, /name="photos"[^>]+multiple/);
+  assert.match(pendingVerification, /data-pe-decision-submit[^>]+disabled/);
+  assert.match(pendingVerification, /required for Verify or Verify with changes/);
+  assert.match(pendingVerification, /option value="verified_with_changes"/);
+  const holdPointVerification = render(linkedCard, 'ConsultantPM', {
+    verifications: [{ id: 22, status: 'pending', kind: 'hold_point' }],
+    rework: [],
+  });
+  assert.match(holdPointVerification, /data-pe-cert-note-required="false"/);
+  assert.match(holdPointVerification, /Short certification note <span[^>]*>\(optional\)/);
+  const completionVerification = render(linkedCard, 'ConsultantPM', {
+    verifications: [{ id: 23, status: 'pending', kind: 'completion' }],
+    rework: [],
+  });
+  assert.doesNotMatch(completionVerification, /option value="verified_with_changes"/);
   const consultantProgress = render({
     ...linkedCard,
     activity_summary: { approved_report_count: 3, approved_quantity: 42 },
@@ -112,6 +134,51 @@ test('activity tabs expose Certification only for milestone-driving activity', (
   }, 'ClientPM');
   assert.match(client, /Certified progress/);
   assert.doesNotMatch(client, /Claimed 65%|Private task|Private report|data-pe-tab="tasks"/);
+});
+
+test('report overview uses the activity-report endpoint payload contract', () => {
+  const context = {
+    window: { currentUserRole: 'ConsultantPM', currentUserId: 8 },
+    isWCLeader: () => true,
+    escapeHtml: (value) => String(value).replace(/[&<>"']/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[char]),
+    _thumbUrl: (url) => url,
+    _safeHttpsUrl: (url) => url,
+    _fileDisplayName: (file) => file.file_name || file.name || 'Attachment',
+  };
+  vm.createContext(context);
+  vm.runInContext(source, context);
+  const report = {
+    activity: {
+      id: 9, title: 'Bridge footing', description: 'Footings', done_when: 'Complete all pours',
+      start_date: '2026-11-01', end_date: '2026-11-05', unit: 'm3',
+      legacy_planned: { work: 'Excavate and pour', manpower: '4 crew', equipment: 'Excavator', materials: 'Concrete' },
+    },
+    progress: { claimed_pct: 65, certified_pct: 40, variance_pct: 10 },
+    quantities: { planned: 100, claimed: 65, certified: 40 },
+    daily_log: [{ date: '2026-11-02', task_title: 'Excavation', reported_by_name: 'Ana', work_done: 'Cut trench', quantity: 40, running_total: 40 },
+      { date: '2026-11-03', task_title: 'Excavation', reported_by_name: 'Ana', work_done: 'Finished trench', quantity: 25, running_total: 65 }],
+    resources: { rows: [{ type: 'manpower', name: 'Crew', unit: 'workers', planned_quantity: 6, used_quantity: 10, planned_hours: 48, used_hours: 52, linked: true },
+      { type: 'material', name: 'Concrete', unit: 'm3', planned_quantity: 50, used_quantity: 26, linked: false }] },
+    photos: [{ file_name: 'site-1.jpg', file_url: 'https://example.test/site-1.jpg' }],
+    attachments: [{ file_name: 'permit.pdf', file_url: 'https://example.test/permit.pdf', mime_type: 'application/pdf' }],
+    next_period: { text: 'Next day: finish steel fix' },
+    quality: { checklists: [{ title: 'Inspect formwork', task_title: 'Excavation', items: 2, done: 1 }], hold_points: [], rework: [] },
+    delays: [{ cause: 'weather', days: 2, text: 'Rain' }],
+    safety: [{ note: 'PPE check complete' }],
+    certificates: [{ certificate_no: 'CERT-12', status: 'verified', decided_at: '2026-11-04', note: 'Approved' }],
+  };
+  const html = vm.runInContext(`_peActivityReportHtml(__report)`, Object.assign(context, { __report: report }));
+  assert.match(html, /Bridge footing/);
+  assert.match(html, /Ana/);
+  assert.match(html, /Running total/);
+  assert.match(html, /Crew/);
+  assert.match(html, /Concrete/);
+  assert.match(html, /permit\.pdf/);
+  assert.match(html, /Next day: finish steel fix/);
+  assert.match(html, /PPE check complete/);
+  assert.match(html, /CERT-12/);
 });
 
 test('consultant certification tab includes approved-work review evidence and existing decision flow', () => {

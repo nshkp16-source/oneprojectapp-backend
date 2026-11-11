@@ -85,7 +85,10 @@ function parseReportResources(value, assignedMembers = []) {
       || (hours != null && (!Number.isFinite(hours) || hours < 0)))
       throw new HttpError(400, 'Resource quantities and hours must be zero or more.');
     if (unit && unit.length > 60) throw new HttpError(400, 'Resource units cannot exceed 60 characters.');
-    return { type, name, quantity, unit, hours, assignedMemberId };
+    const plannedResourceId = row?.plannedResourceId == null || row.plannedResourceId === '' ? null : Number(row.plannedResourceId);
+    if (plannedResourceId != null && !Number.isSafeInteger(plannedResourceId))
+      throw new HttpError(400, 'The planned resource link is invalid.');
+    return { type, name, quantity, unit, hours, assignedMemberId, plannedResourceId };
   });
 }
 
@@ -333,6 +336,37 @@ function registerReportRoutes(app, deps) {
       if (photoMeta.some((meta) => meta.accuracy != null && (!Number.isFinite(meta.accuracy) || meta.accuracy < 0)))
         throw new HttpError(400, 'Photo accuracy metadata is invalid.');
       const resources = parseReportResources(b.resources, assigned);
+      const linkedResourceIds = [...new Set(resources
+        .map((resource) => resource.plannedResourceId)
+        .filter((id) => id != null))];
+      if (linkedResourceIds.length) {
+        const plannedRows = (await pool.query(
+          `SELECT id, resource_type, name, unit
+           FROM planned_resources
+           WHERE id = ANY($1::bigint[]) AND project_id = $2 AND activity_id = $3
+             AND (task_id IS NULL OR task_id = $4)`,
+          [linkedResourceIds, projectId, task.activity_id, taskId])).rows;
+        const plannedById = new Map(plannedRows.map((row) => [Number(row.id), row]));
+        if (plannedById.size !== linkedResourceIds.length)
+          throw new HttpError(400, 'A selected planned resource does not belong to this task.');
+        for (const resource of resources) {
+          if (resource.plannedResourceId == null) continue;
+          const plannedResource = plannedById.get(resource.plannedResourceId);
+          if (plannedResource.resource_type !== resource.type)
+            throw new HttpError(400, 'A selected planned resource must use the matching resource type.');
+          resource.name = plannedResource.name;
+          resource.unit = plannedResource.unit || resource.unit;
+        }
+      }
+      // optional site conditions, shown in the activity report
+      const siteText = (value, max, label) => {
+        const text = String(value || '').trim();
+        if (text.length > max) throw new HttpError(400, `${label} cannot exceed ${max} characters.`);
+        return text || null;
+      };
+      const weather = siteText(b.weather, 100, 'Weather');
+      const safetyNote = siteText(b.safetyNote, 1000, 'The safety note');
+      const nextPlan = siteText(b.nextPlan, 1000, 'The plan for tomorrow');
       const delayCause = String(b.delayCause || '').trim() || null;
       const delayNote = String(b.delayNote || '').trim();
       const delayDaysCount = reportDelayDays(b.reportDate, task.end_date);
@@ -402,13 +436,14 @@ function registerReportRoutes(app, deps) {
         INSERT INTO workspace_work_center_progress
           (task_id, report_date, member_id, member_role, work_done, manpower, equipment, materials,
            progress_pct, issues, notes, attachment_name, attachment_id, attachment_url,
-           quantity_done, quantity_failed, stage_id, delay_cause, delay_note, delay_days, idempotency_key)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,NULL,$12,$13,$14,$15,$16,$17,$18)
+           quantity_done, quantity_failed, stage_id, delay_cause, delay_note, delay_days, idempotency_key,
+           weather, safety_note, next_plan)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,NULL,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
         ON CONFLICT (task_id, member_id, idempotency_key) WHERE idempotency_key IS NOT NULL
         DO NOTHING RETURNING *`,
         [taskId, b.reportDate, userId, role, String(b.workDone).trim(), b.manpower || '', b.equipment || '', b.materials || '',
          stored, b.issues || '', b.notes || '', quantityDone, quantityFailed, stageId,
-         delayCause, delayNote || null, delayDaysCount, idempotencyKey || null])).rows[0];
+         delayCause, delayNote || null, delayDaysCount, idempotencyKey || null, weather, safetyNote, nextPlan])).rows[0];
       if (!entry) {
         await client.query('ROLLBACK');
         const existing = (await pool.query(
@@ -458,10 +493,11 @@ function registerReportRoutes(app, deps) {
       for (const resource of resources) {
         await client.query(
           `INSERT INTO work_center_report_resources
-             (report_id, project_id, resource_type, name, quantity, unit, hours, assigned_member_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+             (report_id, project_id, resource_type, name, quantity, unit, hours, assigned_member_id, planned_resource_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
+                   (SELECT id FROM planned_resources WHERE id = $9 AND project_id = $2))`,
           [entry.id, projectId, resource.type, resource.name, resource.quantity, resource.unit,
-            resource.hours, resource.assignedMemberId]);
+            resource.hours, resource.assignedMemberId, resource.plannedResourceId]);
       }
       await client.query(
         `INSERT INTO work_center_task_history

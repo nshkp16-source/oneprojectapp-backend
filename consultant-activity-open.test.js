@@ -40,9 +40,11 @@ function setup(role, { cardStatus = 200, verificationStatus = 200, listed = true
     async function _openRecordNotification() { window.__log.listLookups++; await new Promise(r => setTimeout(r, 2500)); return false; }
     function _selectNotificationTab() { window.__log.tabSelects++; }
     function _peActivityCardHtml(card, data) {
-      return '<div data-pe-tab="certification"></div>' + (${listed ? 'true' : 'false'} ? '<div id="pe-verification-91"></div>' : '');
+      const tab = wcSide(window.currentUserRole) === 'Consultant' ? 'verify-work' : 'certification';
+      return '<div data-pe-tab="' + tab + '"></div>' + (${listed ? 'true' : 'false'} ? '<div id="pe-verification-91"></div>' : '');
     }
     function _peWireActivityCard() {} function _peUpdateStatusBadge() {}
+    async function _peFetchActivityReport() { return {}; }
     window.alert = (m) => window.__log.alerts.push(m);
     async function authFetch(url) {
       window.__log.calls.push(url);

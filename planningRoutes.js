@@ -5,6 +5,7 @@ import {
   checkOverride, canCompleteMilestone, visibleProgress,
 } from './progressRules.js';
 import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
+import { buildActivityReport, shapeReportForViewer } from './activityReport.js';
 
 const activity = (function () {
 // Routes for activities and their tasks: create an activity together with its tasks, add a task later
@@ -49,6 +50,68 @@ function parseJson(value, fallback, label) {
   try { return JSON.parse(value); } catch { throw new HttpError(400, `${label} must be valid JSON.`); }
 }
 
+function parsePlannedResources(value) {
+  const rows = parseJson(value, [], 'planned_resources');
+  if (!Array.isArray(rows) || rows.length > 60)
+    throw new HttpError(400, 'planned_resources must be a list of at most 60 resources.');
+  return rows.map((row) => {
+    const id = row?.id == null || row.id === '' ? null : Number(row.id);
+    const type = String(row?.type || row?.resource_type || '');
+    const name = String(row?.name || '').trim();
+    const plannedQuantity = row?.planned_quantity === '' || row?.planned_quantity == null
+      ? null : Number(row.planned_quantity);
+    const plannedHours = row?.planned_hours === '' || row?.planned_hours == null
+      ? null : Number(row.planned_hours);
+    const unit = String(row?.unit || '').trim() || null;
+    if (id != null && (!Number.isSafeInteger(id) || id <= 0))
+      throw new HttpError(400, 'A planned resource id is invalid.');
+    if (!['manpower', 'equipment', 'material'].includes(type) || !name || name.length > 200)
+      throw new HttpError(400, 'Each planned resource needs a valid type and name.');
+    if ((plannedQuantity != null && (!Number.isFinite(plannedQuantity) || plannedQuantity < 0))
+      || (plannedHours != null && (!Number.isFinite(plannedHours) || plannedHours < 0)))
+      throw new HttpError(400, 'Planned resource quantities and hours must be zero or more.');
+    if (unit && unit.length > 60) throw new HttpError(400, 'Planned resource units cannot exceed 60 characters.');
+    return { id, type, name, plannedQuantity, plannedHours, unit };
+  });
+}
+
+async function insertPlannedResources(db, projectId, activityId, taskId, rows) {
+  for (const row of rows) {
+    await db.query(
+      `INSERT INTO planned_resources
+         (project_id, activity_id, task_id, resource_type, name, planned_quantity, unit, planned_hours)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [projectId, activityId, taskId, row.type, row.name, row.plannedQuantity, row.unit, row.plannedHours]);
+  }
+}
+
+async function syncActivityPlannedResources(db, projectId, activityId, rows) {
+  const existing = (await db.query(
+    `SELECT id FROM planned_resources WHERE activity_id = $1 AND task_id IS NULL FOR UPDATE`, [activityId])).rows;
+  const existingIds = new Set(existing.map((row) => Number(row.id)));
+  const submittedIds = new Set();
+  for (const row of rows) {
+    if (row.id != null) {
+      if (!existingIds.has(row.id) || submittedIds.has(row.id))
+        throw new HttpError(400, 'A planned resource does not belong to this activity or is duplicated.');
+      submittedIds.add(row.id);
+      await db.query(
+        `UPDATE planned_resources
+         SET resource_type = $2, name = $3, planned_quantity = $4, unit = $5, planned_hours = $6
+         WHERE id = $1 AND activity_id = $7 AND task_id IS NULL`,
+        [row.id, row.type, row.name, row.plannedQuantity, row.unit, row.plannedHours, activityId]);
+    } else {
+      await insertPlannedResources(db, projectId, activityId, null, [row]);
+    }
+  }
+  const removedIds = [...existingIds].filter((id) => !submittedIds.has(id));
+  if (removedIds.length) {
+    await db.query(
+      `DELETE FROM planned_resources WHERE activity_id = $1 AND task_id IS NULL AND id = ANY($2::bigint[])`,
+      [activityId, removedIds]);
+  }
+}
+
 // ── milestone sync ───────────────────────────────────────────────────────────
 
 /**
@@ -79,6 +142,12 @@ async function syncMilestone(client, kind, milestoneId, actor = null) {
     open = null;
   }
 
+  const latestCert = new Map((drivers.length ? (await client.query(
+    `SELECT DISTINCT ON (activity_id) activity_id, id, certificate_no, certification_note, decided_at
+     FROM activity_verifications
+     WHERE activity_id = ANY($1::int[]) AND status IN ('verified', 'verified_with_changes') AND certificate_no IS NOT NULL
+     ORDER BY activity_id, decided_at DESC, id DESC`, [drivers.map((a) => a.id)])).rows : []).map((row) => [row.activity_id, row]));
+
   const derived = milestoneDerivedProgress(acts);
   const effective = effectiveMilestoneProgress({ derived, override: ms.override_pct, breakdownOpen: !!open });
   const executed = Number(ms.quantity) > 0 ? round3((effective / 100) * Number(ms.quantity)) : null;
@@ -99,7 +168,15 @@ async function syncMilestone(client, kind, milestoneId, actor = null) {
                    contributions        = EXCLUDED.contributions,
                    recomputed_at        = NOW()`,
     [Number(ms.project_id), milestoneId, derived, executed,
-     JSON.stringify(drivers.map((a) => ({ activity_id: a.id, title: a.title, weight_pct: Number(a.milestone_weight_pct), certified_progress_pct: Number(a.certified_progress_pct) })))]);
+     JSON.stringify(drivers.map((a) => {
+       const cert = latestCert.get(a.id);
+       return {
+         activity_id: a.id, title: a.title, weight_pct: Number(a.milestone_weight_pct), certified_progress_pct: Number(a.certified_progress_pct),
+         // the latest certificate of this activity: its short note is shown beside the activity in the milestone log
+         verification_id: cert ? cert.id : null, certificate_no: cert ? cert.certificate_no : null,
+         note: cert ? cert.certification_note || '' : '', certified_at: cert ? cert.decided_at : null,
+       };
+     }))]);
 
   return { derived, progress_pct: effective, executed, breakdown_open: !!open };
 }
@@ -455,6 +532,9 @@ function registerActivityRoutes(app, deps) {
          FROM card_attachments
          WHERE project_id = $1 AND entity_type = 'planning_activity' AND entity_id = $2
          ORDER BY created_at, id`, [projectId, activityId])).rows;
+      const plannedResources = activity.side === viewerSide ? (await pool.query(
+        `SELECT id, task_id, resource_type AS type, name, planned_quantity, unit, planned_hours
+         FROM planned_resources WHERE activity_id = $1 ORDER BY task_id NULLS FIRST, id`, [activityId])).rows : undefined;
       // The consultant sees the approved work of each task (titles, shares and approved figures), never the members,
       // notes or report details. Report details and files reach the consultant only when the contractor shares them.
       const workByTask = consultantView ? (await pool.query(
@@ -478,6 +558,7 @@ function registerActivityRoutes(app, deps) {
       return res.json({
         activity: visibleActivity,
         attachments,
+        planned_resources: plannedResources,
         work_by_task: workByTask,
         activity_summary: consultantView ? {
           task_count: Number(activitySummary.task_count),
@@ -501,6 +582,69 @@ function registerActivityRoutes(app, deps) {
         viewer_side: viewerSide,
       });
     } catch (err) { return fail(res, err, 'GET /api/planning-execution/:activityId/activity-card:'); }
+  });
+
+  // One report for the Overview screen and the PDF. A past certificate returns its frozen copy.
+  app.get('/api/planning-execution/:activityId/activity-report', authenticateToken, async (req, res) => {
+    try {
+      const { user_id: userId, role } = req.user;
+      const projectId = parseInt(req.query.projectId, 10);
+      const activityId = parseInt(req.params.activityId, 10);
+      const verificationId = req.query.verificationId ? parseInt(req.query.verificationId, 10) : null;
+      if (!projectId) throw new HttpError(400, 'projectId is required.');
+      if (!activityId) throw new HttpError(400, 'activityId is required.');
+      if (!(await isMember(deps, projectId, userId, role)))
+        throw new HttpError(403, 'You are not a member of this project.');
+
+      const activity = (await pool.query(
+        `SELECT pe.*,
+                (SELECT title FROM milestones WHERE id = pe.baseline_milestone_id) AS baseline_milestone_title,
+                (SELECT title FROM additional_milestones WHERE id = pe.additional_milestone_id) AS additional_milestone_title
+         FROM planning_execution pe WHERE pe.id = $1 AND pe.project_id = $2`, [activityId, projectId])).rows[0];
+      if (!activity) throw new HttpError(404, 'Activity not found.');
+      activity.baseline_milestone_title = activity.baseline_milestone_title || null;
+      activity.additional_milestone_title = activity.additional_milestone_title || activity.milestone_name || null;
+
+      let viewerSide = wcSide(role);
+      if (!viewerSide && role === 'TeamMember') {
+        const membership = await pool.query(
+          `SELECT assigned_part FROM team_member_assignments
+           WHERE project_id = $1 AND team_member_id = $2 LIMIT 1`, [projectId, userId]);
+        viewerSide = membership.rows[0]?.assigned_part || null;
+      }
+      const canViewContractorActivity = ['Consultant', 'Client'].includes(viewerSide) && activity.side === 'Contractor';
+      if (!viewerSide || (viewerSide !== activity.side && !canViewContractorActivity))
+        throw new HttpError(403, 'You cannot view this activity.');
+      const mode = viewerSide === 'Client' ? 'client' : (viewerSide === 'Consultant' && activity.side === 'Contractor') ? 'consultant' : 'own';
+
+      let report = null;
+      let asOfDate = null;
+      if (verificationId) {
+        const v = (await pool.query(
+          `SELECT report_snapshot, decided_at FROM activity_verifications WHERE id = $1 AND activity_id = $2`,
+          [verificationId, activityId])).rows[0];
+        if (!v) throw new HttpError(404, 'Certificate not found.');
+        report = v.report_snapshot || null;
+        asOfDate = v.decided_at ? dateOnly(v.decided_at) : null;
+      }
+      if (!report) report = await buildActivityReport(pool, { activity, asOfDate });
+
+      let pendingReports = null;
+      if (mode === 'own' && !verificationId) {
+        pendingReports = (await pool.query(
+          `SELECT p.id, w.title AS task_title, to_char(p.report_date, 'YYYY-MM-DD') AS date, p.quantity_done,
+                  split_part(COALESCE(tm.display_name, tm.email), '@', 1) AS reported_by_name
+           FROM workspace_work_center_progress p
+           JOIN workspace_work_center w ON w.id = p.task_id
+           JOIN team_members tm ON tm.id = p.member_id
+           WHERE w.activity_id = $1 AND p.validation_status = 'pending'
+           ORDER BY p.report_date, p.id`, [activityId])).rows;
+      }
+      const shaped = shapeReportForViewer(report, mode, { pendingReports });
+      shaped.viewer.side = viewerSide;
+      shaped.viewer.can_certify = mode === 'consultant' && isWCLeader(role) && !!activity.drives_milestone;
+      return res.json(shaped);
+    } catch (err) { return fail(res, err, 'GET /api/planning-execution/:activityId/activity-report:'); }
   });
 
   app.put('/api/planning-execution/:activityId/plan', authenticateToken,
@@ -619,6 +763,11 @@ function registerActivityRoutes(app, deps) {
        req.body.planned_equipment || '', req.body.planned_materials || '',
        req.file?.originalname || null, file?.public_id || null, file?.secure_url || null, activityId])).rows[0];
 
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, 'planned_resources')) {
+        await syncActivityPlannedResources(
+          client, projectId, activityId, parsePlannedResources(req.body.planned_resources));
+      }
+
       if (measured && tasks.length) {
         for (const task of tasks) {
           await client.query(
@@ -663,6 +812,7 @@ function registerActivityRoutes(app, deps) {
       const unit = String(b.unit || '').trim() || null;
       if (needsMeasure && !(planned > 0)) throw new HttpError(400, 'planned_quantity must be above 0 for this activity type.');
       if (needsMeasure && !unit) throw new HttpError(400, 'unit is required for this activity type.');
+      const plannedResources = parsePlannedResources(b.planned_resources);
 
       const taskInputs = parseJson(b.tasks, [], 'tasks');
       if (!Array.isArray(taskInputs)) throw new HttpError(400, 'tasks must be a list.');
@@ -747,6 +897,7 @@ function registerActivityRoutes(app, deps) {
          planned, unit, b.planned_work || '', b.planned_manpower || '', b.planned_equipment || '', b.planned_materials || '',
          file.name, file.id, file.url, userId, role,
          type, String(b.done_when || '').trim() || null, baselineId, additionalId, milestoneWeight])).rows[0];
+      await insertPlannedResources(client, projectId, activity.id, null, plannedResources);
       if (attachmentFiles(req).length) await saveAttachments(client, attachmentFiles(req), {
         projectId, entityType: 'planning_activity', entityId: activity.id, userId, role,
       }, uploads);
@@ -798,6 +949,7 @@ function registerActivityRoutes(app, deps) {
         try { task = JSON.parse(task); } catch { task = {}; }
       }
       if (!String(task.title || '').trim()) throw new HttpError(400, 'The task needs a title.');
+      const plannedResources = parsePlannedResources(task.planned_resources);
       const preview = b.preview === true || b.preview === 'true';
 
       client = await pool.connect();
@@ -856,6 +1008,7 @@ function registerActivityRoutes(app, deps) {
       const created = await insertTask(client, ctx, task,
         { weight_pct: newWeight, target_quantity: needsTarget ? round3((planned * newWeight) / 100) : null }, stages,
         linkedFile ? { name: file.originalname, id: linkedFile.public_id, url: linkedFile.secure_url } : null);
+      await insertPlannedResources(client, act.project_id, activityId, created.id, plannedResources);
       if (attachmentFiles(req).length) await saveAttachments(client, attachmentFiles(req), {
         projectId: act.project_id, entityType: 'work_center_task', entityId: created.id, userId, role,
       }, uploads);

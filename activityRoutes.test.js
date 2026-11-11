@@ -83,7 +83,12 @@ test('linking to a milestone with typed progress asks for confirmation and write
 
 test('confirmed: activity, two tasks with equal weights and targets, milestone switched to activities', async () => {
   const r = await call('POST', '/api/planning-execution/create-with-tasks', contractor, { ...base1, title: 'Excavation', baseline_milestone_id: 1, confirm_replace_manual: 'true', done_when: 'Levels confirmed',
-    tasks: [{ title: 'Block A', priority: 'high', assigned_members: members }, { title: 'Block B', priority: 'low', assigned_members: [{ id: 103 }] }] });
+    planned_resources: [{ type: 'material', name: 'Concrete', planned_quantity: 30, unit: 'm3', planned_hours: null }],
+    tasks: [
+      { title: 'Block A', priority: 'high', assigned_members: members,
+        planned_resources: [{ type: 'equipment', name: 'Excavator', planned_quantity: 1, unit: 'machine', planned_hours: 16 }] },
+      { title: 'Block B', priority: 'low', assigned_members: [{ id: 103 }] },
+    ] });
   assert.equal(r.status, 201, JSON.stringify(r.body));
   actA = r.body.activity;
   assert.equal(actA.milestone_weight_pct, '100.00');
@@ -95,6 +100,15 @@ test('confirmed: activity, two tasks with equal weights and targets, milestone s
   assert.equal(Number(m.progress_pct), 0);
   assert.equal((await q(`SELECT COUNT(*)::int n FROM milestone_progress_entries WHERE milestone_id=1 AND superseded_at IS NOT NULL`))[0].n, 1);
   assert.equal((await q(`SELECT COUNT(*)::int n FROM milestone_activity_progress WHERE baseline_milestone_id=1`))[0].n, 1);
+  const createdResources = await q(`SELECT task_id, resource_type, name, planned_quantity, unit, planned_hours
+    FROM planned_resources WHERE activity_id=$1 ORDER BY task_id NULLS FIRST`, [actA.id]);
+  assert.deepEqual(createdResources.map((row) => [
+    row.task_id == null ? null : Number(row.task_id), row.resource_type, row.name,
+    Number(row.planned_quantity), row.unit, row.planned_hours == null ? null : Number(row.planned_hours),
+  ]), [
+    [null, 'material', 'Concrete', 30, 'm3', null],
+    [Number(r.body.tasks[0].id), 'equipment', 'Excavator', 1, 'machine', 16],
+  ]);
   assert.equal(notes.length, 2);                                   // one notification per task
   assert.deepEqual(notes[0].recipients.map((x) => x.id), [101, 102]);
 });
@@ -110,6 +124,37 @@ test('activity card returns weighted task details to its side and restricts othe
   const denied = await call('GET', `/api/planning-execution/${actA.id}/activity-card?projectId=1`,
     { user_id: 8, role: 'ClientPM' });
   assert.equal(denied.status, 403);
+});
+
+test('activity plan creates and synchronizes activity-level planned resources', async () => {
+  const plan = {
+    projectId: 1, title: 'Excavation', description: '', done_when: 'Levels confirmed',
+    start_date: '2026-03-01', end_date: '2026-04-30', activity_type: 'quantity',
+    planned_quantity: 400, unit: 'm3',
+    planned_resources: [
+      { type: 'manpower', name: 'Crew', planned_quantity: 4, unit: 'workers', planned_hours: 32 },
+      { type: 'equipment', name: 'Excavator', planned_quantity: 1, unit: 'machine', planned_hours: 16 },
+    ],
+  };
+  const created = await call('PUT', `/api/planning-execution/${actA.id}/plan`, contractor, plan);
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  let resources = await q(`SELECT id, task_id, resource_type, name, planned_quantity, unit, planned_hours
+    FROM planned_resources WHERE activity_id=$1 ORDER BY id`, [actA.id]);
+  assert.deepEqual(resources.map((row) => [row.task_id, row.resource_type, row.name, Number(row.planned_quantity), row.unit, Number(row.planned_hours)]),
+    [[null, 'manpower', 'Crew', 4, 'workers', 32], [null, 'equipment', 'Excavator', 1, 'machine', 16]]);
+
+  const updated = await call('PUT', `/api/planning-execution/${actA.id}/plan`, contractor, {
+    ...plan,
+    planned_resources: [
+      { id: resources[0].id, type: 'manpower', name: 'Updated crew', planned_quantity: 5, unit: 'workers', planned_hours: 40 },
+      { type: 'material', name: 'Concrete', planned_quantity: 12, unit: 'm3', planned_hours: null },
+    ],
+  });
+  assert.equal(updated.status, 200, JSON.stringify(updated.body));
+  resources = await q(`SELECT task_id, resource_type, name, planned_quantity, unit, planned_hours
+    FROM planned_resources WHERE activity_id=$1 ORDER BY id`, [actA.id]);
+  assert.deepEqual(resources.map((row) => [row.task_id, row.resource_type, row.name, Number(row.planned_quantity), row.unit, row.planned_hours == null ? null : Number(row.planned_hours)]),
+    [[null, 'manpower', 'Updated crew', 5, 'workers', 40], [null, 'material', 'Concrete', 12, 'm3', null]]);
 });
 
 test('client activity card exposes certified progress only', async () => {
@@ -189,17 +234,24 @@ test('a consultant activity can reference the milestone without changing it', as
 });
 
 test('adding a task: preview writes nothing, apply rebalances and keeps a history', async () => {
-  const body = { task: { title: 'Block C', assigned_members: [{ id: 103 }] }, preview: true };
+  const body = { task: { title: 'Block C', assigned_members: [{ id: 103 }],
+    planned_resources: [{ type: 'equipment', name: 'Compactor', planned_quantity: 1, unit: 'machine', planned_hours: 8 }] }, preview: true };
   const p = await call('POST', `/api/planning-execution/${actA.id}/tasks`, contractor, body);
   assert.equal(p.status, 200, JSON.stringify(p.body));
   assert.deepEqual(p.body.weights.map((w) => w.after), [33.33, 33.33, 33.34]);
   assert.equal((await q(`SELECT COUNT(*)::int n FROM workspace_work_center WHERE activity_id=$1`, [actA.id]))[0].n, 2);
+  assert.equal((await q(`SELECT COUNT(*)::int n FROM planned_resources WHERE activity_id=$1 AND task_id IS NOT NULL`, [actA.id]))[0].n, 0);
   const a = await call('POST', `/api/planning-execution/${actA.id}/tasks`, contractor, { ...body, preview: false, reason: 'Extra block' });
   assert.equal(a.status, 201, JSON.stringify(a.body));
   const tasks = await q(`SELECT weight_pct, target_quantity FROM workspace_work_center WHERE activity_id=$1 ORDER BY id`, [actA.id]);
   assert.deepEqual(tasks.map((t) => Number(t.weight_pct)), [33.33, 33.33, 33.34]);
   assert.deepEqual(tasks.map((t) => Number(t.target_quantity)), [133.32, 133.32, 133.36]);
   assert.equal((await q(`SELECT COUNT(*)::int n FROM activity_weight_changes WHERE activity_id=$1 AND reason='Extra block'`, [actA.id]))[0].n, 1);
+  const addedTaskResources = await q(`SELECT resource_type, name, planned_quantity, unit, planned_hours
+    FROM planned_resources WHERE activity_id=$1 AND task_id=$2`, [actA.id, a.body.task.id]);
+  assert.deepEqual(addedTaskResources.map((row) => [
+    row.resource_type, row.name, Number(row.planned_quantity), row.unit, Number(row.planned_hours),
+  ]), [['equipment', 'Compactor', 1, 'machine', 8]]);
 });
 
 test('adding a task is refused on a closed activity and for another side', async () => {
