@@ -17,6 +17,7 @@ import { layoutStamp, drawStampOnPage, stampPdfBuffer, buildStampPreviewPdf, der
 import { registerActivityRoutes, registerMilestoneRoutes, milestoneCompletionCheck, typedProgressBlockedReason } from './planningRoutes.js';
 import { registerReportRoutes, registerTaskQueryRoutes, registerTaskCardRoutes } from './workCenterRoutes.js';
 import { registerVerificationRoutes } from './verificationRoutes.js';
+import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
 import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
 
@@ -1332,59 +1333,69 @@ async function resolveDisplayNameFor(role, id, projectId = null) {
     if (r === 'Client') {
       const { rows } = await pool.query('SELECT display_name, representative, company_name, company_email FROM clients WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0];
-      return row?.display_name || row?.representative || row?.company_name || row?.company_email || null;
+      return row?.representative || row?.display_name || row?.company_name || row?.company_email || null;
     }
     if (r === 'Contractor') {
       const { rows } = await pool.query('SELECT display_name, email FROM contractors WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0];
-      if (row?.display_name) return row.display_name;
-      // try to find project-specific assignment name/rep
+      let assignment = null;
       if (projectId) {
         const { rows: arows } = await pool.query('SELECT company_name, representative FROM contractor_assignments WHERE contractor_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
-        const a = arows[0];
-        if (a?.representative) return a.representative;
-        if (a?.company_name) return a.company_name;
+        assignment = arows[0];
       }
-      return row?.email || null;
+      if (assignment?.representative) return assignment.representative;
+      if (row?.display_name) return row.display_name;
+      return assignment?.company_name || row?.email || null;
     }
     if (r === 'Consultant') {
       const { rows } = await pool.query('SELECT display_name, email FROM consultants WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0];
-      if (row?.display_name) return row.display_name;
+      let assignment = null;
       if (projectId) {
         const { rows: arows } = await pool.query('SELECT company_name, representative FROM consultant_assignments WHERE consultant_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
-        const a = arows[0];
-        if (a?.representative) return a.representative;
-        if (a?.company_name) return a.company_name;
+        assignment = arows[0];
       }
-      return row?.email || null;
+      if (assignment?.representative) return assignment.representative;
+      if (row?.display_name) return row.display_name;
+      return assignment?.company_name || row?.email || null;
     }
     if (r === 'ClientPM') {
       const { rows } = await pool.query('SELECT display_name, email FROM client_project_managers WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0];
+      if (projectId) {
+        const { rows: arows } = await pool.query('SELECT name FROM client_pm_assignments WHERE client_pm_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
+        if (arows[0]?.name) return arows[0].name;
+      }
       return row?.display_name || row?.email || null;
     }
     if (r === 'ContractorPM') {
       const { rows } = await pool.query('SELECT display_name, email FROM contractor_project_managers WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0];
+      if (projectId) {
+        const { rows: arows } = await pool.query('SELECT name FROM contractor_pm_assignments WHERE contractor_pm_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
+        if (arows[0]?.name) return arows[0].name;
+      }
       return row?.display_name || row?.email || null;
     }
     if (r === 'ConsultantPM') {
       const { rows } = await pool.query('SELECT display_name, email FROM consultant_project_managers WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0];
+      if (projectId) {
+        const { rows: arows } = await pool.query('SELECT name FROM consultant_pm_assignments WHERE consultant_pm_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
+        if (arows[0]?.name) return arows[0].name;
+      }
       return row?.display_name || row?.email || null;
     }
     if (r === 'TeamMember') {
       const { rows } = await pool.query('SELECT display_name, email FROM team_members WHERE id=$1 LIMIT 1', [id]);
       const row = rows[0];
-      if (row?.display_name) return row.display_name;
       if (projectId) {
         const { rows: arows } = await pool.query('SELECT name, position FROM team_member_assignments WHERE team_member_id=$1 AND project_id=$2 LIMIT 1', [id, projectId]);
         const a = arows[0];
         if (a?.name) return a.name;
-        if (a?.position) return a.position;
+        if (a?.position) return row?.display_name || a.position;
       }
-      return row?.email || null;
+      return row?.display_name || row?.email || null;
     }
     return null;
   } catch (err) {
@@ -8093,8 +8104,8 @@ app.get('/api/notifications/target', authenticateToken, async (req, res) => {
 // ── List all activities for the caller's side (leaders + PMs + TeamMembers) ──
 // =============================================================================
 //  ACTIVITY / TASK / REPORT / VERIFICATION / MILESTONE MODEL (2026-11 redesign)
-//  These routes are registered BEFORE the older handlers on purpose: for the same path the first
-//  registered handler answers, so the new POST /api/work-center-progress and its /validate route win.
+//  POST /api/work-center-progress and PUT /api/work-center-progress/:progressId/validate live only in
+//  workCenterRoutes.js (the older copies in this file were removed).
 // =============================================================================
 const progressModelDeps = {
   pool, authenticateToken, upload, reportUpload: workCenterReportUpload,
@@ -8121,20 +8132,6 @@ app.delete('/api/planning-execution/:activityId', authenticateToken, async (req,
     return next();
   } catch (err) { return next(err); }
 });
-app.delete('/api/work-center/:taskId', authenticateToken, async (req, res, next) => {
-  try {
-    const r = await pool.query(
-      `SELECT COUNT(*)::int AS n FROM workspace_work_center_progress WHERE task_id = $1 AND validation_status IN ('approved','voided')`, [parseInt(req.params.taskId, 10)]);
-    if (r.rows[0].n > 0)
-      return res.status(409).json({ error: 'This task has approved reports, which are part of the project record. It cannot be deleted. It is closed when its activity is certified complete.' });
-    const queries = await pool.query(
-      `SELECT COUNT(*)::int AS n FROM work_center_queries WHERE task_id = $1`, [parseInt(req.params.taskId, 10)]);
-    if (queries.rows[0].n > 0)
-      return res.status(409).json({ error: 'This task has question history, which is part of the project record. It cannot be deleted.' });
-    return next();
-  } catch (err) { return next(err); }
-});
-
 app.post('/api/planning-execution', authenticateToken, async (req, res) => {
   try {
     const { user_id, role } = req.user;
@@ -8636,6 +8633,8 @@ app.post('/api/work-center', authenticateToken,
 app.put('/api/work-center/:taskId', authenticateToken,
   upload.single('linked_file'), requireProjectLifecycleWrite, async (req, res) => {
   let client;
+  const uploads = createCloudinaryUploadTracker({ scheduleCloudinaryUpload, cloudinary });
+  let replacedFileId = null;
   try {
     const { user_id, role } = req.user;
     const { taskId }        = req.params;
@@ -8698,13 +8697,9 @@ app.put('/api/work-center/:taskId', authenticateToken,
     if (end_date         !== undefined) push('end_date',         end_date);
 
     if (req.file) {
-      if (taskCheck.rows[0].linked_file_id)
-        await cloudinary.uploader.destroy(
-          taskCheck.rows[0].linked_file_id, { resource_type: 'raw' }
-        ).catch(() => {});
-      const uploaded = await scheduleCloudinaryUpload(
-        req.file.buffer, req.file.originalname, 'work_center/tasks'
-      );
+      // The old file is removed only after the new one is saved and the update has committed.
+      replacedFileId = taskCheck.rows[0].linked_file_id || null;
+      const uploaded = await uploads.upload(req.file.buffer, req.file.originalname, 'work_center/tasks');
       push('linked_file_name', req.file.originalname);
       push('linked_file_id',   uploaded.public_id);
       push('linked_file_url',  uploaded.secure_url);
@@ -8730,71 +8725,24 @@ app.put('/api/work-center/:taskId', authenticateToken,
         start_date: start_date ?? null, end_date: end_date ?? null,
       })]);
     await client.query('COMMIT');
+    uploads.keepAll();
+    if (replacedFileId) {
+      for (const resourceType of ['raw', 'image', 'video']) {
+        try {
+          const removed = await cloudinary.uploader.destroy(replacedFileId, { resource_type: resourceType });
+          if (removed?.result === 'ok') break;
+        } catch (cleanupError) {
+          console.error('PUT /api/work-center/:taskId: could not remove the replaced file', replacedFileId, cleanupError.message);
+        }
+      }
+    }
     return res.json({ success: true, task: updated.rows[0] });
   } catch (err) {
     if (client) await client.query('ROLLBACK').catch(() => {});
+    await uploads.discard();
     console.error('PUT /api/work-center/:taskId:', err);
     return res.status(500).json({ error: 'Server error.' });
   } finally { if (client) client.release(); }
-});
-
-// ── Delete task (same-side leader only) ───────────────────────────────────────
-app.delete('/api/work-center/:taskId', authenticateToken, async (req, res) => {
-  try {
-    const { role }      = req.user;
-    const { taskId }    = req.params;
-    const { projectId } = req.body;
-
-    if (!isWCLeader(role))
-      return res.status(403).json({ error: 'Only leaders and PMs can delete tasks.' });
-    if (!projectId)
-      return res.status(400).json({ error: 'projectId is required.' });
-
-    const side = wcSide(role);
-    const taskCheck = await pool.query(
-      `SELECT id, side, linked_file_id FROM workspace_work_center
-       WHERE id = $1 AND project_id = $2`,
-      [taskId, projectId]
-    );
-    if (!taskCheck.rows.length)
-      return res.status(404).json({ error: 'Task not found.' });
-    if (taskCheck.rows[0].side !== side)
-      return res.status(403).json({ error: 'You cannot delete tasks from another side.' });
-
-    if (taskCheck.rows[0].linked_file_id)
-      await cloudinary.uploader.destroy(
-        taskCheck.rows[0].linked_file_id, { resource_type: 'raw' }
-      ).catch(() => {});
-
-    const progressFiles = await pool.query(
-      `SELECT attachment_id FROM workspace_work_center_progress
-       WHERE task_id = $1 AND attachment_id IS NOT NULL`,
-      [taskId]
-    );
-    const reportPhotos = await pool.query(
-      `SELECT ph.file_id FROM work_center_report_photos ph
-       JOIN workspace_work_center_progress p ON p.id = ph.report_id
-       WHERE p.task_id = $1`,
-      [taskId]
-    );
-    await Promise.allSettled(
-      [
-        ...progressFiles.rows.map((row) =>
-          cloudinary.uploader.destroy(row.attachment_id, { resource_type: 'raw' })),
-        ...reportPhotos.rows.map((photo) =>
-          cloudinary.uploader.destroy(photo.file_id, { resource_type: 'image' })),
-      ]
-    );
-
-    await pool.query(
-      `DELETE FROM workspace_work_center WHERE id = $1 AND project_id = $2`,
-      [taskId, projectId]
-    );
-    return res.json({ success: true, message: 'Task deleted.' });
-  } catch (err) {
-    console.error('DELETE /api/work-center/:taskId:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
 });
 
 // ── Download task linked file ──────────────────────────────────────────────────
@@ -8942,132 +8890,7 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
   }
 });
 
-// ── Submit progress (TeamMember only) ─────────────────────────────────────────
-app.post('/api/work-center-progress', authenticateToken,
-  upload.single('attachment'), requireProjectLifecycleWrite, async (req, res) => {
-  try {
-    const { user_id, role } = req.user;
-    if (role !== 'TeamMember')
-      return res.status(403).json({
-        error: 'Only assigned team members can submit progress reports.'
-      });
-
-    const {
-      projectId, taskId, reportDate, workDone,
-      manpower = '', equipment = '', materials = '',
-      progressPct = '0', issues = '', notes = '',
-    } = req.body;
-
-    if (!projectId)  return res.status(400).json({ error: 'projectId is required.' });
-    if (!taskId)     return res.status(400).json({ error: 'taskId is required.' });
-    if (!reportDate) return res.status(400).json({ error: 'reportDate is required.' });
-    if (!workDone)   return res.status(400).json({ error: 'workDone is required.' });
-
-    const pct = parseInt(progressPct, 10);
-    if (isNaN(pct) || pct < 0 || pct > 100)
-      return res.status(400).json({ error: 'progressPct must be 0–100.' });
-
-    const taskCheck = await pool.query(
-      `SELECT id, assigned_members FROM workspace_work_center
-       WHERE id = $1 AND project_id = $2`,
-      [taskId, projectId]
-    );
-    if (!taskCheck.rows.length)
-      return res.status(404).json({ error: 'Task not found.' });
-
-    const assigned = Array.isArray(taskCheck.rows[0].assigned_members)
-      ? taskCheck.rows[0].assigned_members : [];
-    if (!assigned.some(m => String(m.id) === String(user_id)))
-      return res.status(403).json({ error: 'You are not assigned to this task.' });
-
-    let attachmentName = null, attachmentId = null, attachmentUrl = null;
-    if (req.file) {
-      const uploaded = await scheduleCloudinaryUpload(
-        req.file.buffer, req.file.originalname, 'work_center/progress'
-      );
-      attachmentName = req.file.originalname;
-      attachmentId   = uploaded.public_id;
-      attachmentUrl  = uploaded.secure_url;
-    }
-
-    const result = await pool.query(`
-      INSERT INTO workspace_work_center_progress
-        (task_id, report_date, member_id, member_role,
-         work_done, manpower, equipment, materials,
-         progress_pct, issues, notes,
-         attachment_name, attachment_id, attachment_url)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      RETURNING *
-    `, [
-      taskId, reportDate, user_id, role,
-      workDone, manpower, equipment, materials,
-      pct, issues, notes,
-      attachmentName, attachmentId, attachmentUrl,
-    ]);
-
-    return res.status(201).json({ success: true, entry: result.rows[0] });
-  } catch (err) {
-    console.error('POST /api/work-center-progress:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
-// ── Validate progress entry (same-side leader only) ───────────────────────────
-app.put('/api/work-center-progress/:progressId/validate',
-  authenticateToken, async (req, res) => {
-  try {
-    const { user_id, role }                              = req.user;
-    const { progressId }                                 = req.params;
-    const { projectId, validation_status, validation_notes = '' } = req.body;
-
-    if (!isWCLeader(role))
-      return res.status(403).json({
-        error: 'Only leaders and PMs can validate progress entries.'
-      });
-    if (!projectId)
-      return res.status(400).json({ error: 'projectId is required.' });
-
-    const isCommentOnly = !validation_status || validation_status === 'comment_only';
-    if (!isCommentOnly && !['approved','rejected'].includes(validation_status))
-      return res.status(400).json({
-        error: 'validation_status must be approved, rejected, or comment_only.'
-      });
-
-    const entryCheck = await pool.query(`
-      SELECT p.id, w.side
-      FROM   workspace_work_center_progress p
-      JOIN   workspace_work_center w ON w.id = p.task_id
-      WHERE  p.id = $1 AND w.project_id = $2
-    `, [progressId, projectId]);
-
-    if (!entryCheck.rows.length)
-      return res.status(404).json({ error: 'Progress entry not found.' });
-    if (entryCheck.rows[0].side !== wcSide(role))
-      return res.status(403).json({ error: 'You cannot validate progress from another side.' });
-
-    let updated;
-    if (isCommentOnly) {
-      updated = await pool.query(
-        `UPDATE workspace_work_center_progress
-         SET validation_notes = $1 WHERE id = $2 RETURNING *`,
-        [validation_notes, progressId]
-      );
-    } else {
-      updated = await pool.query(
-        `UPDATE workspace_work_center_progress
-         SET validation_status = $1, validation_notes = $2,
-             validated_by = $3, validated_at = NOW()
-         WHERE id = $4 RETURNING *`,
-        [validation_status, validation_notes, user_id, progressId]
-      );
-    }
-
-    return res.json({ success: true, entry: updated.rows[0] });
-  } catch (err) {
-    console.error('PUT /api/work-center-progress/:progressId/validate:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
+// Submitting and validating progress reports are handled by registerReportRoutes (workCenterRoutes.js).
 
 // ── Download progress attachment ───────────────────────────────────────────────
 app.get('/api/work-center-progress/download/:progressId',

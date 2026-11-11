@@ -1,6 +1,6 @@
 // Activity and milestone routes share milestone linking and progress synchronization.
 import {
-  ACTIVITY_TYPES, splitEqual, weightsValid, rebalanceForNew, activityProgress,
+  ACTIVITY_TYPES, splitEqual, weightsValid, rebalanceForNew, rebalanceAfterRemoval, activityProgress,
   milestoneDerivedProgress, milestoneCoverage, effectiveMilestoneProgress, delayDays,
   checkOverride, canCompleteMilestone, visibleProgress,
 } from './progressRules.js';
@@ -455,9 +455,30 @@ function registerActivityRoutes(app, deps) {
          FROM card_attachments
          WHERE project_id = $1 AND entity_type = 'planning_activity' AND entity_id = $2
          ORDER BY created_at, id`, [projectId, activityId])).rows;
+      // The consultant sees the approved work of each task (titles, shares and approved figures), never the members,
+      // notes or report details. Report details and files reach the consultant only when the contractor shares them.
+      const workByTask = consultantView ? (await pool.query(
+        `SELECT w.title, w.weight_pct, w.progress_pct, w.target_quantity,
+                COUNT(p.id) FILTER (WHERE p.validation_status = 'approved')::int AS approved_report_count,
+                COALESCE(SUM(p.quantity_done) FILTER (WHERE p.validation_status = 'approved'), 0) AS approved_quantity,
+                to_char(MAX(p.report_date) FILTER (WHERE p.validation_status = 'approved'), 'YYYY-MM-DD') AS last_approved_date
+         FROM workspace_work_center w
+         LEFT JOIN workspace_work_center_progress p ON p.task_id = w.id
+         WHERE w.activity_id = $1 AND w.project_id = $2
+         GROUP BY w.id, w.title, w.weight_pct, w.progress_pct, w.target_quantity
+         ORDER BY w.id`, [activityId, projectId])).rows.map((row) => ({
+        title: row.title,
+        weight_pct: Number(row.weight_pct) || 0,
+        progress_pct: Number(row.progress_pct) || 0,
+        target_quantity: row.target_quantity == null ? null : Number(row.target_quantity),
+        approved_report_count: Number(row.approved_report_count) || 0,
+        approved_quantity: Number(row.approved_quantity) || 0,
+        last_approved_date: row.last_approved_date || null,
+      })) : undefined;
       return res.json({
         activity: visibleActivity,
         attachments,
+        work_by_task: workByTask,
         activity_summary: consultantView ? {
           task_count: Number(activitySummary.task_count),
           completed_task_count: Number(activitySummary.completed_task_count),
@@ -859,6 +880,204 @@ function registerActivityRoutes(app, deps) {
       await uploads.discard();
       return fail(res, err, 'POST /api/planning-execution/:activityId/tasks:');
     } finally { if (client) client.release(); }
+  });
+
+  app.delete('/api/work-center/:taskId', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    let committed = false;
+    let assets = [];
+    let activityAfter = null;
+    try {
+    const { user_id: userId, role } = req.user;
+    if (!isWCLeader(role)) throw new HttpError(403, 'Only leaders and PMs can delete tasks.');
+    const side = wcSide(role);
+    if (!side) throw new HttpError(403, 'Cannot determine your side.');
+
+    const taskId = Number(req.params.taskId);
+    const projectId = Number(req.body?.projectId ?? req.query.projectId);
+    if (!Number.isInteger(taskId) || taskId <= 0 || !Number.isInteger(projectId) || projectId <= 0)
+      throw new HttpError(400, 'A valid taskId and projectId are required.');
+    if (!(await isMember(deps, projectId, userId, role)))
+      throw new HttpError(403, 'You are not a member of this project.');
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const task = (await client.query(
+      `SELECT w.id, w.project_id, w.activity_id, w.side, w.title, w.linked_file_id,
+              pe.project_id AS activity_project_id, pe.side AS activity_side,
+              pe.status AS activity_status, pe.activity_type, pe.planned_quantity,
+              pe.progress_pct AS activity_progress_pct, pe.baseline_milestone_id,
+              pe.additional_milestone_id, pe.drives_milestone
+       FROM workspace_work_center w
+       JOIN planning_execution pe ON pe.id = w.activity_id
+       WHERE w.id = $1 AND w.project_id = $2
+       FOR UPDATE OF w, pe`, [taskId, projectId])).rows[0];
+    if (!task) throw new HttpError(404, 'Task not found.');
+    if (task.side !== side || task.activity_side !== side)
+      throw new HttpError(403, 'You cannot delete tasks from another side.');
+    if (Number(task.activity_project_id) !== projectId)
+      throw new HttpError(409, 'The task and its activity belong to different projects.');
+    if (task.activity_status === 'closed')
+      throw new HttpError(409, 'Tasks in a closed activity cannot be deleted.');
+
+    const siblings = (await client.query(
+      `SELECT id, project_id, side, title, weight_pct
+       FROM workspace_work_center
+       WHERE activity_id = $1
+       ORDER BY id
+       FOR UPDATE`, [task.activity_id])).rows;
+    if (siblings.some((sibling) => Number(sibling.project_id) !== projectId || sibling.side !== side))
+      throw new HttpError(409, 'The activity contains tasks linked to a different project or side.');
+    if (!weightsValid(siblings.map((sibling) => Number(sibling.weight_pct))))
+      throw new HttpError(409, 'The activity task weights are invalid; fix the task breakdown before deleting a task.');
+
+    const protectedRecords = (await client.query(
+      `SELECT
+         EXISTS (
+           SELECT 1 FROM workspace_work_center_progress
+           WHERE task_id = $1 AND validation_status IN ('approved', 'voided')
+         ) AS has_final_reports,
+         EXISTS (SELECT 1 FROM work_center_queries WHERE task_id = $1) AS has_queries,
+         EXISTS (SELECT 1 FROM activity_verifications WHERE activity_id = $2) AS has_verifications,
+         EXISTS (
+           SELECT 1 FROM work_center_task_dependencies
+           WHERE depends_on_task_id = $1 AND project_id = $3
+         ) AS has_dependents,
+         EXISTS (
+           SELECT 1 FROM work_center_task_links
+           WHERE link_type = 'task' AND target_id = $1::text AND project_id = $3
+         ) AS has_linkers`,
+      [taskId, task.activity_id, projectId])).rows[0];
+    if (protectedRecords.has_final_reports)
+      throw new HttpError(409, 'This task has approved or voided reports, which are part of the project record and cannot be deleted.');
+    if (protectedRecords.has_queries)
+      throw new HttpError(409, 'This task has question history, which is part of the project record and cannot be deleted.');
+    if (protectedRecords.has_verifications)
+      throw new HttpError(409, 'This activity has verification history; its task breakdown cannot be changed.');
+    if (protectedRecords.has_dependents || protectedRecords.has_linkers)
+      throw new HttpError(409, 'Another task refers to this task. Remove or update that reference before deleting it.');
+
+    const remaining = siblings.filter((sibling) => Number(sibling.id) !== taskId);
+    const weightsAfter = rebalanceAfterRemoval(remaining.map((sibling) => Number(sibling.weight_pct)));
+    const reportDates = (await client.query(
+      `SELECT DISTINCT to_char(p.report_date, 'YYYY-MM-DD') AS day
+       FROM workspace_work_center_progress p
+       JOIN workspace_work_center w ON w.id = p.task_id
+       WHERE w.activity_id = $1`, [task.activity_id])).rows.map((row) => row.day);
+    const reportAssets = (await client.query(
+      `SELECT p.attachment_id AS file_id, 'raw'::text AS resource_type
+       FROM workspace_work_center_progress p
+       JOIN workspace_work_center w ON w.id = p.task_id
+       WHERE w.id = $1 AND p.attachment_id IS NOT NULL
+       UNION ALL
+       SELECT ph.file_id, 'image'::text AS resource_type
+       FROM work_center_report_photos ph
+       JOIN workspace_work_center_progress p ON p.id = ph.report_id
+       WHERE p.task_id = $1
+       UNION ALL
+       SELECT ra.file_id,
+              CASE WHEN ra.mime_type LIKE 'image/%' THEN 'image'
+                   WHEN ra.mime_type LIKE 'video/%' THEN 'video'
+                   ELSE 'raw' END AS resource_type
+       FROM work_center_report_attachments ra
+       JOIN workspace_work_center_progress p ON p.id = ra.report_id
+       WHERE p.task_id = $1`, [taskId])).rows;
+    const taskAssets = (await client.query(
+      `SELECT file_id, resource_type FROM card_attachments
+       WHERE project_id = $1 AND entity_type = 'work_center_task' AND entity_id = $2`,
+      [projectId, taskId])).rows;
+    assets = [
+      ...(task.linked_file_id ? [{ file_id: task.linked_file_id, resource_type: 'raw' }] : []),
+      ...reportAssets,
+      ...taskAssets,
+    ].filter((asset) => asset.file_id && asset.resource_type);
+
+    const beforeWeights = siblings.map((sibling) => ({
+      task_id: Number(sibling.id),
+      title: sibling.title,
+      weight_pct: Number(sibling.weight_pct),
+    }));
+    const measured = task.activity_type === 'quantity' || task.activity_type === 'count';
+    for (let index = 0; index < remaining.length; index++) {
+      const weight = weightsAfter[index];
+      const target = measured
+        ? Math.round((Number(task.planned_quantity) * weight / 100 + Number.EPSILON) * 1000) / 1000
+        : null;
+      await client.query(
+        `UPDATE workspace_work_center
+         SET weight_pct = $2, target_quantity = $3, updated_at = NOW()
+         WHERE id = $1`, [remaining[index].id, weight, target]);
+    }
+
+    const deleted = await client.query(
+      `DELETE FROM workspace_work_center WHERE id = $1 AND project_id = $2 RETURNING id`,
+      [taskId, projectId]);
+    if (!deleted.rows.length) throw new HttpError(409, 'The task changed before it could be deleted.');
+
+    const recomputed = await recomputeActivity(client, task.activity_id, {
+      dates: reportDates,
+      actor: { id: userId, role },
+    });
+    activityAfter = recomputed;
+    await client.query(
+      `INSERT INTO activity_weight_changes
+         (project_id, activity_id, changed_by_id, changed_by_role, reason,
+          before_weights, after_weights, progress_before, progress_after)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8,$9)`,
+      [projectId, task.activity_id, userId, role, `Task deleted: ${task.title}`,
+       JSON.stringify(beforeWeights),
+       JSON.stringify(remaining.map((sibling, index) => ({
+         task_id: Number(sibling.id), title: sibling.title, weight_pct: weightsAfter[index],
+       }))),
+       Number(task.activity_progress_pct) || 0, recomputed?.progress_pct ?? 0]);
+
+    await client.query(
+      `DELETE FROM card_attachments
+       WHERE project_id = $1 AND entity_type = 'work_center_task' AND entity_id = $2`,
+      [projectId, taskId]);
+
+    if (task.drives_milestone && task.baseline_milestone_id)
+      await syncMilestone(client, 'baseline', task.baseline_milestone_id, { id: userId, role });
+    else if (task.drives_milestone && task.additional_milestone_id)
+      await syncMilestone(client, 'additional', task.additional_milestone_id, { id: userId, role });
+
+    await client.query('COMMIT');
+    committed = true;
+    } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    return fail(res, err, 'DELETE /api/work-center/:taskId:');
+    } finally {
+    if (client) client.release();
+    }
+
+    const cleanupWarnings = [];
+    if (assets.length && !deps.cloudinary?.uploader) {
+    console.error(`[task cleanup] storage unavailable for ${assets.length} file(s) after task deletion.`);
+    cleanupWarnings.push('Some task files could not be removed from storage.');
+    } else if (committed && deps.cloudinary?.uploader) {
+    const uniqueAssets = [...new Map(
+      assets.map((asset) => [`${asset.resource_type}:${asset.file_id}`, asset])
+    ).values()];
+    await Promise.all(uniqueAssets.map(async (asset) => {
+      try {
+        const result = await deps.cloudinary.uploader.destroy(asset.file_id, { resource_type: asset.resource_type });
+        if (!['ok', 'not found'].includes(result?.result)) {
+          console.error('[task cleanup] could not delete', asset.file_id, result?.result || 'unknown result');
+          cleanupWarnings.push('Some task files could not be removed from storage.');
+        }
+      } catch (err) {
+        console.error('[task cleanup] could not delete', asset.file_id, err.message);
+        cleanupWarnings.push('Some task files could not be removed from storage.');
+      }
+    }));
+    }
+
+    return res.json({
+    success: true,
+    message: 'Task deleted.',
+    activity: activityAfter,
+    ...(cleanupWarnings.length ? { warning: cleanupWarnings[0] } : {}),
+    });
   });
 }
 

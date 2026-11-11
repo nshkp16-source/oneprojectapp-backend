@@ -44,7 +44,8 @@ node --test \
   "$HERE/project-resolution.test.js" "$HERE/activity-form-v2.test.js" \
   "$HERE/wc-reports-v2.test.js" "$HERE/wc-views.test.js" "$HERE/supportingAttachmentTypes.test.js" \
   "$HERE/notificationTarget.test.js" "$HERE/verificationReminderJob.test.js" \
-  "$HERE/pending-list.test.js" "$HERE/consultant-activity-open.test.js" || FAILED=1
+  "$HERE/pending-list.test.js" "$HERE/consultant-activity-open.test.js" \
+  "$HERE/verificationProjection.test.js" || FAILED=1
 for t in activityRoutes reportRoutes verificationRoutes milestoneRoutes taskQueryRoutes; do
   $PSQL -d "$ADMIN_DB" -c "DROP DATABASE IF EXISTS $DB" -c "CREATE DATABASE $DB"
   load

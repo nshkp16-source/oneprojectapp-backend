@@ -192,7 +192,22 @@ async function buildSharedEvidence(client, activityId, cutOff, includeReportDeta
 }
 
 /** Consultants receive only the report details and evidence frozen on this request. */
-function consultantProjection(verification) {
+// What the consultant may see of a request. The task titles and approved figures are always included (the consultant
+// needs them to check the claimed progress); member names, task ids and notes never are. Report details and files
+// stay limited to what the contractor chose to share.
+function workByTask(figures) {
+  return figures.map((figure) => ({
+    title: String(figure.title || 'Task'),
+    weight_pct: Number(figure.weight_pct) || 0,
+    progress_pct: Number(figure.progress_pct) || 0,
+    target_quantity: figure.target_quantity == null ? null : Number(figure.target_quantity),
+    approved_report_count: Number(figure.approved_report_count) || 0,
+    approved_quantity: Number(figure.approved_quantity) || 0,
+    last_approved_date: figure.last_approved_date || null,
+  }));
+}
+
+export function consultantProjection(verification, { withTasks = false } = {}) {
   const figures = Array.isArray(verification.claimed_figures) ? verification.claimed_figures : [];
   const evidence = verification.shared_evidence;
   const hasExplicitSelection = evidence && !Array.isArray(evidence) && Array.isArray(evidence.selected_evidence);
@@ -214,6 +229,7 @@ function consultantProjection(verification) {
       planned_quantity: figures.reduce((total, figure) => total + Number(figure.target_quantity || 0), 0),
     },
     claimed_figures: [],
+    work_by_task: withTasks ? workByTask(figures) : undefined,
     certified_figures: null,
     shared_activity_summary: verification.share_activity_summary ? verification.shared_activity_summary : null,
     shared_evidence: verification.share_evidence || sharedEvidence?.selected_evidence?.length
@@ -314,7 +330,9 @@ export function registerVerificationRoutes(app, deps) {
                 (SELECT COUNT(*)::int FROM workspace_work_center_progress p
                  WHERE p.task_id = w.id AND p.validation_status = 'approved' AND p.report_date <= $2) AS approved_report_count,
                 COALESCE((SELECT SUM(p.quantity_done) FROM workspace_work_center_progress p
-                          WHERE p.task_id = w.id AND p.validation_status = 'approved' AND p.report_date <= $2), 0) AS approved_quantity
+                          WHERE p.task_id = w.id AND p.validation_status = 'approved' AND p.report_date <= $2), 0) AS approved_quantity,
+                (SELECT to_char(MAX(p.report_date), 'YYYY-MM-DD') FROM workspace_work_center_progress p
+                 WHERE p.task_id = w.id AND p.validation_status = 'approved' AND p.report_date <= $2) AS last_approved_date
          FROM workspace_work_center w WHERE w.activity_id = $1 ORDER BY w.id`, [act.id, cutOff])).rows
         .map((r) => ({ ...r, weight_pct: Number(r.weight_pct), progress_pct: Number(r.progress_pct),
                        target_quantity: r.target_quantity == null ? null : Number(r.target_quantity),
@@ -765,7 +783,7 @@ export function registerVerificationRoutes(app, deps) {
       const consultantView = s === 'Consultant' || (member && (await pool.query(
         `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
         [act.project_id, userId])).rows.length > 0);
-      const visibleVerifications = consultantView ? verifications.map(consultantProjection) : verifications;
+      const visibleVerifications = consultantView ? verifications.map((item) => consultantProjection(item, { withTasks: true })) : verifications;
       const visibleRework = consultantView ? rework.map(({ task_id, ...item }) => item) : rework;
       return res.json({ verifications: visibleVerifications, rework: visibleRework });
     } catch (err) { return fail(res, err, 'GET /api/activities/:activityId/verifications:'); }
@@ -798,7 +816,7 @@ export function registerVerificationRoutes(app, deps) {
         `SELECT 1 FROM team_member_assignments WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = 'Consultant' LIMIT 1`,
         [projectId, userId])).rows.length > 0);
       if (!consultantView) return res.json({ pending: rows.map((row) => ({ ...row, is_unread: false })) });
-      const pending = rows.map(consultantProjection);
+      const pending = rows.map((item) => consultantProjection(item));
       return res.json({ pending });
     } catch (err) { return fail(res, err, 'GET /api/verifications/pending:'); }
   });

@@ -8,7 +8,8 @@ const html = fs.readFileSync(new URL('../frontend/dashboard.html', import.meta.u
 const scripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
 const names = ['_wcFmtDate', '_peDeriveStatus', '_peCertificationPanel', '_peActivityCardHtml',
   '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_safeHttpsUrl', '_fileDisplayName', '_thumbUrl',
-  '_evidenceFileAttrs', '_evidenceFileRowHtml', '_evidencePhotosHtml', '_evidenceFilesHtml', '_peRequestEvidencePickerHtml'];
+  '_evidenceFileAttrs', '_evidenceFileRowHtml', '_evidencePhotosHtml', '_evidenceFilesHtml', '_peRequestEvidencePickerHtml',
+  '_peWorkByTaskHtml'];
 const source = scripts.map((script) => {
   const ast = acorn.parse(script, { ecmaVersion: 'latest', sourceType: 'script' });
   return ast.body.filter((node) => node.type === 'FunctionDeclaration' && names.includes(node.id.name))
@@ -58,6 +59,22 @@ test('activity tabs expose Certification only for milestone-driving activity', (
   assert.match(consultantProgress, /42 m3 reported/);
   assert.match(consultantProgress, /details and files are private here/);
   assert.doesNotMatch(consultantProgress, /No approved task reports have been recorded/);
+  const withTasks = render({
+    ...linkedCard,
+    activity_summary: { approved_report_count: 3, approved_quantity: 42 },
+    work_by_task: [
+      { title: 'Block A', weight_pct: 60, progress_pct: 50, target_quantity: 120, approved_report_count: 2, approved_quantity: 60, last_approved_date: '2026-11-05' },
+      { title: 'Block B', weight_pct: 40, progress_pct: 0, target_quantity: 80, approved_report_count: 0, approved_quantity: 0, last_approved_date: null },
+    ],
+  });
+  assert.match(withTasks, /Approved work by task/);
+  assert.match(withTasks, />Block A</);
+  assert.match(withTasks, /60 of 120 m3/);
+  assert.match(withTasks, />Block B</);                       // a task with no approved work is still listed, so the shares add up
+  assert.match(withTasks, /No approved work yet/);
+  assert.match(withTasks, /2026-11-05/);
+  assert.match(withTasks, /Claimed activity progress[^<]*<\/td><td[^>]*>30%/);   // 60% x 50% = 30% (weighted, never an average)
+  assert.doesNotMatch(withTasks, /@|member|Reported by/i);   // no member identity
   const wrapperContext = {
     window: { currentUserRole: 'ConsultantPM', currentUserId: 8 },
     isWCLeader: () => true,
@@ -119,6 +136,7 @@ test('consultant certification tab includes approved-work review evidence and ex
     claimed_figures: [{ title: 'Block A', weight_pct: 100, progress_pct: 55, target_quantity: 200, approved_quantity: 110 }],
     activity_summary: { task_count: 1, approved_report_count: 1, approved_quantity: 50, planned_quantity: 200 },
     signers: [], request_note: 'Please review this period.',
+    work_by_task: [{ title: 'Block A', weight_pct: 100, progress_pct: 55, target_quantity: 200, approved_report_count: 1, approved_quantity: 110, last_approved_date: '2026-05-04' }],
   };
   const context = {
     window: { currentUserRole: 'ConsultantPM', currentUserId: 8 },
@@ -136,7 +154,10 @@ test('consultant certification tab includes approved-work review evidence and ex
   assert.match(content, /Foundation/);
   assert.match(content, /Activity tasks/);
   assert.match(content, /Approved reports/);
-  assert.doesNotMatch(content, /Block A|Excavated to formation level|5 workers|engineer@example\.test|Excavator/);
+  assert.match(content, /Work covered by this request/);
+  assert.match(content, />Block A</);                         // the approved task and its figures are shown
+  assert.match(content, /110 of 200 m3/);
+  assert.doesNotMatch(content, /Excavated to formation level|5 workers|engineer@example\.test|Excavator/);   // report details stay private unless shared
   assert.match(content, /data-pe-form="decision"/);
   assert.match(content, /data-pe-decision-status/);
   assert.doesNotMatch(content, /data-action="certify"/);
