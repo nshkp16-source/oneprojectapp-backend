@@ -179,6 +179,18 @@ test('report overview uses the activity-report endpoint payload contract', () =>
   assert.match(html, /Next day: finish steel fix/);
   assert.match(html, /PPE check complete/);
   assert.match(html, /CERT-12/);
+  assert.match(html, /OneProjectApp&nbsp; \| &nbsp;Activity Report/);
+  assert.match(html, /ACTIVITY PROGRESS REPORT/);
+  assert.match(html, /data-pe-download-report/);
+  assert.match(html, /Planned today/);
+  assert.doesNotMatch(html, /pe-fold|Show \d+ more/);
+  assert.match(html, /Summary/);
+  assert.match(html, /Activity details/);
+  for (const section of ['Plan details', 'Progress against plan', 'Quantities', 'Daily log',
+    'Planned versus used resources', 'Quality / checks', 'Delays', 'Safety', 'Photos',
+    'Attachments', 'Next period', 'Certificates']) {
+    assert.ok(html.includes(section), `report section missing: ${section}`);
+  }
 });
 
 test('consultant certification tab includes approved-work review evidence and existing decision flow', () => {

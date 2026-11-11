@@ -29,5 +29,4 @@ CREATE TABLE IF NOT EXISTS work_center_report_attachments (
 
 CREATE INDEX IF NOT EXISTS idx_wc_report_attachments_report
   ON work_center_report_attachments (report_id, created_at, id);
-
 COMMIT;

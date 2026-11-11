@@ -225,22 +225,22 @@ test('shared evidence: opt-in, approved reports only, up to the cut-off, no iden
 });
 
 test('decision rules: inspector first, reason for changes, other roles refused', async () => {
-  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, leader, { status: 'verified' })).status, 403);
-  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, client, { status: 'verified' })).status, 403);
-  const early = await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { status: 'verified' });
+  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, leader, { certification_note: 'Checked on site.', status: 'verified' })).status, 403);
+  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, client, { certification_note: 'Checked on site.', status: 'verified' })).status, 403);
+  const early = await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified' });
   assert.equal(early.status, 409);
   assert.equal(early.body.code, 'INSPECTOR_PENDING');
   assert.equal((await call('PUT', `/api/verifications/${v1.id}/inspect`, m(102), { outcome: 'recommend_verify' })).status, 404);   // not the named inspector
   assert.equal((await call('PUT', `/api/verifications/${v1.id}/inspect`, m(201), { outcome: 'maybe' })).status, 400);
   assert.equal((await call('PUT', `/api/verifications/${v1.id}/inspect`, m(201), { outcome: 'recommend_changes', note: 'Measured 80 m3' })).status, 200);
-  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { status: 'verified_with_changes', certified_progress_pct: 20 })).status, 400);   // no reason
-  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { status: 'verified_with_changes', certified_progress_pct: 120, reason: 'x' })).status, 400);
+  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified_with_changes', certified_progress_pct: 20 })).status, 400);   // no reason
+  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified_with_changes', certified_progress_pct: 120, reason: 'x' })).status, 400);
 });
 
 test('verified with changes sets certified progress, ends the temporary milestone value and syncs the milestone', async () => {
   await pool.query(`UPDATE milestones SET override_pct=10, override_reason='Cracks', override_by_id=8, override_by_role='ConsultantPM', override_at=now() WHERE id=1`);
   await pool.query(`INSERT INTO milestone_progress_overrides (project_id, baseline_milestone_id, set_pct, derived_pct_at_time, reason, set_by_id, set_by_role) VALUES (1,1,10,25,'Cracks',8,'ConsultantPM')`);
-  const d = await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { status: 'verified_with_changes', certified_progress_pct: 20, reason: 'Measured 80 m3 on site' });
+  const d = await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified_with_changes', certified_progress_pct: 20, reason: 'Measured 80 m3 on site' });
   assert.equal(d.status, 200, JSON.stringify(d.body));
   assert.equal(d.body.certified_progress_pct, 20);
   assert.equal(d.body.milestone.progress_pct, 20);
@@ -257,7 +257,7 @@ test('verified with changes sets certified progress, ends the temporary mileston
 });
 
 test('a decided request cannot be decided or withdrawn again', async () => {
-  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { status: 'verified' })).status, 409);
+  assert.equal((await call('PUT', `/api/verifications/${v1.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified' })).status, 409);
   assert.equal((await call('PUT', `/api/verifications/${v1.id}/withdraw`, leader, {})).status, 409);
 });
 
@@ -285,7 +285,7 @@ test('withdraw works on a pending request and a new one can follow', async () =>
   assert.equal((await call('PUT', `/api/verifications/${r.body.verification.id}/withdraw`, leader, {})).body.verification.status, 'withdrawn');
   const again = await call('POST', `/api/activities/${act.id}/verifications`, leader, {});
   assert.equal(again.status, 201);
-  const d = await call('PUT', `/api/verifications/${again.body.verification.id}/decide`, cons, { status: 'verified' });
+  const d = await call('PUT', `/api/verifications/${again.body.verification.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified' });
   assert.equal(d.body.certified_progress_pct, 50);                    // verified as claimed
   assert.equal(d.body.milestone.progress_pct, 50);
 });
@@ -321,8 +321,8 @@ test('hold point: needs a completed stage, verification unlocks the next stage',
   const hp = await call('POST', `/api/activities/${a.id}/verifications`, leader, { kind: 'hold_point', stageId: s1.id });
   assert.equal(hp.status, 201, JSON.stringify(hp.body));
   assert.equal((await report(m(101), { taskId: t.id, reportDate: '2026-03-11', stageId: s2.id })).status, 409);
-  assert.equal((await call('PUT', `/api/verifications/${hp.body.verification.id}/decide`, cons, { status: 'verified_with_changes', certified_progress_pct: 10, reason: 'x' })).status, 400);
-  assert.equal((await call('PUT', `/api/verifications/${hp.body.verification.id}/decide`, cons, { status: 'verified' })).status, 200);
+  assert.equal((await call('PUT', `/api/verifications/${hp.body.verification.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified_with_changes', certified_progress_pct: 10, reason: 'x' })).status, 400);
+  assert.equal((await call('PUT', `/api/verifications/${hp.body.verification.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified' })).status, 200);
   assert.ok((await q(`SELECT hold_verified_at FROM task_stages WHERE id=$1`, [s1.id]))[0].hold_verified_at);
   assert.equal((await report(m(101), { taskId: t.id, reportDate: '2026-03-11', stageId: s2.id })).status, 201);
 });
@@ -340,8 +340,8 @@ test('completion: needs 100% and no open rework; snags keep the activity open un
   await call('PUT', `/api/rework/${snag.body.item.id}/close`, cons, {});
   const req = await call('POST', `/api/activities/${act.id}/verifications`, leader, { kind: 'completion', note: 'All blocks done' });
   assert.equal(req.status, 201, JSON.stringify(req.body));
-  assert.equal((await call('PUT', `/api/verifications/${req.body.verification.id}/decide`, cons, { status: 'verified_with_changes', certified_progress_pct: 90, reason: 'x' })).status, 400);   // not allowed for completion
-  const d = await call('PUT', `/api/verifications/${req.body.verification.id}/decide`, cons, { status: 'verified', reason: 'Complete, one snag to clear', rework: [{ reason: 'Touch up edge protection' }] });
+  assert.equal((await call('PUT', `/api/verifications/${req.body.verification.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified_with_changes', certified_progress_pct: 90, reason: 'x' })).status, 400);   // not allowed for completion
+  const d = await call('PUT', `/api/verifications/${req.body.verification.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified', reason: 'Complete, one snag to clear', rework: [{ reason: 'Touch up edge protection' }] });
   assert.equal(d.status, 200, JSON.stringify(d.body));
   assert.equal(d.body.activity_closed, false);                        // a snag is open
   assert.equal(Number((await q(`SELECT certified_progress_pct FROM planning_execution WHERE id=$1`, [act.id]))[0].certified_progress_pct), 99);
@@ -408,7 +408,7 @@ test('read receipts, unread markers and history', async () => {
   assert.ok(onCard.seen_at);
 
   // decide, then the request moves to history; pending no longer lists it
-  const decided = await call('PUT', `/api/verifications/${id}/decide`, cons, { status: 'verified', skip_inspectors: 'true' });
+  const decided = await call('PUT', `/api/verifications/${id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified', skip_inspectors: 'true' });
   assert.equal(decided.status, 200, JSON.stringify(decided.body));
   assert.equal(await pendingRow(cons), undefined);
   const hist = (user, query = '') => call('GET', `/api/verifications/history?projectId=1${query}`, user);

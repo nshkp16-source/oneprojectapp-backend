@@ -21,6 +21,7 @@
 import { certifiedAfterDecision, respondByDate } from './progressRules.js';
 import { syncMilestone } from './planningRoutes.js';
 import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
+import { buildActivityReport } from './activityReport.js';
 
 class HttpError extends Error {
   constructor(status, message, extra = {}) { super(message); this.status = status; this.extra = extra; }
@@ -434,7 +435,8 @@ export function registerVerificationRoutes(app, deps) {
   });
 
   // ── 2b. decision (consultant leader) ───────────────────────────────────────
-  app.put('/api/verifications/:id/decide', authenticateToken, upload.single('attachment'),
+  app.put('/api/verifications/:id/decide', authenticateToken,
+    upload.fields([{ name: 'attachment', maxCount: 1 }, { name: 'photos', maxCount: 10 }]),
     requireProjectLifecycleWrite, async (req, res) => {
     let client;
     const uploads = createCloudinaryUploadTracker(deps);
@@ -448,12 +450,17 @@ export function registerVerificationRoutes(app, deps) {
         throw new HttpError(400, 'status must be verified, verified_with_changes, or rejected.');
       const reason = String(b.reason || '').trim();
       if (status !== 'verified' && !reason) throw new HttpError(400, 'A reason is required.');
+      const certificationNote = String(b.certification_note || '').trim();
 
       client = await pool.connect();
       await client.query('BEGIN');
       const v = (await client.query(`SELECT * FROM activity_verifications WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
       if (!v) throw new HttpError(404, 'Verification not found.');
       if (v.status !== 'pending') throw new HttpError(409, `This request is already ${v.status.replace(/_/g, ' ')}.`);
+      // A certificate of progress needs a short note: it is shown beside the activity in the milestone log.
+      const certifiesProgress = status !== 'rejected' && v.kind !== 'hold_point';
+      if (certifiesProgress && (certificationNote.length < 3 || certificationNote.length > 500))
+        throw new HttpError(400, 'A short note (3 to 500 characters) is required to certify.');
       if (!(await isMember(deps, v.project_id, userId, role))) throw new HttpError(403, 'You are not a member of this project.');
       const act = await loadActivity(client, v.activity_id, true);
 
@@ -493,9 +500,27 @@ export function registerVerificationRoutes(app, deps) {
       }
 
       let attachments = [];
-      if (req.file) {
-        const up = await uploads.upload(req.file.buffer, req.file.originalname, 'verifications/decisions');
-        attachments = [{ name: req.file.originalname, id: up.public_id, url: up.secure_url }];
+      const attachmentFile = req.files?.attachment?.[0];
+      if (attachmentFile) {
+        const up = await uploads.upload(attachmentFile.buffer, attachmentFile.originalname, 'verifications/decisions');
+        attachments = [{ name: attachmentFile.originalname, id: up.public_id, url: up.secure_url }];
+      }
+      // Optional certification photos go to the milestone Site photos; with no milestone they stay on the decision.
+      const photoFiles = (req.files?.photos || []).filter((f) => /^image\//i.test(f.mimetype || ''));
+      const photoUploads = [];
+      for (const file of photoFiles) {
+        const folder = act.baseline_milestone_id
+          ? `oneprojectapp/schedules/${v.project_id}/milestone-photos` : `oneprojectapp/schedules/${v.project_id}/additional-photos`;
+        const up = await uploads.upload(file.buffer, file.originalname, folder);
+        photoUploads.push({ name: file.originalname, id: up.public_id, url: up.secure_url });
+      }
+      const photoColumn = act.baseline_milestone_id ? 'milestone_id' : act.additional_milestone_id ? 'additional_milestone_id' : null;
+      if (!photoColumn) attachments = [...attachments, ...photoUploads];
+
+      let certificateNo = null;
+      if (certifiesProgress) {
+        certificateNo = (await client.query(
+          `SELECT COALESCE(MAX(certificate_no), 0) + 1 AS next FROM activity_verifications WHERE activity_id = $1`, [v.activity_id])).rows[0].next;
       }
 
       const certified = status === 'rejected' ? null
@@ -505,10 +530,21 @@ export function registerVerificationRoutes(app, deps) {
       const decided = (await client.query(
         `UPDATE activity_verifications
          SET status = $2, certified_progress_pct = $3, certified_figures = $4::jsonb, decision_reason = $5,
-             decision_attachments = $6::jsonb, decided_by_id = $7, decided_by_role = $8, decided_at = NOW()
+             decision_attachments = $6::jsonb, decided_by_id = $7, decided_by_role = $8, decided_at = NOW(),
+             certification_note = $9, certificate_no = $10
          WHERE id = $1 RETURNING *`,
         [v.id, status, certified, certifiedFigures ? JSON.stringify(certifiedFigures) : null, reason || null,
-         JSON.stringify(attachments), userId, role])).rows[0];
+         JSON.stringify(attachments), userId, role, certifiesProgress ? certificationNote : null, certificateNo])).rows[0];
+      if (photoColumn) {
+        const link = act.baseline_milestone_id || act.additional_milestone_id;
+        for (const photo of photoUploads) {
+          await client.query(
+            `INSERT INTO milestone_photos (${photoColumn}, project_id, file_name, cloudinary_public_id, cloudinary_url,
+                                           uploaded_by_user_id, uploaded_by_role, verification_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [link, v.project_id, photo.name, photo.id, photo.url, userId, role, v.id]);
+        }
+      }
       await markRead(client, v.id, v.project_id, role, userId);
 
       await client.query(
@@ -556,12 +592,26 @@ export function registerVerificationRoutes(app, deps) {
       await client.query('COMMIT');
       uploads.keepAll();
 
+      // Freeze the activity report as it stood at this certificate. A failure here never undoes the decision:
+      // the report endpoint then rebuilds the report as of the decision date.
+      if (certifiesProgress) {
+        try {
+          const row = (await pool.query(
+            `SELECT pe.*,
+                    (SELECT title FROM milestones WHERE id = pe.baseline_milestone_id) AS baseline_milestone_title,
+                    (SELECT title FROM additional_milestones WHERE id = pe.additional_milestone_id) AS additional_milestone_title
+             FROM planning_execution pe WHERE pe.id = $1`, [v.activity_id])).rows[0];
+          const snapshot = await buildActivityReport(pool, { activity: row });
+          await pool.query(`UPDATE activity_verifications SET report_snapshot = $2::jsonb WHERE id = $1`, [v.id, JSON.stringify(snapshot)]);
+        } catch (snapshotErr) { console.error('[decide] report snapshot failed:', snapshotErr.message); }
+      }
+
       const label = { verified: 'verified', verified_with_changes: 'verified with changes', rejected: 'rejected' }[status];
       await notifySafe(deps, { projectId: v.project_id, entityId: v.id, entityType: 'activity_verification',
         message: `Verification for "${act.title}" was ${label}${reason ? `: ${reason}` : '.'}${closed ? ' The activity is now closed.' : ''}`,
         actorId: userId, actorRole: role,
         recipients: [...(await leadersOf(deps, v.project_id, 'Contractor'))] });
-      return res.json({ success: true, verification: decided, certified_progress_pct: certified, activity_closed: closed, milestone, rework_items: rework.length });
+      return res.json({ success: true, verification: decided, certificate_no: certificateNo, certified_progress_pct: certified, activity_closed: closed, milestone, rework_items: rework.length });
     } catch (err) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       await uploads.discard();

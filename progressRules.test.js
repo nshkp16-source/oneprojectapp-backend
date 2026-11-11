@@ -33,6 +33,15 @@ test('adding a task rebalances proportionally and keeps the ratios', () => {
   assert.throws(() => R.rebalanceForNew([100], 100));
 });
 
+test('removing a task reallocates remaining weights to 100', () => {
+  assert.deepEqual(R.rebalanceAfterRemoval([30, 40]), [42.86, 57.14]);
+  assert.deepEqual(R.rebalanceAfterRemoval([20, 20, 20]), [33.34, 33.33, 33.33]);
+  assert.deepEqual(R.rebalanceAfterRemoval([100]), [100]);
+  assert.deepEqual(R.rebalanceAfterRemoval([]), []);
+  assert.ok(R.weightsValid(R.rebalanceAfterRemoval([30, 40])));
+  assert.throws(() => R.rebalanceAfterRemoval([30, 0]));
+});
+
 test('default milestone weights follow quantities only when every unit matches', () => {
   const m = { unit: 'm3' };
   assert.deepEqual(R.defaultMilestoneWeights(m, [{ planned_quantity: 300, unit: 'm3' }, { planned_quantity: 100, unit: 'M3' }]), [75, 25]);

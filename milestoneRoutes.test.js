@@ -63,7 +63,7 @@ test('fixture: one linked activity, fully reported and verified, so the mileston
   assert.equal(r.status, 201, JSON.stringify(r.body)); act = r.body.activity; task = r.body.tasks[0];
   await progressTo(task, m(101), '2026-03-10', 400);
   const v = await call('POST', `/api/activities/${act.id}/verifications`, leader, {});
-  assert.equal((await call('PUT', `/api/verifications/${v.body.verification.id}/decide`, cons, { status: 'verified' })).status, 200);
+  assert.equal((await call('PUT', `/api/verifications/${v.body.verification.id}/decide`, cons, { certification_note: 'Checked on site.', status: 'verified' })).status, 200);
   const x = await ms(); assert.equal(x.progress_source, 'activities'); assert.equal(Number(x.progress_pct), 100);
 });
 
