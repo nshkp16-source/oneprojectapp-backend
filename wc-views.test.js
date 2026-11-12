@@ -21,17 +21,46 @@ function extract(names) {
 }
 
 const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadField', '_wcLabel', '_wcInput', '_wcStatusBadgeHtml', '_wcDeriveStatus', '_wcActivityStatusBadge',
-  'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
+'wcPriorityBadge', '_wcMemberView', '_wcPMView', '_wcTypeOf', '_wcTodayDate', '_wcUnitText', '_wcStagesOf', '_wcTaskShareHtml',
   '_wcReportFieldsHtml', '_wcEntryFigure', '_wcReportExtraHtml', '_wcTaskSummaryHtml', '_wcActivityPlanHtml', '_wcPlanRow',
+  '_wcInitReportWizard',
+  '_wcEnhanceReports', '_wcOpenReportPanel', '_wcBeginReportEdit', '_wcResetReportEdit', '_wcDeleteReport',
+  '_wcHandleSubmitProgress',
   '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_wcUpdateSupportingAttachmentGroup', '_wcSupportingAttachmentGroupHtml',
   '_wcReportSupportingAttachmentsHtml', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
+  '_wcCollectTaskFiles', '_wcInitTaskFiles', '_wcOpenTaskFilesViewer',
+  '_wcOpenOfflineReportDb', '_wcQueueOfflineTaskAttachments',
+  '_wcDownloadTaskPdf',
   '_wcCardHeaderHtml', '_wcCardTilesHtml',
+  '_wcHistoryText',
   '_safeHttpsUrl', '_fileDisplayName', '_thumbUrl', '_evidenceFileAttrs', '_evidenceFileRowHtml', '_evidencePhotosHtml', '_evidenceFilesHtml'];
 
 function views() {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
   const ctx = dom.getInternalVMContext();
-  vm.runInContext(`function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
+  vm.runInContext(`const CSS = { escape: (value) => String(value) };
+  const API = '/api';
+  var recordsCache = {};
+  window.__wcFetches = [];
+  window.__wcAlerts = [];
+  window._wcReportLocationByTask = {};
+  async function ensureActiveProjectId() { return '9'; }
+  async function _wcFetch(url, options) {
+    window.__wcFetches.push({ url, options });
+    return { ok: true, json: async () => ({}) };
+  }
+  async function _wcReadPhotoMetadata() { return {}; }
+  async function _wcRefreshTaskCard() {}
+  function _wcSetTaskCardMessage() {}
+  async function _wcQueueOfflineReport() {}
+  window.alert = (message) => window.__wcAlerts.push(message);
+  function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
+  vm.runInContext(`function expandGrayPart(html) {
+    const panel = document.createElement('div'); panel.id = 'grayContent'; panel.innerHTML = html;
+    document.body.appendChild(panel);
+  }
+  function collapseGrayPart() { document.getElementById('grayContent')?.remove(); }
+  HTMLElement.prototype.scrollIntoView = function() {};`, ctx);
   vm.runInContext(extract(HELPERS), ctx);
   vm.runInContext(`function tabbed(task, entries, queries, leader) {
     document.body.innerHTML = leader ? _wcPMView(task, entries) : _wcMemberView(task, entries);
@@ -43,7 +72,12 @@ function views() {
   }`, ctx);
   const render = (fn, task, entries) => { dom.window.__t = task; dom.window.__e = entries; dom.window.document.body.innerHTML = vm.runInContext(`${fn}(window.__t, window.__e)`, ctx); return dom.window.document; };
   return {
+    w: dom.window,
     formatDate: (value) => { dom.window.__date = value; return vm.runInContext('_wcFmtDate(window.__date)', ctx); },
+    history: (item) => {
+      dom.window.__historyItem = item;
+      return vm.runInContext('_wcHistoryText(window.__historyItem)', ctx);
+    },
     reportDelayDays: (reportDate, plannedEndDate) => {
       dom.window.__reportDate = reportDate; dom.window.__plannedEndDate = plannedEndDate;
       return vm.runInContext('_wcReportDelayDays(window.__reportDate, window.__plannedEndDate)', ctx);
@@ -71,8 +105,17 @@ function views() {
       dom.window.document.body.innerHTML = vm.runInContext('_wcFilesHtml(window.__t, window.__e, window.__files, ' + leader + ')', ctx);
       return dom.window.document;
     },
+    openFilesViewer: (files, index, taskId) => {
+      dom.window.__files = files; dom.window.__fileIndex = index; dom.window.__taskId = taskId;
+      vm.runInContext('_wcOpenTaskFilesViewer(window.__files, window.__fileIndex, window.__taskId)', ctx);
+      return dom.window.document;
+    },
     tabbed: (t, e, q, leader) => { dom.window.__t = t; dom.window.__e = e; dom.window.__q = q; return vm.runInContext(`tabbed(window.__t, window.__e, window.__q, ${leader})`, ctx); },
     saveReportFilter: (taskId, filter) => { dom.window.__taskId = taskId; dom.window.__filter = filter; vm.runInContext('saveReportFilter(window.__taskId, window.__filter)', ctx); },
+    submitProgress: (taskId) => {
+      dom.window.__submitTaskId = taskId;
+      return vm.runInContext('_wcHandleSubmitProgress(window.__submitTaskId, "reports")', ctx);
+    },
   };
 }
 
@@ -101,6 +144,18 @@ test('report delay days count dates after the planned task end only', () => {
   assert.equal(view.reportDelayDays('2026-03-09', '2026-03-09'), 0);
   assert.equal(view.reportDelayDays('2026-03-08', '2026-03-09'), 0);
   assert.equal(view.reportDelayDays('invalid', '2026-03-09'), 0);
+});
+
+test('report edit and delete history shows only the short summary', () => {
+  const view = views();
+  for (const action of ['report_edited', 'report_deleted']) {
+    const text = view.history({
+      action, detail: { summary: '2 m3 on 11 Mar, rejected: photo was unclear.' },
+    });
+    assert.match(text, /2 m3 on 11 Mar/);
+    assert.match(text, /Summary only/);
+    assert.doesNotMatch(text, /work done|file name/i);
+  }
 });
 
 test('report cards render photo, structured resources and delay details safely', () => {
@@ -143,7 +198,7 @@ test('task dates use one readable format and invalid values have a safe fallback
 test('leader view: validate buttons only on pending reports, void button only on approved ones', () => {
   const d = views().leader(task, entries);
   const actions = (id) => [...d.querySelectorAll(`[data-progress-id="${id}"]`)].map((b) => b.dataset.validateAction).filter(Boolean);
-  assert.deepEqual(actions(1), ['approved', 'rejected', 'comment_only']);
+  assert.deepEqual(actions(1), ['approved', 'rejected']);
   assert.deepEqual(actions(2), ['voided']);
   assert.deepEqual(actions(3), []);                                                      // a voided report offers nothing
   assert.match(d.body.textContent, /Void this report/);
@@ -160,7 +215,7 @@ test('leader view: no void button once the task is closed', () => {
   assert.equal([...d.querySelectorAll('[data-validate-action="voided"]')].length, 0);
 });
 
-test('expanded leader task uses Details and Reports tabs, with queries inside their report', () => {
+test('expanded leader task uses Overview and Reports tabs, with summary first and queries inside their report', () => {
   const t = { ...task, title: 'Excavate trenches', priority: 'high', description: 'Dig to the levels on drawing S-04.',
     activity_description: 'Excavate grid B foundation.', activity_done_when: 'Formation levels confirmed.',
     activity_planned_quantity: 200, activity_planned_work: 'Excavate and remove spoil.',
@@ -176,16 +231,18 @@ test('expanded leader task uses Details and Reports tabs, with queries inside th
   const tabs = [...d.querySelectorAll('[role="tab"]')];
   assert.ok(tabs.every((tab) => tab.classList.contains('detail-tab')));
   assert.deepEqual(tabs.map((tab) => tab.textContent.trim().replace(/\s+\d+$/, '')),
-    ['Details', 'Reports']);
+    ['Overview', 'Reports']);
   const summary = d.querySelector('[data-wc-card-summary]');
-  assert.doesNotMatch(summary.textContent, /Progress|30 m3 completed|200 m3/);
-  assert.doesNotMatch(summary.textContent, /Excavate trenches|Created by|High|Ongoing|Start Date/);
+  assert.ok(summary);
+  assert.equal(summary.parentElement.getAttribute('data-wc-pane'), 'overview');
+  assert.equal(summary.parentElement.firstElementChild, summary);
+  assert.match(summary.textContent, /Approved/);
+  assert.match(summary.textContent, /Pending/);
+  assert.match(summary.textContent, /Quantity/);
   const details = d.querySelector('#wc-read-5').textContent;
   assert.doesNotMatch(details, /Start Date|End Date|Required priority|Excavate trenches/);
   assert.doesNotMatch(d.body.textContent, /Required priorityHigh/);
   assert.doesNotMatch(d.body.textContent, /How to read this task/);
-  assert.match(d.body.textContent, /All 3/);
-  assert.match(d.body.textContent, /Pending 1/);
   assert.match(d.body.textContent, /Materials/);
   assert.match(d.body.textContent, /Marker paint/);
   assert.match(d.body.textContent, /North trench completed/);
@@ -201,12 +258,122 @@ test('expanded leader task uses Details and Reports tabs, with queries inside th
   assert.match(d.body.textContent, /Dug more/);
   assert.ok(d.querySelector('[data-wc-pane="reports"]'));
   assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
+  assert.equal(d.querySelector('[data-wc-report-card][data-report-status="pending"]').hidden, false);
   assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, true);
-  d.querySelector('[data-report-filter="all"]').click();
-  assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, false);
+  assert.ok(d.querySelector('[data-wc-report-row][data-report-id="2"]'));
+  assert.equal(d.querySelector('[data-report-filter]'), null);
 });
 
-test('task card tiles show team-wide totals, pending reports and task progress', () => {
+test('Reports tab keeps pending cards open and turns other reports into newest-first rows', () => {
+  const d = views().tabbed(task, entries, [], true);
+  const pendingCard = d.querySelector('[data-wc-report-card][data-report-status="pending"]');
+  assert.equal(pendingCard.hidden, false);
+  const rejectionReason = pendingCard.querySelector('#wc-val-notes-1');
+  assert.equal(rejectionReason.hidden, true);
+  const reject = pendingCard.querySelector('[data-validate-action="rejected"]');
+  reject.click();
+  assert.equal(rejectionReason.hidden, false);
+  assert.equal(reject.textContent, 'Confirm rejection');
+  assert.equal(d.querySelector('[data-wc-report-row][data-report-id="2"]').hidden, false);
+  assert.equal(d.querySelector('[data-wc-report-row][data-report-id="3"]').hidden, false);
+  assert.deepEqual([...d.querySelectorAll('[data-wc-report-row]')].map((row) => row.dataset.reportId), ['2', '3']);
+  assert.match(d.querySelector('[data-wc-report-row][data-report-id="2"]').textContent, /Running total: 30 m3/);
+  assert.match(d.querySelector('[data-wc-report-row][data-report-id="3"]').textContent, /Running total: 30 m3/);
+  assert.equal(d.querySelector('[data-wc-report-row][data-report-id="3"]').style.opacity, '0.75');
+});
+
+test('member sees edit and delete only on open pending or rejected reports, with the locked note on approved', () => {
+  const memberEntries = [
+    { ...entries[0], validation_status: 'pending' },
+    { ...entries[1], id: 4, validation_status: 'rejected', validation_notes: 'Add a clear photo.' },
+    { ...entries[1], id: 5, validation_status: 'approved' },
+    { ...entries[2], id: 6, validation_status: 'voided' },
+  ];
+  const d = views().tabbed(task, memberEntries, [], false);
+  for (const id of ['1', '4']) {
+    const card = d.querySelector(`[data-wc-report-card][data-report-id="${id}"]`);
+    assert.equal(card.hidden, false);
+    assert.ok(card.querySelector(`[data-action="wc-edit-progress"][data-progress-id="${id}"]`));
+    assert.ok(card.querySelector(`[data-action="wc-delete-progress"][data-progress-id="${id}"]`));
+  }
+  for (const id of ['5', '6']) {
+    const card = d.querySelector(`[data-wc-report-card][data-report-id="${id}"]`);
+    assert.equal(card.hidden, true);
+    assert.equal(card.querySelector('[data-action="wc-edit-progress"]'), null);
+    assert.equal(card.querySelector('[data-action="wc-delete-progress"]'), null);
+  }
+  assert.match(d.querySelector('[data-wc-report-card][data-report-id="5"]').textContent,
+    /Approved reports are locked\. If one is wrong, ask your leader to void it\./);
+  assert.deepEqual([...d.querySelectorAll('[data-wc-report-row]')].map((row) => row.dataset.reportId), ['5', '6']);
+});
+
+test('member report form assigns the report date automatically instead of asking for a date', () => {
+  const d = views().tabbed(task, [], [], false);
+  assert.equal(d.querySelector('[data-wc-pane="record-progress"] input[id^="wc-pr-date-"]'), null);
+  assert.match(d.querySelector('[data-wc-pane="record-progress"]').textContent,
+    /Report date is recorded automatically when you submit/);
+});
+
+test('rejected edit pre-fills the wizard and shows its leader note and exact history notice', () => {
+  const rejected = { ...entries[1], id: 4, validation_status: 'rejected', validation_notes: 'Add a clear photo.' };
+  const d = views().tabbed(task, [rejected], [], false);
+  d.querySelector('[data-action="wc-edit-progress"][data-progress-id="4"]').click();
+  const wizard = d.querySelector('[aria-label="Add progress report"]');
+  const notice = wizard.querySelector('[data-wc-report-edit-notice]');
+  assert.equal(notice.hidden, false);
+  assert.match(notice.textContent, /Leader note: Add a clear photo\./);
+  assert.match(notice.textContent, /Saving replaces the rejected report completely\. The old version is kept in History as a short summary only\./);
+  assert.equal(d.querySelector('[data-action="wc-submit-progress"]').textContent, 'Save and resubmit');
+  assert.equal(d.getElementById('wc-pr-work-5').value, 'Dug more');
+});
+
+test('saving an edited report PATCHes it and sends the selected existing-file IDs', async () => {
+  const s = views();
+  const d = s.tabbed(task, [{ ...entries[0], id: 8, validation_status: 'rejected' }], [], false);
+  d.body.id = 'wc-detail-5';
+  s.w.recordsCache['work-center'] = [task];
+  s.w._wcEditingReportByTask = { 5: { id: '8', status: 'rejected', reportDate: '2026-03-10' } };
+  d.getElementById('wc-pr-work-5').value = 'Revised work';
+  d.getElementById('wc-pr-qty-5').value = '8';
+  const files = d.querySelector('[data-wc-existing-report-files]');
+  files.innerHTML = `<input type="checkbox" data-wc-keep-photo="31" checked>
+    <input type="checkbox" data-wc-keep-supporting="41" checked>
+    <input type="checkbox" data-wc-keep-attachment>`;
+
+  await s.submitProgress(5);
+
+  assert.deepEqual([...s.w.__wcAlerts], []);
+  assert.equal(s.w.__wcFetches.length, 1);
+  const request = s.w.__wcFetches[0];
+  assert.equal(request.url, '/api/work-center-progress/8');
+  assert.equal(request.options.method, 'PATCH');
+  assert.equal(request.options.body.get('reportDate'), '2026-03-10');
+  assert.equal(request.options.body.get('workDone'), 'Revised work');
+  assert.equal(request.options.body.get('keepPhotoIds'), '[\"31\"]');
+  assert.equal(request.options.body.get('keepSupportingAttachmentIds'), '[\"41\"]');
+  assert.equal(request.options.body.get('removeAttachment'), 'true');
+});
+
+test('Reports tab pages ten rows and opens a full report in the existing side panel', () => {
+  const many = Array.from({ length: 12 }, (_, index) => ({
+    ...entries[1], id: index + 10, report_date: `2026-03-${String(index + 1).padStart(2, '0')}`,
+    validation_status: 'approved', quantity_done: String(index + 1), work_done: `Approved work ${index + 1}`,
+  }));
+  const d = views().tabbed(task, many, [], true);
+  const rows = [...d.querySelectorAll('[data-wc-report-row]')];
+  assert.equal(rows.filter((row) => !row.hidden).length, 10);
+  const loadMore = [...d.querySelectorAll('button')].find((button) => button.textContent === 'Load more reports');
+  assert.ok(loadMore);
+  loadMore.click();
+  assert.equal(rows.filter((row) => !row.hidden).length, 12);
+  rows[0].click();
+  const panel = d.querySelector('#grayContent');
+  assert.ok(panel);
+  assert.equal(panel.querySelector('[data-wc-report-card]').hidden, false);
+  assert.match(panel.textContent, /Approved work 12/);
+});
+
+test('task card has the three-cell Progress, Planned today and Due strip', () => {
   const taskTotals = {
     ...task, progress_pct: 35, pending_report_count: 2, total_report_count: 5,
     approved_quantity_done: 70,
@@ -216,10 +383,11 @@ test('task card tiles show team-wide totals, pending reports and task progress',
     { validation_status: 'pending', quantity_done: 40 },
   ]);
   const text = d.body.textContent.replace(/\s+/g, ' ');
-  assert.match(text, /Task progress 35%/);
-  assert.match(text, /Quantity done 70 of 200 m3/);
-  assert.match(text, /Share of activity 50%/);
-  assert.match(text, /Reports 5 2 pending/);
+  assert.match(text, /Progress 35\.0%/);
+  assert.match(text, /70 of 200 m3 approved/);
+  assert.match(text, /Planned today/);
+  assert.match(text, /Ahead by|Behind by|On plan/);
+  assert.match(text, /Due/);
   assert.doesNotMatch(text, /Checklist/);
 });
 
@@ -233,7 +401,7 @@ test('card hierarchy chips show activity, location, dates and drawing', () => {
   assert.match(d.body.textContent, /Drawing S-04/);
 });
 
-test('task attachment tab lists legacy and multiple files and offers upload/removal to leaders', () => {
+test('Files tab shows task and report files in one grid and offers upload controls to leaders', () => {
   const d = views().attachments(
     { ...task, linked_file_name: 'legacy.pdf' },
     [{ id: 2, attachment_name: 'report.jpg', report_date: '2026-03-10' }],
@@ -243,14 +411,121 @@ test('task attachment tab lists legacy and multiple files and offers upload/remo
   assert.match(d.body.textContent, /legacy\.pdf/);
   assert.match(d.body.textContent, /drawing\.dwg/);
   assert.match(d.body.textContent, /report\.jpg/);
-  const download = d.querySelector('[data-ev-download][data-ev-name="drawing.dwg"]');
-  assert.ok(download, 'each task file has a Download control that saves it under its real name');
-  assert.equal(download.dataset.evUrl, 'https://files.test/drawing.dwg');
+  assert.equal(d.querySelectorAll('[data-wc-file-index]').length, 3);
   assert.ok(d.querySelector('[data-wc-attachment-input][multiple]'));
-  assert.ok(d.querySelector('[data-wc-attachment-delete="9"]'));
+  assert.ok(d.querySelector('[data-wc-attachment-choose]'));
+  assert.match(d.body.textContent, /Upload size limit is unavailable/);
 });
 
-test('progress report has exactly Photos and type-first Supporting attachments', () => {
+test('task file viewer navigates between files and previews PDFs inline', () => {
+  const d = views().openFilesViewer([
+    { id: 1, name: 'photo.jpg', file_url: 'https://files.test/photo.jpg', mime_type: 'image/jpeg', source: 'Uploaded here', date: '2026-03-10' },
+    { id: 2, name: 'plan.pdf', file_url: 'https://files.test/plan.pdf', mime_type: 'application/pdf', source: 'From report 11 Mar', date: '2026-03-11' },
+  ], 0, 5);
+  const modal = d.getElementById('wc-task-file-viewer');
+  assert.equal(modal.querySelector('[data-wc-viewer-count]').textContent, '1 of 2');
+  modal.querySelector('[data-wc-viewer-next]').click();
+  assert.equal(modal.querySelector('[data-wc-viewer-count]').textContent, '2 of 2');
+  assert.equal(modal.querySelector('[data-wc-viewer-content] iframe').title, 'plan.pdf');
+  modal.querySelector('[data-wc-viewer-prev]').click();
+  assert.equal(modal.querySelector('[data-wc-viewer-count]').textContent, '1 of 2');
+});
+
+test('task files are persisted in the existing offline database', async () => {
+  const d = views();
+  const stores = new Set();
+  const records = new Map();
+  let openedVersion;
+  const db = {
+    objectStoreNames: { contains: (name) => stores.has(name) },
+    createObjectStore: (name) => stores.add(name),
+    transaction: (name) => ({
+      objectStore: () => ({
+        put: (record) => {
+          assert.equal(name, 'attachments');
+          records.set(record.key, record);
+          const request = {};
+          queueMicrotask(() => request.onsuccess?.());
+          return request;
+        },
+      }),
+    }),
+    close() {},
+  };
+  Object.defineProperty(d.w, 'indexedDB', {
+    configurable: true,
+    value: {
+      open: (_name, version) => {
+        openedVersion = version;
+        const request = { result: db };
+        queueMicrotask(() => {
+          request.onupgradeneeded?.();
+          request.onsuccess?.();
+        });
+        return request;
+      },
+    },
+  });
+  const file = new d.w.Blob(['image-data'], { type: 'image/jpeg' });
+  Object.defineProperty(file, 'name', { value: 'site.jpg' });
+  await d.w._wcQueueOfflineTaskAttachments(12, 9, [file]);
+  assert.equal(openedVersion, 2);
+  assert.ok(stores.has('reports'));
+  assert.ok(stores.has('attachments'));
+  const [record] = records.values();
+  assert.equal(record.taskId, '12');
+  assert.equal(record.projectId, '9');
+  assert.equal(record.files[0].fileName, 'site.jpg');
+  assert.equal(record.files[0].fileType, 'image/jpeg');
+  assert.equal(record.files[0].blob, file);
+});
+
+test('task summary PDF is one page and pending reports do not count', async () => {
+  const d = views();
+  const pdfText = [];
+  let pageCount = 0;
+  const font = { widthOfTextAtSize: (text, size) => String(text).length * size * 0.5 };
+  const page = {
+    drawText: (text) => pdfText.push(String(text)),
+    drawLine() {},
+    drawRectangle() {},
+    drawImage() {},
+  };
+  d.w.PDFLib = {
+    PDFDocument: {
+      create: async () => ({
+        addPage: () => { pageCount++; return page; },
+        embedFont: async () => font,
+        save: async () => new Uint8Array([1, 2, 3]),
+      }),
+    },
+    StandardFonts: { Helvetica: 'Helvetica', HelveticaBold: 'HelveticaBold' },
+    rgb: (...values) => values,
+  };
+  d.w.URL.createObjectURL = () => 'blob:task-pdf';
+  d.w.URL.revokeObjectURL = () => {};
+  d.w.setTimeout = () => 0;
+  d.w.HTMLAnchorElement.prototype.click = function () {};
+  d.w.__task = {
+    id: 21, title: 'Excavation', activity_type: 'quantity', activity_unit: 'm3',
+    activity_id: 3, activity_title: 'Foundation', activity_milestone_title: 'Structure',
+    start_date: '2026-03-01', end_date: '2026-04-30', status: 'open',
+    progress_pct: 25, target_quantity: 80, approved_quantity_done: 20,
+    assigned_members: [{ id: 4, name: 'Taylor' }],
+  };
+  d.w.__entries = [
+    { id: 1, report_date: '2026-03-10', member_title: 'Taylor', quantity_done: 20, validation_status: 'approved' },
+    { id: 2, report_date: '2026-03-11', member_title: 'Jordan', quantity_done: 10, validation_status: 'pending' },
+  ];
+  await d.w._wcDownloadTaskPdf(d.w.__task, d.w.__entries, []);
+  assert.equal(pageCount, 1);
+  assert.ok(pdfText.includes('Only approved reports count toward progress'));
+  assert.ok(pdfText.includes('Not counted'));
+  assert.ok(pdfText.includes('Pending review'));
+  assert.ok(pdfText.some((text) => text.includes('20 m3')));
+});
+
+test('progress report has Photos and optional-type Supporting attachments', () => {
   const view = views();
   const d = view.member(task, entries);
   assert.equal(d.querySelectorAll('input[type="file"]').length, 2);
@@ -259,7 +534,7 @@ test('progress report has exactly Photos and type-first Supporting attachments',
     .find((input) => input.hasAttribute('data-supporting-files'));
   assert.ok(supportingFiles);
   assert.equal(supportingFiles.multiple, true);
-  assert.equal(supportingFiles.disabled, true);
+  assert.equal(supportingFiles.disabled, false);
   assert.equal(d.querySelector(`#wc-pr-file-${task.id}`), null);
   const group = d.querySelector('[data-wc-supporting-group]');
   assert.ok(group.querySelector('[data-supporting-type]'));
@@ -267,7 +542,7 @@ test('progress report has exactly Photos and type-first Supporting attachments',
   assert.equal(customWrap.hidden, true);
   assert.equal(customWrap.style.display, 'none');
   assert.ok(customWrap.querySelector('[data-supporting-custom][disabled]'));
-  assert.match(group.textContent, /Evidence title/);
+  assert.match(group.textContent, /Evidence type \(optional\)/);
   assert.match(customWrap.textContent, /Custom title \(required for Other\)/);
   view.updateSupportingGroup(group, 'other');
   assert.equal(customWrap.hidden, false);
@@ -279,7 +554,7 @@ test('progress report has exactly Photos and type-first Supporting attachments',
   assert.equal(customWrap.style.display, 'none');
 });
 
-test('progress submission pairs each supporting file with its chosen title', async () => {
+test('progress submission defaults missing supporting types to General and preserves selected titles', async () => {
   const dom = new JSDOM('<!doctype html><body></body>', { runScripts: 'outside-only', url: 'http://localhost/' });
   const ctx = dom.getInternalVMContext();
   dom.window.__form = null;
@@ -288,6 +563,7 @@ test('progress submission pairs each supporting file with its chosen title', asy
     const recordsCache = { 'work-center': [{ id: 5, activity_type: 'percentage', end_date: '2026-03-10' }] };
     async function ensureActiveProjectId() { return '1'; }
     function _wcTypeOf(task) { return task.activity_type; }
+    function _wcTodayDate() { return '2026-03-12'; }
     function _wcReportDelayDays() { return 0; }
     async function _wcReadPhotoMetadata() { return {}; }
     async function _wcFetch(_url, options) { window.__form = options.body; return { ok: true, json: async () => ({}) }; }
@@ -298,14 +574,14 @@ test('progress submission pairs each supporting file with its chosen title', asy
   vm.runInContext(extract(['_wcHandleSubmitProgress']), ctx);
   const d = dom.window.document;
   d.body.innerHTML = `
-    <input id="wc-pr-date-5" value="2026-03-10"/><input id="wc-pr-pct-5" value="20"/>
+    <input id="wc-pr-pct-5" value="20"/>
     <textarea id="wc-pr-work-5">Installed pipes</textarea>
     <input id="wc-pr-manpower-5"/><input id="wc-pr-equipment-5"/><input id="wc-pr-materials-5"/>
     <input id="wc-pr-issues-5"/><textarea id="wc-pr-notes-5"></textarea>
     <select id="wc-pr-delay-cause-5"><option value=""></option></select><textarea id="wc-pr-delay-note-5"></textarea>
     <input id="wc-pr-photos-5" type="file" multiple/>
     <div data-wc-supporting-groups data-task-id="5">
-      <div data-wc-supporting-group><select data-supporting-type><option value="daily_progress" selected></option></select>
+      <div data-wc-supporting-group><select data-supporting-type><option value="" selected></option></select>
         <input data-supporting-custom/><input data-supporting-files type="file" multiple/></div>
       <div data-wc-supporting-group><select data-supporting-type><option value="other" selected></option></select>
         <input data-supporting-custom value="Calibration records"/><input data-supporting-files type="file" multiple/></div>
@@ -325,10 +601,11 @@ test('progress submission pairs each supporting file with its chosen title', asy
     'daily-1.pdf', 'daily-2.pdf', 'calibration.pdf',
   ]);
   assert.deepEqual(JSON.parse(body.get('supportingAttachmentMetadata')), [
-    { attachmentType: 'daily_progress', customAttachmentType: '' },
-    { attachmentType: 'daily_progress', customAttachmentType: '' },
+    { attachmentType: 'general', customAttachmentType: '' },
+    { attachmentType: 'general', customAttachmentType: '' },
     { attachmentType: 'other', customAttachmentType: 'Calibration records' },
   ]);
+  assert.equal(body.get('reportDate'), '2026-03-12');
 });
 
 test('task creation forms keep ordinary multiple-file inputs without evidence type selectors', () => {
@@ -338,7 +615,7 @@ test('task creation forms keep ordinary multiple-file inputs without evidence ty
 });
 
 test('internal task-card links are buttons and leader choices are selected from project items', async () => {
-  const dom = new JSDOM('<!doctype html><body><div id="wc-detail-5"><div id="card"><div role="tablist"></div><div data-wc-pane="details"></div></div></div></body>',
+  const dom = new JSDOM('<!doctype html><body><div id="wc-detail-5"><div id="card"><div role="tablist"></div><div data-wc-pane="overview"></div></div></div></body>',
     { runScripts: 'outside-only', url: 'http://localhost/' });
   const ctx = dom.getInternalVMContext();
   const cardData = {
@@ -370,15 +647,16 @@ test('internal task-card links are buttons and leader choices are selected from 
     }`, ctx);
   vm.runInContext(extract([
     '_wcFmtDate', '_wcTypeOf', '_wcUnitText', '_wcStagesOf', '_wcHistoryText',
-    '_wcCardHeaderHtml', '_wcCardTilesHtml', '_wcFilesHtml', '_wcRenderTaskCardExtras', '_wcOpenInternalTaskLink',
+    '_wcCardHeaderHtml', '_wcCardTilesHtml', '_wcCollectTaskFiles', '_wcFilesHtml',
+    '_wcInitTaskFiles', '_wcOpenTaskFilesViewer', '_wcRenderTaskCardExtras', '_wcOpenInternalTaskLink',
   ]), ctx);
   dom.window.__navigation = [];
   dom.window.__task = { ...task, activity_title: 'Excavation' };
   await vm.runInContext(`_wcRenderTaskCardExtras(window.__task, document.getElementById('card'), true, [])`, ctx);
   const d = dom.window.document;
   assert.equal(d.querySelectorAll('[data-card-operation="link-open"]').length, 3);
-  assert.ok(d.querySelector('[data-wc-tab="attachments"]'));
-  assert.ok(d.querySelector('[data-wc-pane="attachments"] input[type="file"][multiple]'));
+  assert.ok(d.querySelector('[data-wc-tab="files"]'));
+  assert.ok(d.querySelector('[data-wc-pane="files"] input[type="file"][multiple]'));
   assert.equal(d.querySelector('a[href="https://example.test/spec"]')?.textContent, 'External spec');
   const typeSelect = d.querySelector('[data-card-field="link-type"]');
   const targetSelect = d.querySelector('[data-card-field="link-target"]');
@@ -406,22 +684,27 @@ test('internal task-card links are buttons and leader choices are selected from 
   ]);
 });
 
-test('expanded standalone task does not show a task-level query tab', () => {
+test('expanded standalone task uses the new tab set and does not show a task-level query tab', () => {
   const d = views().tabbed({ ...task, activity_id: null, activity_title: null }, [], [], false);
   assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
   assert.match(d.body.textContent, /Task plan/);
+  assert.deepEqual([...d.querySelectorAll('[role="tab"]')].map((tab) => tab.dataset.wcTab),
+    ['overview', 'record-progress', 'my-submissions']);
+  assert.ok(d.querySelector('[data-wc-pane="record-progress"] [data-action="wc-submit-progress"]'));
+  assert.ok(d.querySelector('[data-wc-pane="my-submissions"]'));
 });
 
-test('leader reports default to All when there are no pending reports', () => {
+test('leader reports do not render obsolete status filter chips', () => {
   const stalePending = views();
   stalePending.saveReportFilter(task.id, 'pending');
   const d = stalePending.tabbed(task, [{ ...entries[1], validation_status: 'approved' }], [], true);
-  assert.equal(d.querySelector('[data-report-filter="all"]').getAttribute('aria-pressed'), 'true');
-  assert.equal(d.querySelector('[data-report-filter="pending"]').getAttribute('aria-pressed'), 'false');
-  assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, false);
+  assert.equal(d.querySelector('[data-report-filter]'), null);
+  assert.equal(d.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, true);
+  assert.ok(d.querySelector('[data-wc-report-row][data-report-status="approved"]'));
 
   const withPending = views().tabbed(task, entries, [], true);
-  assert.equal(withPending.querySelector('[data-report-filter="pending"]').getAttribute('aria-pressed'), 'true');
+  assert.equal(withPending.querySelector('[data-report-filter]'), null);
+  assert.equal(withPending.querySelector('[data-wc-report-card][data-report-status="pending"]').hidden, false);
   assert.equal(withPending.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, true);
 });
 
@@ -433,7 +716,7 @@ test('questions without a matching report appear in Other questions for leaders 
   ];
   for (const leader of [true, false]) {
     const d = views().tabbed(task, [entries[1]], questions, leader);
-    const paneKey = leader ? 'reports' : 'my-reports';
+    const paneKey = leader ? 'reports' : 'my-submissions';
     const orphanPanel = d.querySelector(`[data-wc-pane="${paneKey}"] [data-wc-orphan-queries]`);
     assert.ok(orphanPanel);
     assert.match(orphanPanel.textContent, /Other questions \(2\)/);
@@ -445,21 +728,25 @@ test('questions without a matching report appear in Other questions for leaders 
   }
 });
 
-test('expanded member task separates progress and reports; closed task hides progress', () => {
+test('expanded member task separates progress recording and submissions; closed task hides progress', () => {
   const d = views().tabbed(task, entries.filter((entry) => entry.member_id === 101), [], false);
   const tabs = [...d.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('data-wc-tab'));
-  assert.deepEqual(tabs, ['details', 'progress', 'my-reports']);
-  assert.ok(d.querySelector('[data-wc-pane="my-reports"]')?.textContent.includes('My Previous Submissions'));
+  assert.deepEqual(tabs, ['overview', 'record-progress', 'my-submissions']);
+  assert.ok(d.querySelector('[data-wc-pane="record-progress"] [data-action="wc-submit-progress"]'));
+  assert.equal(d.querySelector('[data-wc-pane="record-progress"] [data-wc-report-card]'), null);
+  assert.ok(d.querySelector('[data-wc-pane="my-submissions"]')?.textContent.includes('My Previous Submissions'));
+  assert.equal(d.querySelector('[data-wc-pane="my-submissions"] [data-action="wc-submit-progress"]'), null);
   assert.equal(d.querySelector('[data-wc-pane="queries"]'), null);
   assert.equal(d.querySelectorAll('[data-wc-report-queries]').length, entries.length);
   assert.match(d.body.textContent, /leader must approve the report before it changes task or activity progress/);
   assert.match(d.body.textContent, /Pending reports are waiting for review/);
   assert.match(d.body.textContent, /Survey stakes/);
   assert.match(d.body.textContent, /Levels checked/);
-  assert.ok(d.querySelector('[data-wc-pane="progress"]'));
+  assert.ok(d.querySelector('[data-wc-pane="my-submissions"]'));
 
   const closed = views().tabbed({ ...task, status: 'closed' }, [], [], false);
   assert.deepEqual([...closed.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('data-wc-tab')),
-    ['details', 'my-reports']);
-  assert.equal(closed.querySelector('[data-wc-pane="progress"]'), null);
+    ['overview', 'my-submissions']);
+  assert.ok(closed.querySelector('[data-wc-pane="my-submissions"]'));
+  assert.equal(closed.querySelector('[data-action="wc-submit-progress"]'), null);
 });
