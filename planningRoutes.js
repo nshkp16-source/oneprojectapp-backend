@@ -579,6 +579,7 @@ function registerActivityRoutes(app, deps) {
         progress_reports: progressReports,
         can_add_task: isWCLeader(role) && activity.side === viewerSide && activity.status !== 'closed',
         can_edit_activity: isWCLeader(role) && String(activity.creator_id) === String(userId) && activity.status !== 'closed',
+        can_delete_activity: isWCLeader(role) && activity.side === viewerSide,
         viewer_side: viewerSide,
       });
     } catch (err) { return fail(res, err, 'GET /api/planning-execution/:activityId/activity-card:'); }
@@ -1032,6 +1033,247 @@ function registerActivityRoutes(app, deps) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       await uploads.discard();
       return fail(res, err, 'POST /api/planning-execution/:activityId/tasks:');
+    } finally { if (client) client.release(); }
+  });
+
+  async function activityDeletePreview(db, activity) {
+    const tasks = (await db.query(
+      `SELECT id, title FROM workspace_work_center
+       WHERE activity_id = $1 AND project_id = $2 ORDER BY id`,
+      [activity.id, activity.project_id])).rows;
+    const kind = activity.baseline_milestone_id ? 'baseline'
+      : activity.additional_milestone_id ? 'additional' : null;
+    let remainingActivities = [];
+    let weights = [];
+    let sourceWeights = [];
+    let progressBefore = null;
+    let progressAfter = null;
+    let milestoneTitle = null;
+    if (kind && activity.drives_milestone) {
+      const m = MILESTONE[kind];
+      const milestone = (await db.query(
+        `SELECT id, title FROM ${m.table} WHERE id = $1 AND project_id = $2`,
+        [activity[`${kind}_milestone_id`], activity.project_id])).rows[0];
+      milestoneTitle = milestone?.title || null;
+      const activities = (await db.query(
+        `SELECT id, title, drives_milestone, milestone_weight_pct, certified_progress_pct
+         FROM planning_execution WHERE project_id = $1 AND ${m.col} = $2
+         ORDER BY id`,
+        [activity.project_id, activity[`${kind}_milestone_id`]])).rows;
+      const remainingDrivers = activities.filter((row) =>
+        row.drives_milestone && Number(row.id) !== Number(activity.id));
+      const before = activities.filter((row) => row.drives_milestone);
+      sourceWeights = before.map((row) => ({
+        activity_id: Number(row.id),
+        weight_pct: Number(row.milestone_weight_pct),
+        certified_progress_pct: Number(row.certified_progress_pct),
+      }));
+      progressBefore = milestoneDerivedProgress(before);
+      const rebalanced = rebalanceAfterRemoval(remainingDrivers.map((row) => Number(row.milestone_weight_pct)));
+      remainingActivities = remainingDrivers.map((row, index) => ({
+        activity_id: Number(row.id),
+        title: row.title,
+        before_weight_pct: Number(row.milestone_weight_pct),
+        after_weight_pct: rebalanced[index],
+      }));
+      const weightsById = new Map(remainingActivities.map((row) => [row.activity_id, row.after_weight_pct]));
+      progressAfter = milestoneDerivedProgress(remainingDrivers.map((row) => ({
+        ...row,
+        milestone_weight_pct: weightsById.get(Number(row.id)),
+      })));
+      weights = remainingActivities.map(({ activity_id, after_weight_pct }) => ({
+        activity_id, weight_pct: after_weight_pct,
+      }));
+    }
+    return {
+      activity: { id: Number(activity.id), title: activity.title },
+      task_count: tasks.length,
+      tasks,
+      milestone_title: milestoneTitle,
+      remaining_activities: remainingActivities,
+      expected_weights: weights,
+      source_weights: sourceWeights,
+      progress_before: progressBefore,
+      progress_after: progressAfter,
+    };
+  }
+
+  async function authorizeActivityDeletion(db, activity, projectId, userId, role) {
+    if (!activity) throw new HttpError(404, 'Activity not found.');
+    if (!isWCLeader(role) || wcSide(role) !== activity.side)
+      throw new HttpError(403, 'Only a leader on this activity’s side can delete it.');
+    if (!(await isMember(deps, projectId, userId, role)))
+      throw new HttpError(403, 'You are not a member of this project.');
+  }
+
+  app.get('/api/planning-execution/:activityId/delete-preview', authenticateToken, async (req, res) => {
+    try {
+      const projectId = Number(req.query.projectId);
+      const activityId = Number(req.params.activityId);
+      if (!Number.isSafeInteger(projectId) || projectId < 1
+        || !Number.isSafeInteger(activityId) || activityId < 1)
+        throw new HttpError(400, 'projectId and activityId are required.');
+      const activity = (await pool.query(
+        `SELECT * FROM planning_execution WHERE id = $1 AND project_id = $2`,
+        [activityId, projectId])).rows[0];
+      await authorizeActivityDeletion(pool, activity, projectId, req.user.user_id, req.user.role);
+      return res.json({ preview: await activityDeletePreview(pool, activity) });
+    } catch (error) { return fail(res, error, 'GET activity delete preview:'); }
+  });
+
+  app.delete('/api/planning-execution/:activityId', authenticateToken,
+    requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    try {
+      const projectId = Number(req.body?.projectId);
+      const activityId = Number(req.params.activityId);
+      if (!Number.isSafeInteger(projectId) || projectId < 1
+        || !Number.isSafeInteger(activityId) || activityId < 1)
+        throw new HttpError(400, 'projectId and activityId are required.');
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const activity = (await client.query(
+        `SELECT * FROM planning_execution WHERE id = $1 AND project_id = $2 FOR UPDATE`,
+        [activityId, projectId])).rows[0];
+      await authorizeActivityDeletion(client, activity, projectId, req.user.user_id, req.user.role);
+      const kind = activity.baseline_milestone_id ? 'baseline'
+        : activity.additional_milestone_id ? 'additional' : null;
+      const milestoneId = kind ? Number(activity[`${kind}_milestone_id`]) : null;
+      if (kind && activity.drives_milestone) {
+        await client.query(`SELECT id FROM ${MILESTONE[kind].table} WHERE id = $1 FOR UPDATE`, [milestoneId]);
+        await client.query(
+          `SELECT id FROM planning_execution
+           WHERE project_id = $1 AND ${MILESTONE[kind].col} = $2
+           ORDER BY id FOR UPDATE`, [projectId, milestoneId]);
+      }
+      const preview = await activityDeletePreview(client, activity);
+      const expectedWeights = req.body?.expectedWeights;
+      const submittedWeights = new Map(Array.isArray(expectedWeights)
+        ? expectedWeights.map((row) => [Number(row?.activity_id), row])
+        : []);
+      if (!Array.isArray(expectedWeights)
+        || submittedWeights.size !== expectedWeights.length
+        || submittedWeights.size !== preview.source_weights.length
+        || preview.source_weights.some((expected) => {
+          const submitted = submittedWeights.get(expected.activity_id);
+          return !submitted
+            || !Number.isFinite(Number(submitted.weight_pct))
+            || !Number.isFinite(Number(submitted.certified_progress_pct))
+            || Math.abs(Number(submitted.weight_pct) - expected.weight_pct) >= 0.0001
+            || Math.abs(Number(submitted.certified_progress_pct) - expected.certified_progress_pct) >= 0.0001;
+        })) {
+        throw new HttpError(409, 'The activity or milestone weights changed. Review the updated preview before deleting.', {
+          code: 'DELETE_PREVIEW_STALE',
+          preview,
+        });
+      }
+
+      const tasks = (await client.query(
+        `SELECT id, title FROM workspace_work_center
+         WHERE activity_id = $1 AND project_id = $2 ORDER BY id FOR UPDATE`,
+        [activityId, projectId])).rows;
+      const taskIds = tasks.map((row) => Number(row.id));
+      for (const row of preview.remaining_activities) {
+        await client.query(
+          `UPDATE planning_execution SET milestone_weight_pct = $2, updated_at = NOW()
+           WHERE id = $1 AND project_id = $3`,
+          [row.activity_id, row.after_weight_pct, projectId]);
+      }
+      if (taskIds.length) {
+        await client.query(
+          `UPDATE planned_resources SET activity_id = NULL
+           WHERE activity_id = $1 AND task_id = ANY($2::int[])`,
+          [activityId, taskIds]);
+        await client.query(
+          `UPDATE workspace_work_center
+           SET activity_type = COALESCE(activity_type, $2),
+               standalone_unit = COALESCE(standalone_unit, $3),
+               activity_id = NULL, updated_at = NOW()
+           WHERE activity_id = $1 AND project_id = $4`,
+          [activityId, activity.activity_type, activity.unit, projectId]);
+        for (const task of tasks) {
+          await client.query(
+            `INSERT INTO work_center_task_history
+               (task_id, project_id, actor_id, actor_role, action, detail)
+             VALUES
+               ($1,$2,$3,$4,'task_unlinked',$5::jsonb),
+               ($1,$2,$3,$4,'activity_deleted',$6::jsonb)`,
+            [task.id, projectId, req.user.user_id, req.user.role,
+              JSON.stringify({ activity_id: activityId, summary: `Task "${task.title}" was unlinked from activity "${activity.title}". Reports, files and progress were retained.` }),
+              JSON.stringify({ activity_id: activityId, summary: `Activity "${activity.title}" was deleted. Task "${task.title}" and its reports were retained.` })]);
+        }
+      }
+      await client.query(`DELETE FROM planned_resources WHERE activity_id = $1 AND task_id IS NULL`, [activityId]);
+
+      const assets = [];
+      if (activity.linked_file_id) {
+        const resourceType = activity.linked_file_url?.includes('/video/upload/') ? 'video'
+          : activity.linked_file_url?.includes('/image/upload/') ? 'image' : 'raw';
+        assets.push({ id: activity.linked_file_id, resourceType });
+      }
+      assets.push(...(await client.query(
+        `SELECT file_id AS id, COALESCE(resource_type, 'raw') AS "resourceType"
+         FROM card_attachments
+         WHERE project_id = $1 AND entity_type = 'planning_activity' AND entity_id = $2`,
+        [projectId, activityId])).rows);
+      assets.push(...(await client.query(
+        `SELECT attachment_id AS id, 'raw'::text AS "resourceType"
+         FROM planning_execution_tracking
+         WHERE activity_id = $1 AND attachment_id IS NOT NULL`,
+        [activityId])).rows);
+      assets.push(...(await client.query(
+        `SELECT attachment->>'id' AS id,
+                CASE
+                  WHEN attachment->>'url' LIKE '%/video/upload/%' THEN 'video'
+                  WHEN attachment->>'url' LIKE '%/image/upload/%' THEN 'image'
+                  ELSE 'raw'
+                END AS "resourceType"
+         FROM activity_verifications verification
+         CROSS JOIN LATERAL jsonb_array_elements(
+           COALESCE(verification.attachments, '[]'::jsonb)
+           || COALESCE(verification.decision_attachments, '[]'::jsonb)
+         ) AS files(attachment)
+         WHERE verification.activity_id = $1
+           AND NULLIF(attachment->>'id', '') IS NOT NULL`,
+        [activityId])).rows);
+      await client.query(`DELETE FROM card_attachments
+        WHERE project_id = $1 AND entity_type = 'planning_activity' AND entity_id = $2`,
+      [projectId, activityId]);
+      await client.query(`DELETE FROM planning_execution_tracking WHERE activity_id = $1`, [activityId]);
+      const deleted = await client.query(
+        `DELETE FROM planning_execution WHERE id = $1 AND project_id = $2 RETURNING id`,
+        [activityId, projectId]);
+      if (!deleted.rows.length) throw new HttpError(409, 'The activity changed before it could be deleted.');
+
+      if (kind && activity.drives_milestone)
+        await syncMilestone(client, kind, milestoneId, { id: req.user.user_id, role: req.user.role });
+      await client.query('COMMIT');
+
+      const cleanupErrors = [];
+      const uniqueAssets = [...new Map(assets.filter((asset) => asset.id)
+        .map((asset) => [`${asset.id}|${asset.resourceType}`, asset])).values()];
+      if (uniqueAssets.length && !deps.cloudinary?.uploader) {
+        cleanupErrors.push('File storage is unavailable.');
+      } else {
+        for (const asset of uniqueAssets) {
+          try {
+            const result = await deps.cloudinary.uploader.destroy(asset.id, { resource_type: asset.resourceType });
+            if (!['ok', 'not found'].includes(result?.result))
+              cleanupErrors.push(`Could not remove activity file ${asset.id} from storage.`);
+          } catch (error) {
+            console.error('Activity file cleanup failed:', error);
+            cleanupErrors.push(`Could not remove activity file ${asset.id} from storage.`);
+          }
+        }
+      }
+      return res.json({
+        success: true,
+        unlinked_tasks: taskIds.length,
+        cleanup_warning: cleanupErrors.length ? cleanupErrors.join(' ') : null,
+      });
+    } catch (error) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, error, 'DELETE /api/planning-execution/:activityId:');
     } finally { if (client) client.release(); }
   });
 

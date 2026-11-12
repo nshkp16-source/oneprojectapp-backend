@@ -44,8 +44,9 @@ cloudinary.config({
 // ─── Multer ───────────────────────────────────────────────────────────────────
 // Files are held in memory while they are uploaded, so the limit protects the server when many users upload at once.
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 50;
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 const upload = multer({
-  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 },
+  limits: { fileSize: MAX_UPLOAD_BYTES },
   storage: multer.memoryStorage(),
   fileFilter: (_req, _file, cb) => cb(null, true),
 });
@@ -8109,6 +8110,7 @@ app.get('/api/notifications/target', authenticateToken, async (req, res) => {
 // =============================================================================
 const progressModelDeps = {
   pool, authenticateToken, upload, reportUpload: workCenterReportUpload,
+  maxUploadBytes: MAX_UPLOAD_BYTES,
   requireProjectLifecycleWrite, scheduleCloudinaryUpload, cloudinary,
   wcSide, isWCLeader, sideRoles, flowKey,
   notify: ({ projectId, entityId, entityType, message, actorId, actorRole, recipients }) =>
@@ -8121,17 +8123,6 @@ registerMilestoneRoutes(app, progressModelDeps);
 registerTaskQueryRoutes(app, progressModelDeps);
 registerTaskCardRoutes(app, progressModelDeps);
 
-// Friendly refusals instead of database errors. next() hands over to the original handler when nothing blocks.
-app.delete('/api/planning-execution/:activityId', authenticateToken, async (req, res, next) => {
-  try {
-    const r = await pool.query(
-      `SELECT (SELECT COUNT(*)::int FROM workspace_work_center WHERE activity_id = $1) AS tasks,
-              (SELECT COUNT(*)::int FROM activity_verifications WHERE activity_id = $1) AS verifications`, [parseInt(req.params.activityId, 10)]);
-    if (r.rows[0].tasks > 0 || r.rows[0].verifications > 0)
-      return res.status(409).json({ error: 'This activity has tasks or verification history, so it cannot be deleted. Close it through completion certification instead.' });
-    return next();
-  } catch (err) { return next(err); }
-});
 app.post('/api/planning-execution', authenticateToken, async (req, res) => {
   try {
     const { user_id, role } = req.user;
@@ -8233,59 +8224,6 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
   }
 });
 
-// ── Delete activity (creating leader only) ────────────────────────────────────
-app.delete('/api/planning-execution/:activityId', authenticateToken, async (req, res) => {
-  try {
-    const { user_id, role } = req.user;
-    const { activityId }    = req.params;
-    const { projectId }     = req.body;
-
-    if (!isWCLeader(role))
-      return res.status(403).json({ error: 'Only leaders and PMs can delete activities.' });
-    if (!projectId)
-      return res.status(400).json({ error: 'projectId is required.' });
-
-    const actCheck = await pool.query(
-      `SELECT id, creator_id, linked_file_id
-       FROM planning_execution WHERE id = $1 AND project_id = $2`,
-      [activityId, projectId]
-    );
-    if (!actCheck.rows.length)
-      return res.status(404).json({ error: 'Activity not found.' });
-    if (String(actCheck.rows[0].creator_id) !== String(user_id))
-      return res.status(403).json({ error: 'Only the creating leader can delete this activity.' });
-
-    if (actCheck.rows[0].linked_file_id)
-      await cloudinary.uploader.destroy(
-        actCheck.rows[0].linked_file_id, { resource_type: 'raw' }
-      ).catch(() => {});
-
-    const trackingFiles = await pool.query(
-      `SELECT attachment_id FROM planning_execution_tracking
-       WHERE activity_id = $1 AND attachment_id IS NOT NULL`,
-      [activityId]
-    );
-    await Promise.allSettled(
-      trackingFiles.rows.map(r =>
-        cloudinary.uploader.destroy(r.attachment_id, { resource_type: 'raw' })
-      )
-    );
-
-    await pool.query(
-      `DELETE FROM planning_execution_tracking WHERE activity_id = $1`, [activityId]
-    );
-    await pool.query(
-      `DELETE FROM planning_execution WHERE id = $1 AND project_id = $2`,
-      [activityId, projectId]
-    );
-
-    return res.json({ success: true, message: 'Activity deleted.' });
-  } catch (err) {
-    console.error('DELETE /api/planning-execution/:activityId:', err);
-    return res.status(500).json({ error: 'Server error.' });
-  }
-});
-
 // ── Download linked plan file ─────────────────────────────────────────────────
 app.get('/api/planning-execution/:activityId/download', authenticateToken, async (req, res) => {
   try {
@@ -8359,7 +8297,7 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
             'id', pr.id, 'type', pr.resource_type, 'name', pr.name,
             'planned_quantity', pr.planned_quantity, 'unit', pr.unit, 'planned_hours', pr.planned_hours
           ) ORDER BY pr.id) FROM planned_resources pr
-            WHERE pr.activity_id = pe.id AND (pr.task_id IS NULL OR pr.task_id = w.id)), '[]'::json) AS planned_resources,
+            WHERE pr.task_id = w.id OR (pr.activity_id = pe.id AND pr.task_id IS NULL)), '[]'::json) AS planned_resources,
           COALESCE(
             (SELECT m.title FROM milestones m WHERE m.id = pe.baseline_milestone_id),
             (SELECT am.title FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
@@ -8423,7 +8361,7 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
             'id', pr.id, 'type', pr.resource_type, 'name', pr.name,
             'planned_quantity', pr.planned_quantity, 'unit', pr.unit, 'planned_hours', pr.planned_hours
           ) ORDER BY pr.id) FROM planned_resources pr
-            WHERE pr.activity_id = pe.id AND (pr.task_id IS NULL OR pr.task_id = w.id)), '[]'::json) AS planned_resources,
+            WHERE pr.task_id = w.id OR (pr.activity_id = pe.id AND pr.task_id IS NULL)), '[]'::json) AS planned_resources,
           COALESCE(
             (SELECT m.title FROM milestones m WHERE m.id = pe.baseline_milestone_id),
             (SELECT am.title FROM additional_milestones am WHERE am.id = pe.additional_milestone_id)
@@ -8823,6 +8761,7 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                tma.name      AS member_title,
                COALESCE((SELECT json_agg(json_build_object(
                  'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
+                 'uploaded_at', ph.uploaded_at, 'resource_type', ph.resource_type,
                  'captured_at', ph.captured_at, 'latitude', ph.latitude,
                  'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
                ) ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
@@ -8838,7 +8777,9 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
                ,COALESCE((SELECT json_agg(json_build_object(
                  'id', ra.id, 'file_name', ra.file_name, 'file_url', ra.file_url, 'mime_type', ra.mime_type,
-                 'attachment_type', ra.attachment_type, 'custom_attachment_type', ra.custom_attachment_type
+                 'attachment_type', ra.attachment_type, 'custom_attachment_type', ra.custom_attachment_type,
+                 'created_at', ra.created_at, 'uploaded_by_id', ra.uploaded_by_id,
+                 'uploaded_by_role', ra.uploaded_by_role
                ) ORDER BY ra.created_at, ra.id)
                  FROM work_center_report_attachments ra WHERE ra.report_id = p.id AND ra.project_id = $2), '[]'::json) AS supporting_attachments
         FROM   workspace_work_center_progress p
@@ -8866,7 +8807,8 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                 COALESCE(GREATEST(p.report_date - w.end_date, 0), 0)::int AS schedule_delay_days,
         COALESCE((SELECT json_agg(json_build_object(
                   'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
-                  'captured_at', ph.captured_at, 'latitude', ph.latitude,
+                 'uploaded_at', ph.uploaded_at, 'resource_type', ph.resource_type,
+                 'captured_at', ph.captured_at, 'latitude', ph.latitude,
                   'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
                 ) ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
                 COALESCE((SELECT json_agg(json_build_object(
@@ -8881,7 +8823,9 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                 ) ORDER BY rr.id) FROM work_center_report_resources rr WHERE rr.report_id = p.id), '[]'::json) AS resources
                 ,COALESCE((SELECT json_agg(json_build_object(
                   'id', ra.id, 'file_name', ra.file_name, 'file_url', ra.file_url, 'mime_type', ra.mime_type,
-                  'attachment_type', ra.attachment_type, 'custom_attachment_type', ra.custom_attachment_type
+                  'attachment_type', ra.attachment_type, 'custom_attachment_type', ra.custom_attachment_type,
+                  'created_at', ra.created_at, 'uploaded_by_id', ra.uploaded_by_id,
+                  'uploaded_by_role', ra.uploaded_by_role
                 ) ORDER BY ra.created_at, ra.id)
                   FROM work_center_report_attachments ra WHERE ra.report_id = p.id AND ra.project_id = w.project_id), '[]'::json) AS supporting_attachments
          FROM workspace_work_center_progress p

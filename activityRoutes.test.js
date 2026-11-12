@@ -1,4 +1,5 @@
-// Needs a THROWAWAY PostgreSQL database with the base schema and both 2026-11 migrations applied.
+// Needs a THROWAWAY PostgreSQL database with the base schema and migrations through
+// 2026-11-14-standalone-tasks-after-activity-delete.sql applied.
 // It inserts fixtures and switches the project-deletion guard off for its own sessions, so never point it at real data.
 // Run:  TEST_DATABASE_URL=postgres://user:pass@localhost/scratch node --test activityRoutes.test.js
 // Needs the packages express, pg and multer (npm i -D express pg multer).
@@ -287,4 +288,63 @@ test('milestone follows certified progress, is capped by a breakdown request and
   assert.equal(r.progress_pct, 60);
   assert.equal(r.derived, 100);
   } finally { c.release(); }
+});
+
+test('activity deletion keeps task data, rebalances the milestone and rejects a stale preview', async () => {
+  const create = (title, resources) => call('POST', '/api/planning-execution/create-with-tasks', contractor, {
+    projectId: 1, title, activity_type: 'quantity', planned_quantity: 100, unit: 'm2',
+    start_date: '2026-03-02', end_date: '2026-05-01', baseline_milestone_id: 2,
+    planned_resources: resources,
+    tasks: [{
+      title: `${title} task`, assigned_members: [{ id: 101 }],
+      planned_resources: [{ type: 'equipment', name: `${title} equipment`, planned_quantity: 1, unit: 'machine' }],
+    }],
+  });
+  const first = await create('Delete fixture A', [
+    { type: 'material', name: 'Activity-only material', planned_quantity: 2, unit: 'bag' },
+  ]);
+  assert.equal(first.status, 201, JSON.stringify(first.body));
+  const second = await create('Delete fixture B', []);
+  assert.equal(second.status, 201, JSON.stringify(second.body));
+  const activity = first.body.activity;
+  const taskId = first.body.tasks[0].id;
+  await pool.query(`UPDATE planning_execution SET certified_progress_pct=20 WHERE id=$1`, [activity.id]);
+  await pool.query(`UPDATE planning_execution SET certified_progress_pct=60 WHERE id=$1`, [second.body.activity.id]);
+  await pool.query(`INSERT INTO workspace_work_center_progress
+    (task_id, report_date, member_id, member_role, work_done, progress_pct)
+    VALUES ($1,'2026-03-10',101,'TeamMember','Kept report',10)`, [taskId]);
+
+  const denied = await call('GET', `/api/planning-execution/${activity.id}/delete-preview?projectId=1`, consultant);
+  assert.equal(denied.status, 403);
+  const initial = await call('GET', `/api/planning-execution/${activity.id}/delete-preview?projectId=1`, contractor);
+  assert.equal(initial.status, 200, JSON.stringify(initial.body));
+  assert.equal(initial.body.preview.task_count, 1);
+  await pool.query(`UPDATE planning_execution SET milestone_weight_pct=40 WHERE id=$1`, [activity.id]);
+  await pool.query(`UPDATE planning_execution SET milestone_weight_pct=60 WHERE id=$1`, [second.body.activity.id]);
+  const stale = await call('DELETE', `/api/planning-execution/${activity.id}`, contractor, {
+    projectId: 1, expectedWeights: initial.body.preview.source_weights,
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.code, 'DELETE_PREVIEW_STALE');
+
+  const preview = await call('GET', `/api/planning-execution/${activity.id}/delete-preview?projectId=1`, contractor);
+  assert.equal(preview.status, 200, JSON.stringify(preview.body));
+  assert.equal(preview.body.preview.remaining_activities[0].after_weight_pct, 100);
+  assert.equal(preview.body.preview.progress_after, 60);
+  const deleted = await call('DELETE', `/api/planning-execution/${activity.id}`, contractor, {
+    projectId: 1, expectedWeights: preview.body.preview.source_weights,
+  });
+  assert.equal(deleted.status, 200, JSON.stringify(deleted.body));
+  assert.equal(deleted.body.unlinked_tasks, 1);
+  assert.equal((await q(`SELECT COUNT(*)::int n FROM planning_execution WHERE id=$1`, [activity.id]))[0].n, 0);
+  const [task] = await q(`SELECT activity_id, activity_type, standalone_unit FROM workspace_work_center WHERE id=$1`, [taskId]);
+  assert.deepEqual(task, { activity_id: null, activity_type: 'quantity', standalone_unit: 'm2' });
+  assert.equal((await q(`SELECT COUNT(*)::int n FROM workspace_work_center_progress WHERE task_id=$1`, [taskId]))[0].n, 1);
+  const resources = await q(`SELECT activity_id, task_id, name FROM planned_resources WHERE task_id=$1`, [taskId]);
+  assert.deepEqual(resources.map((row) => [row.activity_id, Number(row.task_id), row.name]), [[null, Number(taskId), 'Delete fixture A equipment']]);
+  assert.equal((await q(`SELECT COUNT(*)::int n FROM planned_resources WHERE activity_id=$1`, [activity.id]))[0].n, 0);
+  const history = await q(`SELECT action FROM work_center_task_history WHERE task_id=$1 ORDER BY id`, [taskId]);
+  assert.deepEqual(history.map((row) => row.action), ['task_created', 'task_unlinked', 'activity_deleted']);
+  assert.equal(Number((await q(`SELECT milestone_weight_pct FROM planning_execution WHERE id=$1`, [second.body.activity.id]))[0].milestone_weight_pct), 100);
+  assert.equal(Number((await q(`SELECT progress_pct FROM milestones WHERE id=2`))[0].progress_pct), 60);
 });
