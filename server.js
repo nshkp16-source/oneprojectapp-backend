@@ -8955,7 +8955,8 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
     //                         title_position
     const contractorRes = await pool.query(
       `SELECT ca.company_name, c.email, ca.telephone,
-              ca.representative, ca.title_position, ca.task
+              ca.representative, ca.title_position, ca.task,
+               (c.password_hash IS NULL) AS pending_activation
        FROM contractor_assignments ca
        JOIN contractors c ON ca.contractor_id = c.id
        WHERE ca.project_id = $1
@@ -8967,7 +8968,8 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
     // ── Consultant ───────────────────────────────────────────────────────────
     const consultantRes = await pool.query(
       `SELECT co.company_name, c.email, co.telephone,
-              co.representative, co.title_position, co.task
+              co.representative, co.title_position, co.task,
+               (c.password_hash IS NULL) AS pending_activation
        FROM consultant_assignments co
        JOIN consultants c ON co.consultant_id = c.id
        WHERE co.project_id = $1
@@ -8980,7 +8982,8 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
     // client_pm_assignments: name, telephone, task
     // client_project_managers: email
     const clientPMRes = await pool.query(
-      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task
+      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task,
+              (pm.password_hash IS NULL) AS pending_activation
        FROM client_pm_assignments cpa
        JOIN client_project_managers pm ON cpa.client_pm_id = pm.id
        WHERE cpa.project_id = $1
@@ -8991,7 +8994,8 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
 
     // ── Contractor PM ─────────────────────────────────────────────────────────
     const contractorPMRes = await pool.query(
-      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task
+      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task,
+              (pm.password_hash IS NULL) AS pending_activation
        FROM contractor_pm_assignments cpa
        JOIN contractor_project_managers pm ON cpa.contractor_pm_id = pm.id
        WHERE cpa.project_id = $1
@@ -9002,7 +9006,8 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
 
     // ── Consultant PM ─────────────────────────────────────────────────────────
     const consultantPMRes = await pool.query(
-      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task
+      `SELECT cpa.name, pm.email, cpa.telephone, cpa.task,
+              (pm.password_hash IS NULL) AS pending_activation
        FROM consultant_pm_assignments cpa
        JOIN consultant_project_managers pm ON cpa.consultant_pm_id = pm.id
        WHERE cpa.project_id = $1
@@ -9016,7 +9021,8 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
     // team_members: email
     const teamRes = await pool.query(
       `SELECT tma.id, tma.name, tm.email, tma.position,
-              tma.telephone, tma.assigned_part
+              tma.telephone, tma.assigned_part,
+              (tm.password_hash IS NULL) AS pending_activation
        FROM team_member_assignments tma
        JOIN team_members tm ON tma.team_member_id = tm.id
        WHERE tma.project_id = $1
@@ -9045,10 +9051,181 @@ app.get('/api/project-info/:projectId', authenticateToken, async (req, res) => {
 });
 
 
+// =============================================================================
+//  EDIT VERIFICATION
+//  An emailed 6-digit code is required before any project-information change.
+//  Flow: POST /api/edit-verification/send -> POST /api/edit-verification/verify
+//        -> short-lived edit token, sent as the "x-edit-token" header on every edit route.
+//  The check is enforced here on the server (requireEditToken), not only in the page.
+// =============================================================================
+const EDIT_CODE_TTL_MIN = 10;
+const EDIT_CODE_MAX_ATTEMPTS = 5;
+const EDIT_CODE_SENDS_PER_15_MIN = 3;
+const EDIT_TOKEN_TTL_SECONDS = 600;
+const editSecret = () => process.env.JWT_SECRET || 'supersecretkey';
+
+const EDIT_ACCOUNT_TABLES = {
+  Client:       { table: 'clients',                      email: 'company_email' },
+  Contractor:   { table: 'contractors',                  email: 'email' },
+  Consultant:   { table: 'consultants',                  email: 'email' },
+  ClientPM:     { table: 'client_project_managers',      email: 'email' },
+  ContractorPM: { table: 'contractor_project_managers',  email: 'email' },
+  ConsultantPM: { table: 'consultant_project_managers',  email: 'email' },
+  TeamMember:   { table: 'team_members',                 email: 'email' },
+};
+
+async function ensureEditVerificationSchema() {
+  // projects.time_zone is read and written by the server but missing from the schema files.
+  await pool.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS time_zone TEXT`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS edit_verification_codes (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    user_role   TEXT    NOT NULL,
+    project_id  INTEGER NOT NULL,
+    code_hash   TEXT    NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    used        BOOLEAN NOT NULL DEFAULT false,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_edit_verif_lookup
+                    ON edit_verification_codes (user_id, user_role, project_id, created_at DESC)`);
+}
+await ensureEditVerificationSchema().catch(err => console.error('[edit-verification] schema setup failed:', err.message));
+
+function editCodeHash(userId, role, projectId, code) {
+  return crypto.createHmac('sha256', editSecret()).update(`${userId}:${role}:${projectId}:${code}`).digest('hex');
+}
+
+function maskEmail(value) {
+  const [name, domain] = String(value || '').split('@');
+  if (!domain) return '';
+  return `${name.slice(0, 1)}${'*'.repeat(Math.max(name.length - 1, 2))}@${domain}`;
+}
+
+// Used on every edit route: the caller must hold a valid edit token for this user, role and project.
+function requireEditToken(req, res, next) {
+  const fail = (message) => res.status(401).json({ success: false, code: 'EDIT_VERIFICATION_REQUIRED', error: message });
+  const raw = req.headers['x-edit-token'];
+  if (!raw) return fail('Verification is required before you can make changes.');
+  try {
+    const decoded = jwt.verify(String(raw), editSecret());
+    const pid = normalizeProjectId(req.body?.projectId);
+    if (decoded.purpose !== 'project-edit'
+        || parseInt(decoded.sub, 10) !== req.user.user_id
+        || normalizeRole(decoded.role) !== req.user.role
+        || !pid || Number(decoded.projectId) !== pid) {
+      return fail('Verification does not match this project. Request a new code.');
+    }
+    return next();
+  } catch (_) {
+    return fail('Verification expired. Request a new code.');
+  }
+}
+
+app.post('/api/edit-verification/send', authenticateToken, async (req, res) => {
+  const pid = normalizeProjectId(req.body?.projectId);
+  if (!pid) return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  const account = EDIT_ACCOUNT_TABLES[req.user.role];
+  if (!account || req.user.role === 'TeamMember')
+    return res.status(403).json({ success: false, error: 'Your role cannot edit project information.' });
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, pid))
+      return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    const recent = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM edit_verification_codes
+       WHERE user_id = $1 AND user_role = $2 AND project_id = $3
+         AND created_at > NOW() - INTERVAL '15 minutes'`,
+      [req.user.user_id, req.user.role, pid]);
+    if (recent.rows[0].n >= EDIT_CODE_SENDS_PER_15_MIN)
+      return res.status(429).json({ success: false, error: 'Too many codes requested. Wait a few minutes and try again.' });
+
+    // The code always goes to the signed-in user's own account email, read from the database.
+    const acc = await pool.query(`SELECT ${account.email} AS email FROM ${account.table} WHERE id = $1`, [req.user.user_id]);
+    const email = acc.rows[0]?.email;
+    if (!email) return res.status(404).json({ success: false, error: 'Account email not found.' });
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    await pool.query(
+      `UPDATE edit_verification_codes SET used = true
+       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND used = false`,
+      [req.user.user_id, req.user.role, pid]);
+    await pool.query(
+      `INSERT INTO edit_verification_codes (user_id, user_role, project_id, code_hash, expires_at)
+       VALUES ($1, $2, $3, $4, NOW() + make_interval(mins => $5::int))`,
+      [req.user.user_id, req.user.role, pid, editCodeHash(req.user.user_id, req.user.role, pid, code), EDIT_CODE_TTL_MIN]);
+
+    await transporter.sendMail({
+      from: 'skyprincenkp16@gmail.com',
+      to: email,
+      subject: 'OneProjectApp edit verification code',
+      html: `<p>Your code to edit project information is: <b>${code}</b></p>
+             <p>It expires in ${EDIT_CODE_TTL_MIN} minutes. If you did not ask for it, ignore this email and consider changing your password.</p>`,
+    });
+    return res.json({ success: true, sentTo: maskEmail(email), expiresInMinutes: EDIT_CODE_TTL_MIN });
+  } catch (err) {
+    console.error('[POST /api/edit-verification/send]', err);
+    return res.status(500).json({ success: false, error: 'Could not send the verification code.' });
+  }
+});
+
+app.post('/api/edit-verification/verify', authenticateToken, async (req, res) => {
+  const pid = normalizeProjectId(req.body?.projectId);
+  const code = String(req.body?.code || '').trim();
+  if (!pid) return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ success: false, error: 'Enter the 6-digit code.' });
+  if (!EDIT_ACCOUNT_TABLES[req.user.role] || req.user.role === 'TeamMember')
+    return res.status(403).json({ success: false, error: 'Your role cannot edit project information.' });
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, pid))
+      return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    const { rows } = await pool.query(
+      `SELECT id, code_hash, attempts FROM edit_verification_codes
+       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND used = false AND expires_at > NOW()
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.user.user_id, req.user.role, pid]);
+    if (!rows.length)
+      return res.status(400).json({ success: false, code: 'EDIT_CODE_EXPIRED', error: 'This code has expired. Request a new one.' });
+
+    const row = rows[0];
+    if (row.attempts >= EDIT_CODE_MAX_ATTEMPTS) {
+      await pool.query('UPDATE edit_verification_codes SET used = true WHERE id = $1', [row.id]);
+      return res.status(429).json({ success: false, error: 'Too many wrong attempts. Request a new code.' });
+    }
+
+    const expected = Buffer.from(row.code_hash, 'hex');
+    const given = Buffer.from(editCodeHash(req.user.user_id, req.user.role, pid, code), 'hex');
+    const ok = expected.length === given.length && crypto.timingSafeEqual(expected, given);
+    if (!ok) {
+      const upd = await pool.query(
+        `UPDATE edit_verification_codes SET attempts = attempts + 1, used = (attempts + 1 >= $2)
+         WHERE id = $1 RETURNING attempts`,
+        [row.id, EDIT_CODE_MAX_ATTEMPTS]);
+      const left = Math.max(EDIT_CODE_MAX_ATTEMPTS - upd.rows[0].attempts, 0);
+      return res.status(400).json({
+        success: false,
+        error: left ? `Incorrect code. ${left} attempt${left === 1 ? '' : 's'} left.` : 'Too many wrong attempts. Request a new code.',
+      });
+    }
+
+    await pool.query('UPDATE edit_verification_codes SET used = true WHERE id = $1', [row.id]);
+    const editToken = jwt.sign(
+      { sub: req.user.user_id, role: req.user.role, projectId: pid, purpose: 'project-edit' },
+      editSecret(), { expiresIn: EDIT_TOKEN_TTL_SECONDS });
+    return res.json({ success: true, editToken, expiresInSeconds: EDIT_TOKEN_TTL_SECONDS });
+  } catch (err) {
+    console.error('[POST /api/edit-verification/verify]', err);
+    return res.status(500).json({ success: false, error: 'Could not verify the code.' });
+  }
+});
+
+
 // ── POST /api/project-edit ────────────────────────────────────────────────────
 // Edit project base fields (name, location, contract_reference).
 // Only Client / ClientPM can call this (enforced in frontend + here).
-app.post('/api/project-edit', authenticateToken, async (req, res) => {
+app.post('/api/project-edit', authenticateToken, requireEditToken, async (req, res) => {
   const { projectId, name, location, contract_reference, time_zone } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid) return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
@@ -9094,91 +9271,67 @@ app.post('/api/project-edit', authenticateToken, async (req, res) => {
 
 
 // ── POST /api/project-edit-party ─────────────────────────────────────────────
-// Edit client / contractor / consultant party fields.
-// Each side can only edit their own party row.
-// Columns differ: clients uses (company_email, title) not (email, title_position).
-app.post('/api/project-edit-party', authenticateToken, async (req, res) => {
-  const {
-    projectId, side,
-    company_name, email, telephone, representative,
-    title_position, task,
-    title,          // client-specific alias sent by frontend
-  } = req.body;
-
+// Edit client / contractor / consultant company details.
+// Rule: you can edit only what you were allowed to create.
+//   - Only side leaders (Client, Contractor, Consultant) can edit. PMs and team members cannot.
+//   - A leader edits their own party. The Client leader also edits the contractor and
+//     consultant details, because the client entered them when creating the project.
+//   - Email is never changed here: it is the person's login. See /api/project-correct-email.
+//   - Requires the emailed edit code (x-edit-token).
+// Note: client details live on the clients row, so they are shared by all of that client's projects.
+app.post('/api/project-edit-party', authenticateToken, requireEditToken, async (req, res) => {
+  const { projectId, side, email, title } = req.body;
   const pid = normalizeProjectId(projectId);
-  if (!pid)   return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
-  if (!side)  return res.status(400).json({ success: false, error: 'side is required.' });
+  if (!pid)  return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
   if (!['client', 'contractor', 'consultant'].includes(side))
     return res.status(400).json({ success: false, error: 'side must be client, contractor or consultant.' });
 
-  // Enforce: you can only edit your own side
-  const userSide = getSide(req.user.role);
-  if (userSide !== side)
-    return res.status(403).json({ success: false, error: 'You can only edit your own party information.' });
+  const role = req.user.role;
+  if (!['Client', 'Contractor', 'Consultant'].includes(role))
+    return res.status(403).json({ success: false, error: 'Only the leader of a side can edit company information.' });
+  const userSide = getSide(role);
+  const clientEditsOthers = userSide === 'client' && ['contractor', 'consultant'].includes(side);
+  if (userSide !== side && !clientEditsOthers)
+    return res.status(403).json({ success: false, error: 'You cannot edit this party.' });
+
+  const clean = (v) => String(v ?? '').trim();
+  const company_name   = clean(req.body.company_name);
+  const representative = clean(req.body.representative);
+  const telephone      = clean(req.body.telephone);
+  const title_position = clean(req.body.title_position || title);
+  const task           = clean(req.body.task) || null;
+
+  if (!company_name || !representative)
+    return res.status(400).json({ success: false, error: 'Company name and representative are required.' });
+  if (side !== 'client' && (!telephone || !title_position))
+    return res.status(400).json({ success: false, error: 'Telephone and position / title are required.' });
 
   try {
     const hasAccess = await userHasProjectAccess(req.user.user_id, req.user.role, pid);
     if (!hasAccess) return res.status(403).json({ success: false, error: 'Access denied.' });
 
     if (side === 'client') {
-      // clients row: update via projects.client_id join
-      // company_email is the unique key so we do NOT let them change it here
-      // title_position sent by frontend maps to clients.title for the client side
-      const effectiveTitle = title || title_position || null;
       await pool.query(
-        `UPDATE clients SET
-           company_name   = $1,
-           representative = $2,
-           title          = $3,
-           telephone      = $4
+        `UPDATE clients SET company_name = $1, representative = $2, title = $3, telephone = $4
          WHERE id = (SELECT client_id FROM projects WHERE id = $5)`,
-        [company_name, representative, effectiveTitle, telephone, pid]
-      );
-    } else if (side === 'contractor') {
-      // contractor_assignments row
-      await pool.query(
-        `UPDATE contractor_assignments SET
-           company_name   = $1,
-           representative = $2,
-           title_position = $3,
-           telephone      = $4,
-           task           = $5
-         WHERE project_id = $6`,
-        [company_name, representative, title_position, telephone, task, pid]
-      );
-      // Also update email on the contractors row if it changed
-      if (email) {
-        await pool.query(
-          `UPDATE contractors SET email = $1
-           WHERE id = (
-             SELECT contractor_id FROM contractor_assignments WHERE project_id = $2
-           )`,
-          [email, pid]
-        );
-      }
+        [company_name, representative, title_position || null, telephone || null, pid]);
     } else {
-      // consultant_assignments row
+      const cfg = side === 'contractor'
+        ? { assign: 'contractor_assignments', account: 'contractors', fk: 'contractor_id' }
+        : { assign: 'consultant_assignments', account: 'consultants', fk: 'consultant_id' };
+      const cur = await pool.query(
+        `SELECT acc.email FROM ${cfg.assign} a JOIN ${cfg.account} acc ON acc.id = a.${cfg.fk}
+         WHERE a.project_id = $1 LIMIT 1`, [pid]);
+      if (!cur.rows.length)
+        return res.status(404).json({ success: false, error: `No ${side} is assigned to this project.` });
+      if (email && clean(email).toLowerCase() !== clean(cur.rows[0].email).toLowerCase())
+        return res.status(400).json({ success: false, error: 'Email cannot be changed here. Use "Correct email" for an account that has not been activated.' });
       await pool.query(
-        `UPDATE consultant_assignments SET
-           company_name   = $1,
-           representative = $2,
-           title_position = $3,
-           telephone      = $4,
-           task           = $5
+        `UPDATE ${cfg.assign} SET company_name = $1, representative = $2, title_position = $3,
+                telephone = $4, task = $5
          WHERE project_id = $6`,
-        [company_name, representative, title_position, telephone, task, pid]
-      );
-      if (email) {
-        await pool.query(
-          `UPDATE consultants SET email = $1
-           WHERE id = (
-             SELECT consultant_id FROM consultant_assignments WHERE project_id = $2
-           )`,
-          [email, pid]
-        );
-      }
+        [company_name, representative, title_position, telephone, task, pid]);
     }
-
     return res.json({ success: true, message: `${side} info updated.` });
   } catch (err) {
     console.error('[POST /api/project-edit-party]', err);
@@ -9187,10 +9340,95 @@ app.post('/api/project-edit-party', authenticateToken, async (req, res) => {
 });
 
 
+// ── POST /api/project-correct-email ──────────────────────────────────────────
+// Fix a mistyped email on an account that has NOT been activated yet (no password set).
+//   - Only side leaders can do it: the Client leader for any side, other leaders for their own side.
+//   - Refused once the person has a password, or if the account is also assigned to another
+//     project (the email is the account login shared by all projects). Use Replace instead.
+//   - Refused if the new email already belongs to another account of the same type.
+//   - Requires the emailed edit code (x-edit-token).
+app.post('/api/project-correct-email', authenticateToken, requireEditToken, async (req, res) => {
+  const { projectId, target, side, memberId } = req.body;
+  const pid = normalizeProjectId(projectId);
+  if (!pid) return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
+
+  const role = req.user.role;
+  if (!['Client', 'Contractor', 'Consultant'].includes(role))
+    return res.status(403).json({ success: false, error: 'Only the leader of a side can correct an email.' });
+
+  const email = String(req.body.newEmail || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    return res.status(400).json({ success: false, error: 'Enter a valid email address.' });
+
+  const userSide = getSide(role);
+  const dbClient = await pool.connect();
+  const bail = async (status, message) => {
+    await dbClient.query('ROLLBACK').catch(() => {});
+    return res.status(status).json({ success: false, error: message });
+  };
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, role, pid))
+      return res.status(403).json({ success: false, error: 'Access denied.' });
+
+    // Resolve which account the assignment points to. Table names come only from these fixed values.
+    let assignTable, fk, accountTable, targetSide, found;
+    if (target === 'contractor' || target === 'consultant') {
+      assignTable = `${target}_assignments`; fk = `${target}_id`; accountTable = `${target}s`; targetSide = target;
+      found = await pool.query(`SELECT ${fk} AS account_id FROM ${assignTable} WHERE project_id = $1 LIMIT 1`, [pid]);
+    } else if (target === 'pm' && ['client', 'contractor', 'consultant'].includes(side)) {
+      assignTable = `${side}_pm_assignments`; fk = `${side}_pm_id`; accountTable = `${side}_project_managers`; targetSide = side;
+      found = await pool.query(`SELECT ${fk} AS account_id FROM ${assignTable} WHERE project_id = $1 LIMIT 1`, [pid]);
+    } else if (target === 'team_member' && memberId) {
+      assignTable = 'team_member_assignments'; fk = 'team_member_id'; accountTable = 'team_members';
+      found = await pool.query(
+        `SELECT team_member_id AS account_id, assigned_part FROM team_member_assignments WHERE id = $1 AND project_id = $2`,
+        [memberId, pid]);
+      targetSide = String(found.rows[0]?.assigned_part || '').toLowerCase();
+    } else {
+      return res.status(400).json({ success: false, error: 'Unsupported target.' });
+    }
+    if (!found.rows.length) return res.status(404).json({ success: false, error: 'Person not found on this project.' });
+    if (userSide !== targetSide && userSide !== 'client')
+      return res.status(403).json({ success: false, error: 'You cannot correct an email on another side.' });
+
+    const accountId = found.rows[0].account_id;
+    await dbClient.query('BEGIN');
+    const acc = await dbClient.query(`SELECT id, email, password_hash FROM ${accountTable} WHERE id = $1 FOR UPDATE`, [accountId]);
+    if (!acc.rows.length) return bail(404, 'Account not found.');
+    if (acc.rows[0].password_hash)
+      return bail(409, 'This person has already activated their account, so the email cannot be corrected. Replace the person instead.');
+    if (String(acc.rows[0].email || '').trim().toLowerCase() === email)
+      return bail(400, 'That is already the current email.');
+
+    const elsewhere = await dbClient.query(
+      `SELECT 1 FROM ${assignTable} WHERE ${fk} = $1 AND project_id <> $2 LIMIT 1`, [accountId, pid]);
+    if (elsewhere.rows.length)
+      return bail(409, 'This account is also assigned to another project, so its email cannot be corrected here. Replace the person instead.');
+
+    const dupe = await dbClient.query(
+      `SELECT 1 FROM ${accountTable} WHERE LOWER(TRIM(email)) = $1 AND id <> $2`, [email, accountId]);
+    if (dupe.rows.length)
+      return bail(409, 'That email already belongs to another account. Use Replace to assign that person.');
+
+    await dbClient.query(`UPDATE ${accountTable} SET email = $1 WHERE id = $2`, [email, accountId]);
+    await dbClient.query('DELETE FROM email_tokens WHERE email = $1 AND verified = false', [acc.rows[0].email]);
+    await dbClient.query('COMMIT');
+    return res.json({ success: true, email });
+  } catch (err) {
+    await dbClient.query('ROLLBACK').catch(() => {});
+    if (err.code === '23505') return res.status(409).json({ success: false, error: 'That email is already in use.' });
+    console.error('[POST /api/project-correct-email]', err);
+    return res.status(500).json({ success: false, error: 'Server error correcting email.' });
+  } finally {
+    dbClient.release();
+  }
+});
+
+
 // ── POST /api/project-delete-party ───────────────────────────────────────────
 // Remove contractor or consultant (and their PM) from a project.
 // Only client-side roles can do this. Client itself cannot be deleted.
-app.post('/api/project-delete-party', authenticateToken, async (req, res) => {
+app.post('/api/project-delete-party', authenticateToken, requireEditToken, async (req, res) => {
   const { projectId, side } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid)  return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
@@ -9248,7 +9486,7 @@ app.post('/api/project-delete-party', authenticateToken, async (req, res) => {
 // Inserts into the *_project_managers table if email is new,
 // then deletes the old *_pm_assignments row and inserts a fresh one.
 // Auth: same-side leaders/PMs, or client-side for any party.
-app.post('/api/project-replace-pm', authenticateToken, async (req, res) => {
+app.post('/api/project-replace-pm', authenticateToken, requireEditToken, async (req, res) => {
   const { projectId, side, name, email, telephone, task } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid)   return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
@@ -9321,7 +9559,7 @@ app.post('/api/project-replace-pm', authenticateToken, async (req, res) => {
 // ── POST /api/project-remove-pm ──────────────────────────────────────────────
 // Remove the PM assignment for a given side from this project.
 // The *_project_managers user row is kept (they may be on other projects).
-app.post('/api/project-remove-pm', authenticateToken, async (req, res) => {
+app.post('/api/project-remove-pm', authenticateToken, requireEditToken, async (req, res) => {
   const { projectId, side } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid)  return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
@@ -9361,7 +9599,7 @@ app.post('/api/project-remove-pm', authenticateToken, async (req, res) => {
 // ── POST /api/project-remove-member ──────────────────────────────────────────
 // Remove a team member assignment from a project.
 // Allowed if: the member themselves, same-side leader/PM, or client-side.
-app.post('/api/project-remove-member', authenticateToken, async (req, res) => {
+app.post('/api/project-remove-member', authenticateToken, requireEditToken, async (req, res) => {
   const { projectId, memberId } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid)      return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
@@ -9414,7 +9652,7 @@ app.post('/api/project-remove-member', authenticateToken, async (req, res) => {
 // Upserts the new person into team_members, removes old assignment,
 // inserts new assignment inheriting the same assigned_part and assigned_by.
 // Only same-side or client-side leaders/PMs can do this (not self).
-app.post('/api/project-replace-member', authenticateToken, async (req, res) => {
+app.post('/api/project-replace-member', authenticateToken, requireEditToken, async (req, res) => {
   const { projectId, oldMemberId, name, email, position, telephone } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid)         return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
@@ -9516,7 +9754,7 @@ app.post('/api/project-replace-member', authenticateToken, async (req, res) => {
 // ── POST /api/project-update-member ──────────────────────────────────────────
 // Update name / position / telephone on a team_member_assignments row.
 // The team_member_id (user) is NOT changed — only the assignment metadata.
-app.post('/api/project-update-member', authenticateToken, async (req, res) => {
+app.post('/api/project-update-member', authenticateToken, requireEditToken, async (req, res) => {
   const { projectId, memberId, name, position, telephone } = req.body;
   const pid = normalizeProjectId(projectId);
   if (!pid)      return res.status(400).json({ success: false, error: 'Valid projectId is required.' });
