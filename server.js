@@ -4838,8 +4838,8 @@ async function buildRecordFlowView(c) {
     is_team_member: r.is_team_member, is_decider: r.is_decider, order_no: r.order_no, status: r.status,
     outcome: r.outcome, signed_at: r.signed_at, first_viewed_at: r.first_viewed_at, last_viewed_at: r.last_viewed_at,
     reminder_sent_at: r.reminder_sent_at,
-    // The personal name is shown to the signer's own side (signed or not); findings only after signing. The other side sees position, side and time.
-    name: (userSide === r.side || isMe(r)) ? await nameOf(r.signer_role, r.signer_user_id) : null,
+    // Keep pending signers' names private across sides; reveal them after they sign.
+    name: (userSide === r.side || isMe(r) || r.status === 'signed') ? await nameOf(r.signer_role, r.signer_user_id) : null,
     queries_raised: Array.isArray(r.findings?.queries) ? r.findings.queries.length : 0,
     user_id: r.signer_user_id,
     findings: (r.status === 'signed' && (userSide === r.side || isMe(r))) ? { note: r.findings?.note || '', queries: Array.isArray(r.findings?.queries) ? r.findings.queries : [] } : null,
@@ -8761,7 +8761,8 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                tma.name      AS member_title,
                COALESCE((SELECT json_agg(json_build_object(
                  'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
-                 'uploaded_at', ph.uploaded_at, 'resource_type', ph.resource_type,
+                 'uploaded_at', ph.uploaded_at,
+                 'resource_type', COALESCE(to_jsonb(ph)->>'resource_type', 'image'),
                  'captured_at', ph.captured_at, 'latitude', ph.latitude,
                  'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
                ) ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
@@ -8807,7 +8808,8 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                 COALESCE(GREATEST(p.report_date - w.end_date, 0), 0)::int AS schedule_delay_days,
         COALESCE((SELECT json_agg(json_build_object(
                   'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
-                 'uploaded_at', ph.uploaded_at, 'resource_type', ph.resource_type,
+                 'uploaded_at', ph.uploaded_at,
+                 'resource_type', COALESCE(to_jsonb(ph)->>'resource_type', 'image'),
                  'captured_at', ph.captured_at, 'latitude', ph.latitude,
                   'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
                 ) ORDER BY ph.seq) FROM work_center_report_photos ph WHERE ph.report_id = p.id), '[]'::json) AS photos,
