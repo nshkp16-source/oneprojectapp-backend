@@ -20,11 +20,19 @@ import { registerVerificationRoutes } from './verificationRoutes.js';
 import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
 import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
+import { createLoginLockout } from './loginLockout.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cors());
+
+const loginLockout = createLoginLockout({
+  windowMs: Number(process.env.LOGIN_LOCKOUT_MS) || 5 * 60 * 1000,
+  maxAttempts: Number(process.env.LOGIN_MAX_FAILED_ATTEMPTS) || 5,
+});
+app.use(['/login', '/client/login'], loginLockout.middleware);
 
 // Simple request logger for API routes
 app.use((req, _res, next) => {
@@ -1945,10 +1953,10 @@ app.post('/api/project-deletion/request', authenticateToken, async (req, res) =>
   if (normalizeRole(req.user.role) !== 'Client') {
     return res.status(403).json({ error: 'Only the client project owner can schedule deletion.' });
   }
-  const projectName = String(req.body.projectName || '').trim();
+  const verificationCode = String(req.body.verificationCode || '').trim();
   const password = req.body.password;
-  if (!projectName || typeof password !== 'string' || !password) {
-    return res.status(400).json({ error: 'Project name and password are required.' });
+  if (!verificationCode || typeof password !== 'string' || !password) {
+    return res.status(400).json({ error: 'Verification code and password are required.' });
   }
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
@@ -1956,8 +1964,9 @@ app.post('/api/project-deletion/request', authenticateToken, async (req, res) =>
     }
     const projectCheck = await pool.query('SELECT name FROM projects WHERE id=$1 AND client_id=$2', [projectId, req.user.user_id]);
     if (!projectCheck.rows.length) return res.status(404).json({ error: 'Project not found.' });
-    if (projectName !== projectCheck.rows[0].name) return res.status(400).json({ error: 'Project name does not match.' });
     if (!await verifyClientPassword(req.user.user_id, password)) return res.status(401).json({ error: 'Incorrect password.' });
+    const codeCheck = await consumeActionCode(req.user.user_id, req.user.role, projectId, 'delete', verificationCode);
+    if (!codeCheck.ok) return res.status(codeCheck.status).json({ error: codeCheck.error });
     const result = await pool.query(
       `UPDATE projects
        SET lifecycle_status='pending_deletion',deletion_requested_at=NOW(),
@@ -2026,10 +2035,14 @@ app.post('/api/project-exit/request', authenticateToken, async (req, res) => {
   if (normalizeRole(req.user.role) === 'Client') {
     return res.status(403).json({ error: 'Only a project member can schedule an exit.' });
   }
+  const verificationCode = String(req.body.verificationCode || '').trim();
+  if (!verificationCode) return res.status(400).json({ error: 'Enter the verification code we emailed you.' });
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
       return res.status(403).json({ error: 'Only a project member can schedule an exit.' });
     }
+    const codeCheck = await consumeActionCode(req.user.user_id, req.user.role, projectId, 'exit', verificationCode);
+    if (!codeCheck.ok) return res.status(codeCheck.status).json({ error: codeCheck.error });
     const result = await pool.query(
       `INSERT INTO project_exit_requests (project_id,user_id,user_role,effective_at)
        SELECT $1,$2,$3,NOW()+INTERVAL '15 days'
@@ -3237,11 +3250,20 @@ app.post('/login', async (req, res) => {
     const loginEmail = role==='Client'?company_email:email;
     const selectFields = role==='Client'?'id,company_name,company_email,representative,title,telephone,password_hash,verified,profile_picture,created_at':'id,email,password_hash,verified,profile_picture,created_at';
     const result = await pool.query(`SELECT ${selectFields} FROM ${map.table} WHERE TRIM(LOWER(${map.emailCol}))=TRIM(LOWER($1))`,[loginEmail]);
-    if (!result.rows.length) return res.json({success:false,error:'Account not found.'});
+    if (!result.rows.length) {
+      const lockout = loginLockout.recordFailure(req, res);
+      if (lockout) return lockout;
+      return res.status(401).json({success:false,error:'Account not found.'});
+    }
     const user = result.rows[0];
     if (!user.password_hash) return res.json({success:false,error:'No password set yet. Follow the first-login guideline.'});
-    if (!await bcrypt.compare(password,user.password_hash)) return res.json({success:false,error:'Invalid password.'});
+    if (!await bcrypt.compare(password,user.password_hash)) {
+      const lockout = loginLockout.recordFailure(req, res);
+      if (lockout) return lockout;
+      return res.status(401).json({success:false,error:'Invalid password.'});
+    }
     if (!user.verified) return res.json({success:false,error:'Account not verified.'});
+    loginLockout.recordSuccess(req);
     let projectAssignments=[];
     if (role==='Client') {
       const r=await pool.query('SELECT id FROM projects WHERE client_id=$1',[user.id]);
@@ -3430,9 +3452,18 @@ app.post('/client/login', async (req, res) => {
   const {email,password}=req.body;
   try {
     const result=await pool.query('SELECT company_email,password_hash FROM clients WHERE company_email=$1',[email]);
-    if (!result.rows.length) return res.status(401).json({success:false,error:'Client not found.'});
+    if (!result.rows.length) {
+      const lockout = loginLockout.recordFailure(req, res);
+      if (lockout) return lockout;
+      return res.status(401).json({success:false,error:'Client not found.'});
+    }
     const client=result.rows[0];
-    if (!await bcrypt.compare(password,client.password_hash)) return res.status(401).json({success:false,error:'Invalid password.'});
+    if (!await bcrypt.compare(password,client.password_hash)) {
+      const lockout = loginLockout.recordFailure(req, res);
+      if (lockout) return lockout;
+      return res.status(401).json({success:false,error:'Invalid password.'});
+    }
+    loginLockout.recordSuccess(req);
     res.json({success:true,clientEmail:client.company_email});
   } catch(err){console.error('Login error:',err);res.status(500).json({success:false,error:'Server error'});}
 });
@@ -9088,13 +9119,29 @@ async function ensureEditVerificationSchema() {
     expires_at  TIMESTAMPTZ NOT NULL,
     created_at  TIMESTAMPTZ DEFAULT NOW()
   )`);
+  await pool.query(`ALTER TABLE edit_verification_codes ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'edit'`);
+  // Cascade with the project so a purged project leaves no codes behind.
+  await pool.query(`DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conname = 'edit_verification_codes_project_fk'
+                   AND conrelid = 'edit_verification_codes'::regclass) THEN
+    DELETE FROM edit_verification_codes WHERE project_id NOT IN (SELECT id FROM projects);
+    ALTER TABLE edit_verification_codes
+      ADD CONSTRAINT edit_verification_codes_project_fk
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+  END IF;
+END;
+$$;
+`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_edit_verif_lookup
                     ON edit_verification_codes (user_id, user_role, project_id, created_at DESC)`);
 }
 await ensureEditVerificationSchema().catch(err => console.error('[edit-verification] schema setup failed:', err.message));
 
-function editCodeHash(userId, role, projectId, code) {
-  return crypto.createHmac('sha256', editSecret()).update(`${userId}:${role}:${projectId}:${code}`).digest('hex');
+function editCodeHash(userId, role, projectId, code, purpose = 'edit') {
+  const scope = purpose === 'edit' ? '' : `${purpose}:`;
+  return crypto.createHmac('sha256', editSecret()).update(`${scope}${userId}:${role}:${projectId}:${code}`).digest('hex');
 }
 
 function maskEmail(value) {
@@ -9136,7 +9183,7 @@ app.post('/api/edit-verification/send', authenticateToken, async (req, res) => {
     const recent = await pool.query(
       `SELECT COUNT(*)::int AS n FROM edit_verification_codes
        WHERE user_id = $1 AND user_role = $2 AND project_id = $3
-         AND created_at > NOW() - INTERVAL '15 minutes'`,
+         AND purpose = 'edit' AND created_at > NOW() - INTERVAL '15 minutes'`,
       [req.user.user_id, req.user.role, pid]);
     if (recent.rows[0].n >= EDIT_CODE_SENDS_PER_15_MIN)
       return res.status(429).json({ success: false, error: 'Too many codes requested. Wait a few minutes and try again.' });
@@ -9149,7 +9196,7 @@ app.post('/api/edit-verification/send', authenticateToken, async (req, res) => {
     const code = String(crypto.randomInt(100000, 1000000));
     await pool.query(
       `UPDATE edit_verification_codes SET used = true
-       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND used = false`,
+       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND purpose = 'edit' AND used = false`,
       [req.user.user_id, req.user.role, pid]);
     await pool.query(
       `INSERT INTO edit_verification_codes (user_id, user_role, project_id, code_hash, expires_at)
@@ -9183,7 +9230,7 @@ app.post('/api/edit-verification/verify', authenticateToken, async (req, res) =>
 
     const { rows } = await pool.query(
       `SELECT id, code_hash, attempts FROM edit_verification_codes
-       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND used = false AND expires_at > NOW()
+       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND purpose = 'edit' AND used = false AND expires_at > NOW()
        ORDER BY created_at DESC LIMIT 1`,
       [req.user.user_id, req.user.role, pid]);
     if (!rows.length)
@@ -9218,6 +9265,93 @@ app.post('/api/edit-verification/verify', authenticateToken, async (req, res) =>
   } catch (err) {
     console.error('[POST /api/edit-verification/verify]', err);
     return res.status(500).json({ success: false, error: 'Could not verify the code.' });
+  }
+});
+
+
+// ── Confirmation codes for project deletion and project exit ─────────────────
+// The person types an emailed 6-digit code instead of the project name.
+// Codes are separate from edit codes (purpose 'delete' / 'exit'), single use, and expire in 10 minutes.
+const LIFECYCLE_PURPOSES = {
+  delete: { allowed: (role) => role === 'Client',  denied: 'Only the client project owner can schedule deletion.', action: 'schedule the deletion of' },
+  exit:   { allowed: (role) => role !== 'Client',  denied: 'Only a project member can schedule an exit.',          action: 'schedule your exit from' },
+};
+
+async function consumeActionCode(userId, role, pid, purpose, code) {
+  const value = String(code || '').trim();
+  if (!/^\d{6}$/.test(value)) return { ok: false, status: 400, error: 'Enter the 6-digit verification code.' };
+  const { rows } = await pool.query(
+    `SELECT id, code_hash, attempts FROM edit_verification_codes
+     WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND purpose = $4
+       AND used = false AND expires_at > NOW()
+     ORDER BY created_at DESC LIMIT 1`,
+    [userId, role, pid, purpose]);
+  if (!rows.length) return { ok: false, status: 400, error: 'This code has expired or was never sent. Request a new one.' };
+  const row = rows[0];
+  if (row.attempts >= EDIT_CODE_MAX_ATTEMPTS) {
+    await pool.query('UPDATE edit_verification_codes SET used = true WHERE id = $1', [row.id]);
+    return { ok: false, status: 429, error: 'Too many wrong attempts. Request a new code.' };
+  }
+  const expected = Buffer.from(row.code_hash, 'hex');
+  const given = Buffer.from(editCodeHash(userId, role, pid, value, purpose), 'hex');
+  if (!(expected.length === given.length && crypto.timingSafeEqual(expected, given))) {
+    const upd = await pool.query(
+      `UPDATE edit_verification_codes SET attempts = attempts + 1, used = (attempts + 1 >= $2)
+       WHERE id = $1 RETURNING attempts`, [row.id, EDIT_CODE_MAX_ATTEMPTS]);
+    const left = Math.max(EDIT_CODE_MAX_ATTEMPTS - upd.rows[0].attempts, 0);
+    return { ok: false, status: 400, error: left ? `Incorrect code. ${left} attempt${left === 1 ? '' : 's'} left.` : 'Too many wrong attempts. Request a new code.' };
+  }
+  await pool.query('UPDATE edit_verification_codes SET used = true WHERE id = $1', [row.id]);
+  return { ok: true };
+}
+
+app.post('/api/project-lifecycle/send-code', authenticateToken, async (req, res) => {
+  const pid = normalizeProjectId(req.body?.projectId);
+  const purpose = String(req.body?.purpose || '');
+  const cfg = LIFECYCLE_PURPOSES[purpose];
+  if (!pid || !cfg) return res.status(400).json({ error: 'Valid projectId and purpose are required.' });
+  const role = req.user.role;
+  if (!cfg.allowed(role)) return res.status(403).json({ error: cfg.denied });
+  const account = EDIT_ACCOUNT_TABLES[role];
+  if (!account) return res.status(403).json({ error: cfg.denied });
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, role, pid)) return res.status(403).json({ error: cfg.denied });
+
+    const recent = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM edit_verification_codes
+       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND purpose = $4
+         AND created_at > NOW() - INTERVAL '15 minutes'`,
+      [req.user.user_id, role, pid, purpose]);
+    if (recent.rows[0].n >= EDIT_CODE_SENDS_PER_15_MIN)
+      return res.status(429).json({ error: 'Too many codes requested. Wait a few minutes and try again.' });
+
+    const acc = await pool.query(`SELECT ${account.email} AS email FROM ${account.table} WHERE id = $1`, [req.user.user_id]);
+    const email = acc.rows[0]?.email;
+    if (!email) return res.status(404).json({ error: 'Account email not found.' });
+    const proj = await pool.query('SELECT name FROM projects WHERE id = $1', [pid]);
+    const projectName = proj.rows[0]?.name || 'this project';
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    await pool.query(
+      `UPDATE edit_verification_codes SET used = true
+       WHERE user_id = $1 AND user_role = $2 AND project_id = $3 AND purpose = $4 AND used = false`,
+      [req.user.user_id, role, pid, purpose]);
+    await pool.query(
+      `INSERT INTO edit_verification_codes (user_id, user_role, project_id, code_hash, purpose, expires_at)
+       VALUES ($1, $2, $3, $4, $5, NOW() + make_interval(mins => $6::int))`,
+      [req.user.user_id, role, pid, editCodeHash(req.user.user_id, role, pid, code, purpose), purpose, EDIT_CODE_TTL_MIN]);
+
+    await transporter.sendMail({
+      from: 'skyprincenkp16@gmail.com',
+      to: email,
+      subject: `OneProjectApp confirmation code: ${purpose === 'delete' ? 'project deletion' : 'project exit'}`,
+      html: `<p>Your code to ${cfg.action} <b>${escapeEmailHtml(projectName)}</b> is: <b>${code}</b></p>
+             <p>It expires in ${EDIT_CODE_TTL_MIN} minutes. If you did not ask for it, do not share it and consider changing your password.</p>`,
+    });
+    return res.json({ success: true, sentTo: maskEmail(email), expiresInMinutes: EDIT_CODE_TTL_MIN });
+  } catch (err) {
+    console.error('[POST /api/project-lifecycle/send-code]', err);
+    return res.status(500).json({ error: 'Could not send the confirmation code.' });
   }
 });
 
