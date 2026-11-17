@@ -21,6 +21,7 @@ import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
 import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
 import { createLoginLockout } from './loginLockout.js';
+import { checkProjectAccess } from './projectAccess.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -1769,22 +1770,7 @@ async function notifyProjectLifecycleChange(projectId, actorUserId, actorRole, {
 }
 
 async function userHasProjectAccess(userId, role, projectId) {
-  const projectCheck = {
-    Client:       { table: 'projects',                  idCol: 'client_id' },
-    Contractor:   { table: 'contractor_assignments',    idCol: 'contractor_id' },
-    Consultant:   { table: 'consultant_assignments',    idCol: 'consultant_id' },
-    ClientPM:     { table: 'client_pm_assignments',     idCol: 'client_pm_id' },
-    ContractorPM: { table: 'contractor_pm_assignments', idCol: 'contractor_pm_id' },
-    ConsultantPM: { table: 'consultant_pm_assignments', idCol: 'consultant_pm_id' },
-    TeamMember:   { table: 'team_member_assignments',   idCol: 'team_member_id' },
-  }[normalizeRole(role)];
-
-  if (!projectCheck) return false;
-  const query = projectCheck.table === 'projects'
-    ? `SELECT 1 FROM ${projectCheck.table} WHERE id=$1 AND ${projectCheck.idCol}=$2`
-    : `SELECT 1 FROM ${projectCheck.table} WHERE project_id=$1 AND ${projectCheck.idCol}=$2`;
-  const { rows } = await pool.query(query, [projectId, userId]);
-  return rows.length > 0;
+  return checkProjectAccess(pool, userId, role, projectId, normalizeRole);
 }
 
 function lifecycleProjectId(req) {
@@ -4966,6 +4952,14 @@ const ARRET_ALLOWED_FILE = /\.(jpe?g|png|webp|gif|pdf|docx?|xlsx?|txt)$/i;
 const ARRET_STATUSES = ['open', 'resolved', 'closed'];
 // Besides the creator, these roles may resolve, close or reopen an arret (so it never stays open because its author is away).
 const ARRET_CLOSER_ROLES = ['Client', 'Consultant'];
+const ARRET_CATEGORIES = {
+  safety: 'Safety', quality: 'Quality', design_instruction: 'Design or instruction', weather: 'Weather', other: 'Other',
+};
+const ARRET_WORK_MIN = 3;
+const ARRET_WORK_MAX = 300;
+const ARRET_RESUME_MIN = 3;
+const ARRET_RESUME_MAX = 2000;
+const ARRET_FUTURE_LIMIT_MS = 30 * 24 * 60 * 60 * 1000;   // an effective time may be backdated, but not set months ahead
 
 async function ensureArretSchema() {
   const statements = [
@@ -4977,7 +4971,11 @@ async function ensureArretSchema() {
        ADD COLUMN IF NOT EXISTS resolution_note  TEXT,
        ADD COLUMN IF NOT EXISTS deleted_at       TIMESTAMPTZ,
        ADD COLUMN IF NOT EXISTS deleted_by_id    INTEGER,
-       ADD COLUMN IF NOT EXISTS deleted_by_role  TEXT`,
+       ADD COLUMN IF NOT EXISTS deleted_by_role  TEXT,
+       ADD COLUMN IF NOT EXISTS category          TEXT,
+       ADD COLUMN IF NOT EXISTS work_affected     TEXT,
+       ADD COLUMN IF NOT EXISTS effective_at      TIMESTAMPTZ,
+       ADD COLUMN IF NOT EXISTS resume_conditions TEXT`,
     `CREATE TABLE IF NOT EXISTS arret_events (
        id          SERIAL PRIMARY KEY,
        arret_id    INTEGER NOT NULL REFERENCES arrets(id) ON DELETE CASCADE,
@@ -5021,13 +5019,34 @@ function arretUpload(req, res, next) {
   });
 }
 
-function validateArretText(title, description) {
+// Reads and checks every field of the arret form. Returns { error } or { values }.
+function parseArretFields(body) {
+  const title = String(body.title || '').trim();
+  const description = String(body.description || '').trim();
+  const category = String(body.category || '').trim();
+  const workAffected = String(body.workAffected ?? body.work_affected ?? '').trim();
+  const resumeConditions = String(body.resumeConditions ?? body.resume_conditions ?? '').trim();
+  const rawEffective = body.effectiveAt ?? body.effective_at;
+
   if (title.length < ARRET_TITLE_MIN || title.length > ARRET_TITLE_MAX)
-    return `The title must be between ${ARRET_TITLE_MIN} and ${ARRET_TITLE_MAX} characters.`;
-  if (!description) return 'A description is required.';
+    return { error: `The title must be between ${ARRET_TITLE_MIN} and ${ARRET_TITLE_MAX} characters.` };
+  if (!description) return { error: 'A description is required.' };
   if (description.length > ARRET_DESCRIPTION_MAX)
-    return `The description must be ${ARRET_DESCRIPTION_MAX} characters or fewer.`;
-  return null;
+    return { error: `The description must be ${ARRET_DESCRIPTION_MAX} characters or fewer.` };
+  if (!Object.prototype.hasOwnProperty.call(ARRET_CATEGORIES, category))
+    return { error: 'Choose a category for the arret.' };
+  if (workAffected.length < ARRET_WORK_MIN || workAffected.length > ARRET_WORK_MAX)
+    return { error: `Describe the work affected in ${ARRET_WORK_MIN} to ${ARRET_WORK_MAX} characters.` };
+  if (resumeConditions.length < ARRET_RESUME_MIN || resumeConditions.length > ARRET_RESUME_MAX)
+    return { error: `State the conditions to resume work in ${ARRET_RESUME_MIN} to ${ARRET_RESUME_MAX} characters.` };
+
+  const effectiveAt = rawEffective ? new Date(rawEffective) : new Date();   // no value means effective now
+  if (Number.isNaN(effectiveAt.getTime()))
+    return { error: 'The effective date and time are not valid.' };
+  if (effectiveAt.getTime() > Date.now() + ARRET_FUTURE_LIMIT_MS)
+    return { error: 'The effective date cannot be more than 30 days ahead.' };
+
+  return { values: { title, description, category, workAffected, resumeConditions, effectiveAt: effectiveAt.toISOString() } };
 }
 
 function isArretCreatorRow(arret, user) {
@@ -5186,12 +5205,10 @@ app.get('/api/arrets/unseen-count', authenticateToken, async (req, res) => {
 
 app.post('/api/arrets', authenticateToken, arretUpload, requireProjectLifecycleWrite, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
-  const title = (req.body.title || '').trim();
-  const description = (req.body.description || '').trim();
-  if (!projectId || !title || !description)
-    return res.status(400).json({ success: false, message: 'projectId, title, and description are required.' });
-  const textError = validateArretText(title, description);
-  if (textError) return res.status(400).json({ success: false, message: textError });
+  if (!projectId) return res.status(400).json({ success: false, message: 'projectId is required.' });
+  const parsed = parseArretFields(req.body);
+  if (parsed.error) return res.status(400).json({ success: false, message: parsed.error });
+  const { title, description, category, workAffected, resumeConditions, effectiveAt } = parsed.values;
 
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
@@ -5202,9 +5219,11 @@ app.post('/api/arrets', authenticateToken, arretUpload, requireProjectLifecycleW
     try {
       await client.query('BEGIN');
       const arretRes = await client.query(
-        `INSERT INTO arrets (project_id, title, description, issued_date, created_by, creator_role, creator_email, status, is_resolved, created_at, updated_at)
-         VALUES ($1,$2,$3,NOW(),$4,$5,$6,'open',false,NOW(),NOW()) RETURNING *`,
-        [projectId, title, description, req.user.user_id, req.user.role, req.user.email || null]
+        `INSERT INTO arrets (project_id, title, description, issued_date, created_by, creator_role, creator_email, status, is_resolved,
+                             category, work_affected, effective_at, resume_conditions, created_at, updated_at)
+         VALUES ($1,$2,$3,NOW(),$4,$5,$6,'open',false,$7,$8,$9,$10,NOW(),NOW()) RETURNING *`,
+        [projectId, title, description, req.user.user_id, req.user.role, req.user.email || null,
+         category, workAffected, effectiveAt, resumeConditions]
       );
       const arret = arretRes.rows[0];
       const attachments = [];
@@ -5244,7 +5263,7 @@ app.post('/api/arrets', authenticateToken, arretUpload, requireProjectLifecycleW
       await client.query('COMMIT');
 
       await logArretEvent(arret, req.user, 'created');
-      await notifyArretUsers(arret, req.user, `Stop-work arret issued: ${title}`, 'Stop-work arret');
+      await notifyArretUsers(arret, req.user, `Stop-work arret issued (${ARRET_CATEGORIES[category]}): ${title} - ${workAffected}`, 'Stop-work arret');
 
       return res.status(201).json({ success: true, arret: { ...decorateArret(arret, req.user), attachments }, message: 'Arret saved.' });
     } catch (err) {
@@ -5377,13 +5396,11 @@ app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
 app.put('/api/arrets/:id', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const arretId = parseInt(req.params.id, 10);
-  const title = String(req.body.title || '').trim();
-  const description = String(req.body.description || '').trim();
 
   if (!projectId || !arretId) return res.status(400).json({ error: 'projectId and arretId are required' });
-  if (!title || !description) return res.status(400).json({ error: 'Title and description are required.' });
-  const textError = validateArretText(title, description);
-  if (textError) return res.status(400).json({ error: textError, message: textError });
+  const parsed = parseArretFields(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error, message: parsed.error });
+  const { title, description, category, workAffected, resumeConditions, effectiveAt } = parsed.values;
 
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
@@ -5399,11 +5416,14 @@ app.put('/api/arrets/:id', authenticateToken, async (req, res) => {
     }
 
     const updateRes = await pool.query(
-      `UPDATE arrets SET title=$1, description=$2, updated_at=NOW() WHERE id=$3 RETURNING *`,
-      [title, description, arretId]
+      `UPDATE arrets SET title=$1, description=$2, category=$4, work_affected=$5, effective_at=$6, resume_conditions=$7, updated_at=NOW()
+        WHERE id=$3 RETURNING *`,
+      [title, description, arretId, category, workAffected, effectiveAt, resumeConditions]
     );
 
-    if (title !== arret.title || description !== arret.description) {
+    const sameInstant = arret.effective_at && new Date(arret.effective_at).getTime() === new Date(effectiveAt).getTime();
+    if (title !== arret.title || description !== arret.description || category !== arret.category ||
+        workAffected !== arret.work_affected || resumeConditions !== arret.resume_conditions || !sameInstant) {
       await logArretEvent(arret, req.user, 'edited');
       await notifyArretUsers(arret, req.user, `Stop-work arret updated: ${title}`, 'Stop-work arret updated');
     }
@@ -8163,7 +8183,13 @@ app.get('/api/milestone-photos', authenticateToken, async (req, res) => {
   if (!milestoneId&&!additionalMilestoneId) return res.status(400).json({ error: 'milestoneId or additionalMilestoneId is required' });
   try {
     const col=milestoneId?'milestone_id':'additional_milestone_id', val=milestoneId??additionalMilestoneId;
-    const { rows }=await pool.query(`SELECT id,file_name,cloudinary_url,uploaded_at FROM milestone_photos WHERE ${col}=$1 ORDER BY uploaded_at ASC`,[val]);
+    const table=milestoneId?'milestones':'additional_milestones';
+    const milestone=await pool.query(`SELECT project_id FROM ${table} WHERE id=$1`,[val]);
+    if (!milestone.rows.length) return res.status(404).json({error:'Milestone not found'});
+    const projectId=milestone.rows[0].project_id;
+    if (!await userHasProjectAccess(req.user.user_id,req.user.role,projectId))
+      return res.status(403).json({error:'You are not a member of this project.'});
+    const { rows }=await pool.query(`SELECT id,file_name,cloudinary_url,uploaded_at FROM milestone_photos WHERE ${col}=$1 AND project_id=$2 ORDER BY uploaded_at ASC`,[val,projectId]);
     res.json({ photos: rows });
   } catch(err){console.error('[GET /api/milestone-photos]',err);res.status(500).json({error:'Failed to fetch photos'});}
 });
@@ -8176,9 +8202,14 @@ app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',
   if (!milestoneId&&!additionalMilestoneId) return res.status(400).json({error:'milestoneId or additionalMilestoneId is required'});
   if (!req.files||req.files.length===0) return res.status(400).json({error:'No files uploaded'});
   const col=milestoneId?'milestone_id':'additional_milestone_id', val=milestoneId??additionalMilestoneId;
+  const table=milestoneId?'milestones':'additional_milestones';
   const folder=milestoneId?`oneprojectapp/schedules/${projectId}/milestone-photos`:`oneprojectapp/schedules/${projectId}/additional-photos`;
   const inserted=[];
   try {
+    if (!await userHasProjectAccess(req.user.user_id,req.user.role,projectId))
+      return res.status(403).json({error:'You are not a member of this project.'});
+    const milestone=await pool.query(`SELECT 1 FROM ${table} WHERE id=$1 AND project_id=$2`,[val,projectId]);
+    if (!milestone.rows.length) return res.status(404).json({error:'Milestone not found'});
     for (const file of req.files) {
       const cdResult=await new Promise((resolve,reject)=>{const stream=cloudinary.uploader.upload_stream({folder,resource_type:'image',public_id:`${Date.now()}_${file.originalname.replace(/\s+/g,'-')}`},(err,result)=>(err?reject(err):resolve(result)));Readable.from(file.buffer).pipe(stream);});
       const { rows }=await pool.query(`INSERT INTO milestone_photos (${col},project_id,file_name,cloudinary_public_id,cloudinary_url,uploaded_by_user_id,uploaded_by_role) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,file_name,cloudinary_url,uploaded_at`,[val,projectId,file.originalname,cdResult.public_id,cdResult.secure_url,req.user.user_id,req.user.role]);
@@ -8191,10 +8222,12 @@ app.post('/api/milestone-photos', authenticateToken, photoUpload.array('photos',
 app.delete('/api/milestone-photos/:id', authenticateToken, async (req, res) => {
   try {
     if (!canEditSchedule(req.user.role)) return res.status(403).json({error:'Schedule edit permission is required'});
-    const { rows }=await pool.query('SELECT cloudinary_public_id,uploaded_by_user_id FROM milestone_photos WHERE id=$1',[req.params.id]);
+    const { rows }=await pool.query('SELECT cloudinary_public_id,uploaded_by_user_id,project_id FROM milestone_photos WHERE id=$1',[req.params.id]);
     if (!rows.length) return res.status(404).json({error:'Photo not found'});
+    if (!await userHasProjectAccess(req.user.user_id,req.user.role,rows[0].project_id))
+      return res.status(403).json({error:'You are not a member of this project.'});
     try{await cloudinary.uploader.destroy(rows[0].cloudinary_public_id,{resource_type:'image'});}catch(cdErr){console.error('[DELETE /api/milestone-photos] Cloudinary destroy error (non-fatal):',cdErr);}
-    await pool.query('DELETE FROM milestone_photos WHERE id=$1',[req.params.id]);
+    await pool.query('DELETE FROM milestone_photos WHERE id=$1 AND project_id=$2',[req.params.id,rows[0].project_id]);
     res.json({ success:true });
   } catch(err){console.error('[DELETE /api/milestone-photos/:id]',err);res.status(500).json({error:'Failed to delete photo'});}
 });
@@ -8203,6 +8236,8 @@ app.get('/api/project-summary', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
   if (!projectId) return res.status(400).json({error:'Valid projectId is required'});
   try {
+    if (!await userHasProjectAccess(req.user.user_id,req.user.role,projectId))
+      return res.status(403).json({error:'Access denied to this project'});
     const scheduleClock=await getProjectScheduleClock(projectId);
     const schedRow=await pool.query('SELECT id,planned_start,planned_finish,total_duration,location FROM project_schedules WHERE project_id=$1 LIMIT 1',[projectId]);
     if (!schedRow.rows.length) return res.json({hasSchedule:false,milestones:[],photos:[],timeline:null,effective_today:scheduleClock?.effective_today||null,schedule_paused:scheduleClock?.paused||false,pause_started_at:scheduleClock?.pause_started_at||null});
@@ -8392,6 +8427,8 @@ app.post('/api/planning-execution', authenticateToken, async (req, res) => {
     const { user_id, role } = req.user;
     const { projectId }     = req.body;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const side = await resolveSide(role, user_id, projectId);
     if (!side) return res.status(403).json({ error: 'Access denied.' });
@@ -8447,6 +8484,8 @@ app.get('/api/planning-execution', authenticateToken, async (req, res) => {
     const { user_id, role } = req.user;
     const { projectId }     = req.query;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const side = await resolveSide(role, user_id, projectId);
     if (!side) return res.status(403).json({ error: 'Access denied.' });
@@ -8495,6 +8534,8 @@ app.get('/api/planning-execution/:activityId/download', authenticateToken, async
     const { activityId }    = req.params;
     const { projectId }     = req.query;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const result = await pool.query(
       `SELECT linked_file_id, linked_file_url, linked_file_name, side
@@ -8529,6 +8570,8 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
     const { user_id, role } = req.user;
     const { projectId }     = req.body;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     console.log(`[WC] fetch-work-center-records projectId=${projectId} user=${user_id} role=${role}`);
 
@@ -8683,6 +8726,8 @@ app.get('/api/work-center/team-members', authenticateToken, async (req, res) => 
     const { user_id, role } = req.user;
     const { projectId }     = req.query;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const side = wcSide(role);   // only leaders call this; TeamMember can't assign
     if (!side) return res.status(403).json({ error: 'Your role cannot manage tasks.' });
@@ -8724,6 +8769,8 @@ app.post('/api/work-center', authenticateToken,
     if (!title) return res.status(400).json({ error: 'title is required.' });
     if (!startDate || !endDate || endDate < startDate)
       return res.status(400).json({ error: 'Enter valid task dates with the end date on or after the start date.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const projectSide = await resolveSide(role, user_id, projectId);
     if (!projectSide || projectSide !== side)
       return res.status(403).json({ error: 'You are not a member of this project on your side.' });
@@ -8856,6 +8903,8 @@ app.put('/api/work-center/:taskId', authenticateToken,
       return res.status(403).json({ error: 'Only leaders and PMs can update tasks.' });
     if (!projectId)
       return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const side = wcSide(role);
     const taskCheck = await pool.query(
@@ -8964,6 +9013,8 @@ app.get('/api/work-center/:taskId/download', authenticateToken, async (req, res)
     const { taskId }        = req.params;
     const { projectId }     = req.query;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const taskCheck = await pool.query(
       `SELECT id, side, linked_file_id, linked_file_url, linked_file_name, assigned_members
@@ -9003,6 +9054,8 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
     const { taskId }        = req.params;
     const { projectId }     = req.query;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const taskCheck = await pool.query(
       `SELECT id, side, assigned_members FROM workspace_work_center
@@ -9120,6 +9173,8 @@ app.get('/api/work-center-progress/download/:progressId',
     const { progressId }    = req.params;
     const { projectId }     = req.query;
     if (!projectId) return res.status(400).json({ error: 'projectId is required.' });
+    if (!await userHasProjectAccess(user_id, role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
 
     const result = await pool.query(`
       SELECT p.id, p.member_id, p.attachment_id, p.attachment_url,
@@ -10236,6 +10291,9 @@ async function uploadDocumentFile(buffer, name, folder) {
 //  member  = anyone else on the same side
 const roleKeyOf = (role) => String(role || '').toLowerCase().replace(/[\s_-]+/g, '');
 async function documentAccess(req, doc, projectId) {
+  const accessProjectId = doc.project_id ?? projectId;
+  if (!await userHasProjectAccess(req.user.user_id, req.user.role, accessProjectId))
+    return { isAuthor: false, isAuthorSelf: false, isLeader: false, sameSide: false };
   const docSide = String(doc.side || '').toLowerCase();
   const isAuthorSelf = String(doc.creator_id) === String(req.user.user_id) && normalizeRole(doc.creator_role) === normalizeRole(req.user.role);
   // the leader who assigned the team member to the project is "their" leader, whatever side the assignment names
@@ -10245,14 +10303,14 @@ async function documentAccess(req, doc, projectId) {
       `SELECT 1 FROM team_member_assignments
         WHERE project_id=$1 AND team_member_id=$2 AND assigned_by=$3
           AND lower(regexp_replace(COALESCE(assigned_by_role,''), '[ _-]', '', 'g')) = $4 LIMIT 1`,
-      [projectId, doc.creator_id, req.user.user_id, roleKeyOf(req.user.role)]);
+      [accessProjectId, doc.creator_id, req.user.user_id, roleKeyOf(req.user.role)]);
     isAssigner = chk.rows.length > 0;
   }
   const leaderSide = getSide(req.user.role);
   const isLeader = Boolean(leaderSide) && (leaderSide === docSide || isAssigner);
   let sameSide = isLeader;
   if (!sameSide) {
-    const mine = await resolveSide(req.user.role, req.user.user_id, projectId);
+    const mine = await resolveSide(req.user.role, req.user.user_id, accessProjectId);
     sameSide = Boolean(mine) && mine.toLowerCase() === docSide;
   }
   return { isAuthor: isAuthorSelf || isAssigner, isAuthorSelf, isLeader, sameSide };
@@ -10379,6 +10437,8 @@ app.post('/api/document-approval', authenticateToken, async (req, res) => {
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const isLeaderRole = getSide(req.user.role) !== null;
     const leaderSide = isLeaderRole ? await resolveSide(req.user.role, req.user.user_id, projectId) : null;
     const assignedByMe = `EXISTS (SELECT 1 FROM team_member_assignments tma
@@ -10417,6 +10477,8 @@ app.post('/api/document-approval/create', authenticateToken, docUploadFields, re
   let doc_type = req.body.doc_type;
   if (!title || (!toDraft && !doc_type)) return res.status(400).json({ error: 'Missing fields' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     cleanFolderName(doc_type);   // rejects the reserved name early
     const stampReq = readDocStampRequest(req.body);
     if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
@@ -10479,6 +10541,8 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const { rows } = await pool.query('SELECT creator_id, creator_role FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     const docCreatorId = String(rows[0].creator_id);
@@ -10605,6 +10669,8 @@ app.post('/api/document-approval/:id/submit', authenticateToken, async (req, res
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const { rows } = await pool.query('SELECT creator_id, creator_role, approval_status FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     const docCreatorId = String(rows[0].creator_id);
@@ -10647,6 +10713,8 @@ app.delete('/api/document-approval/:id', authenticateToken, async (req, res) => 
   const projectId = req.body.projectId || req.query.projectId;
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const { rows } = await pool.query('SELECT creator_id, creator_role, side FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
     const creatorId = String(rows[0].creator_id);
@@ -10698,6 +10766,8 @@ app.post('/api/control-reports', authenticateToken, async (req, res) => {
   const { projectId } = req.body || {};
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const side = await resolveSide(req.user.role, req.user.user_id, projectId);
     if (!side) return res.status(403).json({ error: 'Access denied' });
     const isLeader = getSide(req.user.role) !== null;
@@ -10726,6 +10796,8 @@ app.post('/api/control-reports/create', authenticateToken, docUploadFields, requ
   const { doc_type, title, description } = req.body;
   if (!doc_type || !title || !description) return res.status(400).json({ error: 'Missing fields' });
   try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const userSide = getSide(req.user.role);
     if (!userSide) return res.status(403).json({ error: 'Only side leaders can add control & report records' });
     const stampReq = readDocStampRequest(req.body);
@@ -10910,6 +10982,8 @@ app.post('/api/document-folders/rename', authenticateToken, requireProjectLifecy
   if (!projectId || !from || !to) return res.status(400).json({ error: 'Missing fields' });
   try {
     if (getSide(req.user.role) === null) return res.status(403).json({ error: 'Only leaders can rename or merge folders.' });
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
     const side = sideLabel(await resolveSide(req.user.role, req.user.user_id, projectId));
     const target = await resolveFolder(projectId, side, to, from);
     if (!target) throw new DocFlowError(400, 'Type the new folder name.');
