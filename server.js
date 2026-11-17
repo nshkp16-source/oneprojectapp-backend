@@ -4951,7 +4951,7 @@ const ARRET_MAX_FILE_BYTES = 10 * 1024 * 1024;
 const ARRET_ALLOWED_FILE = /\.(jpe?g|png|webp|gif|pdf|docx?|xlsx?|txt)$/i;
 const ARRET_STATUSES = ['open', 'resolved', 'closed'];
 // Besides the creator, these roles may resolve, close or reopen an arret (so it never stays open because its author is away).
-const ARRET_CLOSER_ROLES = ['Client', 'Consultant'];
+const ARRET_CLOSER_ROLES = ['Client', 'Consultant', 'ClientPM', 'ConsultantPM'];
 const ARRET_CATEGORIES = {
   safety: 'Safety', quality: 'Quality', design_instruction: 'Design or instruction', weather: 'Weather', other: 'Other',
 };
@@ -5456,7 +5456,7 @@ app.patch('/api/arrets/:id/status', authenticateToken, async (req, res) => {
 
     const arret = rows[0];
     if (!canManageArretStatus(arret, req.user))
-      return res.status(403).json({ error: 'Only the arret creator, the Client or the Consultant can change its status.' });
+      return res.status(403).json({ error: 'Only the arret creator, the Client, the Consultant or their Project Managers can change its status.' });
     if (arret.status === status)
       return res.json({ success: true, unchanged: true, arret: decorateArret(arret, req.user) });
 
