@@ -4953,6 +4953,149 @@ async function buildRecordFlowView(c) {
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  ARRETS (stop-work orders)
+// ─────────────────────────────────────────────────────────────────────────────
+const ARRET_TITLE_MIN = 3;
+const ARRET_TITLE_MAX = 200;
+const ARRET_DESCRIPTION_MAX = 5000;
+const ARRET_NOTE_MAX = 1000;
+const ARRET_MAX_FILES = 5;
+const ARRET_MAX_FILE_BYTES = 10 * 1024 * 1024;
+const ARRET_ALLOWED_FILE = /\.(jpe?g|png|webp|gif|pdf|docx?|xlsx?|txt)$/i;
+const ARRET_STATUSES = ['open', 'resolved', 'closed'];
+// Besides the creator, these roles may resolve, close or reopen an arret (so it never stays open because its author is away).
+const ARRET_CLOSER_ROLES = ['Client', 'Consultant'];
+
+async function ensureArretSchema() {
+  const statements = [
+    `ALTER TABLE arrets
+       ADD COLUMN IF NOT EXISTS closed_at        TIMESTAMPTZ,
+       ADD COLUMN IF NOT EXISTS closed_by_id     INTEGER,
+       ADD COLUMN IF NOT EXISTS closed_by_role   TEXT,
+       ADD COLUMN IF NOT EXISTS closed_by_name   TEXT,
+       ADD COLUMN IF NOT EXISTS resolution_note  TEXT,
+       ADD COLUMN IF NOT EXISTS deleted_at       TIMESTAMPTZ,
+       ADD COLUMN IF NOT EXISTS deleted_by_id    INTEGER,
+       ADD COLUMN IF NOT EXISTS deleted_by_role  TEXT`,
+    `CREATE TABLE IF NOT EXISTS arret_events (
+       id          SERIAL PRIMARY KEY,
+       arret_id    INTEGER NOT NULL REFERENCES arrets(id) ON DELETE CASCADE,
+       project_id  INTEGER,
+       actor_id    INTEGER,
+       actor_role  TEXT,
+       actor_name  TEXT,
+       action      TEXT NOT NULL,
+       detail      TEXT,
+       created_at  TIMESTAMPTZ DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_arret_events_arret ON arret_events (arret_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_arrets_project_active ON arrets (project_id) WHERE deleted_at IS NULL`,
+  ];
+  for (const sql of statements) {
+    try { await pool.query(sql); }
+    catch (err) { console.warn('[schema] arret statement failed:', err.message); }
+  }
+  console.log('[schema] arret tables ensured');
+}
+await ensureArretSchema();
+
+const arretMulter = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: ARRET_MAX_FILE_BYTES, files: ARRET_MAX_FILES },
+  fileFilter: (_req, file, cb) => {
+    if (file.fieldname !== 'attachments') return cb(new Error('Unexpected file field.'));
+    if (!ARRET_ALLOWED_FILE.test(file.originalname || ''))
+      return cb(new Error(`"${file.originalname}" is not an allowed file type. Use an image, PDF, Word, Excel or text file.`));
+    cb(null, true);
+  },
+}).array('attachments', ARRET_MAX_FILES);
+
+function arretUpload(req, res, next) {
+  arretMulter(req, res, (err) => {
+    if (!err) return next();
+    let message = err.message || 'File upload failed.';
+    if (err.code === 'LIMIT_FILE_SIZE') message = `Each file must be ${ARRET_MAX_FILE_BYTES / (1024 * 1024)} MB or smaller.`;
+    else if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') message = `Attach at most ${ARRET_MAX_FILES} files.`;
+    return res.status(400).json({ success: false, message });
+  });
+}
+
+function validateArretText(title, description) {
+  if (title.length < ARRET_TITLE_MIN || title.length > ARRET_TITLE_MAX)
+    return `The title must be between ${ARRET_TITLE_MIN} and ${ARRET_TITLE_MAX} characters.`;
+  if (!description) return 'A description is required.';
+  if (description.length > ARRET_DESCRIPTION_MAX)
+    return `The description must be ${ARRET_DESCRIPTION_MAX} characters or fewer.`;
+  return null;
+}
+
+function isArretCreatorRow(arret, user) {
+  return Number(arret.created_by) === Number(user.user_id) && String(arret.creator_role) === String(user.role);
+}
+function canManageArretStatus(arret, user) {
+  return isArretCreatorRow(arret, user) || ARRET_CLOSER_ROLES.includes(normalizeRole(user.role));
+}
+// Adds what the dashboard needs to decide which buttons to show.
+function decorateArret(arret, user) {
+  const creator = isArretCreatorRow(arret, user);
+  return { ...arret, creator_id: arret.created_by, is_creator: creator, can_manage: canManageArretStatus(arret, user) };
+}
+
+async function logArretEvent(arret, user, action, detail = null) {
+  try {
+    const name = await resolveSignerNameForStamp(arret.project_id, user.user_id, user.role).catch(() => null);
+    await pool.query(
+      `INSERT INTO arret_events (arret_id, project_id, actor_id, actor_role, actor_name, action, detail)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [arret.id, arret.project_id, user.user_id, user.role, name || user.email || null, action, detail]
+    );
+  } catch (err) {
+    console.warn('[arrets] audit log failed (non-fatal):', err.message);
+  }
+}
+
+// Everyone on the project except the actor gets a bell entry (and an email). A failure never blocks the action.
+async function notifyArretUsers(arret, user, message, subject) {
+  try {
+    const recipients = await getProjectRecipientKeys(arret.project_id, user.user_id, user.role);
+    await notifyRecordUsers({
+      projectId: arret.project_id, recordId: arret.id, table: 'arrets', message,
+      actorId: user.user_id, actorRole: user.role, recipients, email: true, emailSubject: subject,
+    });
+  } catch (err) {
+    console.error('[arrets] notification failed (non-fatal):', err.message);
+  }
+}
+
+// Opening an arret clears its bell entry too, so the dot and the bell number never disagree.
+async function markArretNotificationsRead(arretId, user) {
+  try {
+    await pool.query(
+      `UPDATE notification_recipients nr
+          SET is_read = true, read_at = NOW()
+         FROM notifications n
+        WHERE nr.notification_id = n.id
+          AND n.entity_type = 'arrets' AND n.entity_id = $1
+          AND nr.recipient_role = $2 AND nr.recipient_role_id = $3
+          AND nr.is_read = false`,
+      [arretId, normalizeRole(user.role), user.user_id]
+    );
+  } catch (err) {
+    console.warn('[arrets] could not mark notifications read:', err.message);
+  }
+}
+
+// Cloudinary was told resource_type 'auto', so the real type is rebuilt from the mime type when deleting.
+function arretCloudinaryType(mime) {
+  const m = String(mime || '');
+  return m.startsWith('image/') ? 'image' : m.startsWith('video/') ? 'video' : 'raw';
+}
+async function destroyArretFiles(files) {
+  await Promise.all((files || []).filter(f => f && f.public_id).map(f =>
+    cloudinary.uploader.destroy(f.public_id, { resource_type: arretCloudinaryType(f.file_mime || f.mime) }).catch(() => {})));
+}
+
 app.get('/api/arrets', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
   if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
@@ -4962,14 +5105,14 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'You are not assigned to this project.' });
 
     const { rows: arrets } = await pool.query(
-      `SELECT a.*, 
+      `SELECT a.*,
               EXISTS(
                 SELECT 1 FROM arret_views v
                 WHERE v.arret_id = a.id AND v.viewer_id = $2 AND v.viewer_role = $3
               ) AS is_viewed
        FROM arrets a
-       WHERE a.project_id = $1
-       ORDER BY a.issued_date DESC, a.id DESC`,
+       WHERE a.project_id = $1 AND a.deleted_at IS NULL
+       ORDER BY (a.status = 'open') DESC, a.issued_date DESC, a.id DESC`,
       [projectId, req.user.user_id, req.user.role]
     );
 
@@ -4993,7 +5136,7 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
     }
 
     const result = arrets.map(arret => ({
-      ...arret,
+      ...decorateArret(arret, req.user),
       is_viewed: Boolean(arret.is_viewed),
       attachments: attachmentsByArret[arret.id] || (arret.attachment_url ? [{
         file_name: arret.attachment_name,
@@ -5010,18 +5153,52 @@ app.get('/api/arrets', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/arrets', authenticateToken, upload.array('attachments'), requireProjectLifecycleWrite, async (req, res) => {
+// GET /api/arrets/unseen-count — two numbers for the header pill, without sending the arrets themselves.
+// Registered before '/api/arrets/:id' so the word "unseen-count" is never read as an id.
+app.get('/api/arrets/unseen-count', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.query.projectId);
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not assigned to this project.' });
+
+    const { rows } = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE a.status = 'open')::int AS open,
+         COUNT(*) FILTER (
+           WHERE a.status = 'open'
+             AND NOT (a.created_by = $4::int AND a.creator_role = $3)
+             AND NOT EXISTS (
+               SELECT 1 FROM arret_views v
+               WHERE v.arret_id = a.id AND v.viewer_id = $2 AND v.viewer_role = $3
+             )
+         )::int AS unseen
+       FROM arrets a
+       WHERE a.project_id = $1 AND a.deleted_at IS NULL`,
+      [projectId, req.user.user_id, req.user.role, Number(req.user.user_id)]
+    );
+    return res.json({ open: rows[0].open, unseen: rows[0].unseen });
+  } catch (err) {
+    console.error('GET /api/arrets/unseen-count:', err);
+    return res.status(500).json({ error: 'Failed to count arrets' });
+  }
+});
+
+app.post('/api/arrets', authenticateToken, arretUpload, requireProjectLifecycleWrite, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const title = (req.body.title || '').trim();
   const description = (req.body.description || '').trim();
   if (!projectId || !title || !description)
     return res.status(400).json({ success: false, message: 'projectId, title, and description are required.' });
+  const textError = validateArretText(title, description);
+  if (textError) return res.status(400).json({ success: false, message: textError });
 
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
       return res.status(403).json({ success: false, message: 'You are not assigned to this project.' });
 
     const client = await pool.connect();
+    let uploadedArretFiles = [];
     try {
       await client.query('BEGIN');
       const arretRes = await client.query(
@@ -5031,6 +5208,7 @@ app.post('/api/arrets', authenticateToken, upload.array('attachments'), requireP
       );
       const arret = arretRes.rows[0];
       const attachments = [];
+      uploadedArretFiles = attachments;   // lets the catch block clean up if the transaction fails
 
       for (const file of req.files || []) {
         const uploaded = await scheduleCloudinaryUpload(
@@ -5064,9 +5242,14 @@ app.post('/api/arrets', authenticateToken, upload.array('attachments'), requireP
       }
 
       await client.query('COMMIT');
-      return res.status(201).json({ success: true, arret: { ...arret, attachments }, message: 'Arret saved.' });
+
+      await logArretEvent(arret, req.user, 'created');
+      await notifyArretUsers(arret, req.user, `Stop-work arret issued: ${title}`, 'Stop-work arret');
+
+      return res.status(201).json({ success: true, arret: { ...decorateArret(arret, req.user), attachments }, message: 'Arret saved.' });
     } catch (err) {
       await client.query('ROLLBACK');
+      destroyArretFiles(uploadedArretFiles);   // files already sent to Cloudinary would otherwise be orphaned
       console.error('POST /api/arrets transaction error:', err);
       return res.status(500).json({ success: false, message: 'Failed to save arret.' });
     } finally {
@@ -5087,7 +5270,8 @@ app.post('/api/arrets/view', authenticateToken, async (req, res) => {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
       return res.status(403).json({ error: 'You are not assigned to this project.' });
 
-    const { rows } = await pool.query(`SELECT 1 FROM arrets WHERE id=$1 AND project_id=$2`, [arretId, projectId]);
+    const { rows } = await pool.query(
+      `SELECT 1 FROM arrets WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL`, [arretId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
 
     // Use upsert pattern to ensure role-scoped view records (prevents users with same ID across roles from clobbering each other's views)
@@ -5115,6 +5299,7 @@ app.post('/api/arrets/view', authenticateToken, async (req, res) => {
       }
     }
 
+    await markArretNotificationsRead(arretId, req.user);
     return res.json({ success: true });
   } catch (err) {
     console.error('POST /api/arrets/view:', err);
@@ -5122,7 +5307,7 @@ app.post('/api/arrets/view', authenticateToken, async (req, res) => {
   }
 });
 
-// GET /api/arrets/:id — Fetch individual arret with attachments
+// GET /api/arrets/:id — Fetch individual arret with attachments and its history
 app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.query.projectId);
   const arretId = parseInt(req.params.id, 10);
@@ -5132,7 +5317,8 @@ app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
       return res.status(403).json({ error: 'You are not assigned to this project.' });
 
-    const { rows } = await pool.query(`SELECT * FROM arrets WHERE id=$1 AND project_id=$2`, [arretId, projectId]);
+    const { rows } = await pool.query(
+      `SELECT * FROM arrets WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL`, [arretId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
 
     const arret = rows[0];
@@ -5157,6 +5343,14 @@ app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
       }
     }
 
+    let events = [];
+    try {
+      const { rows: evRows } = await pool.query(
+        `SELECT action, detail, actor_role, actor_name, created_at FROM arret_events
+          WHERE arret_id=$1 ORDER BY created_at ASC, id ASC`, [arretId]);
+      events = evRows;
+    } catch (_) { /* history table may not exist yet */ }
+
     // Mark as viewed
     try {
       await pool.query(
@@ -5170,53 +5364,116 @@ app.get('/api/arrets/:id', authenticateToken, async (req, res) => {
       // Silently continue if viewing fails
       console.warn(`[GET /api/arrets/:id] Could not mark arret ${arretId} as viewed:`, err.message);
     }
+    await markArretNotificationsRead(arretId, req.user);
 
-    return res.json({ success: true, arret: { ...arret, attachments } });
+    return res.json({ success: true, arret: { ...decorateArret(arret, req.user), attachments, events } });
   } catch (err) {
     console.error('GET /api/arrets/:id:', err);
     return res.status(500).json({ error: 'Failed to fetch arret' });
   }
 });
 
-// PUT /api/arrets/:id — Update arret title/description and optionally status by creator only
+// PUT /api/arrets/:id — Update title and description (creator only). Status has its own route below.
 app.put('/api/arrets/:id', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
   const arretId = parseInt(req.params.id, 10);
-  const { title, description, status } = req.body;
+  const title = String(req.body.title || '').trim();
+  const description = String(req.body.description || '').trim();
 
   if (!projectId || !arretId) return res.status(400).json({ error: 'projectId and arretId are required' });
   if (!title || !description) return res.status(400).json({ error: 'Title and description are required.' });
-  if (status && !['open', 'closed', 'resolved'].includes(status))
-    return res.status(400).json({ error: 'Valid status required: open, closed, resolved' });
+  const textError = validateArretText(title, description);
+  if (textError) return res.status(400).json({ error: textError, message: textError });
 
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
       return res.status(403).json({ error: 'You are not assigned to this project.' });
 
-    const { rows } = await pool.query(`SELECT * FROM arrets WHERE id=$1 AND project_id=$2`, [arretId, projectId]);
+    const { rows } = await pool.query(
+      `SELECT * FROM arrets WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL`, [arretId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
 
     const arret = rows[0];
-    if (Number(arret.created_by) !== Number(req.user.user_id) || String(arret.creator_role) !== String(req.user.role)) {
+    if (!isArretCreatorRow(arret, req.user)) {
       return res.status(403).json({ error: 'Only the arret creator can edit this arret.' });
     }
 
-    const updatedFields = [title.trim(), description.trim(), status || arret.status, arretId];
     const updateRes = await pool.query(
-      `UPDATE arrets SET title=$1, description=$2, status=$3, is_resolved=($3 = 'resolved'), updated_at=NOW() WHERE id=$4 RETURNING *`,
-      updatedFields
+      `UPDATE arrets SET title=$1, description=$2, updated_at=NOW() WHERE id=$3 RETURNING *`,
+      [title, description, arretId]
     );
 
-    return res.json({ success: true, arret: updateRes.rows[0], message: 'Arret updated.' });
+    if (title !== arret.title || description !== arret.description) {
+      await logArretEvent(arret, req.user, 'edited');
+      await notifyArretUsers(arret, req.user, `Stop-work arret updated: ${title}`, 'Stop-work arret updated');
+    }
+
+    return res.json({ success: true, arret: decorateArret(updateRes.rows[0], req.user), message: 'Arret updated.' });
   } catch (err) {
     console.error('PUT /api/arrets/:id:', err);
     return res.status(500).json({ error: 'Failed to update arret' });
   }
 });
 
-// DELETE /api/arrets/:id — Delete arret (creator only)
-app.delete('/api/arrets/:id', authenticateToken, async (req, res) => {
+// PATCH /api/arrets/:id/status — resolve, close or reopen. The creator or a Client/Consultant leader may do it.
+app.patch('/api/arrets/:id/status', authenticateToken, async (req, res) => {
   const projectId = normalizeProjectId(req.body.projectId);
+  const arretId = parseInt(req.params.id, 10);
+  const status = String(req.body.status || '').trim();
+  const note = String(req.body.note || '').trim().slice(0, ARRET_NOTE_MAX);
+
+  if (!projectId || !arretId) return res.status(400).json({ error: 'projectId and arretId are required' });
+  if (!ARRET_STATUSES.includes(status))
+    return res.status(400).json({ error: `Valid status required: ${ARRET_STATUSES.join(', ')}` });
+
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not assigned to this project.' });
+
+    const { rows } = await pool.query(
+      `SELECT * FROM arrets WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL`, [arretId, projectId]);
+    if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
+
+    const arret = rows[0];
+    if (!canManageArretStatus(arret, req.user))
+      return res.status(403).json({ error: 'Only the arret creator, the Client or the Consultant can change its status.' });
+    if (arret.status === status)
+      return res.json({ success: true, unchanged: true, arret: decorateArret(arret, req.user) });
+
+    let updated;
+    if (status === 'open') {
+      ({ rows: [updated] } = await pool.query(
+        `UPDATE arrets SET status='open', is_resolved=false, closed_at=NULL, closed_by_id=NULL, closed_by_role=NULL,
+                closed_by_name=NULL, resolution_note=NULL, updated_at=NOW()
+          WHERE id=$1 RETURNING *`, [arretId]));
+    } else {
+      const name = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
+      ({ rows: [updated] } = await pool.query(
+        `UPDATE arrets SET status=$2, is_resolved=($2 = 'resolved'), closed_at=NOW(), closed_by_id=$3, closed_by_role=$4,
+                closed_by_name=$5, resolution_note=$6, updated_at=NOW()
+          WHERE id=$1 RETURNING *`,
+        [arretId, status, req.user.user_id, req.user.role, name || req.user.email || null, note || null]));
+    }
+
+    const action = status === 'open' ? 'reopened' : status;
+    await logArretEvent(arret, req.user, action, note || null);
+    const messages = {
+      resolved: `Stop-work arret resolved: ${arret.title}`,
+      closed:   `Stop-work arret closed: ${arret.title}`,
+      open:     `Stop-work arret reopened: ${arret.title}`,
+    };
+    await notifyArretUsers(arret, req.user, messages[status], `Stop-work arret ${action}`);
+
+    return res.json({ success: true, arret: decorateArret(updated, req.user), message: `Arret ${action}.` });
+  } catch (err) {
+    console.error('PATCH /api/arrets/:id/status:', err);
+    return res.status(500).json({ error: 'Failed to change arret status' });
+  }
+});
+
+// DELETE /api/arrets/:id — Soft delete (creator only). The row, its files and its history are kept as the project record.
+app.delete('/api/arrets/:id', authenticateToken, async (req, res) => {
+  const projectId = normalizeProjectId(req.body?.projectId ?? req.query.projectId);
   const arretId = parseInt(req.params.id, 10);
 
   if (!projectId || !arretId) return res.status(400).json({ error: 'projectId and arretId are required' });
@@ -5225,50 +5482,26 @@ app.delete('/api/arrets/:id', authenticateToken, async (req, res) => {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
       return res.status(403).json({ error: 'You are not assigned to this project.' });
 
-    // Check arret exists and verify creator
-    const { rows } = await pool.query(`SELECT * FROM arrets WHERE id=$1 AND project_id=$2`, [arretId, projectId]);
+    const { rows } = await pool.query(
+      `SELECT * FROM arrets WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL`, [arretId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Arret not found' });
 
     const arret = rows[0];
-    if (Number(arret.created_by) !== Number(req.user.user_id) || String(arret.creator_role) !== String(req.user.role)) {
+    if (!isArretCreatorRow(arret, req.user)) {
       return res.status(403).json({ error: 'Only the arret creator can delete it.' });
     }
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    await pool.query(
+      `UPDATE arrets SET deleted_at=NOW(), deleted_by_id=$2, deleted_by_role=$3, updated_at=NOW() WHERE id=$1`,
+      [arretId, req.user.user_id, req.user.role]
+    );
 
-      // Delete attachments
-      try {
-        await client.query(`DELETE FROM arret_attachments WHERE arret_id=$1`, [arretId]);
-      } catch (err) {
-        // Table may not exist, continue
-      }
+    await logArretEvent(arret, req.user, 'deleted');
+    // People were told to stop work, so they are also told when an open order is withdrawn.
+    if (arret.status === 'open')
+      await notifyArretUsers(arret, req.user, `Stop-work arret withdrawn: ${arret.title}`, 'Stop-work arret withdrawn');
 
-      // Delete arret views
-      try {
-        await client.query(`DELETE FROM arret_views WHERE arret_id=$1`, [arretId]);
-      } catch (err) {
-        // Table may not exist, continue
-      }
-
-      // Delete related notifications
-      const notifRes = await client.query(
-        `DELETE FROM notifications WHERE entity_id=$1 AND entity_type='arrets' RETURNING id`,
-        [arretId]
-      );
-
-      // Delete the arret
-      await client.query(`DELETE FROM arrets WHERE id=$1`, [arretId]);
-
-      await client.query('COMMIT');
-      return res.json({ success: true, message: 'Arret deleted.' });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    return res.json({ success: true, message: 'Arret deleted.' });
   } catch (err) {
     console.error('DELETE /api/arrets/:id:', err);
     return res.status(500).json({ error: 'Failed to delete arret' });
