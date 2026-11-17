@@ -27,6 +27,18 @@ test('project access denies callers without a matching assignment', async () => 
   assert.equal(await checkProjectAccess(pool, 7, 'ContractorPM', 42, identity), false);
 });
 
+test('client project access checks project ownership', async () => {
+  const pool = {
+    query: async (sql, params) => {
+      assert.match(sql, /FROM projects WHERE id=\$1 AND client_id=\$2/);
+      assert.deepEqual(params, [42, 7]);
+      return { rows: [{}] };
+    },
+  };
+
+  assert.equal(await checkProjectAccess(pool, 7, 'Client', 42, identity), true);
+});
+
 test('project access denies unknown roles without querying the database', async () => {
   const pool = { query: async () => assert.fail('unknown roles must not query the database') };
 

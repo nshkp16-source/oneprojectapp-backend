@@ -8377,12 +8377,7 @@ app.get('/api/notifications/target', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'projectId, entityType and entityId are required.' });
     }
 
-    const membership = await pool.query(
-      `SELECT 1 FROM assignments_view
-       WHERE project_id = $1 AND role_id = $2 AND role = $3 LIMIT 1`,
-      [projectId, userId, userRole],
-    );
-    if (!membership.rows.length)
+    if (!await userHasProjectAccess(userId, userRole, projectId))
       return res.status(403).json({ error: 'You are not a member of this project.' });
     const viewerSide = await resolveSide(userRole, userId, projectId);
     if (!viewerSide) return res.status(403).json({ error: 'You are not a member of this project.' });
@@ -8411,6 +8406,7 @@ const progressModelDeps = {
   pool, authenticateToken, upload, reportUpload: workCenterReportUpload,
   maxUploadBytes: MAX_UPLOAD_BYTES,
   requireProjectLifecycleWrite, scheduleCloudinaryUpload, cloudinary,
+  isProjectMember: (projectId, userId, role) => userHasProjectAccess(userId, role, projectId),
   wcSide, isWCLeader, sideRoles, flowKey,
   notify: ({ projectId, entityId, entityType, message, actorId, actorRole, recipients }) =>
     notifyRecordUsers({ projectId, recordId: entityId, table: entityType, message, actorId, actorRole, recipients }),
