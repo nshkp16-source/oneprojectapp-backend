@@ -19,6 +19,7 @@ import { registerReportRoutes, registerTaskQueryRoutes, registerTaskCardRoutes }
 import { registerVerificationRoutes } from './verificationRoutes.js';
 import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
 import { createSupportingArchive } from './recordSupportingArchive.js';
+import { getNewRecordNoticeIds } from './recordNoticeTracking.js';
 import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
 import { createLoginLockout } from './loginLockout.js';
@@ -515,6 +516,16 @@ async function ensureRecordFlowSchema() {
      )`,
     `CREATE INDEX IF NOT EXISTS record_queries_record_idx ON record_queries (record_table, record_id)`,
     `ALTER TABLE record_queries ADD COLUMN IF NOT EXISTS raised_by TEXT`,
+    `CREATE TABLE IF NOT EXISTS record_opens (
+       record_table TEXT NOT NULL,
+       record_id INTEGER NOT NULL,
+       project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+       user_id INTEGER NOT NULL,
+       user_role TEXT NOT NULL,
+       last_opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       PRIMARY KEY (record_table, record_id, user_id, user_role)
+     )`,
+    `CREATE INDEX IF NOT EXISTS record_opens_user_project_idx ON record_opens (project_id, user_id, user_role, record_table)`,
     // One live row per person per stage: stops duplicates and double-clicks racing each other
     `CREATE UNIQUE INDEX IF NOT EXISTS record_signers_one_active ON record_signers (record_table, record_id, stage, signer_role, signer_user_id) WHERE status <> 'replaced'`,
   ];
@@ -5583,6 +5594,12 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       `SELECT * FROM record_queries WHERE record_table=$1 AND project_id=$2 ORDER BY record_id, seq`, [table, projectId]);
     const queriesByRecord = new Map();
     for (const qr of allQueries) { if (!queriesByRecord.has(qr.record_id)) queriesByRecord.set(qr.record_id, []); queriesByRecord.get(qr.record_id).push(qr); }
+    const { rows: openRows } = await pool.query(
+      `SELECT record_id, last_opened_at FROM record_opens
+       WHERE record_table=$1 AND project_id=$2 AND user_id=$3 AND user_role=$4`,
+      [table, projectId, userId, userRole]
+    );
+    const lastOpenedByRecord = new Map(openRows.map(row => [String(row.record_id), row.last_opened_at]));
     const nameCache = new Map();
     const projectTz = await loadProjectTz(projectId);
     const memberKeys = await loadProjectMemberKeys(projectId);
@@ -5698,6 +5715,13 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         ...notice,
         uploaded_by_name: await nameOf(notice.uploader_role, notice.uploaded_by),
       })));
+      const lastOpenedAt = lastOpenedByRecord.get(String(rec.id)) || null;
+      const newNoticeIds = getNewRecordNoticeIds(
+        embeddedNotices,
+        lastOpenedAt,
+        notice => String(notice.uploaded_by) === String(userId)
+          && getSide(notice.uploader_role) === getSide(userRole)
+      );
       // Notice issued by the current user (for button state)
       const { rows: myNoticeRows } = await pool.query(
         `SELECT id FROM ${table} WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 LIMIT 1`,
@@ -5734,6 +5758,9 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         workflow_steps: workflowSteps,
         my_issued_notice: myIssuedNotice,
         embedded_notices: embeddedNotices,
+        last_opened_at: lastOpenedAt,
+        has_new_notice: newNoticeIds.length > 0,
+        new_notice_ids: newNoticeIds,
         tied_record_title: tiedRecordTitle,
         ...flowView,
       };
@@ -5757,7 +5784,16 @@ app.post('/api/mark-record-viewed', authenticateToken, async (req, res) => {
     if (!await userHasProjectAccess(reviewerId, reviewerRole, projectId)) return res.status(403).json({ error: 'You are not assigned to this project.' });
     const { rows: rec } = await pool.query(`SELECT uploaded_by, role FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
     if (!rec.length) return res.status(400).json({ error: 'Record not found.' });
-    if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) return res.json({ success: true, skipped: true });
+    await pool.query(
+      `INSERT INTO record_opens (record_table, record_id, project_id, user_id, user_role, last_opened_at)
+       VALUES ($1,$2,$3,$4,$5,NOW())
+       ON CONFLICT (record_table, record_id, user_id, user_role)
+       DO UPDATE SET project_id=EXCLUDED.project_id, last_opened_at=EXCLUDED.last_opened_at`,
+      [table, recordId, projectId, reviewerId, reviewerRole]
+    );
+    if (String(rec[0].uploaded_by) === String(reviewerId) && getSide(rec[0].role) === getSide(reviewerRole)) {
+      return res.json({ success: true, is_uploader: true });
+    }
     const assignRow = await pool.query(`SELECT av.role_email AS email, av.title_position AS position FROM assignments_view av WHERE av.project_id=$1 AND av.role_id=$2 AND av.role=$3 LIMIT 1`, [projectId, reviewerId, reviewerRole]);
     await pool.query(
       `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, action)
