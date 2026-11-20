@@ -19,6 +19,7 @@ import { registerReportRoutes, registerTaskQueryRoutes, registerTaskCardRoutes }
 import { registerVerificationRoutes } from './verificationRoutes.js';
 import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
 import { createSupportingArchive } from './recordSupportingArchive.js';
+import { parseRecordSignoffPlacement } from './recordSignoffStamp.js';
 import { getNewRecordNoticeIds } from './recordNoticeTracking.js';
 import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
@@ -613,13 +614,13 @@ async function insertSignerRows(client, { table, recordId, projectId, stage, sid
 }
 
 // Where the record is in its review chain right now.
-async function getRecordFlowState(table, projectId, recordId) {
-  const { rows: recRows } = await pool.query(`SELECT * FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
+async function getRecordFlowState(table, projectId, recordId, db = pool) {
+  const { rows: recRows } = await db.query(`SELECT * FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
   const rec = recRows[0];
   if (!rec) return null;
   const uploaderSide = getSide(rec.role);
   const steps = uploaderSide ? FLOW_STEP_MAP[uploaderSide] : null;
-  const { rows: reviews } = await pool.query(
+  const { rows: reviews } = await db.query(
     `SELECT reviewer_role, reviewer_id, action FROM document_reviews WHERE record_type=$1 AND record_id=$2`,
     [table, recordId]
   );
@@ -1223,7 +1224,9 @@ async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLin
   const signoffSlots = slots.map(sl => ({ ...sl }));
   try {
     const { rows: prior } = await pool.query(
-      `SELECT signer_user_id, signer_role, stamp_id FROM stamp_registry WHERE record_table=$1 AND record_id=$2 AND kind IN ('review','record_upload')`,
+      `SELECT signer_user_id, signer_role, stamp_id FROM stamp_registry
+       WHERE record_table=$1 AND record_id=$2 AND kind IN ('review','record_upload')
+       ORDER BY signed_at DESC`,
       [ctx.table, rec.id]
     );
     for (const sl of signoffSlots) {
@@ -1781,8 +1784,8 @@ async function notifyProjectLifecycleChange(projectId, actorUserId, actorRole, {
   return result;
 }
 
-async function userHasProjectAccess(userId, role, projectId) {
-  return checkProjectAccess(pool, userId, role, projectId, normalizeRole);
+async function userHasProjectAccess(userId, role, projectId, db = pool) {
+  return checkProjectAccess(db, userId, role, projectId, normalizeRole);
 }
 
 function lifecycleProjectId(req) {
@@ -4645,6 +4648,7 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
   const recordId = Number(req.body.recordId);
   const table = resolveTable(req.body.recordType);
   const fail = (status, message) => res.status(status).json({ success: false, message });
+  const reject = (status, message) => Object.assign(new Error(message), { httpStatus: status });
   if (!table || !Number.isInteger(projectId) || !Number.isInteger(recordId)) return fail(400, 'Invalid request.');
   const outcome = req.body.outcome === 'queries' ? 'queries' : req.body.outcome === 'clear' ? 'clear' : null;
   if (!outcome) return fail(400, 'Choose "No queries" or "Queries raised".');
@@ -4652,33 +4656,137 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
   const parsed = parseQueryList(req.body.queries);
   if (parsed.error) return fail(400, parsed.error);
   if (outcome === 'queries' && !parsed.queries.length) return fail(400, 'Add at least one query, or choose "No queries".');
+  let client = null;
+  let transactionOpen = false;
+  let uploadedFile = null;
+  let previousStampedPublicId = null;
+  let originalAttachmentId = null;
+  let signerPosition = '';
+  let recordTitle = '';
+  let deciders = [];
+  let findings = null;
+  let state = null;
+  let profile = null;
+  let tz = null;
   try {
-    const state = await getRecordFlowState(table, projectId, recordId);
-    if (!state || state.isLocked || !state.stage) return fail(409, 'This record is not waiting for signatures.');
-    const { rows } = await pool.query(
-      `SELECT * FROM record_signers WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND signer_role=$4 AND signer_user_id=$5 AND is_decider=FALSE AND (status='pending' OR (status='signed' AND outcome='queries' AND notice_id IS NULL))`,
+    if (!await userHasProjectAccess(userId, role, projectId)) throw reject(403, 'You are not assigned to this project.');
+    const setupProblem = await explainMissingSignerSetup(projectId, role, userId, false);
+    if (setupProblem) throw reject(400, setupProblem);
+    profile = await loadSignerProfile(projectId, role, userId);
+    if (!profile) throw reject(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
+    tz = await loadProjectTz(projectId);
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionOpen = true;
+    const { rows: recordRows } = await client.query(
+      `SELECT project_id, file_path, stamped_doc_url, attachment_id, stamped_doc_public_id
+       FROM ${table} WHERE id=$1 AND project_id=$2 FOR UPDATE`,
+      [recordId, projectId]
+    );
+    if (!recordRows.length) throw reject(404, 'Record not found.');
+
+    state = await getRecordFlowState(table, projectId, recordId, client);
+    if (!state || state.isLocked || !state.stage) throw reject(409, 'This record is not waiting for signatures.');
+    const { rows } = await client.query(
+      `SELECT * FROM record_signers
+       WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND signer_role=$4 AND signer_user_id=$5 AND is_decider=FALSE
+         AND (status='pending' OR (status='signed' AND outcome='queries' AND notice_id IS NULL))
+       FOR UPDATE`,
       [table, recordId, state.stage, role, userId]
     );
     const mine = rows[0];
-    if (!mine) return fail(403, 'You are not a named signer for this stage, or your review is already final.');
-    const setupProblem = await explainMissingSignerSetup(projectId, role, userId, false);
-    if (setupProblem) return fail(400, setupProblem);
-    const profile = await loadSignerProfile(projectId, role, userId);
-    if (!profile) return fail(400, 'Your signature could not be loaded. Save it again in your Signature & Stamp setup and retry.');
+    if (!mine) throw reject(403, 'You are not a named signer for this stage, or your review is already final.');
+
+    const record = recordRows[0];
+    const recordUrl = record.stamped_doc_url || record.file_path;
+    if (!recordUrl) throw reject(400, 'This record has no PDF to sign.');
+    let remote;
+    try {
+      remote = await fetch(recordUrl, { redirect: 'follow' });
+    } catch (fetchError) {
+      console.error('[record-signoff] record PDF fetch failed:', fetchError.message);
+      throw reject(502, 'The record PDF could not be opened for signing. Try again.');
+    }
+    if (!remote.ok) throw reject(502, 'The record PDF could not be opened for signing. Try again.');
+    const recordBytes = Buffer.from(await remote.arrayBuffer());
+    if (recordBytes.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      throw reject(400, 'The record file is not a valid PDF and cannot be signed.');
+    }
+    let pageCount;
+    try {
+      const pdf = await PDFDocument.load(recordBytes, { ignoreEncryption: true });
+      pageCount = pdf.getPageCount();
+    } catch (pdfError) {
+      console.error('[record-signoff] record PDF parse failed:', pdfError.message);
+      throw reject(400, 'The record PDF could not be read for signing.');
+    }
+    let placement;
+    try {
+      placement = parseRecordSignoffPlacement(req.body.stampPlacement, pageCount);
+    } catch (placementError) {
+      throw reject(400, placementError.message);
+    }
+
+    const signedAt = new Date();
+    const stampId = deriveStampId({
+      k: 'review', p: projectId, rec: recordId, u: userId, r: role,
+      ts: signedAt.getTime(), n: crypto.randomBytes(4).toString('hex'),
+    });
+    const stampSpec = stampSpecFromProfile(
+      { ...profile, position: mine.signer_position || profile.position, side: mine.side || profile.side },
+      { label: 'SIGNED', signedAt, tz, stampId, baseUrl: publicBaseUrl(req) }
+    );
+    let stamped;
+    try {
+      stamped = await stampPdfBuffer(recordBytes, stampSpec, placement);
+    } catch (stampError) {
+      console.error('[record-signoff] stamping failed:', stampError.message);
+      throw reject(400, 'The signature could not be added to this PDF. Check that it is readable and try again.');
+    }
+    const uploadResult = await uploadRecordFile(
+      { buffer: stamped.bytes },
+      'oneproject/records',
+      `${Date.now()}-record-signoff-${recordId}.pdf`
+    );
+    uploadedFile = { public_id: uploadResult.public_id, resource_type: uploadResult.resource_type };
+
     // Signing again after raising queries keeps the earlier review in the history
     const earlier = mine.status === 'signed' ? [{ outcome: mine.outcome, note: mine.findings?.note || '', queries: mine.findings?.queries || [], signed_at: mine.signed_at }] : [];
     const raisedBy = `${mine.signer_position || flowRoleLabel(role)}, ${flowSideLabel(mine.side)} side`;
-    const findings = { note, queries: outcome === 'queries' ? parsed.queries.map(q => ({ ...q, by: raisedBy })) : [], history: [...(mine.findings?.history || []), ...earlier] };
-    await pool.query(
-      `UPDATE record_signers SET status='signed', outcome=$1, findings=$2, signed_at=NOW(), first_viewed_at=COALESCE(first_viewed_at, NOW()) WHERE id=$3`,
-      [outcome, JSON.stringify(findings), mine.id]
+    findings = { note, queries: outcome === 'queries' ? parsed.queries.map(q => ({ ...q, by: raisedBy })) : [], history: [...(mine.findings?.history || []), ...earlier] };
+    const signerUpdate = await client.query(
+      `UPDATE record_signers
+       SET status='signed', outcome=$1, findings=$2, signed_at=$3, first_viewed_at=COALESCE(first_viewed_at, $3)
+       WHERE id=$4 AND (status='pending' OR (status='signed' AND outcome='queries' AND notice_id IS NULL))`,
+      [outcome, JSON.stringify(findings), signedAt, mine.id]
     );
+    if (!signerUpdate.rowCount) throw reject(409, 'Your sign-off was already recorded. Refresh the record and try again.');
+    previousStampedPublicId = record.stamped_doc_public_id || null;
+    originalAttachmentId = record.attachment_id || null;
+    signerPosition = mine.signer_position || flowRoleLabel(role);
+    recordTitle = state.rec.title;
+    await client.query(
+      `UPDATE ${table}
+       SET stamped_doc_url=$1, stamped_doc_public_id=$2, signed_by_id=$3, signed_by_role=$4, signed_at=$5,
+           stamp_type='STAMPED', stamp_page=$6, stamp_x=$7, stamp_y=$8
+       WHERE id=$9 AND project_id=$10`,
+      [uploadResult.secure_url, uploadResult.public_id, userId, role, signedAt,
+       stamped.page, stamped.box.xRatio, stamped.box.yRatio, recordId, projectId]
+    );
+    const fileHash = crypto.createHash('sha256').update(stamped.bytes).digest('hex');
+    await registerStamp(client, {
+      stampId, projectId, table, recordId, kind: 'review', userId, role,
+      name: profile.name, position: signerPosition, company: profile.company,
+      label: 'SIGNED', tz, fileHash, signedAt,
+    });
+
     if (role === 'TeamMember') {
       const summary = outcome === 'clear' ? 'Checked, no queries' : `${findings.queries.length} ${findings.queries.length === 1 ? 'query' : 'queries'} raised`;
       const comment = note ? `${summary}. ${note}` : summary;
-      const part = await pool.query(`SELECT assigned_part FROM team_member_assignments WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`, [projectId, userId]);
-      const email = await pool.query(`SELECT role_email AS email, title_position AS position FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 LIMIT 1`, [projectId, userId, role]);
-      await pool.query(
+      const part = await client.query(`SELECT assigned_part FROM team_member_assignments WHERE project_id=$1 AND team_member_id=$2 LIMIT 1`, [projectId, userId]);
+      const email = await client.query(`SELECT role_email AS email, title_position AS position FROM assignments_view WHERE project_id=$1 AND role_id=$2 AND role=$3 LIMIT 1`, [projectId, userId, role]);
+      await client.query(
         `INSERT INTO document_reviews (record_type, record_id, record_kind, reviewer_id, reviewer_role, reviewer_email, reviewer_position, reviewer_assigned_part, action, comment)
          VALUES ($1,$2,'new',$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (record_type, record_id, reviewer_id, reviewer_role)
@@ -4686,17 +4794,38 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
         [table, recordId, userId, role, email.rows[0]?.email || null, mine.signer_position || email.rows[0]?.position || null, part.rows[0]?.assigned_part || null, outcome === 'clear' ? 'approved' : 'rejected', comment]
       );
     }
-    const { rows: deciders } = await pool.query(`SELECT signer_role, signer_user_id FROM record_signers WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND is_decider=TRUE AND status='pending'`, [table, recordId, state.stage]);
+    const { rows: pendingDeciders } = await client.query(
+      `SELECT signer_role, signer_user_id FROM record_signers
+       WHERE record_table=$1 AND record_id=$2 AND stage=$3 AND is_decider=TRUE AND status='pending'`,
+      [table, recordId, state.stage]
+    );
+    deciders = pendingDeciders;
+    await client.query('COMMIT');
+    transactionOpen = false;
+  } catch (err) {
+    if (transactionOpen && client) await client.query('ROLLBACK').catch(() => {});
+    if (uploadedFile) await removeUploadedRecordFiles([uploadedFile]);
+    if (err.httpStatus) return fail(err.httpStatus, err.message);
+    console.error('[record-signoff]', err);
+    return fail(500, 'Your signed review could not be saved.');
+  } finally {
+    if (client) client.release();
+  }
+
+  if (previousStampedPublicId && previousStampedPublicId !== originalAttachmentId
+      && previousStampedPublicId !== uploadedFile.public_id) {
+    await removeUploadedRecordFiles([{ public_id: previousStampedPublicId, resource_type: uploadedFile.resource_type }]);
+  }
+  try {
     await notifyRecordUsers({
       projectId, recordId, table, actorId: userId, actorRole: role,
-      message: `${mine.signer_position || flowRoleLabel(role)} signed the review of "${state.rec.title}": ${outcome === 'clear' ? 'no queries' : findings.queries.length + ' queries raised'}.`,
+      message: `${signerPosition} signed the review of "${recordTitle}": ${outcome === 'clear' ? 'no queries' : findings.queries.length + ' queries raised'}.`,
       recipients: deciders.map(x => flowKey(x.signer_role, x.signer_user_id)),
     });
-    res.json({ success: true, message: 'Your review is signed.' });
-  } catch (err) {
-    console.error('[record-signoff]', err);
-    res.status(500).json({ success: false, message: 'Your sign-off could not be saved.' });
+  } catch (notificationError) {
+    console.error('[record-signoff] notification failed:', notificationError.message);
   }
+  return res.json({ success: true, message: 'Your signature was added to the record and your review is signed.' });
 });
 
 // ── "Under review": only named signers count, and only while still pending ──
