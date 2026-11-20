@@ -4697,6 +4697,13 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
     );
     const mine = rows[0];
     if (!mine) throw reject(403, 'You are not a named signer for this stage, or your review is already final.');
+    const stageStep = state.steps[state.stage - 1];
+    if (!stageStep || mine.side !== stageStep.side) {
+      throw reject(403, 'This named signer is not assigned to the side for this review stage.');
+    }
+    if (getSide(state.rec.role) === mine.side) {
+      throw reject(403, 'A team member on the submitting side cannot sign this record.');
+    }
 
     const record = recordRows[0];
     const recordUrl = record.stamped_doc_url || record.file_path;
@@ -4768,10 +4775,10 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
     recordTitle = state.rec.title;
     await client.query(
       `UPDATE ${table}
-       SET stamped_doc_url=$1, stamped_doc_public_id=$2, signed_by_id=$3, signed_by_role=$4, signed_at=$5,
-           stamp_type='STAMPED', stamp_page=$6, stamp_x=$7, stamp_y=$8
-       WHERE id=$9 AND project_id=$10`,
-      [uploadResult.secure_url, uploadResult.public_id, userId, role, signedAt,
+       SET stamped_doc_url=$1, stamped_doc_public_id=$2,
+           stamp_type='STAMPED', stamp_page=$3, stamp_x=$4, stamp_y=$5
+       WHERE id=$6 AND project_id=$7`,
+      [uploadResult.secure_url, uploadResult.public_id,
        stamped.page, stamped.box.xRatio, stamped.box.yRatio, recordId, projectId]
     );
     const fileHash = crypto.createHash('sha256').update(stamped.bytes).digest('hex');
