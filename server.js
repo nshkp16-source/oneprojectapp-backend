@@ -18,6 +18,7 @@ import { registerActivityRoutes, registerMilestoneRoutes, milestoneCompletionChe
 import { registerReportRoutes, registerTaskQueryRoutes, registerTaskCardRoutes } from './workCenterRoutes.js';
 import { registerVerificationRoutes } from './verificationRoutes.js';
 import { createCloudinaryUploadTracker } from './cloudinaryUploadTracker.js';
+import { createSupportingArchive } from './recordSupportingArchive.js';
 import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
 import { createLoginLockout } from './loginLockout.js';
@@ -3886,7 +3887,7 @@ for (const prefix of ['/notifications', '/api/notifications']) {
 const RECORD_MAX_FILE_BYTES = 10 * 1024 * 1024;
 const RECORD_MAX_SUPPORTING = 10;
 const RECORD_NOTICE_KINDS   = ['notice', 'rejection_notice', 'acceptance_notice'];
-const RECORD_SUPPORTING_EXT = /\.(xlsx?|docx?|dwg|dxf|jpe?g|png|webp|zip|csv)$/i;
+const RECORD_SUPPORTING_EXT = /\.(pdf|xlsx?|docx?|dwg|dxf|jpe?g|png|webp|zip|csv)$/i;
 const RECORD_TITLE_MIN = 3;
 const RECORD_TITLE_MAX = 200;
 const RECORD_TEXT_MIN  = 10;
@@ -4085,16 +4086,24 @@ async function handleAddRecord(req, res) {
       uploaded.push({ public_id: official.public_id, resource_type: official.resource_type });
       filePath = official.secure_url;
       attachmentId = official.public_id;
-      const settled = await Promise.allSettled(supportingFiles.map(f => uploadRecordFile(f, 'oneproject/record-supporting')));
-      settled.forEach((s, i) => {
-        if (s.status !== 'fulfilled') return;
-        uploaded.push({ public_id: s.value.public_id, resource_type: s.value.resource_type });
+      const supportingArchive = await createSupportingArchive(supportingFiles);
+      if (supportingArchive) {
+        const archiveUpload = await uploadRecordFile(
+          { buffer: supportingArchive.buffer },
+          'oneproject/record-supporting',
+          `${Date.now()}-${safeFileName(supportingArchive.name)}`
+        );
+        uploaded.push({ public_id: archiveUpload.public_id, resource_type: archiveUpload.resource_type });
         supportingFileRows.push({
-          name: supportingFiles[i].originalname, mime: supportingFiles[i].mimetype, size: supportingFiles[i].size,
-          url: s.value.secure_url, public_id: s.value.public_id,
+          name: supportingArchive.name,
+          mime: supportingArchive.mime,
+          size: supportingArchive.size,
+          url: archiveUpload.secure_url,
+          public_id: archiveUpload.public_id,
+          archive: true,
+          contents: supportingArchive.contents,
         });
-      });
-      if (settled.some(s => s.status === 'rejected')) throw new Error('A supporting file failed to upload.');
+      }
       console.log('[add-record] ✅ Official PDF and supporting files uploaded');
     } catch (uploadErr) {
       console.error('[add-record] ❌ Cloudinary upload error:', uploadErr);
@@ -4471,13 +4480,24 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
         uploaded.push({ public_id: upRec.public_id, resource_type: upRec.resource_type });
         stampedRecordUrl = upRec.secure_url; stampedRecordPublicId = upRec.public_id; stampedRecordType = upRec.resource_type;
       }
-      const settled = await Promise.allSettled(d.supportingFiles.map(f => uploadRecordFile(f, 'oneproject/record-supporting')));
-      settled.forEach((s, i) => {
-        if (s.status !== 'fulfilled') return;
-        uploaded.push({ public_id: s.value.public_id, resource_type: s.value.resource_type });
-        supportingRows.push({ name: d.supportingFiles[i].originalname, mime: d.supportingFiles[i].mimetype, size: d.supportingFiles[i].size, url: s.value.secure_url, public_id: s.value.public_id });
-      });
-      if (settled.some(s => s.status === 'rejected')) throw new Error('A supporting file failed to upload.');
+      const supportingArchive = await createSupportingArchive(d.supportingFiles);
+      if (supportingArchive) {
+        const archiveUpload = await uploadRecordFile(
+          { buffer: supportingArchive.buffer },
+          'oneproject/record-supporting',
+          `${Date.now()}-${safeFileName(supportingArchive.name)}`
+        );
+        uploaded.push({ public_id: archiveUpload.public_id, resource_type: archiveUpload.resource_type });
+        supportingRows.push({
+          name: supportingArchive.name,
+          mime: supportingArchive.mime,
+          size: supportingArchive.size,
+          url: archiveUpload.secure_url,
+          public_id: archiveUpload.public_id,
+          archive: true,
+          contents: supportingArchive.contents,
+        });
+      }
     } catch (uploadErr) {
       console.error('[issue-decision] upload failed:', uploadErr);
       await removeUploadedRecordFiles(uploaded);
@@ -5589,7 +5609,11 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
          FROM document_reviews dr WHERE dr.record_type = $1 AND dr.record_id = $2 ORDER BY dr.action_date ASC`,
         [table, rec.id, projectId]
       );
-      const annotatedReviews = reviews.map(r => ({ ...r, is_decision_maker: isDecisionMaker(r.reviewer_role) }));
+      const annotatedReviews = await Promise.all(reviews.map(async r => ({
+        ...r,
+        reviewer_name: await nameOf(r.reviewer_role, r.reviewer_id),
+        is_decision_maker: isDecisionMaker(r.reviewer_role),
+      })));
       const isUploader = String(rec.uploaded_by) === String(userId) && getSide(rec.uploader_role) === getSide(userRole);
       let isViewed = isUploader;
       if (!isUploader) {
@@ -5605,7 +5629,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       const step2SideMap  = { contractor: 'client', consultant: 'contractor', client: 'contractor' };
       const step2Side     = step2SideMap[uploaderSide];
       const isRejected    = rec.status === 'rejected';
-      const isLocked      = isRejected || rec.status === 'approved_record' || annotatedReviews.some(r => getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
+      const isLocked      = isRejected || rec.status === 'approved_record' || annotatedReviews.some(r => r.is_decision_maker && getSide(r.reviewer_role) === step2Side && r.action === 'accepted');
       const stepMap = {
         contractor: [{ side:'consultant',step:1,label:'Consultant Approval',action:'approved'},{side:'client',step:2,label:'Client Acceptance',action:'accepted'}],
         consultant: [{ side:'client',step:1,label:'Client Approval',action:'approved'},{side:'contractor',step:2,label:'Contractor Acceptance',action:'accepted'}],
@@ -5617,8 +5641,8 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       // 'pending' (the record is waiting on it), later ones are 'waiting', and
       // once the record is closed any undecided step is 'skipped'.
       const workflowSteps = steps ? steps.map(s => {
-        const doneReview     = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
-        const rejectedReview = annotatedReviews.find(r => getSide(r.reviewer_role) === s.side && r.action === 'rejected');
+        const doneReview     = annotatedReviews.find(r => r.is_decision_maker && getSide(r.reviewer_role) === s.side && (r.action === 'approved' || r.action === 'accepted'));
+        const rejectedReview = annotatedReviews.find(r => r.is_decision_maker && getSide(r.reviewer_role) === s.side && r.action === 'rejected');
         const decided = doneReview || rejectedReview || null;
         return {
           label: s.label,
@@ -5653,15 +5677,15 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
           if (!myStep) { btnState = 'none'; }
           else if (myStep.step === 2) {
             const step1 = steps.find(s => s.step === 1);
-            const step1Done = annotatedReviews.some(r => getSide(r.reviewer_role) === step1.side && (r.action === 'approved' || r.action === 'accepted'));
+            const step1Done = annotatedReviews.some(r => r.is_decision_maker && getSide(r.reviewer_role) === step1.side && (r.action === 'approved' || r.action === 'accepted'));
             if (!step1Done) { btnState = 'awaiting'; pendingRole = step1.side; }
             else { btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve'; }
           } else { btnState = 'can_approve'; approveLabel = myStep.action === 'accepted' ? 'Accept' : 'Approve'; }
         }
       }
       // All notices tied to this record — full data, newest first, for card embedding
-      const { rows: embeddedNotices } = await pool.query(
-        `SELECT id, title, description, file_path, supporting_files, issued_date,
+      const { rows: rawEmbeddedNotices } = await pool.query(
+        `SELECT id, title, description, file_path, supporting_files, issued_date, uploaded_by,
                 role AS uploader_role, record_kind,
                 signed_by_id, signed_by_role, signed_at, stamp_type, stamped_doc_url,
                 notice_source, respond_by
@@ -5670,6 +5694,10 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
          ORDER BY issued_date DESC`,
         [rec.id, projectId]
       );
+      const embeddedNotices = await Promise.all(rawEmbeddedNotices.map(async notice => ({
+        ...notice,
+        uploaded_by_name: await nameOf(notice.uploader_role, notice.uploaded_by),
+      })));
       // Notice issued by the current user (for button state)
       const { rows: myNoticeRows } = await pool.query(
         `SELECT id FROM ${table} WHERE notice_tied_id=$1 AND project_id=$2 AND uploaded_by=$3 LIMIT 1`,
@@ -5684,6 +5712,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
         tiedRecordTitle = tied[0]?.title || null;
       }
       const signedByDisplayName = rec.signed_by_id ? await resolveDisplayNameFor(rec.signed_by_role, rec.signed_by_id, projectId) : null;
+      const uploaderDisplayName = await nameOf(rec.uploader_role, rec.uploaded_by);
       const flowView = await buildRecordFlowView({
         rec, projectId, userId, userRole, userSide, userIsDM, isUploader, isLocked, isRejected, steps,
         btnState, pendingRole, approveLabel, workflowSteps, embeddedNotices,
@@ -5691,6 +5720,7 @@ app.post('/api/fetch-tab-records', authenticateToken, async (req, res) => {
       });
       return {
         ...rec,
+        uploaded_by_name: uploaderDisplayName,
         signed_by_display_name: signedByDisplayName,
         reviews: annotatedReviews,
         is_uploader: isUploader,
@@ -5932,57 +5962,64 @@ app.get('/api/download-file', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/download-record-bundle', authenticateToken, async (req, res) => {
-  const { projectId, recordType, noticeId, noticeIds, recordId, mode = 'both' } = req.query;
+  const { projectId, recordType, noticeId, noticeIds, recordId, mode = 'both', includeRecord } = req.query;
   const table = resolveTable(recordType);
-  if (!table || !projectId || !recordId || !['notice', 'record', 'both'].includes(mode)) {
+  if (!table || !projectId || !recordId || !['notice', 'record', 'both', 'selected'].includes(mode)) {
     return res.status(400).json({ error: 'Invalid record bundle request.' });
   }
   try {
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId)) {
       return res.status(403).json({ error: 'You are not assigned to this project.' });
     }
-    const selectedNoticeIds = mode === 'both'
+    const selectedNoticeIds = mode === 'both' || mode === 'selected'
       ? String(noticeIds || noticeId || '').split(',').map(id => id.trim()).filter(Boolean)
-      : [noticeId].filter(Boolean);
-    const ids = mode === 'notice' ? selectedNoticeIds.slice(0, 1)
+      : mode === 'notice' ? [noticeId].filter(Boolean) : [];
+    const includeOriginal = mode === 'record' || mode === 'both'
+      || (mode === 'selected' && String(includeRecord).toLowerCase() === 'true');
+    const numericRecordId = Number(recordId);
+    const ids = mode === 'both' ? [...selectedNoticeIds, recordId]
       : mode === 'record' ? [recordId]
-      : [...selectedNoticeIds, recordId];
-    if (ids.some(id => !id) || (mode !== 'record' && !selectedNoticeIds.length)) {
+      : mode === 'notice' ? selectedNoticeIds.slice(0, 1)
+      : [...(includeOriginal ? [recordId] : []), ...selectedNoticeIds];
+    const numericIds = ids.map(Number);
+    const numericNoticeIds = selectedNoticeIds.map(Number);
+    if (!Number.isSafeInteger(numericRecordId) || numericRecordId <= 0
+      || !ids.length || numericIds.some(id => !Number.isSafeInteger(id) || id <= 0)
+      || (mode === 'both' && !selectedNoticeIds.length)
+      || (mode === 'notice' && !selectedNoticeIds.length)
+      || (mode === 'selected' && !includeOriginal && !selectedNoticeIds.length)) {
       return res.status(400).json({ error: 'Missing document ID.' });
     }
-    if (mode !== 'record') {
-      const { rows: relation } = await pool.query(
-        `SELECT 1 FROM ${table}
-         WHERE id = ANY($1::int[]) AND notice_tied_id=$2 AND project_id=$3
-         LIMIT 1`,
-        [selectedNoticeIds.map(Number), recordId, projectId]
+    if (selectedNoticeIds.length) {
+      if (numericNoticeIds.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+        return res.status(400).json({ error: 'Invalid notice ID.' });
+      }
+      const { rows: matchingNotices } = await pool.query(
+        `SELECT id FROM ${table}
+         WHERE id = ANY($1::int[]) AND notice_tied_id=$2 AND project_id=$3`,
+        [numericNoticeIds, numericRecordId, projectId]
       );
-      if (relation.length !== 1 || mode === 'both') {
-        const { rows: matchingNotices } = await pool.query(
-          `SELECT id FROM ${table}
-           WHERE id = ANY($1::int[]) AND notice_tied_id=$2 AND project_id=$3`,
-          [selectedNoticeIds.map(Number), recordId, projectId]
-        );
-        if (matchingNotices.length !== selectedNoticeIds.length) {
-          return res.status(400).json({ error: 'One or more notices are not tied to this record.' });
-        }
+      if (matchingNotices.length !== selectedNoticeIds.length) {
+        return res.status(400).json({ error: 'One or more notices are not tied to this record.' });
       }
     }
     const { rows } = await pool.query(
       `SELECT id, title, file_path, stamped_doc_url, role AS added_by, issued_date
        FROM ${table} WHERE project_id=$1 AND id = ANY($2::int[])`,
-      [projectId, ids.map(Number)]
+      [projectId, numericIds]
     );
     const byId = new Map(rows.map(row => [String(row.id), row]));
+    if (byId.size !== ids.length) return res.status(404).json({ error: 'One or more documents were not found.' });
     const output = await PDFDocument.create();
     const labelFont = await output.embedFont(StandardFonts.Helvetica);
     const labelBoldFont = await output.embedFont(StandardFonts.HelveticaBold);
+    let noticeNumber = 0;
     for (const [index, id] of ids.entries()) {
       const row = byId.get(String(id));
       const filePath = row?.stamped_doc_url || row?.file_path;
       if (!filePath) return res.status(404).json({ error: 'Official document not found.' });
-      const isOriginal = mode === 'record' || (mode === 'both' && index === selectedNoticeIds.length);
-      const label = isOriginal ? 'ORIGINAL RECORD' : `NOTICE ${index + 1}`;
+      const isOriginal = includeOriginal && Number(id) === numericRecordId;
+      const label = isOriginal ? 'ORIGINAL RECORD' : `NOTICE ${++noticeNumber}`;
       const strip = output.addPage([612, 72]);
       const stripColor = isOriginal ? rgb(0.04, 0.32, 0.42) : rgb(0.57, 0.35, 0.04);
       strip.drawRectangle({ x: 0, y: 0, width: 612, height: 72, color: rgb(0.98, 0.99, 1) });
