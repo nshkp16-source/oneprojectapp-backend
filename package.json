@@ -16,12 +16,18 @@
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^4.22.1",
+    "express-rate-limit": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.1.1",
     "nodemailer": "^8.0.11",
     "nodemailer-sendgrid": "^1.0.3",
     "pdf-lib": "^1.17.1",
     "pg": "^8.20.0",
-    "qrcode": "^1.5.4"
+    "qrcode": "^1.5.4",
+    "yazl": "^3.3.1"
+  },
+  "devDependencies": {
+    "acorn": "^8.19.0",
+    "jsdom": "^29.1.1"
   }
 }
