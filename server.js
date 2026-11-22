@@ -230,6 +230,9 @@ async function ensureDocumentFlowSchema() {
       ADD COLUMN IF NOT EXISTS doc_number TEXT,
       ADD COLUMN IF NOT EXISTS revision_no INTEGER NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS supporting_files JSONB NOT NULL DEFAULT '[]'::jsonb`],
+    // Control & Reports keeps its own folder name, so a leader can file a shared document under a different folder than in Document & Approval.
+    // NULL = same folder as Document & Approval (older documents and documents added directly to Control & Reports).
+    [`documents control folder`, `ALTER TABLE documents ADD COLUMN IF NOT EXISTS cr_folder TEXT`],
     [`documents number index`, `CREATE UNIQUE INDEX IF NOT EXISTS uq_documents_project_number ON documents (project_id, doc_number) WHERE doc_number IS NOT NULL`],
     [`document_comments query columns`, `ALTER TABLE document_comments
       ADD COLUMN IF NOT EXISTS respond_by DATE,
@@ -1886,6 +1889,7 @@ app.use(async (req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
   if (lifecycleWriteExemptPaths.has(req.path)) return next();
   if (/^\/api\/control-reports\/[^/]+\/(comments\/list|versions)$/.test(req.path)) return next();   // read-only lookups
+  if (req.path === '/api/control-reports/folders') return next();   // read-only lookup
   if (/^\/api\/documents\/[^/]+\/(events|read)$/.test(req.path)) return next();   // document history and read markers
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return next();
@@ -10672,7 +10676,7 @@ async function documentAccess(req, doc, projectId) {
 const DOC_SELECT = `d.id, d.project_id, d.title, d.description, d.category AS doc_type, d.document_date, d.file_name, d.file_url,
   d.creator_id, d.creator_role, d.creator_name, d.side, d.approval_status AS status, d.approved_by_id, d.approved_by_role, d.signed_by_name,
   d.approval_date AS reviewed_at, d.rejection_reason, d.is_shared, d.shared_at, d.created_at, d.updated_at,
-  d.author_stamp_id, d.author_signed_at, d.signer_stamp_id, d.cr_status, d.cr_reject_reason, d.cr_rejected_by_role, d.cr_rejected_at, d.replaced_at,
+  d.author_stamp_id, d.author_signed_at, d.signer_stamp_id, d.cr_status, d.cr_folder, d.cr_reject_reason, d.cr_rejected_by_role, d.cr_rejected_at, d.replaced_at,
   (SELECT COUNT(*)::int FROM document_comments c WHERE c.document_id = d.id) AS comment_count,
   d.doc_number, d.revision_no, to_char(d.deadline, 'YYYY-MM-DD') AS deadline, d.supporting_files,
   (SELECT COUNT(*)::int FROM document_comments c WHERE c.document_id = d.id AND c.kind = 'query' AND c.status = 'open') AS open_query_count,
@@ -10694,6 +10698,23 @@ async function resolveFolder(projectId, side, raw, excludeFolder = null) {
         AND ($3::text IS NULL OR lower(category) <> lower($3))`,
     [projectId, side || '', excludeFolder]);
   return canonicalFolder(clean, rows.map(r => r.category));
+}
+
+// Control & Reports folders: the name a shared document is filed under there (cr_folder, or its Document & Approval folder when none was chosen).
+const CR_FOLDER_SQL = `COALESCE(NULLIF(d.cr_folder, ''), d.category)`;
+async function crFolderNames(projectId, side, excludeFolder = null) {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ${CR_FOLDER_SQL} AS name FROM documents d
+      WHERE d.project_id=$1 AND lower(d.side)=lower($2) AND d.is_shared = true AND ${CR_FOLDER_SQL} IS NOT NULL
+        AND ($3::text IS NULL OR lower(${CR_FOLDER_SQL}) <> lower($3))`,
+    [projectId, side || '', excludeFolder]);
+  return rows.map(r => r.name);
+}
+// Same as resolveFolder, but against the folders that exist in Control & Reports ("drawings" -> "Drawing").
+async function resolveCrFolder(projectId, side, raw, excludeFolder = null) {
+  const clean = cleanFolderName(raw);
+  if (!clean) return '';
+  return canonicalFolder(clean, await crFolderNames(projectId, side, excludeFolder));
 }
 
 // Whoever acts on a document has, by definition, seen it.
@@ -10993,7 +11014,9 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
   }
 });
 
-// Share a signed document to Control & Report (leader of that side only)
+// Share a signed document to Control & Report (leader of that side only).
+// body.cr_folder (optional): the folder to file it under in Control & Reports - an existing one or a new name.
+// Without it the document keeps the folder it has in Document & Approval. Document & Approval is never changed by this.
 app.post('/api/document-approval/:id/share', authenticateToken, async (req, res) => {
   const docId = req.params.id;
   const { projectId } = req.body || {};
@@ -11005,11 +11028,15 @@ app.post('/api/document-approval/:id/share', authenticateToken, async (req, res)
     if (rows[0].cr_status && rows[0].cr_status !== 'shared') return res.status(400).json({ error: 'This document is under correction and cannot be shared again.' });
     const access = await documentAccess(req, rows[0], projectId);
     if (!access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can share documents.' });
-    await pool.query(`UPDATE documents SET is_shared=true, cr_status='shared', shared_at=NOW(), updated_at=NOW() WHERE id=$1`, [docId]);
+    const side = sideLabel(rows[0].side);
+    const wanted = String(req.body.cr_folder || '').trim() || rows[0].category;
+    const crFolder = await resolveCrFolder(projectId, side, wanted);
+    if (!crFolder) throw new DocFlowError(400, 'Choose a folder in Control & Reports.');
+    await pool.query(`UPDATE documents SET is_shared=true, cr_status='shared', cr_folder=$2, shared_at=NOW(), updated_at=NOW() WHERE id=$1`, [docId, crFolder]);
     await markDocRead(docId, req);
-    await logDocEvent(docId, projectId, req, 'shared', 'Shared to Control & Reports');
-    docNotify(req, rows[0], { to: ['side', 'submitter'], entityType: 'control_reports', subject: 'New document in Control & Reports', message: `${docLabel(rows[0])} was shared to Control & Reports.` });
-    return res.json({ success: true });
+    await logDocEvent(docId, projectId, req, 'shared', `Shared to Control & Reports, in the ${crFolder} folder`);
+    docNotify(req, rows[0], { to: ['side', 'submitter'], entityType: 'control_reports', subject: 'New document in Control & Reports', message: `${docLabel(rows[0])} was shared to Control & Reports, in the ${crFolder} folder.` });
+    return res.json({ success: true, folder: crFolder });
   } catch (err) {
     return docFail(res, err, 'POST /api/document-approval/:id/share:');
   }
@@ -11134,7 +11161,7 @@ app.post('/api/control-reports', authenticateToken, async (req, res) => {
       [projectId, side.toLowerCase(), isLeader, req.user.user_id, req.user.role]
     );
     const truncated = rows.length > 1000;
-    const docs = (truncated ? rows.slice(0, 1000) : rows).map(r => ({ ...r, cr_status: r.cr_status || 'shared' }));
+    const docs = (truncated ? rows.slice(0, 1000) : rows).map(r => ({ ...r, cr_status: r.cr_status || 'shared', da_folder: r.doc_type, doc_type: r.cr_folder || r.doc_type }));
     await attachUnread(req, docs);
     return res.json({ documents: docs, truncated });
   } catch (err) {
@@ -11164,7 +11191,7 @@ app.post('/api/control-reports/create', authenticateToken, docUploadFields, requ
     const insert = await pool.query(
       `INSERT INTO documents(project_id, title, description, category, file_name, file_id, file_url, creator_id, creator_role, creator_name, side, approval_status, approved_by_id, approved_by_role, signed_by_name, signer_stamp_id, author_stamp_id, author_signed_at, approval_date, is_shared, cr_status, shared_at)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'approved',$8,$9,$10,$12,$12,$13,NOW(),true,'shared',NOW()) RETURNING id`,
-      [projectId, title, description, await resolveFolder(projectId, userSide, doc_type) || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, name || null, side, stamped ? stamped.stampId : null, stamped ? stamped.signedAt : null]
+      [projectId, title, description, await resolveCrFolder(projectId, userSide, doc_type) || null, fileName, fileId, fileUrl, req.user.user_id, req.user.role, name || null, side, stamped ? stamped.stampId : null, stamped ? stamped.signedAt : null]
     );
     if (stamped) await registerDocumentStamp(projectId, insert.rows[0].id, req, stamped);
     const newId = insert.rows[0].id;
@@ -11330,17 +11357,33 @@ app.get('/api/document-approval/:id/supporting/:idx', authenticateToken, async (
 });
 
 // Leaders rename a folder, or merge it into another one by typing that folder's name. Drafts are never touched.
+// body.tab 'control-reports': renames the Control & Reports folder only (cr_folder); Document & Approval keeps its own names.
+// Any other tab: renames the Document & Approval folder (category) only; Control & Reports folders are not touched.
 app.post('/api/document-folders/rename', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
-  const { projectId, from, to } = req.body || {};
+  const { projectId, from, to, tab } = req.body || {};
   if (!projectId || !from || !to) return res.status(400).json({ error: 'Missing fields' });
   try {
     if (getSide(req.user.role) === null) return res.status(403).json({ error: 'Only leaders can rename or merge folders.' });
     if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
       return res.status(403).json({ error: 'You are not a member of this project.' });
     const side = sideLabel(await resolveSide(req.user.role, req.user.user_id, projectId));
+    const name = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
+    if (tab === 'control-reports') {
+      const target = await resolveCrFolder(projectId, side, to, from);
+      if (!target) throw new DocFlowError(400, 'Type the new folder name.');
+      await pool.query(
+        `INSERT INTO document_events(document_id, project_id, actor_id, actor_role, actor_name, action, detail)
+         SELECT d.id, d.project_id, $4, $5, $6, 'folder_renamed', $7 FROM documents d
+          WHERE d.project_id=$1 AND lower(d.side)=lower($2) AND d.is_shared = true AND lower(${CR_FOLDER_SQL})=lower($3)`,
+        [projectId, side, from, String(req.user.user_id), String(req.user.role), name || null, `Control & Reports: ${from} → ${target}`]);
+      const r = await pool.query(
+        `UPDATE documents d SET cr_folder=$1, updated_at=NOW()
+          WHERE d.project_id=$2 AND lower(d.side)=lower($3) AND d.is_shared = true AND lower(${CR_FOLDER_SQL})=lower($4)`,
+        [target, projectId, side, from]);
+      return res.json({ success: true, moved: r.rowCount, folder: target });
+    }
     const target = await resolveFolder(projectId, side, to, from);
     if (!target) throw new DocFlowError(400, 'Type the new folder name.');
-    const name = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
     await pool.query(
       `INSERT INTO document_events(document_id, project_id, actor_id, actor_role, actor_name, action, detail)
        SELECT id, project_id, $4, $5, $6, 'folder_renamed', $7 FROM documents
@@ -11352,6 +11395,20 @@ app.post('/api/document-folders/rename', authenticateToken, requireProjectLifecy
       [target, projectId, side, from]);
     return res.json({ success: true, moved: r.rowCount, folder: target });
   } catch (err) { return docFail(res, err, 'POST /api/document-folders/rename:'); }
+});
+
+// The folders that exist in Control & Reports for the caller's side (the share dialog offers these).
+app.post('/api/control-reports/folders', authenticateToken, async (req, res) => {
+  const { projectId } = req.body || {};
+  if (!projectId) return res.status(400).json({ error: 'Missing projectId' });
+  try {
+    if (!await userHasProjectAccess(req.user.user_id, req.user.role, projectId))
+      return res.status(403).json({ error: 'You are not a member of this project.' });
+    if (getSide(req.user.role) === null) return res.status(403).json({ error: 'Only leaders can choose a Control & Reports folder.' });
+    const side = sideLabel(await resolveSide(req.user.role, req.user.user_id, projectId));
+    const names = (await crFolderNames(projectId, side)).sort((a, b) => a.localeCompare(b));
+    return res.json({ folders: names });
+  } catch (err) { return docFail(res, err, 'POST /api/control-reports/folders:'); }
 });
 
 // Audit trail of one document (people who may open it)
