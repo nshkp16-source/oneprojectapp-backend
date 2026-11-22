@@ -6871,6 +6871,14 @@ const MEETING_FIELD_LABELS = { title: 'Title', location: 'Location', purpose: 'P
 const MEETING_MIGRATION = 'backend/migrations/2026-10-12-meeting-cancel-and-report-audit.sql';
 const MEETING_PROFESSIONAL_MIGRATION = 'backend/migrations/2026-10-13-professional-meetings.sql';
 
+// A short reason that an invitee can write with their reply (only the planner can read it)
+async function ensureMeetingRsvpNoteColumn() {
+  try { await pool.query('ALTER TABLE meeting_rsvps ADD COLUMN IF NOT EXISTS note TEXT'); }
+  catch (err) { console.warn('Could not add meeting_rsvps.note:', err.message); }
+}
+await ensureMeetingRsvpNoteColumn();
+const meetingRsvpNote = value => String(value || '').trim().slice(0, 300) || null;
+
 const meetingAttachmentUpload = multer({
   limits: { fileSize: 25 * 1024 * 1024, files: 10 },
   storage: multer.memoryStorage(),
@@ -7050,6 +7058,20 @@ async function notifyMeetingChange(client, meeting, actor, message) {
     [meeting.project_id, meeting.id, message, actor.user_id, actor.role]);
   const recipients = await getProjectRecipientKeys(meeting.project_id, actor.user_id, actor.role, meeting.scope, meeting.scope_value);
   await insertNotificationRecipients(client, rows[0].id, recipients);
+}
+
+// Tell only the planner when an invitee declines (with the reason, if one was written)
+async function notifyPlannerOfDecline(meeting, personName, note) {
+  try {
+    if (!meeting?.created_by || !meeting?.created_role) return;
+    const message = `${personName || 'A participant'} declined \"${meeting.title}\"${note ? `: ${note}` : '.'}`;
+    const { rows } = await pool.query(
+      `INSERT INTO notifications (project_id,entity_id,entity_type,message,added_by_id,added_by_role) VALUES ($1,$2,'meetings',$3,$4,$5) RETURNING id`,
+      [meeting.project_id, meeting.id, message, meeting.created_by, meeting.created_role]);
+    await insertNotificationRecipients(pool, rows[0].id, [{
+      recipient_role: normalizeRole(meeting.created_role), recipient_role_id: Number(meeting.created_by), user_id: Number(meeting.created_by),
+    }]);
+  } catch (err) { console.error('Decline notification failed:', err); }
 }
 
 function addMeetingRecurrence(localValue, frequency, count) {
@@ -7324,7 +7346,7 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
           'version',to_jsonb(mm)->>'report_version',
           'attachments',(SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.minute_id=mm.id)) FROM meeting_minutes mm WHERE mm.meeting_id=m.id LIMIT 1) AS minute,
         (SELECT COALESCE(json_agg(json_build_object('name',a.name,'url',a.url)),'[]') FROM meeting_attachments a WHERE a.meeting_id=m.id AND a.minute_id IS NULL) AS attachments,
-        (SELECT COALESCE(json_agg(json_build_object('participant_key',r.participant_key,'participant_name',r.participant_name,'response',r.response,'participant_source',r.participant_source,'participant_role',r.participant_role,'participant_role_id',r.participant_role_id)),'[]')
+        (SELECT COALESCE(json_agg(json_build_object('participant_key',r.participant_key,'participant_name',r.participant_name,'response',r.response,'participant_source',r.participant_source,'participant_role',r.participant_role,'participant_role_id',r.participant_role_id,'note',r.note)),'[]')
          FROM meeting_rsvps r WHERE r.meeting_id=m.id) AS rsvps,
         (SELECT COUNT(*) + 1 FROM meetings recurring WHERE recurring.recurrence_group=m.recurrence_group
            AND recurring.scheduled_at < m.scheduled_at) AS series_index
@@ -7336,6 +7358,12 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
       ORDER BY m.is_draft DESC, COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
+    rows.forEach(row => {
+      if (isMeetingPlannerRow(row, req.user)) return;
+      row.rsvps = (row.rsvps || []).filter(r => r.participant_source === 'project'
+        && normalizeRole(r.participant_role) === normalizeRole(req.user.role)
+        && String(r.participant_role_id) === String(req.user.user_id));
+    });
     if (rows.length) {
       const labels = await getMeetingLabels(project_id);
       rows.forEach(row => {
@@ -7442,6 +7470,7 @@ app.get('/api/meetings/rsvp', async (req, res) => {
       <p>${escapeMeetingEmail(formatMeetingWhen(meeting) || '')}<br>${escapeMeetingEmail(meeting.location || meeting.virtual_link || '')}</p>
       <form method="post" action="/api/meetings/${meeting.meeting_id}/rsvp">
       <input type="hidden" name="token" value="${escapeMeetingEmail(token)}">
+      <p><label>Reason (optional)<br><textarea name="note" maxlength="300" rows="3" style="width:100%"></textarea></label></p>
       <button name="response" value="accepted">Accept</button>
       <button name="response" value="declined">Decline</button></form>`;
     return res.type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${heading}</title><main style="font:16px system-ui;max-width:600px;margin:4rem auto;padding:1rem"><h1>${heading}</h1>${form}</main>`);
@@ -7460,13 +7489,19 @@ app.post('/api/meetings/:id/rsvp', express.urlencoded({ extended: false }), asyn
     }
     try {
       const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const note = meetingRsvpNote(req.body.note);
+      const before = (await pool.query(
+        `SELECT r.response,r.participant_name,m.id,m.project_id,m.title,m.created_by,m.created_role
+           FROM meeting_rsvps r JOIN meetings m ON m.id=r.meeting_id WHERE m.id=$1 AND r.token_hash=$2`,
+        [req.params.id, tokenHash])).rows[0];
       const { rowCount } = await pool.query(
-        `UPDATE meeting_rsvps r SET response=$1,responded_at=NOW()
+        `UPDATE meeting_rsvps r SET response=$1,note=$4,responded_at=NOW()
           FROM meetings m
          WHERE r.meeting_id=m.id AND m.id=$2 AND r.token_hash=$3 AND m.is_draft=false AND m.status='scheduled'`,
-        [response, req.params.id, tokenHash]
+        [response, req.params.id, tokenHash, note]
       );
       if (!rowCount) return res.status(404).send('This invitation has expired or is no longer available.');
+      if (response === 'declined' && before && before.response !== 'declined') await notifyPlannerOfDecline(before, before.participant_name, note);
       return res.type('html').send(`<!doctype html><meta charset="utf-8"><title>RSVP saved</title><main style="font:16px system-ui;max-width:600px;margin:4rem auto;padding:1rem"><h1>Response saved</h1><p>Thank you. Your response was recorded as ${response}.</p></main>`);
     } catch (err) {
       console.error('External meeting RSVP update failed:', err);
@@ -7487,11 +7522,16 @@ app.post('/api/meetings/:id/rsvp', express.urlencoded({ extended: false }), asyn
         && normalizeRsvpRole(entry.role) === normalizeRsvpRole(req.user.role)
         && String(entry.role_id) === String(req.user.user_id));
       if (!person) return res.status(403).json({ error: 'You are not an invitee for this meeting.' });
+      const key = `project:${person.role}:${person.role_id}`;
+      const note = meetingRsvpNote(req.body?.note);
+      const previous = (await pool.query('SELECT response FROM meeting_rsvps WHERE meeting_id=$1 AND participant_key=$2', [req.params.id, key])).rows[0]?.response;
       const { rowCount } = await pool.query(
-        'UPDATE meeting_rsvps SET response=$1,responded_at=NOW() WHERE meeting_id=$2 AND participant_key=$3',
-        [response, req.params.id, `project:${person.role}:${person.role_id}`]
+        'UPDATE meeting_rsvps SET response=$1,note=$4,responded_at=NOW() WHERE meeting_id=$2 AND participant_key=$3',
+        [response, req.params.id, key, note]
       );
       if (!rowCount) return res.status(404).json({ error: 'RSVP record not found.' });
+      const isPlanner = isMeetingPlannerRow(meeting, req.user);
+      if (response === 'declined' && previous !== 'declined' && !isPlanner) await notifyPlannerOfDecline(meeting, person.name, note);
       return res.json({ success: true, response });
     } catch (err) {
       console.error('Internal meeting RSVP failed:', err);
@@ -7651,7 +7691,7 @@ app.put('/api/meetings/:id', authenticateToken, meetingAttachmentsMiddleware, re
         || new Date(existing.end_at).getTime() !== m.endInstant.getTime());
     if (meetingTimeChanged) {
       await client.query(
-        `UPDATE meeting_rsvps SET response='pending',responded_at=NULL,reminder_sent_at=NULL WHERE meeting_id=$1`,
+        `UPDATE meeting_rsvps SET response='pending',note=NULL,responded_at=NULL,reminder_sent_at=NULL WHERE meeting_id=$1`,
         [req.params.id]
       );
     }
