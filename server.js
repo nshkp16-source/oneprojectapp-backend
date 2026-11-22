@@ -7221,10 +7221,21 @@ function meetingPersonSide(person) {
   return getSide(person.role) || String(person.name || '').match(/\b(Client|Consultant|Contractor)\b/i)?.[1]?.toLowerCase() || null;
 }
 function meetingPersonRank(person) {
+  if (person.is_planner) return -1;
   if (person.source !== 'project') return 3;
   const role = String(person.role || '');
   if (['Client', 'Contractor', 'Consultant'].includes(role)) return 0;
   return role.endsWith('PM') ? 1 : 2;
+}
+// The planner is shown with the participants (first in his side), without becoming an invitee
+function meetingPeopleWithPlanner(meeting) {
+  const list = Array.isArray(meeting.participant_details) ? meeting.participant_details.map(person => ({ ...person })) : [];
+  if (!meeting.created_by || !meeting.created_role) return list;
+  const role = normalizeRole(meeting.created_role);
+  const existing = list.find(person => person.source === 'project' && normalizeRole(person.role) === role && String(person.role_id) === String(meeting.created_by));
+  if (existing) existing.is_planner = true;
+  else list.push({ source: 'project', role: meeting.created_role, role_id: meeting.created_by, name: meeting.planned_by_name || 'Planner', email: '', attendance_type: 'planner', is_planner: true });
+  return list;
 }
 function arrangeMeetingParticipants(list) {
   const sideIndex = side => (side ? MEETING_SIDE_ORDER.indexOf(side) : 9);
@@ -7339,8 +7350,11 @@ async function buildMeetingBriefPdf(meeting, references = []) {
   divider();
 
   // participants grouped by side, leader first
-  const people = arrangeMeetingParticipants(meeting.participant_details);
+  const people = arrangeMeetingParticipants(meetingPeopleWithPlanner(meeting));
   const attendanceText = { required: 'Required', optional: 'Optional', information: 'For information' };
+  const attendanceOf = person => person.is_planner
+    ? (person.attendance_type === 'planner' ? 'Planner' : `Planner  |  ${attendanceText[person.attendance_type] || 'Required'}`)
+    : (attendanceText[person.attendance_type] || 'Required');
   if (people.length) {
     if (y < 150) addPage();
     drawLines(`PARTICIPANTS (${people.length})`, bold, 9, teal);
@@ -7358,7 +7372,7 @@ async function buildMeetingBriefPdf(meeting, references = []) {
       for (const person of group.list) {
         if (y < 90) addPage();
         drawLines(person.name || 'Project participant', regular, 11, ink, 10);
-        drawLines([person.email, attendanceText[person.attendance_type] || 'Required'].filter(Boolean).join('  |  '), regular, 9, grey, 10);
+        drawLines([person.email, attendanceOf(person)].filter(Boolean).join('  |  '), regular, 9, grey, 10);
         y -= 2;
       }
       y -= 4;
@@ -7461,6 +7475,7 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
       const labels = await getMeetingLabels(project_id);
       rows.forEach(row => {
         row.planned_by_name = labels.get(meetingActorKey(row.created_role, row.created_by)) || null;
+        row.participants_display = arrangeMeetingParticipants(meetingPeopleWithPlanner(row));
         if (row.minute) row.minute.uploaded_by_name = labels.get(meetingActorKey(row.minute.created_role, row.minute.created_by)) || null;
       });
     }
