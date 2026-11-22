@@ -7211,6 +7211,29 @@ async function destroyUploadedMeetingFiles(files) {
     cloudinary.uploader.destroy(file.public_id, { resource_type: file.resource_type || 'image' }).catch(() => {})));
 }
 
+// Participants in a clear order: Client, Consultant, Contractor, then external guests.
+// Inside a side: the company leader first, then project managers, then team members.
+const MEETING_SIDE_ORDER = ['client', 'consultant', 'contractor'];
+const MEETING_SIDE_LABELS = { client: 'Client', consultant: 'Consultant', contractor: 'Contractor' };
+function meetingPersonSide(person) {
+  if (person.source !== 'project') return null;
+  if (person.side) return person.side;
+  return getSide(person.role) || String(person.name || '').match(/\b(Client|Consultant|Contractor)\b/i)?.[1]?.toLowerCase() || null;
+}
+function meetingPersonRank(person) {
+  if (person.source !== 'project') return 3;
+  const role = String(person.role || '');
+  if (['Client', 'Contractor', 'Consultant'].includes(role)) return 0;
+  return role.endsWith('PM') ? 1 : 2;
+}
+function arrangeMeetingParticipants(list) {
+  const sideIndex = side => (side ? MEETING_SIDE_ORDER.indexOf(side) : 9);
+  return (Array.isArray(list) ? list : [])
+    .map((person, index) => ({ ...person, side: meetingPersonSide(person), rank: meetingPersonRank(person), _i: index }))
+    .sort((a, b) => sideIndex(a.side) - sideIndex(b.side) || a.rank - b.rank || a._i - b._i)
+    .map(({ _i, ...person }) => person);
+}
+
 async function buildMeetingBriefPdf(meeting, references = []) {
   const pdf = await PDFDocument.create();
   const regular = await pdf.embedFont(StandardFonts.Helvetica);
@@ -7219,8 +7242,8 @@ async function buildMeetingBriefPdf(meeting, references = []) {
   let page = pdf.addPage(pageSize);
   let y = 744;
   const addPage = () => { page = pdf.addPage(pageSize); y = 744; };
-  const drawLines = (value, font, size, color, indent = 0) => {
-    const maxWidth = 516 - indent;
+  const drawLines = (value, font, size, color, indent = 0, left = 48, width = 516) => {
+    const maxWidth = width - indent;
     const paragraphs = pdfPlainText(value).split('\n');
     for (const paragraph of paragraphs) {
       const words = paragraph.split(/\s+/).filter(Boolean).flatMap(word => {
@@ -7249,15 +7272,40 @@ async function buildMeetingBriefPdf(meeting, references = []) {
       if (line || !words.length) lines.push(line);
       for (const text of lines) {
         if (y < 56) addPage();
-        if (text) page.drawText(text, { x: 48 + indent, y, size, font, color, maxWidth });
+        if (text) page.drawText(text, { x: left + indent, y, size, font, color, maxWidth });
         y -= size + 5;
       }
     }
   };
   const section = (label, value) => {
     drawLines(label.toUpperCase(), bold, 9, rgb(0.04, 0.39, 0.43));
-    drawLines(value || 'Not provided', regular, 11, rgb(0.12, 0.16, 0.2), 8);
+    drawLines(value || 'Not provided', regular, 11, rgb(0.12, 0.16, 0.2));
     y -= 7;
+  };
+
+  const teal = rgb(0.04, 0.39, 0.43), ink = rgb(0.12, 0.16, 0.2), grey = rgb(0.4, 0.45, 0.5), ruleColor = rgb(0.85, 0.88, 0.9);
+  const divider = () => {
+    if (y < 80) addPage();
+    page.drawLine({ start: { x: 48, y: y + 4 }, end: { x: 564, y: y + 4 }, thickness: 0.5, color: ruleColor });
+    y -= 12;
+  };
+  // two short facts side by side
+  const facts = rows => {
+    for (const row of rows) {
+      const cells = row.filter(cell => cell && cell[1]);
+      if (!cells.length) continue;
+      if (y < 150) addPage();
+      const top = y;
+      let lowest = y;
+      cells.forEach((cell, index) => {
+        y = top;
+        const left = 48 + index * 264;
+        drawLines(cell[0].toUpperCase(), bold, 8, teal, 0, left, 246);
+        drawLines(cell[1], regular, 11, ink, 0, left, 246);
+        lowest = Math.min(lowest, y);
+      });
+      y = lowest - 4;
+    }
   };
 
   const cancelled = isMeetingCancelled(meeting);
@@ -7269,31 +7317,75 @@ async function buildMeetingBriefPdf(meeting, references = []) {
   }
   y = 724;
   drawLines(meeting.title || 'Meeting', bold, 20, rgb(0.1, 0.17, 0.21));
-  y -= 8;
-  if (meeting.project_reference) section('Project reference', meeting.project_reference);
-  if (meeting.meeting_number) section('Meeting number', meeting.meeting_number);
-  section('Meeting type', MEETING_TYPE_LABELS[meeting.meeting_type] || meeting.meeting_type);
-  section('Date and time', meeting.is_draft ? 'Not scheduled (draft)' : formatMeetingWhen(meeting));
-  if (meeting.end_at) section('End time', formatMeetingWhen({ scheduled_at: meeting.end_at, time_zone: meeting.time_zone }));
+  y -= 6;
+  divider();
+
+  const visibility = meeting.scope === 'side'
+    ? `${String(getSide(meeting.scope_value) || 'Team').replace(/^./, c => c.toUpperCase())} side only`
+    : 'All project participants';
+  facts([
+    [['Date and time', meeting.is_draft ? 'Not scheduled (draft)' : formatMeetingWhen(meeting)],
+     ['End time', meeting.end_at ? formatMeetingWhen({ scheduled_at: meeting.end_at, time_zone: meeting.time_zone }) : '']],
+    [['Meeting type', MEETING_TYPE_LABELS[meeting.meeting_type] || meeting.meeting_type], ['Meeting number', meeting.meeting_number]],
+    [['Planned by', meeting.planned_by_name], ['Visibility', visibility]],
+    [['Chairperson', meeting.chairperson], ['Minute-taker', meeting.minute_taker]],
+    [['Project reference', meeting.project_reference]],
+  ]);
   if (meeting.location || meeting.meeting_type !== 'virtual') section('Location / access details', meeting.location || '—');
   if (meeting.virtual_link) section('Virtual meeting link', meeting.virtual_link);
   if (meeting.safety_notes) section('Site access / safety notes', meeting.safety_notes);
-  section('Visibility', meeting.scope === 'side'
-    ? `${String(getSide(meeting.scope_value) || 'Team').replace(/^./, c => c.toUpperCase())} side only`
-    : 'All project participants');
-  if (meeting.planned_by_name) section('Planned by', meeting.planned_by_name);
-  if (meeting.chairperson) section('Chairperson', meeting.chairperson);
-  if (meeting.minute_taker) section('Minute-taker', meeting.minute_taker);
+  divider();
   section('Purpose', meetingHtmlToPlainText(meeting.purpose));
-  const selected = Array.isArray(meeting.participant_details) && meeting.participant_details.length
-    ? meeting.participant_details.map(person => `${person.name || 'Project participant'}${person.email ? ` <${person.email}>` : ''} (${{ required: 'required', optional: 'optional', information: 'for information' }[person.attendance_type] || 'required'})`).join('\n')
-    : meeting.participants;
-  section('Participants', selected);
-  const agendaText = Array.isArray(meeting.agenda_items) && meeting.agenda_items.length
-    ? meeting.agenda_items.map((item, index) => `${index + 1}. ${item.title} — ${item.duration_minutes} min${item.presenter ? ` · ${item.presenter}` : ''}\n${meetingHtmlToPlainText(item.details)}`).join('\n')
-    : meetingHtmlToPlainText(meeting.agenda);
-  section('Agenda', agendaText);
-  if (references.length) section('Attachments / references', references.map(file => file.name).join('\n'));
+  divider();
+
+  // participants grouped by side, leader first
+  const people = arrangeMeetingParticipants(meeting.participant_details);
+  const attendanceText = { required: 'Required', optional: 'Optional', information: 'For information' };
+  if (people.length) {
+    if (y < 150) addPage();
+    drawLines(`PARTICIPANTS (${people.length})`, bold, 9, teal);
+    y -= 4;
+    const groups = [];
+    for (const person of people) {
+      const key = person.side || 'external';
+      let group = groups.find(g => g.key === key);
+      if (!group) { group = { key, list: [] }; groups.push(group); }
+      group.list.push(person);
+    }
+    for (const group of groups) {
+      if (y < 130) addPage();
+      drawLines(`${group.key === 'external' ? 'External guests' : MEETING_SIDE_LABELS[group.key]}  (${group.list.length})`, bold, 10, ink);
+      for (const person of group.list) {
+        if (y < 90) addPage();
+        drawLines(person.name || 'Project participant', regular, 11, ink, 10);
+        drawLines([person.email, attendanceText[person.attendance_type] || 'Required'].filter(Boolean).join('  |  '), regular, 9, grey, 10);
+        y -= 2;
+      }
+      y -= 4;
+    }
+  } else if (meeting.participants) section('Participants', meeting.participants);
+  divider();
+
+  // agenda, without repeating the title as its details
+  const agendaItems = Array.isArray(meeting.agenda_items) ? meeting.agenda_items : [];
+  if (agendaItems.length) {
+    if (y < 150) addPage();
+    drawLines('AGENDA', bold, 9, teal);
+    y -= 4;
+    agendaItems.forEach((item, index) => {
+      if (y < 100) addPage();
+      drawLines(`${index + 1}. ${item.title || 'Agenda item'}`, bold, 11, ink);
+      const meta = [item.duration_minutes ? `${item.duration_minutes} min` : '', item.presenter ? `Presenter: ${item.presenter}` : ''].filter(Boolean).join('  |  ');
+      if (meta) drawLines(meta, regular, 9, grey, 14);
+      const details = meetingHtmlToPlainText(item.details).trim();
+      if (details && details.toLowerCase() !== String(item.title || '').trim().toLowerCase()) drawLines(details, regular, 10, ink, 14);
+      y -= 4;
+    });
+  } else section('Agenda', meetingHtmlToPlainText(meeting.agenda));
+  if (references.length) {
+    divider();
+    section('Attachments / references', references.map(file => `- ${file.name}`).join('\n'));
+  }
 
   const generated = new Date().toISOString().slice(0, 10);
   pdf.getPages().forEach(pg => {
@@ -7358,6 +7450,7 @@ app.get('/api/meetings', authenticateToken, async (req, res) => {
       ORDER BY m.is_draft DESC, COALESCE(m.scheduled_at, m.date_time::timestamptz) ${view==='scheduled'?'ASC':'DESC'}
       LIMIT $${params.length - 1} OFFSET $${params.length}
     `, params);
+    rows.forEach(row => { row.participant_details = arrangeMeetingParticipants(row.participant_details); });
     rows.forEach(row => {
       if (isMeetingPlannerRow(row, req.user)) return;
       row.rsvps = (row.rsvps || []).filter(r => r.participant_source === 'project'
