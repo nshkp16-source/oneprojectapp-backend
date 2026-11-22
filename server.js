@@ -10612,7 +10612,7 @@ function readDocStampRequest(body) {
 
 // Draws the signer's stamp on a PDF. Identity comes from the database, never from the browser.
 async function stampDocumentBuffer(req, projectId, buffer, request) {
-  if (buffer.subarray(0, 5).toString('latin1') !== '%PDF-') throw new DocFlowError(400, 'Only PDF documents can be signed with a stamp.');
+  if (buffer.subarray(0, 5).toString('latin1') !== '%PDF-') throw new DocFlowError(400, 'Only PDF documents can be stamped.');
   const profile = await loadSignerProfile(projectId, req.user.role, req.user.user_id);
   if (!profile) throw new DocFlowError(400, 'You have not set up a signature or stamp for this project. Open your Signature & Stamp setup, save it, then try again.');
   const tz = await loadProjectTz(projectId);
@@ -10631,7 +10631,7 @@ async function registerDocumentStamp(projectId, docId, req, stamped) {
 }
 
 async function fetchDocumentBytes(url) {
-  if (!url) throw new DocFlowError(400, 'This document has no file to sign.');
+  if (!url) throw new DocFlowError(400, 'This document has no file to stamp.');
   const r = await fetch(url, { redirect: 'follow' });
   if (!r.ok) throw new DocFlowError(502, 'The document file could not be reached. Try again in a moment.');
   return Buffer.from(await r.arrayBuffer());
@@ -10855,7 +10855,7 @@ app.post('/api/document-approval/create', authenticateToken, docUploadFields, re
       return res.status(403).json({ error: 'You are not a member of this project.' });
     cleanFolderName(doc_type);   // rejects the reserved name early
     const stampReq = readDocStampRequest(req.body);
-    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
+    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to place it.');
     let buffer = req.file ? req.file.buffer : null;
     let stamped = null;
     if (stampReq) { stamped = await stampDocumentBuffer(req, projectId, buffer, stampReq); buffer = stamped.bytes; }
@@ -10876,7 +10876,7 @@ app.post('/api/document-approval/create', authenticateToken, docUploadFields, re
       supporting.push({ name: f.originalname, url: up2.url, id: up2.id, size: f.size, mime: f.mimetype });
     }
     const isLeader = getSide(req.user.role) !== null;
-    // The database only allows 'draft','pending_approval','approved','rejected'. 'approved' is shown to users as "Signed".
+    // The database only allows 'draft','pending_approval','approved','rejected'. 'approved' is shown to users as "Approved", or "Approved and stamped" when the leader also put a stamp on the file.
     const approvalStatus = toDraft ? 'draft' : (isLeader ? 'approved' : 'pending_approval');
     const creatorName = await resolveSignerNameForStamp(projectId, req.user.user_id, req.user.role).catch(() => null);
     const cols = ['project_id','title','description','category','file_name','file_id','file_url','creator_id','creator_role','creator_name','side','approval_status'];
@@ -10896,7 +10896,7 @@ app.post('/api/document-approval/create', authenticateToken, docUploadFields, re
     await markDocRead(newId, req);
     const fresh = { id: newId, project_id: projectId, title, doc_number: number, side, creator_id: req.user.user_id, creator_role: req.user.role };
     if (toDraft) await logDocEvent(newId, projectId, req, 'draft_saved', null);
-    else if (isLeader) await logDocEvent(newId, projectId, req, 'created_signed', `Filed in ${doc_type}${number ? ` as ${number}` : ''}`);
+    else if (isLeader) await logDocEvent(newId, projectId, req, stamped ? 'created_stamped' : 'created_approved', `Filed in ${doc_type}${number ? ` as ${number}` : ''}`);
     else {
       await logDocEvent(newId, projectId, req, 'submitted', `Sent to the ${doc_type} folder${number ? ` as ${number}` : ''}`);
       docNotify(req, fresh, { to: ['leaders'], entityType: 'document_approval', subject: 'Document waiting for your review',
@@ -10931,7 +10931,7 @@ app.put('/api/document-approval/:id/resubmit', authenticateToken, upload.single(
     if (rows[0].approval_status !== 'rejected') return res.status(400).json({ error: 'Only rejected documents can be resubmitted.' });
     let fileUrl = null; let fileName = null; let fileId = null;
     const stampReq = readDocStampRequest(req.body);
-    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
+    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to place it.');
     let stamped = null, newBuffer = req.file ? req.file.buffer : null;
     if (stampReq) { stamped = await stampDocumentBuffer(req, projectId, newBuffer, stampReq); newBuffer = stamped.bytes; }
     if (newBuffer) {
@@ -10978,6 +10978,7 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
     if (!access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can review documents.' });
     if (doc.approval_status !== 'pending_approval') return res.status(400).json({ error: 'This document is not waiting for review.' });
     const reason = String(comment || '').trim();
+    let stampedNow = false;   // the leader approved AND put a stamp on the file
     if (action === 'rejected') {
       if (reason.length < 3) throw new DocFlowError(400, 'Write the reason, so the submitter knows what to correct.');
       await pool.query(`UPDATE documents SET approval_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2`, [reason, docId]);
@@ -10986,6 +10987,7 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
       let stamped = null, fileSet = '';
       const params = [req.user.user_id, req.user.role, null, null, docId];
       if (stampReq) {
+        stampedNow = true;
         const bytes = await fetchDocumentBytes(doc.file_url);
         stamped = await stampDocumentBuffer(req, projectId, bytes, stampReq);
         const up = await uploadDocumentFile(stamped.bytes, doc.file_name || 'document.pdf', 'documents');
@@ -10999,14 +11001,15 @@ app.post('/api/document-approval/:id/review', authenticateToken, async (req, res
       if (stamped) await registerDocumentStamp(projectId, docId, req, stamped);
     }
     await pool.query(`INSERT INTO document_approval_notes(document_id, note_text, created_by_id, created_by_role, is_visible_to_creator) VALUES($1,$2,$3,$4,$5)`,
-      [docId, reason || (action === 'approved' ? 'Signed' : 'Returned'), req.user.user_id, req.user.role, true]);
+      [docId, reason || (action === 'approved' ? (stampedNow ? 'Approved and stamped' : 'Approved') : 'Returned'), req.user.user_id, req.user.role, true]);
     await markDocRead(docId, req);
     { const d = (await pool.query('SELECT id, project_id, title, doc_number, side, creator_id, creator_role FROM documents WHERE id=$1', [docId])).rows[0];
       if (d) {
-        const signed = req.body.action === 'approved';
-        await logDocEvent(docId, projectId, req, signed ? 'signed' : 'returned', signed ? null : String(req.body.comment || '').slice(0, 300));
-        docNotify(req, d, { to: ['submitter'], entityType: 'document_approval', subject: signed ? 'Your document was signed' : 'Your document was returned',
-          message: signed ? `${docLabel(d)} was signed by your leader.` : `${docLabel(d)} was returned to you. Reason: ${String(req.body.comment || 'not written').slice(0, 200)}` });
+        const approved = req.body.action === 'approved';
+        await logDocEvent(docId, projectId, req, approved ? (stampedNow ? 'approved_stamped' : 'approved') : 'returned', approved ? null : String(req.body.comment || '').slice(0, 300));
+        docNotify(req, d, { to: ['submitter'], entityType: 'document_approval',
+          subject: approved ? (stampedNow ? 'Your document was approved and stamped' : 'Your document was approved') : 'Your document was returned',
+          message: approved ? `${docLabel(d)} was ${stampedNow ? 'approved and stamped' : 'approved'} by your leader.` : `${docLabel(d)} was returned to you. Reason: ${String(req.body.comment || 'not written').slice(0, 200)}` });
       } }
     return res.json({ success: true });
   } catch (err) {
@@ -11024,7 +11027,7 @@ app.post('/api/document-approval/:id/share', authenticateToken, async (req, res)
   try {
     const { rows } = await pool.query('SELECT * FROM documents WHERE id=$1 AND project_id=$2', [docId, projectId]);
     if (!rows.length) return res.status(404).json({ error: 'Document not found' });
-    if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Sign the document before sharing it.' });
+    if (rows[0].approval_status !== 'approved') return res.status(400).json({ error: 'Approve the document before sharing it.' });
     if (rows[0].cr_status && rows[0].cr_status !== 'shared') return res.status(400).json({ error: 'This document is under correction and cannot be shared again.' });
     const access = await documentAccess(req, rows[0], projectId);
     if (!access.isLeader) return res.status(403).json({ error: 'Only the leader of this side can share documents.' });
@@ -11181,7 +11184,7 @@ app.post('/api/control-reports/create', authenticateToken, docUploadFields, requ
     const userSide = getSide(req.user.role);
     if (!userSide) return res.status(403).json({ error: 'Only side leaders can add control & report records' });
     const stampReq = readDocStampRequest(req.body);
-    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to sign it.');
+    if (stampReq && !req.file) throw new DocFlowError(400, 'Attach a PDF first, then choose where to place it.');
     let buffer = req.file ? req.file.buffer : null, stamped = null;
     if (stampReq) { stamped = await stampDocumentBuffer(req, projectId, buffer, stampReq); buffer = stamped.bytes; }
     let fileUrl = null, fileName = null, fileId = null;
@@ -11497,7 +11500,7 @@ app.post('/api/control-reports/:id/replace', authenticateToken, upload.single('f
     }
     await markDocRead(req.params.id, req);
     await logDocEvent(req.params.id, projectId, req, 'file_replaced', String(req.body.mode) === 'replace' ? 'Replaced the first file completely' : 'Uploaded as a new revision');
-    docNotify(req, got.doc, { to: ['leaders'], entityType: 'control_reports', subject: 'Corrected file uploaded', message: `A corrected file for ${docLabel(got.doc)} was uploaded and is waiting for your signature.` });
+    docNotify(req, got.doc, { to: ['leaders'], entityType: 'control_reports', subject: 'Corrected file uploaded', message: `A corrected file for ${docLabel(got.doc)} was uploaded and is waiting for your approval.` });
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/:id/replace:');
@@ -11526,8 +11529,8 @@ app.post('/api/control-reports/:id/accept', authenticateToken, requireProjectLif
     await pool.query(`UPDATE documents SET approved_by_id=$1, approved_by_role=$2, signed_by_name=$3, signer_stamp_id=$4, approval_date=NOW(), cr_status='shared', cr_reject_reason=NULL, shared_at=NOW(), updated_at=NOW()${fileSet} WHERE id=$5`, params);
     if (stamped) await registerDocumentStamp(projectId, req.params.id, req, stamped);
     await markDocRead(req.params.id, req);
-    await logDocEvent(req.params.id, projectId, req, 'accepted', 'Corrected file signed and shared again');
-    docNotify(req, got.doc, { to: ['side', 'submitter'], entityType: 'control_reports', subject: 'Document back in Control & Reports', message: `${docLabel(got.doc)} has a new signed file and is visible to the side again.` });
+    await logDocEvent(req.params.id, projectId, req, 'accepted', 'Corrected file approved and shared again');
+    docNotify(req, got.doc, { to: ['side', 'submitter'], entityType: 'control_reports', subject: 'Document back in Control & Reports', message: `${docLabel(got.doc)} has a new approved file and is visible to the side again.` });
     return res.json({ success: true });
   } catch (err) {
     return docFail(res, err, 'POST /api/control-reports/:id/accept:');
