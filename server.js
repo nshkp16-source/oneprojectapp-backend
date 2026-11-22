@@ -7624,7 +7624,7 @@ app.post('/api/meetings/:id/rsvp', express.urlencoded({ extended: false }), asyn
       );
       if (!rowCount) return res.status(404).json({ error: 'RSVP record not found.' });
       const isPlanner = isMeetingPlannerRow(meeting, req.user);
-      if (response === 'declined' && previous !== 'declined' && !isPlanner) await notifyPlannerOfDecline(meeting, person.name, note);
+      if (response === 'declined' && previous !== 'declined' && !isPlanner) await notifyPlannerOfDecline(meeting, String(person.name || '').split(' · ')[0], note);
       return res.json({ success: true, response });
     } catch (err) {
       console.error('Internal meeting RSVP failed:', err);
