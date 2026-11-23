@@ -1139,7 +1139,8 @@ async function appendSignaturePage(pdfDoc, ctx, slots, opts = {}) {
       if (slot.stampedOnDoc) {
         // Already stamped on the document itself: never draw a second stamp, just point to it.
         const sid = slot.stampedOnDoc.stampId || stampId;
-        const where = slot.stampedOnDoc.page ? `Stamp placed on page ${slot.stampedOnDoc.page} of this record` : 'Stamp already placed on this record';
+        const docWord = opts.docWord || 'this record';
+        const where = slot.stampedOnDoc.page ? `Stamp placed on page ${slot.stampedOnDoc.page} of ${docWord}` : `Stamp already placed on ${docWord}`;
         const roleLine = `${slot.position || p.position || ''}${slot.side ? ', ' + flowSideLabel(slot.side) + ' side' : ''}`;
         L.page.drawRectangle({ x, y: boxTop - 76, width: boxW, height: 76, borderColor: MUTED, borderWidth: 0.8, color: rgb(1, 1, 1) });
         const rows = [
@@ -1184,7 +1185,7 @@ async function addFlowFooters(doc, { left, fromIndex = 0 }) {
   }
 }
 
-async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots }) {
+async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots, placement = null, contentOnly = false }) {
   const out = await PDFDocument.create();
   let ownPages = 0;
   if (source === 'uploaded') {
@@ -1196,7 +1197,26 @@ async function composeNoticePdf({ source, uploadedBytes, ctx, queries, slots }) 
   } else {
     await drawGeneratedLetter(out, ctx, queries);
   }
-  await appendSignaturePage(out, ctx, slots);
+  // Content only: the pages the leader can place a stamp on (the signature page is added after them).
+  if (contentOnly) return Buffer.from(await out.save());
+  // Copies, so a stamp placed on the notice is never mistaken for a stamp placed on the record.
+  slots = slots.map(sl => ({ ...sl }));
+  if (placement) {
+    const decider = slots.find(sl => sl.isDecider);
+    if (decider?.profile) {
+      if (!(placement.page >= 1 && placement.page <= out.getPageCount())) {
+        const e = new Error('The stamp position on the notice is no longer valid because the notice changed. Choose the position again.');
+        e.code = 'NOTICE_PLACEMENT';
+        throw e;
+      }
+      const stampId = decisionStampId(ctx, decider);
+      const spec = stampSpecFromProfile({ ...decider.profile, position: decider.position || decider.profile.position, side: decider.side || decider.profile.side },
+        { label: ctx.decisionWord || 'APPROVED', signedAt: decider.signed_at, tz: ctx.tz, stampId, baseUrl: ctx.baseUrl });
+      await drawStampOnPage(out, out.getPage(placement.page - 1), spec, { xRatio: placement.x, yRatio: placement.y, scale: placement.scale });
+      decider.stampedOnDoc = { page: placement.page, stampId };
+    }
+  }
+  await appendSignaturePage(out, ctx, slots, { docWord: 'this notice' });
   await addFlowFooters(out, { left: `${ctx.projectName}  |  ${ctx.recordRef}  |  ${ctx.kindTitle}`, fromIndex: ownPages });   // never over the leader's own pages
   return Buffer.from(await out.save());
 }
@@ -4286,7 +4306,7 @@ app.get('/api/signer-candidates', authenticateToken, async (req, res) => {
 });
 
 // ── Everything a decision needs, checked before anything is uploaded ────────
-async function prepareDecision(req, { preview }) {
+async function prepareDecision(req, { preview, noticeOnly = false }) {
   const fail = (status, message) => ({ fail: { status, message } });
   const { user_id: userId, role } = req.user;
   const projectId = Number(req.body.projectId);
@@ -4416,7 +4436,22 @@ async function prepareDecision(req, { preview }) {
     kindTitle: FLOW_NOTICE_TITLE[kind], decisionWord: FLOW_DECISION_WORD[decision], fingerprint,
   };
   const noticeSlots = slots.filter(sl => sl.isDecider);   // the notice carries the leader's signature and stamp only
-  const noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots: noticeSlots });
+  let noticePlacementIn = null;   // where the leader chose to stamp the notice itself (optional; default is the signature page)
+  if (req.body.noticeStampPlacement) {
+    try {
+      const sp = JSON.parse(String(req.body.noticeStampPlacement));
+      const pg = parseInt(sp.page, 10), px = Number(sp.x), py = Number(sp.y);
+      if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) noticePlacementIn = { page: pg, x: px, y: py, scale: clampStampScale(sp.scale) };
+    } catch (_) { /* ignore a malformed placement: the signature page still carries the stamp */ }
+  }
+  let noticeBytes;
+  try {
+    noticeBytes = await composeNoticePdf({ source, uploadedBytes: noticeFile?.buffer, ctx, queries, slots: noticeSlots, placement: noticePlacementIn, contentOnly: noticeOnly });
+  } catch (noticeErr) {
+    if (noticeErr.code === 'NOTICE_PLACEMENT') return fail(400, noticeErr.message);
+    throw noticeErr;
+  }
+  if (noticeOnly) return { data: { noticeBytes } };   // used to pick the stamp position on the notice
   let recordBytes = null, recordStampPlacement = null;
   let placementIn = null;   // where the approver chose to stamp the record (optional)
   if (req.body.stampPlacement) {
@@ -4467,9 +4502,15 @@ app.get('/api/signing-readiness', authenticateToken, async (req, res) => {
 
 app.post('/api/decision-preview', authenticateToken, decisionUpload, async (req, res) => {
   try {
-    const r = await prepareDecision(req, { preview: true });
+    const noticeOnly = req.body.part === 'notice';
+    const r = await prepareDecision(req, { preview: true, noticeOnly });
     if (r.fail) return res.status(r.fail.status).json({ success: false, message: r.fail.message });
     const d = r.data;
+    if (noticeOnly) {
+      res.set('Content-Type', 'application/pdf');
+      res.set('Content-Disposition', 'inline; filename="notice-pages.pdf"');
+      return res.send(d.noticeBytes);
+    }
     const bundle = await buildDecisionBundle({ rec: d.state.rec, noticeBytes: d.noticeBytes, noticeLabel: FLOW_NOTICE_TITLE[d.kind].split(' (')[0], recordBytes: d.recordBytes, tz: d.tz });
     res.set('Content-Type', 'application/pdf');
     res.set('Content-Disposition', 'inline; filename="decision-preview.pdf"');
@@ -6617,7 +6658,7 @@ app.post('/api/stamp-preview', authenticateToken, photoUpload.fields([{ name: 'm
     else if (typeof req.body.markDataUrl === 'string' && /^data:image\/(png|jpeg);base64,/i.test(req.body.markDataUrl)) markSource = req.body.markDataUrl;
     else markSource = pickMark(saved);
     const wanted = String(req.body.label || 'APPROVED').toUpperCase();
-    const label = ['SIGNED', 'APPROVED', 'RECEIVED'].includes(wanted) ? wanted : 'APPROVED';
+    const label = ['SIGNED', 'APPROVED', 'ACCEPTED', 'REJECTED', 'RECEIVED'].includes(wanted) ? wanted : 'APPROVED';
     const tz = await loadProjectTz(projectId);
     const spec = stampSpecFromProfile(
       { name: saved?.name || name || 'Your Name', company: company || null, position: ps?.position || null, side: ps?.side || null, mark_type: req.body.markType || saved?.mark_type, signature_image: markSource, stamp_image_url: null },
