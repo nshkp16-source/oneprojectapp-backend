@@ -1213,6 +1213,10 @@ async function buildRecordWithSignoff({ rec, ctx, slots, stageLabel, decisionLin
   let placement = null;
   if (placementIn) {
     const decider = slots.find(sl => sl.isDecider);
+    if (placementIn.newPage) {   // on the record's signature page (added at the end if it has none yet)
+      const sig = await ensureSignaturePage(doc, placementIn.auto === true);
+      placementIn = { ...placementIn, page: sig.pageNumber, ...(placementIn.auto === true ? { x: 0.5, y: sigSlotY(sig.slot) } : {}) };
+    }
     placement = await drawRecordDecisionStamp(doc, { word: 'RECEIVED', slot: decider, ctx, at: placementIn });
     if (!ctx.preview && decider) {
       await registerStamp(pool, { stampId: receptionStampId(ctx, decider), projectId: ctx.projectId, table: ctx.table, recordId: rec.id, kind: 'reception',
@@ -4418,8 +4422,9 @@ async function prepareDecision(req, { preview }) {
   if (req.body.stampPlacement) {
     try {
       const sp = JSON.parse(String(req.body.stampPlacement));
-      const pg = parseInt(sp.page, 10), px = Number(sp.x), py = Number(sp.y);
-      if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) placementIn = { page: pg, x: px, y: py, scale: clampStampScale(sp.scale) };
+      const wantsNewPage = sp.newPage === true;
+      const pg = wantsNewPage ? 1 : parseInt(sp.page, 10), px = Number(sp.x), py = Number(sp.y);
+      if (pg >= 1 && px >= 0 && px <= 1 && py >= 0 && py <= 1) placementIn = { page: pg, x: px, y: py, scale: clampStampScale(sp.scale), newPage: wantsNewPage, auto: sp.auto === true };
     } catch (_) { /* ignore a malformed placement: the sign-off page still carries the signatures */ }
   }
   if (decision !== 'rejected' || placementIn) {
@@ -4650,19 +4655,35 @@ app.post('/api/issue-decision', authenticateToken, decisionUpload, requireProjec
 // The first signer who asks for it adds the page and the PDF remembers which page it is (in its keywords),
 // so every later signer is placed on that same page instead of getting another one.
 const SIGNATURE_PAGE_KEY = 'oneproject-sigpage';
-async function ensureSignaturePage(pdf) {
+// Keyword token: oneproject-sigpage:<page>:<signatures placed so far>
+const SIG_PAGE_RE = new RegExp(`\\s*${SIGNATURE_PAGE_KEY}:(\\d+)(?::(\\d+))?`);
+// Where the next automatic signature goes on the signature page: one under the other, from the top
+const sigSlotY = (slot) => Math.max(0.1, 0.85 - (slot % 6) * 0.15);
+// takeSlot: the caller wants the next free spot on the page (returned as slot); false: it only needs the page.
+async function ensureSignaturePage(pdf, takeSlot = false) {
   const keywords = String(pdf.getKeywords() || '');
-  const found = new RegExp(`${SIGNATURE_PAGE_KEY}:(\\d+)`).exec(keywords);
-  if (found && Number(found[1]) >= 1 && Number(found[1]) <= pdf.getPageCount()) return { pageNumber: Number(found[1]), added: false };
-  const pages = pdf.getPages();
-  const { width, height } = pages[pages.length - 1].getSize();   // same size as the last page
-  const page = pdf.addPage([width, height]);
-  const font = await pdf.embedFont(StandardFonts.HelveticaBold);
-  const label = 'SIGNATURES';
-  page.drawText(label, { x: (width - font.widthOfTextAtSize(label, 14)) / 2, y: height - 42, size: 14, font, color: rgb(0.58, 0.64, 0.72) });
-  const pageNumber = pdf.getPageCount();
-  pdf.setKeywords([keywords.trim(), `${SIGNATURE_PAGE_KEY}:${pageNumber}`].filter(Boolean));
-  return { pageNumber, added: true };
+  const found = SIG_PAGE_RE.exec(keywords);
+  let pageNumber = found ? Number(found[1]) : 0;
+  let used = found ? Number(found[2] || 0) : 0;
+  let added = false;
+  if (!(pageNumber >= 1 && pageNumber <= pdf.getPageCount())) {
+    const pages = pdf.getPages();
+    const { width, height } = pages[pages.length - 1].getSize();   // same size as the last page
+    const page = pdf.addPage([width, height]);
+    const font = await pdf.embedFont(StandardFonts.HelveticaBold);
+    const label = 'SIGNATURES';
+    page.drawText(label, { x: (width - font.widthOfTextAtSize(label, 14)) / 2, y: height - 42, size: 14, font, color: rgb(0.58, 0.64, 0.72) });
+    pageNumber = pdf.getPageCount();
+    used = 0;
+    added = true;
+  }
+  const slot = used;
+  if (takeSlot) used += 1;
+  if (added || takeSlot) {
+    const others = keywords.replace(SIG_PAGE_RE, '').trim();
+    pdf.setKeywords([others, `${SIGNATURE_PAGE_KEY}:${pageNumber}:${used}`].filter(Boolean));
+  }
+  return { pageNumber, added, slot, changed: added || takeSlot };
 }
 
 app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite, async (req, res) => {
@@ -4760,11 +4781,12 @@ app.post('/api/record-signoff', authenticateToken, requireProjectLifecycleWrite,
       try {
         const asObject = typeof placementInput === 'string' ? JSON.parse(placementInput) : placementInput;
         if (asObject && asObject.newPage === true) {   // "put it on a new signature page"
-          const sig = await ensureSignaturePage(pdf);
-          if (sig.added) recordBytes = Buffer.from(await pdf.save());
+          const sig = await ensureSignaturePage(pdf, asObject.auto === true);
+          if (sig.changed) recordBytes = Buffer.from(await pdf.save());
           pageCount = pdf.getPageCount();
           const adjusted = { ...asObject, page: sig.pageNumber };
-          delete adjusted.newPage;
+          if (asObject.auto === true) { adjusted.x = 0.5; adjusted.y = sigSlotY(sig.slot); }
+          delete adjusted.newPage; delete adjusted.auto;
           placementInput = typeof req.body.stampPlacement === 'string' ? JSON.stringify(adjusted) : adjusted;
         }
       } catch (pageError) {
@@ -10640,13 +10662,14 @@ const docFail = (res, err, label) => {
 // Reads the optional "sign this document" request. Returns null when the user did not ask for a stamp.
 function readDocStampRequest(body) {
   if (String(body?.applyStamp) !== 'true') return null;
+  const newPage = String(body.stampNewPage) === 'true';   // "put it on a new signature page at the end"
   const raw = String(body.stampPage ?? '1');
-  const page = raw === 'append' ? 'append' : Number.parseInt(raw, 10);
+  const page = newPage ? 1 : (raw === 'append' ? 'append' : Number.parseInt(raw, 10));
   const x = Number.parseFloat(body.stampX), y = Number.parseFloat(body.stampY);
   if ((page !== 'append' && (!Number.isInteger(page) || page < 1)) || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) {
     throw new DocFlowError(400, 'Choose where the stamp goes on the page first.');
   }
-  return { page, x, y, scale: clampStampScale(body.stampScale) };
+  return { page, x, y, scale: clampStampScale(body.stampScale), newPage };
 }
 
 // Draws the signer's stamp on a PDF. Identity comes from the database, never from the browser.
@@ -10659,7 +10682,14 @@ async function stampDocumentBuffer(req, projectId, buffer, request) {
   const stampId = deriveStampId({ k: 'document', p: projectId, u: req.user.user_id, r: req.user.role, ts: Date.now(), h: hash, n: crypto.randomBytes(4).toString('hex') });
   const signedAt = new Date();
   const spec = stampSpecFromProfile(profile, { label: 'SIGNED', signedAt, tz, stampId, baseUrl: publicBaseUrl(req) });
-  const stamped = await stampPdfBuffer(buffer, spec, request);
+  let toStamp = buffer, placement = request;
+  if (request.newPage) {
+    const pdf = await PDFDocument.load(buffer, { ignoreEncryption: true });
+    const sig = await ensureSignaturePage(pdf);
+    if (sig.changed) toStamp = Buffer.from(await pdf.save());
+    placement = { page: sig.pageNumber, x: request.x, y: request.y, scale: request.scale };
+  }
+  const stamped = await stampPdfBuffer(toStamp, spec, placement);
   return { bytes: stamped.bytes, stampId, signedAt, profile, tz };
 }
 
