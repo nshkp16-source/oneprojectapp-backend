@@ -6017,10 +6017,11 @@ app.post('/api/review-record', authenticateToken, upload.single('attachment'), r
   const isWorkflow = workflowActions.includes(action);
   const isDecisionMakerActor = isDecisionMaker(reviewerRole) && actorType !== 'team_member';
   if (!isWorkflow && action !== 'no_action') return res.status(400).json({ error: 'Invalid action.' });
-  if (isWorkflow && !isDecisionMaker(reviewerRole) && actorType !== 'team_member') return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
-  if (isWorkflow && isDecisionMakerActor) return res.status(400).json({ error: 'A decision is issued together with a signed notice. Use the review and sign form.' });
   // Only a real team member can act as one. The role comes from the login token, never from the request.
   if (actorType === 'team_member' && normalizeRole(reviewerRole) !== 'TeamMember') return res.status(403).json({ error: 'Only team members can act as team members.' });
+  if (isWorkflow && actorType === 'team_member') return res.status(403).json({ error: 'Team members cannot approve, accept, or reject records. Named signers must use the review and sign form.' });
+  if (isWorkflow && !isDecisionMaker(reviewerRole)) return res.status(403).json({ error: 'Only decision makers can run workflow actions.' });
+  if (isWorkflow && isDecisionMakerActor) return res.status(400).json({ error: 'A decision is issued together with a signed notice. Use the review and sign form.' });
   try {
     if (!await userHasProjectAccess(reviewerId, reviewerRole, projectId)) return res.status(403).json({ error: 'You are not assigned to this project.' });
     const { rows: recRows } = await pool.query(`SELECT id, role, uploaded_by, file_path, attachment_id, stamp_status, stamp_type FROM ${table} WHERE id=$1 AND project_id=$2`, [recordId, projectId]);
