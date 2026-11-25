@@ -1,4 +1,4 @@
-// Needs a THROWAWAY PostgreSQL database with the base schema and migrations through 2026-11-07-work-center-task-card.sql.
+// Needs a THROWAWAY PostgreSQL database with the base schema and migrations through 2026-11-25-wc-progress-review.sql.
 // It inserts fixtures, so never point it at real data.
 // Run:  TEST_DATABASE_URL=postgres://user:pass@localhost/scratch node --test reportRoutes.test.js
 // Needs the packages express, pg and multer (npm i -D express pg multer).
@@ -56,6 +56,7 @@ before(async () => {
 after(async () => { server.close(); await pool.end(); });
 
 let act, tA, tB, rA, rB;
+let lifecycleTask;
 
 test('fixture: quantity activity with two tasks', async () => {
   const r = await call('POST', '/api/planning-execution/create-with-tasks', leader, { ...common, title: 'Excavation', activity_type: 'quantity', planned_quantity: 400, unit: 'm3',
@@ -163,6 +164,152 @@ test('report delay days are calculated from report date and planned task end dat
   });
   assert.equal(memberView.status, 200);
   assert.equal((await memberView.json()).entries[0].schedule_delay_days, 1);
+});
+
+test('report edit and delete enforce reporter ownership, summary history, status rules, and file cleanup', async () => {
+  const [task] = await q(`
+    INSERT INTO workspace_work_center
+      (project_id, title, description, assigned_members, priority, status, start_date, end_date,
+       creator_id, creator_role, side, activity_id, activity_type, target_quantity, standalone_unit, weight_pct)
+    VALUES (1,'Report lifecycle task','', '[{"id":101}]'::jsonb, 'normal', 'ongoing',
+       '2026-03-01','2026-04-30',5,'ContractorPM','Contractor',NULL,'quantity',20,'m3',100)
+    RETURNING id`);
+  lifecycleTask = task.id;
+  const created = await report(m(101), {
+    taskId: lifecycleTask, reportDate: '2026-03-10', quantityDone: 1,
+    workDone: 'Old private work description', idempotencyKey: 'lifecycle-pending',
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const pendingId = created.body.entry.id;
+  const patchPath = `/api/work-center-progress/${pendingId}`;
+  const deletePath = patchPath;
+  const replacement = {
+    projectId: 1, reportDate: '2026-03-11', quantityDone: 2,
+    workDone: 'Replacement private work description', manpower: '4 workers',
+    resources: '[]', photoMeta: '[]', supportingAttachmentMetadata: '',
+  };
+  assert.equal((await call('PATCH', patchPath, m(102), replacement)).status, 403);
+  assert.equal((await call('PATCH', patchPath, leader, replacement)).status, 403);
+  assert.equal((await call('DELETE', deletePath, m(102), { projectId: 1 })).status, 403);
+  assert.equal((await call('DELETE', deletePath, leader, { projectId: 1 })).status, 403);
+
+  const editedPending = await call('PATCH', patchPath, m(101), replacement);
+  assert.equal(editedPending.status, 200, JSON.stringify(editedPending.body));
+  assert.equal(editedPending.body.entry.validation_status, 'pending');
+  assert.equal(editedPending.body.entry.work_done, replacement.workDone);
+  let history = (await q(
+    `SELECT action, detail FROM work_center_task_history WHERE task_id=$1 AND action='report_edited' ORDER BY id`,
+    [lifecycleTask])).map((item) => item.detail);
+  assert.equal(history.length, 1);
+  assert.equal(history[0].wasStatus, 'pending');
+  assert.match(history[0].summary, /2 m3 on 11 Mar, pending/);
+  assert.doesNotMatch(JSON.stringify(history[0]), /Old private work description|Replacement private work description/);
+
+  const rejected = await decide(leader, pendingId, 'rejected', 'Photos did not show the full trench.');
+  assert.equal(rejected.status, 200, JSON.stringify(rejected.body));
+  const resubmitted = await call('PATCH', patchPath, m(101), {
+    ...replacement, reportDate: '2026-03-12', quantityDone: 3, workDone: 'Corrected report content',
+  });
+  assert.equal(resubmitted.status, 200, JSON.stringify(resubmitted.body));
+  assert.equal(resubmitted.body.entry.validation_status, 'pending');
+  assert.equal(resubmitted.body.entry.validation_notes, null);
+  history = (await q(
+    `SELECT detail FROM work_center_task_history WHERE task_id=$1 AND action='report_edited' ORDER BY id`,
+    [lifecycleTask])).map((item) => item.detail);
+  assert.equal(history[1].wasStatus, 'rejected');
+  assert.match(history[1].summary, /rejected: Photos did not show the full trench/);
+  assert.doesNotMatch(JSON.stringify(history[1]), /Corrected report content|Old private work description/);
+  assert.match(notes.at(-1).message, /resubmitted report.*waiting for validation/);
+
+  const removedPending = await call('DELETE', deletePath, m(101), { projectId: 1 });
+  assert.equal(removedPending.status, 200, JSON.stringify(removedPending.body));
+  assert.equal((await q(`SELECT COUNT(*)::int n FROM workspace_work_center_progress WHERE id=$1`, [pendingId]))[0].n, 0);
+
+  const rejectedReport = await report(m(101), {
+    taskId: lifecycleTask, reportDate: '2026-03-13', quantityDone: 1, workDone: 'Remove this version',
+    idempotencyKey: 'lifecycle-rejected-delete',
+  });
+  assert.equal(rejectedReport.status, 201, JSON.stringify(rejectedReport.body));
+  const rejectedId = rejectedReport.body.entry.id;
+  assert.equal((await decide(leader, rejectedId, 'rejected', 'Wrong measurement.')).status, 200);
+  await q(`UPDATE workspace_work_center_progress
+           SET attachment_name='private-name.pdf', attachment_id='removed-legacy-file',
+               attachment_url='https://files.test/private-name.pdf', attachment_resource_type='raw'
+           WHERE id=$1`, [rejectedId]);
+  await q(`INSERT INTO work_center_report_photos
+             (report_id, project_id, seq, file_name, file_id, file_url, resource_type)
+           VALUES ($1,1,1,'private-photo.jpg','removed-photo-file','https://files.test/private-photo.jpg','image')`,
+    [rejectedId]);
+  await q(`INSERT INTO work_center_report_attachments
+             (report_id, project_id, file_name, file_id, file_url, attachment_type, resource_type)
+           VALUES ($1,1,'private-support.pdf','removed-support-file','https://files.test/private-support.pdf','site_photos','raw')`,
+    [rejectedId]);
+  const destroyed = [];
+  deps.cloudinary = { uploader: { destroy: async (id, options) => {
+    destroyed.push([id, options.resource_type]); return { result: 'ok' };
+  } } };
+  const removedRejected = await call('DELETE', `/api/work-center-progress/${rejectedId}`, m(101), { projectId: 1 });
+  assert.equal(removedRejected.status, 200, JSON.stringify(removedRejected.body));
+  assert.deepEqual(destroyed.sort((a, b) => a[0].localeCompare(b[0])), [
+    ['removed-legacy-file', 'raw'], ['removed-photo-file', 'image'], ['removed-support-file', 'raw'],
+  ]);
+  const deletion = (await q(
+    `SELECT detail FROM work_center_task_history WHERE task_id=$1 AND action='report_deleted'`,
+    [lifecycleTask])).at(-1).detail;
+  assert.equal(deletion.wasStatus, 'rejected');
+  assert.match(deletion.summary, /rejected: Wrong measurement/);
+  assert.doesNotMatch(JSON.stringify(deletion), /private-name|private-photo|private-support|Remove this version/);
+
+  const locked = await report(m(101), {
+    taskId: lifecycleTask, reportDate: '2026-03-14', quantityDone: 1, workDone: 'Locked report',
+    idempotencyKey: 'lifecycle-locked',
+  });
+  const lockedId = locked.body.entry.id;
+  await q(`UPDATE workspace_work_center SET status='closed' WHERE id=$1`, [lifecycleTask]);
+  assert.equal((await call('PATCH', `/api/work-center-progress/${lockedId}`, m(101), replacement)).status, 409);
+  assert.equal((await call('DELETE', `/api/work-center-progress/${lockedId}`, m(101), { projectId: 1 })).status, 409);
+  await q(`UPDATE workspace_work_center SET status='ongoing' WHERE id=$1`, [lifecycleTask]);
+  assert.equal((await decide(leader, lockedId, 'approved', 'Reviewed')).status, 200);
+  const approvedEdit = await call('PATCH', `/api/work-center-progress/${lockedId}`, m(101), replacement);
+  assert.equal(approvedEdit.status, 409);
+  assert.match(approvedEdit.body.error, /Approved reports are locked/);
+  assert.equal((await call('DELETE', `/api/work-center-progress/${lockedId}`, m(101), { projectId: 1 })).status, 409);
+  assert.equal((await decide(leader, lockedId, 'voided', 'Withdrawn')).status, 200);
+  assert.equal((await call('PATCH', `/api/work-center-progress/${lockedId}`, m(101), replacement)).status, 409);
+  assert.equal((await call('DELETE', `/api/work-center-progress/${lockedId}`, m(101), { projectId: 1 })).status, 409);
+});
+
+test('a failed report edit removes files uploaded before the failure', async () => {
+  const created = await report(m(101), {
+    taskId: lifecycleTask, reportDate: '2026-03-15', quantityDone: 1,
+    workDone: 'Current report', idempotencyKey: 'lifecycle-upload-rollback',
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const progressId = created.body.entry.id;
+  const destroyed = [];
+  let attempts = 0;
+  deps.scheduleCloudinaryUpload = async () => {
+    attempts++;
+    if (attempts === 1) return { public_id: 'temporary-report-photo', secure_url: 'https://files.test/photo.png', resource_type: 'image' };
+    throw new Error('test upload failure');
+  };
+  deps.cloudinary = { uploader: { destroy: async (id) => {
+    destroyed.push(id); return { result: 'ok' };
+  } } };
+  const form = new FormData();
+  for (const [key, value] of Object.entries({
+    projectId: '1', reportDate: '2026-03-15', quantityDone: '2', workDone: 'Changed report',
+    resources: '[]', photoMeta: '[{},{}]', keepPhotoIds: '[]', keepSupportingAttachmentIds: '[]',
+  })) form.append(key, value);
+  form.append('photos', new Blob(['one'], { type: 'image/png' }), 'one.png');
+  form.append('photos', new Blob(['two'], { type: 'image/png' }), 'two.png');
+  const response = await fetch(`${base}/api/work-center-progress/${progressId}`, {
+    method: 'PATCH', headers: { 'x-user': JSON.stringify(m(101)) }, body: form,
+  });
+  assert.equal(response.status, 500);
+  assert.deepEqual(destroyed, ['temporary-report-photo']);
+  const [stillCurrent] = await q(`SELECT work_done FROM workspace_work_center_progress WHERE id=$1`, [progressId]);
+  assert.equal(stillCurrent.work_done, 'Current report');
 });
 
 test('task card collaboration is visible to assigned members and same-side leaders only', async () => {

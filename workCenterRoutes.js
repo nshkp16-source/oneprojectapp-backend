@@ -92,6 +92,66 @@ function parseReportResources(value, assignedMembers = []) {
   });
 }
 
+function parseIdList(value, label) {
+  if (value == null || value === '') return [];
+  let rows = value;
+  if (typeof value === 'string') {
+    try { rows = JSON.parse(value); }
+    catch { throw new HttpError(400, `${label} is invalid.`); }
+  }
+  if (!Array.isArray(rows)) throw new HttpError(400, `${label} is invalid.`);
+  const ids = rows.map((id) => Number(id));
+  if (ids.some((id) => !Number.isSafeInteger(id) || id < 1))
+    throw new HttpError(400, `${label} is invalid.`);
+  return [...new Set(ids)];
+}
+
+function reportHistorySummary(report, task, reason = '') {
+  const date = DATE(report.report_date);
+  const dateText = isDate(date)
+    ? new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' })
+      .format(new Date(`${date}T00:00:00Z`))
+    : 'unknown date';
+  let figure = 'Progress report';
+  if (['quantity', 'count'].includes(task.activity_type) && report.quantity_done != null) {
+    const unit = String(task.activity_unit || '').trim();
+    const quantity = Number(report.quantity_done);
+    figure = `${Number.isFinite(quantity) ? quantity : report.quantity_done}${unit ? ` ${unit}` : ''}`;
+  } else if (task.activity_type === 'stages' && report.stage_id) {
+    figure = 'Stage progress';
+  } else if (report.progress_pct != null) {
+    figure = `${report.progress_pct}% progress`;
+  }
+  const note = String(reason || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return `${figure} on ${dateText}, ${report.validation_status}${note ? `: ${note}` : ''}.`;
+}
+
+async function destroyCloudinaryFiles(deps, files) {
+  const unique = [...new Map(files.filter((file) => file?.file_id).map((file) => [
+    `${file.file_id}|${file.resource_type || 'raw'}`,
+    { id: file.file_id, resourceType: file.resource_type || 'raw' },
+  ])).values()];
+  if (!unique.length) return [];
+  if (!deps.cloudinary?.uploader) {
+    console.error(`[report cleanup] storage unavailable for ${unique.length} removed report file(s).`);
+    return unique.map((file) => file.id);
+  }
+  const failed = [];
+  await Promise.all(unique.map(async ({ id, resourceType }) => {
+    try {
+      const result = await deps.cloudinary.uploader.destroy(id, { resource_type: resourceType });
+      if (!['ok', 'not found'].includes(result?.result)) {
+        failed.push(id);
+        console.error('[report cleanup] could not delete', id, result?.result || 'unknown result');
+      }
+    } catch (error) {
+      failed.push(id);
+      console.error('[report cleanup] could not delete', id, error.message);
+    }
+  }));
+  return failed;
+}
+
 // ── recompute ────────────────────────────────────────────────────────────────
 
 /**
@@ -307,7 +367,11 @@ function registerReportRoutes(app, deps) {
       const supportingFiles = req.files?.supporting_attachments || [];
       let supportingMetadata = [];
       if (supportingFiles.length) {
-        try { supportingMetadata = JSON.parse(b.supportingAttachmentMetadata || ''); }
+        try {
+          supportingMetadata = b.supportingAttachmentMetadata
+            ? JSON.parse(b.supportingAttachmentMetadata)
+            : supportingFiles.map(() => ({}));
+        }
         catch { throw new HttpError(400, 'Supporting attachment details are invalid.'); }
         if (!Array.isArray(supportingMetadata) || supportingMetadata.length !== supportingFiles.length)
           throw new HttpError(400, 'Supporting attachment details do not match the selected files.');
@@ -460,8 +524,9 @@ function registerReportRoutes(app, deps) {
         file = { name: attachment.originalname, id: up.public_id, url: up.secure_url };
         entry = (await client.query(
           `UPDATE workspace_work_center_progress
-           SET attachment_name=$1, attachment_id=$2, attachment_url=$3 WHERE id=$4 RETURNING *`,
-          [file.name, file.id, file.url, entry.id])).rows[0];
+           SET attachment_name=$1, attachment_id=$2, attachment_url=$3, attachment_resource_type=$4
+           WHERE id=$5 RETURNING *`,
+          [file.name, file.id, file.url, up.resource_type || 'raw', entry.id])).rows[0];
       }
 
       for (let i = 0; i < supportingFiles.length; i++) {
@@ -472,11 +537,11 @@ function registerReportRoutes(app, deps) {
         await client.query(
           `INSERT INTO work_center_report_attachments
              (report_id, project_id, file_name, file_id, file_url, mime_type,
-              attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+              attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role, resource_type)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
           [entry.id, projectId, supportingFile.originalname, up.public_id, up.secure_url,
             supportingFile.mimetype || null, metadata.attachmentType, metadata.customAttachmentType,
-            userId, role]);
+            userId, role, up.resource_type || 'raw']);
       }
 
       for (let i = 0; i < photos.length; i++) {
@@ -485,10 +550,10 @@ function registerReportRoutes(app, deps) {
         const up = await uploads.upload(photo.buffer, `report-${entry.id}-photo-${i + 1}`, 'work_center/progress');
         await client.query(
           `INSERT INTO work_center_report_photos
-             (report_id, project_id, seq, file_name, file_id, file_url, captured_at, latitude, longitude, accuracy_m)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+             (report_id, project_id, seq, file_name, file_id, file_url, captured_at, latitude, longitude, accuracy_m, resource_type)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
           [entry.id, projectId, i + 1, photo.originalname, up.public_id, up.secure_url, meta.capturedAt,
-            meta.latitude, meta.longitude, meta.accuracy]);
+            meta.latitude, meta.longitude, meta.accuracy, up.resource_type || 'raw']);
       }
       for (const resource of resources) {
         await client.query(
@@ -528,6 +593,403 @@ function registerReportRoutes(app, deps) {
       if (client) await client.query('ROLLBACK').catch(() => {});
       await uploads.discard();
       return fail(res, err, 'POST /api/work-center-progress:');
+    } finally { if (client) client.release(); }
+  });
+
+  app.patch('/api/work-center-progress/:progressId', authenticateToken,
+    reportUpload.fields([
+      { name: 'attachment', maxCount: 1 },
+      { name: 'photos', maxCount: 10 },
+      { name: 'supporting_attachments', maxCount: 20 },
+    ]),
+    requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    const uploads = createCloudinaryUploadTracker(deps);
+    try {
+      const { user_id: userId, role } = req.user;
+      if (role !== 'TeamMember') throw new HttpError(403, 'Only the original reporter can edit this report.');
+      const b = req.body || {};
+      const progressId = Number(req.params.progressId);
+      const projectId = parseInt(b.projectId, 10);
+      if (!Number.isSafeInteger(progressId) || progressId < 1 || !projectId)
+        throw new HttpError(400, 'progressId and projectId are required.');
+
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const row = (await client.query(`
+        SELECT p.*, w.id AS task_id, w.project_id, w.side, w.title AS task_title,
+               w.status AS task_status, w.activity_id, w.activity_type AS task_activity_type,
+               w.standalone_unit, w.target_quantity,
+               to_char(w.start_date, 'YYYY-MM-DD') AS task_start_date,
+               to_char(w.end_date, 'YYYY-MM-DD') AS task_end_date,
+               to_char(p.report_date, 'YYYY-MM-DD') AS report_day, w.assigned_members,
+               COALESCE(w.activity_type, pe.activity_type) AS activity_type,
+               COALESCE(w.standalone_unit, pe.unit) AS activity_unit,
+               pe.status AS activity_status
+        FROM workspace_work_center_progress p
+        JOIN workspace_work_center w ON w.id = p.task_id
+        LEFT JOIN planning_execution pe ON pe.id = w.activity_id
+        WHERE p.id = $1 AND w.project_id = $2
+        FOR UPDATE OF p, w`, [progressId, projectId])).rows[0];
+      if (!row) throw new HttpError(404, 'Progress report not found.');
+      if (Number(row.member_id) !== Number(userId) || row.member_role !== role)
+        throw new HttpError(403, 'You can edit only your own reports.');
+      if (!['pending', 'rejected'].includes(row.validation_status))
+        throw new HttpError(409, 'Approved reports are locked. Ask your leader to void it.');
+      if (['closed', 'completed'].includes(String(row.task_status || '').toLowerCase())
+        || ['closed', 'completed'].includes(String(row.activity_status || '').toLowerCase()))
+        throw new HttpError(409, 'The task is closed or completed, so its reports can no longer change.');
+      if (!(await isMember(deps, projectId, userId, role)))
+        throw new HttpError(403, 'You are not a member of this project.');
+      const assigned = Array.isArray(row.assigned_members) ? row.assigned_members : [];
+      if (!assigned.some((member) => String(member.id) === String(userId)))
+        throw new HttpError(403, 'You are not assigned to this task.');
+      const sideAssignment = await client.query(
+        `SELECT 1 FROM team_member_assignments
+         WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = $3 LIMIT 1`,
+        [projectId, userId, row.side]);
+      if (!sideAssignment.rows.length) throw new HttpError(403, 'You are not assigned to this task.');
+      if (!isDate(b.reportDate)) throw new HttpError(400, 'reportDate must be a valid date (YYYY-MM-DD).');
+      const workDone = String(b.workDone || '').trim();
+      if (!workDone) throw new HttpError(400, 'workDone is required.');
+
+      const today = (await client.query(`SELECT to_char(CURRENT_DATE + 1, 'YYYY-MM-DD') AS d`)).rows[0].d;
+      if (b.reportDate > today) throw new HttpError(400, 'The report date cannot be in the future.');
+      const taskStart = row.task_start_date;
+      if (b.reportDate < taskStart)
+        throw new HttpError(400, `The report date cannot be before the task start (${taskStart}).`);
+
+      const reports = (await client.query(
+        `SELECT id, task_id, stage_id, report_date, validation_status, quantity_done, quantity_failed, progress_pct
+         FROM workspace_work_center_progress
+         WHERE task_id = $1 AND id <> $2`,
+        [row.task_id, progressId])).rows.map((entry) => ({
+          ...entry,
+          report_date: DATE(entry.report_date),
+        }));
+      const stages = (await client.query(
+        `SELECT * FROM task_stages WHERE task_id = $1 ORDER BY seq`, [row.task_id])).rows;
+      const approved = reports.filter((entry) => entry.validation_status === 'approved');
+      const type = row.activity_type || 'percentage';
+      let quantityDone = null, quantityFailed = 0, stageId = null, pct = 0, warning = null;
+      if (type === 'quantity' || type === 'count') {
+        quantityDone = Number(b.quantityDone);
+        if (!(quantityDone > 0)) throw new HttpError(400, 'quantityDone must be above 0.');
+        if (type === 'count') {
+          quantityFailed = Number(b.quantityFailed || 0);
+          if (!Number.isInteger(quantityDone))
+            throw new HttpError(400, 'For a count activity, quantityDone must be a whole number.');
+          if (!Number.isInteger(quantityFailed) || quantityFailed < 0 || quantityFailed > quantityDone)
+            throw new HttpError(400, 'quantityFailed must be a whole number from 0 up to quantityDone.');
+        }
+        const already = reports.filter((entry) => ['approved', 'pending'].includes(entry.validation_status))
+          .reduce((sum, entry) => sum + (Number(entry.quantity_done) || 0), 0);
+        if (Number(row.target_quantity) > 0 && already + quantityDone > Number(row.target_quantity))
+          warning = `With this report the total is ${already + quantityDone}, above the task target of ${Number(row.target_quantity)}.`;
+      } else if (type === 'stages') {
+        stageId = Number.parseInt(b.stageId, 10);
+        const stage = stages.find((item) => item.id === stageId);
+        if (!stage) throw new HttpError(400, 'Choose one of the stages of this task.');
+        if (approved.some((entry) => entry.stage_id === stageId))
+          throw new HttpError(409, 'This stage is already completed.');
+        if (reports.some((entry) => entry.stage_id === stageId && entry.validation_status === 'pending'))
+          throw new HttpError(409, 'A report for this stage is already waiting for validation.');
+        const verifiedHolds = stages.filter((item) => item.is_hold_point && item.hold_verified_at).map((item) => item.id);
+        if (!stageUnlocked(stages, stageId, verifiedHolds))
+          throw new HttpError(409, 'An earlier hold point has not been verified by the consultant yet.');
+      } else {
+        pct = Number.parseInt(b.progressPct, 10);
+        const problem = checkPercentageReport(pct, approved);
+        if (problem) throw new HttpError(400, problem);
+      }
+
+      const projected = taskProgress(type, row, [
+        ...approved,
+        { validation_status: 'approved', report_date: b.reportDate, id: Number.MAX_SAFE_INTEGER,
+          quantity_done: quantityDone, quantity_failed: quantityFailed, stage_id: stageId, progress_pct: pct },
+      ], stages);
+      const storedProgress = Math.round(projected);
+      const resources = parseReportResources(b.resources, assigned);
+      const linkedResourceIds = [...new Set(resources.map((resource) => resource.plannedResourceId)
+        .filter((id) => id != null))];
+      if (linkedResourceIds.length) {
+        const plannedRows = row.activity_id ? (await client.query(
+          `SELECT id, resource_type, name, unit FROM planned_resources
+           WHERE id = ANY($1::bigint[]) AND project_id = $2 AND activity_id = $3
+             AND (task_id IS NULL OR task_id = $4)`,
+          [linkedResourceIds, projectId, row.activity_id, row.task_id])).rows : [];
+        const plannedById = new Map(plannedRows.map((resource) => [Number(resource.id), resource]));
+        if (plannedById.size !== linkedResourceIds.length)
+          throw new HttpError(400, 'A selected planned resource does not belong to this task.');
+        for (const resource of resources) {
+          if (resource.plannedResourceId == null) continue;
+          const planned = plannedById.get(resource.plannedResourceId);
+          if (planned.resource_type !== resource.type)
+            throw new HttpError(400, 'A selected planned resource must use the matching resource type.');
+          resource.name = planned.name;
+          resource.unit = planned.unit || resource.unit;
+        }
+      }
+
+      const siteText = (value, max, label) => {
+        const text = String(value || '').trim();
+        if (text.length > max) throw new HttpError(400, `${label} cannot exceed ${max} characters.`);
+        return text || null;
+      };
+      const weather = siteText(b.weather, 100, 'Weather');
+      const safetyNote = siteText(b.safetyNote, 1000, 'The safety note');
+      const nextPlan = siteText(b.nextPlan, 1000, 'The plan for tomorrow');
+      const delayCause = String(b.delayCause || '').trim() || null;
+      const delayNote = String(b.delayNote || '').trim();
+      const delayDaysCount = reportDelayDays(b.reportDate, row.task_end_date);
+      if (delayCause && !['weather', 'materials', 'equipment', 'access', 'design', 'labor', 'other'].includes(delayCause))
+        throw new HttpError(400, 'Choose a valid delay cause.');
+      if (delayNote.length > 2000) throw new HttpError(400, 'The delay note cannot exceed 2000 characters.');
+      if (delayNote && !delayCause) throw new HttpError(400, 'Choose a delay cause when reporting a delay.');
+
+      const photos = req.files?.photos || [];
+      const photoMeta = (() => {
+        let value = [];
+        if (b.photoMeta) {
+          try { value = JSON.parse(b.photoMeta); }
+          catch { throw new HttpError(400, 'Photo metadata is invalid.'); }
+        }
+        if (!Array.isArray(value) || value.length !== photos.length)
+          throw new HttpError(400, 'Photo metadata does not match the selected photos.');
+        return value.map((meta) => ({
+          latitude: parseOptionalCoordinate(meta?.latitude, -90, 90),
+          longitude: parseOptionalCoordinate(meta?.longitude, -180, 180),
+          accuracy: meta?.accuracy === '' || meta?.accuracy == null ? null : Number(meta.accuracy),
+          capturedAt: meta?.capturedAt && !Number.isNaN(Date.parse(meta.capturedAt))
+            ? new Date(meta.capturedAt) : null,
+        }));
+      })();
+      if (photoMeta.some((meta) => meta.accuracy != null
+        && (!Number.isFinite(meta.accuracy) || meta.accuracy < 0)))
+        throw new HttpError(400, 'Photo accuracy metadata is invalid.');
+      const supportingFiles = req.files?.supporting_attachments || [];
+      let supportingMetadata = [];
+      if (supportingFiles.length) {
+        try {
+          supportingMetadata = b.supportingAttachmentMetadata
+            ? JSON.parse(b.supportingAttachmentMetadata)
+            : supportingFiles.map(() => ({}));
+        }
+        catch { throw new HttpError(400, 'Supporting attachment details are invalid.'); }
+        if (!Array.isArray(supportingMetadata) || supportingMetadata.length !== supportingFiles.length)
+          throw new HttpError(400, 'Supporting attachment details do not match the selected files.');
+        supportingMetadata = supportingMetadata.map((metadata) => {
+          const parsed = parseSupportingAttachmentType(metadata);
+          if (parsed.error) throw new HttpError(400, parsed.error);
+          return parsed;
+        });
+      } else if (b.supportingAttachmentMetadata) {
+        throw new HttpError(400, 'Choose supporting files before setting their titles.');
+      }
+
+      const oldPhotos = (await client.query(
+        `SELECT id, file_id, file_name, seq, resource_type FROM work_center_report_photos
+         WHERE report_id = $1 ORDER BY seq FOR UPDATE`, [progressId])).rows;
+      const oldSupporting = (await client.query(
+        `SELECT id, file_id, file_name, resource_type FROM work_center_report_attachments
+         WHERE report_id = $1 ORDER BY id FOR UPDATE`, [progressId])).rows;
+      const keepPhotoIds = parseIdList(b.keepPhotoIds, 'Photo selection');
+      const keepSupportingIds = parseIdList(b.keepSupportingAttachmentIds, 'Supporting attachment selection');
+      const oldPhotoIds = new Set(oldPhotos.map((file) => Number(file.id)));
+      const oldSupportingIds = new Set(oldSupporting.map((file) => Number(file.id)));
+      if (keepPhotoIds.some((id) => !oldPhotoIds.has(id))
+        || keepSupportingIds.some((id) => !oldSupportingIds.has(id)))
+        throw new HttpError(400, 'A selected existing report file is invalid.');
+      if (keepPhotoIds.length + photos.length > 10)
+        throw new HttpError(400, 'A report can include at most 10 photos.');
+      if (keepSupportingIds.length + supportingFiles.length > 20)
+        throw new HttpError(400, 'A report can include at most 20 supporting files.');
+
+      const previousStatus = row.validation_status;
+      const summary = reportHistorySummary({ ...row, report_date: row.report_day }, row, row.validation_notes || '');
+      const oldFiles = [
+        ...oldPhotos.filter((file) => !keepPhotoIds.includes(Number(file.id)))
+          .map((file) => ({ ...file, resource_type: file.resource_type || 'raw' })),
+        ...oldSupporting.filter((file) => !keepSupportingIds.includes(Number(file.id)))
+          .map((file) => ({ ...file, resource_type: file.resource_type || 'raw' })),
+      ];
+      let attachmentName = row.attachment_name;
+      let attachmentId = row.attachment_id;
+      let attachmentUrl = row.attachment_url;
+      let attachmentResourceType = row.attachment_resource_type || 'raw';
+      if (req.files?.attachment?.length) {
+        const previousAttachment = attachmentId
+          ? { file_id: attachmentId, resource_type: attachmentResourceType } : null;
+        const uploaded = await uploads.upload(
+          req.files.attachment[0].buffer, req.files.attachment[0].originalname, 'work_center/progress');
+        attachmentName = req.files.attachment[0].originalname;
+        attachmentId = uploaded.public_id;
+        attachmentUrl = uploaded.secure_url;
+        attachmentResourceType = uploaded.resource_type || 'raw';
+        if (previousAttachment) oldFiles.push(previousAttachment);
+      } else if (String(b.removeAttachment || '').toLowerCase() === 'true') {
+        if (attachmentId) oldFiles.push({ file_id: attachmentId, resource_type: attachmentResourceType });
+        attachmentName = attachmentId = attachmentUrl = null;
+        attachmentResourceType = 'raw';
+      }
+
+      const updated = (await client.query(
+        `UPDATE workspace_work_center_progress
+         SET report_date = $1, work_done = $2, manpower = $3, equipment = $4, materials = $5,
+             progress_pct = $6, issues = $7, notes = $8, attachment_name = $9, attachment_id = $10,
+             attachment_url = $11, attachment_resource_type = $12, quantity_done = $13,
+             quantity_failed = $14, stage_id = $15, delay_cause = $16, delay_note = $17,
+             delay_days = $18, weather = $19, safety_note = $20, next_plan = $21,
+             validation_status = 'pending',
+             validation_notes = NULL, validated_by = NULL, validated_by_role = NULL, validated_at = NULL
+         WHERE id = $22 RETURNING *`,
+        [b.reportDate, workDone, b.manpower || '', b.equipment || '', b.materials || '', storedProgress,
+          b.issues || '', b.notes || '', attachmentName, attachmentId, attachmentUrl, attachmentResourceType,
+          quantityDone, quantityFailed, stageId, delayCause, delayNote || null, delayDaysCount, weather,
+          safetyNote, nextPlan, progressId])).rows[0];
+      await client.query(
+        `DELETE FROM work_center_report_photos WHERE report_id = $1 AND NOT (id = ANY($2::bigint[]))`,
+        [progressId, keepPhotoIds]);
+      await client.query(
+        `DELETE FROM work_center_report_attachments WHERE report_id = $1 AND NOT (id = ANY($2::bigint[]))`,
+        [progressId, keepSupportingIds]);
+      await client.query(`DELETE FROM work_center_report_resources WHERE report_id = $1`, [progressId]);
+
+      const keptPhotos = oldPhotos.filter((file) => keepPhotoIds.includes(Number(file.id)));
+      let nextPhotoSeq = keptPhotos.reduce((maximum, file) => Math.max(maximum, Number(file.seq) || 0), 0);
+      for (let index = 0; index < photos.length; index++) {
+        const photo = photos[index], metadata = photoMeta[index];
+        const uploaded = await uploads.upload(photo.buffer, `report-${progressId}-photo-${index + 1}`, 'work_center/progress');
+        await client.query(
+          `INSERT INTO work_center_report_photos
+             (report_id, project_id, seq, file_name, file_id, file_url, captured_at, latitude, longitude, accuracy_m, resource_type)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [progressId, projectId, ++nextPhotoSeq, photo.originalname, uploaded.public_id, uploaded.secure_url,
+            metadata.capturedAt, metadata.latitude, metadata.longitude, metadata.accuracy, uploaded.resource_type || 'raw']);
+      }
+      for (let index = 0; index < supportingFiles.length; index++) {
+        const file = supportingFiles[index], metadata = supportingMetadata[index];
+        const uploaded = await uploads.upload(file.buffer, file.originalname, 'work_center/progress-supporting-attachments');
+        await client.query(
+          `INSERT INTO work_center_report_attachments
+             (report_id, project_id, file_name, file_id, file_url, mime_type,
+              attachment_type, custom_attachment_type, uploaded_by_id, uploaded_by_role, resource_type)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [progressId, projectId, file.originalname, uploaded.public_id, uploaded.secure_url,
+            file.mimetype || null, metadata.attachmentType, metadata.customAttachmentType, userId, role,
+            uploaded.resource_type || 'raw']);
+      }
+      for (const resource of resources) {
+        await client.query(
+          `INSERT INTO work_center_report_resources
+             (report_id, project_id, resource_type, name, quantity, unit, hours, assigned_member_id, planned_resource_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,
+                   (SELECT id FROM planned_resources WHERE id = $9 AND project_id = $2))`,
+          [progressId, projectId, resource.type, resource.name, resource.quantity, resource.unit,
+            resource.hours, resource.assignedMemberId, resource.plannedResourceId]);
+      }
+      await client.query(
+        `INSERT INTO work_center_task_history (task_id, project_id, actor_id, actor_role, action, detail)
+         VALUES ($1,$2,$3,$4,'report_edited',$5::jsonb)`,
+        [row.task_id, projectId, userId, role,
+          JSON.stringify({ reportId: progressId, summary, wasStatus: previousStatus })]);
+      const leaderRecipients = previousStatus === 'rejected' ? await leadersOf(deps, projectId, row.side) : [];
+      await client.query('COMMIT');
+      uploads.keepAll();
+      const cleanupFailures = await destroyCloudinaryFiles(deps, oldFiles);
+      if (previousStatus === 'rejected') {
+        await notifySafe(deps, {
+          projectId, entityId: progressId, entityType: 'work_center_progress',
+          message: `A resubmitted report on "${row.task_title}" is waiting for validation.`,
+          actorId: userId, actorRole: role, recipients: leaderRecipients,
+        });
+      }
+      const warnings = [
+        warning,
+        cleanupFailures.length
+          ? 'The report was saved, but one or more replaced files could not be removed from storage.' : '',
+      ].filter(Boolean);
+      return res.json({
+        success: true, entry: updated,
+        ...(warnings.length ? { warning: warnings.join(' ') } : {}),
+      });
+    } catch (error) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      await uploads.discard();
+      return fail(res, error, 'PATCH /api/work-center-progress/:progressId:');
+    } finally { if (client) client.release(); }
+  });
+
+  app.delete('/api/work-center-progress/:progressId', authenticateToken,
+    requireProjectLifecycleWrite, async (req, res) => {
+    let client;
+    try {
+      const { user_id: userId, role } = req.user;
+      if (role !== 'TeamMember') throw new HttpError(403, 'Only the original reporter can delete this report.');
+      const progressId = Number(req.params.progressId);
+      const projectId = parseInt(req.body?.projectId, 10) || parseInt(req.query.projectId, 10);
+      if (!Number.isSafeInteger(progressId) || progressId < 1 || !projectId)
+        throw new HttpError(400, 'progressId and projectId are required.');
+      client = await pool.connect();
+      await client.query('BEGIN');
+      const row = (await client.query(`
+        SELECT p.*, w.id AS task_id, w.project_id, w.side, w.title AS task_title,
+               w.status AS task_status, pe.status AS activity_status,
+               to_char(p.report_date, 'YYYY-MM-DD') AS report_day,
+               COALESCE(w.activity_type, pe.activity_type) AS activity_type,
+               COALESCE(w.standalone_unit, pe.unit) AS activity_unit
+        FROM workspace_work_center_progress p
+        JOIN workspace_work_center w ON w.id = p.task_id
+        LEFT JOIN planning_execution pe ON pe.id = w.activity_id
+        WHERE p.id = $1 AND w.project_id = $2
+        FOR UPDATE OF p, w`, [progressId, projectId])).rows[0];
+      if (!row) throw new HttpError(404, 'Progress report not found.');
+      if (Number(row.member_id) !== Number(userId) || row.member_role !== role)
+        throw new HttpError(403, 'You can delete only your own reports.');
+      if (!['pending', 'rejected'].includes(row.validation_status))
+        throw new HttpError(409, 'Approved reports are locked. Ask your leader to void it.');
+      if (['closed', 'completed'].includes(String(row.task_status || '').toLowerCase())
+        || ['closed', 'completed'].includes(String(row.activity_status || '').toLowerCase()))
+        throw new HttpError(409, 'The task is closed or completed, so its reports can no longer change.');
+      if (!(await isMember(deps, projectId, userId, role)))
+        throw new HttpError(403, 'You are not a member of this project.');
+      const assigned = await client.query(
+        `SELECT 1 FROM workspace_work_center w
+         WHERE w.id = $1 AND EXISTS (SELECT 1 FROM jsonb_array_elements(w.assigned_members) am
+                                    WHERE am->>'id' = $2::text)`,
+        [row.task_id, String(userId)]);
+      if (!assigned.rows.length) throw new HttpError(403, 'You are not assigned to this task.');
+      const sideAssignment = await client.query(
+        `SELECT 1 FROM team_member_assignments
+         WHERE project_id = $1 AND team_member_id = $2 AND assigned_part = $3 LIMIT 1`,
+        [projectId, userId, row.side]);
+      if (!sideAssignment.rows.length) throw new HttpError(403, 'You are not assigned to this task.');
+
+      const files = [
+        ...(await client.query(
+          `SELECT file_id, resource_type FROM work_center_report_photos WHERE report_id = $1`,
+          [progressId])).rows,
+        ...(await client.query(
+          `SELECT file_id, resource_type FROM work_center_report_attachments WHERE report_id = $1`,
+          [progressId])).rows,
+      ];
+      if (row.attachment_id) files.push({ file_id: row.attachment_id, resource_type: row.attachment_resource_type || 'raw' });
+      const summary = reportHistorySummary({ ...row, report_date: row.report_day }, row, row.validation_notes || '');
+      await client.query(
+        `INSERT INTO work_center_task_history (task_id, project_id, actor_id, actor_role, action, detail)
+         VALUES ($1,$2,$3,$4,'report_deleted',$5::jsonb)`,
+        [row.task_id, projectId, userId, role,
+          JSON.stringify({ reportId: progressId, summary, wasStatus: row.validation_status })]);
+      await client.query(`DELETE FROM workspace_work_center_progress WHERE id = $1`, [progressId]);
+      await client.query('COMMIT');
+      const cleanupFailures = await destroyCloudinaryFiles(deps, files);
+      return res.json({
+        success: true,
+        ...(cleanupFailures.length ? { warning: 'The report was deleted, but one or more files could not be removed from storage.' } : {}),
+      });
+    } catch (error) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      return fail(res, error, 'DELETE /api/work-center-progress/:progressId:');
     } finally { if (client) client.release(); }
   });
 
@@ -598,6 +1060,10 @@ function registerReportRoutes(app, deps) {
       }
       if (row.activity_status === 'closed' || row.task_status === 'closed')
         throw new HttpError(409, 'The activity or task is closed, so its reports can no longer change.');
+
+      if (decision === 'approved' || decision === 'rejected') {
+        await client.query(`SELECT set_config('app.work_center_progress_review', 'on', true)`);
+      }
 
       let updated;
       if (decision === 'voided') {
@@ -1044,6 +1510,7 @@ const taskCards = (function () {
       }
     }
     const bodyId = (body, key) => validId(body?.[key]);
+    const TASK_ATTACHMENT_MAX_FILES = 20;
 
     app.get('/api/work-center/:taskId/card', authenticateToken, async (req, res) => {
       try {
@@ -1051,7 +1518,7 @@ const taskCards = (function () {
         if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
         const task = await loadTask(taskId, projectId);
         await authorize(task, projectId, req.user.user_id, req.user.role);
-        const [comments, history, checklists, links, dependencies, attachments] = await Promise.all([
+        const [comments, history, checklists, links, dependencies, attachments, reportFiles] = await Promise.all([
           pool.query(
             `SELECT id, author_id, author_role, body, created_at
              FROM work_center_task_comments WHERE task_id = $1 AND project_id = $2
@@ -1080,10 +1547,38 @@ const taskCards = (function () {
              WHERE d.task_id = $1 AND d.project_id = $2 ORDER BY w.id`,
             [taskId, projectId]),
           pool.query(
-            `SELECT id, file_name, file_id, file_url, mime_type, created_at
+            `SELECT id, file_name, file_id, file_url, mime_type, created_at,
+                    uploaded_by_id, uploaded_by_role
              FROM card_attachments
              WHERE project_id = $1 AND entity_type = 'work_center_task' AND entity_id = $2
              ORDER BY created_at, id`, [projectId, taskId]),
+          pool.query(
+            `SELECT p.id AS report_id, p.report_date, p.attachment_name, p.attachment_url,
+                    COALESCE(NULLIF(tma.name, ''), tm.email, 'Team member') AS reporter_name,
+                    COALESCE((SELECT json_agg(json_build_object(
+                      'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
+                      'uploaded_at', ph.uploaded_at, 'captured_at', ph.captured_at,
+                      'latitude', ph.latitude, 'longitude', ph.longitude, 'accuracy_m', ph.accuracy_m
+                    ) ORDER BY ph.seq) FROM work_center_report_photos ph
+                       WHERE ph.report_id = p.id AND ph.project_id = $2), '[]'::json) AS photos,
+                    COALESCE((SELECT json_agg(json_build_object(
+                      'id', ra.id, 'file_name', ra.file_name, 'file_url', ra.file_url,
+                      'mime_type', ra.mime_type, 'attachment_type', ra.attachment_type,
+                      'custom_attachment_type', ra.custom_attachment_type, 'created_at', ra.created_at,
+                      'uploaded_by_id', ra.uploaded_by_id, 'uploaded_by_role', ra.uploaded_by_role
+                    ) ORDER BY ra.created_at, ra.id) FROM work_center_report_attachments ra
+                       WHERE ra.report_id = p.id AND ra.project_id = $2), '[]'::json) AS supporting_attachments
+             FROM workspace_work_center_progress p
+             LEFT JOIN team_members tm ON tm.id = p.member_id
+             LEFT JOIN LATERAL (
+               SELECT name FROM team_member_assignments
+               WHERE team_member_id = p.member_id AND project_id = $2
+               ORDER BY id DESC LIMIT 1
+             ) tma ON true
+             WHERE p.task_id = $1 AND p.project_id = $2
+               AND ($3 <> 'TeamMember' OR p.member_id = $4)
+             ORDER BY p.report_date DESC, p.id DESC`,
+            [taskId, projectId, req.user.role, req.user.user_id]),
         ]);
         let visibleLinks = links.rows;
         if (req.user.role === 'TeamMember') {
@@ -1109,46 +1604,67 @@ const taskCards = (function () {
           }));
           visibleLinks = visibleLinks.filter((_link, index) => accessChecks[index]);
         }
+        const isLeader = isWCLeader(req.user.role) && wcSide(req.user.role) === task.side;
+        const visibleAttachments = attachments.rows.map((attachment) => ({
+          ...attachment,
+          can_delete: isLeader || Number(attachment.uploaded_by_id) === Number(req.user.user_id),
+        }));
         return res.json({
           location: {
             block: task.location_block, floor: task.location_floor, zone: task.location_zone,
             grid: task.location_grid, drawing: task.location_drawing,
           },
           comments: comments.rows, history: history.rows, checklists: checklists.rows,
-          links: visibleLinks, dependencies: dependencies.rows, attachments: attachments.rows,
+          links: visibleLinks, dependencies: dependencies.rows, attachments: visibleAttachments,
+          report_files: reportFiles.rows,
+          upload_limits: { max_file_size_bytes: Number(deps.maxUploadBytes) || null, max_files: TASK_ATTACHMENT_MAX_FILES },
         });
       } catch (error) { return fail(res, error, 'GET /api/work-center/:taskId/card:'); }
     });
 
     app.post('/api/work-center/:taskId/attachments', authenticateToken,
-      upload.array('attachments', 20), requireProjectLifecycleWrite, async (req, res) => {
+      upload.array('attachments', TASK_ATTACHMENT_MAX_FILES), requireProjectLifecycleWrite, async (req, res) => {
       const uploads = createCloudinaryUploadTracker(deps);
+      let client;
       try {
         const taskId = validId(req.params.taskId), projectId = bodyId(req.body, 'projectId');
         if (!taskId || !projectId) throw new HttpError(400, 'taskId and projectId are required.');
         if (!req.files?.length) throw new HttpError(400, 'Choose at least one attachment.');
         const task = await loadTask(taskId, projectId);
-        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        await authorize(task, projectId, req.user.user_id, req.user.role);
+        client = await pool.connect();
+        await client.query('BEGIN');
         const saved = [];
         for (const file of req.files) {
           const uploaded = await uploads.upload(file.buffer, file.originalname, 'work_center/attachments');
-          const attachment = (await pool.query(
+          const attachment = (await client.query(
             `INSERT INTO card_attachments
                (project_id, entity_type, entity_id, file_name, file_id, file_url, mime_type,
                 resource_type, uploaded_by_id, uploaded_by_role)
              VALUES ($1,'work_center_task',$2,$3,$4,$5,$6,$7,$8,$9)
-             RETURNING id, file_name, file_id, file_url, mime_type, created_at`,
+             RETURNING id, file_name, file_id, file_url, mime_type, created_at, uploaded_by_id, uploaded_by_role`,
             [projectId, taskId, file.originalname, uploaded.public_id, uploaded.secure_url,
               file.mimetype || null, uploaded.resource_type || 'raw', req.user.user_id, req.user.role])).rows[0];
           saved.push(attachment);
-          uploads.keep(uploaded);
         }
-        await audit(task, projectId, req.user.user_id, req.user.role, 'attachments_added',
-          { attachment_ids: saved.map((item) => item.id) });
-        return res.status(201).json({ attachments: saved });
+        await client.query(
+          `INSERT INTO work_center_task_history
+             (task_id, project_id, actor_id, actor_role, action, detail)
+           VALUES ($1,$2,$3,$4,'attachments_added',$5::jsonb)`,
+          [task.id, projectId, req.user.user_id, req.user.role,
+            JSON.stringify({ attachment_ids: saved.map((item) => item.id) })]);
+        await client.query('COMMIT');
+        uploads.keepAll();
+        return res.status(201).json({
+          attachments: saved, max_file_size_bytes: Number(deps.maxUploadBytes) || null,
+          max_files: TASK_ATTACHMENT_MAX_FILES,
+        });
       } catch (error) {
+        if (client) await client.query('ROLLBACK').catch(() => {});
         await uploads.discard();
         return fail(res, error, 'POST /api/work-center/:taskId/attachments:');
+      } finally {
+        if (client) client.release();
       }
     });
 
@@ -1160,12 +1676,14 @@ const taskCards = (function () {
         if (!taskId || !attachmentId || !projectId)
           throw new HttpError(400, 'taskId, projectId and attachmentId are required.');
         const task = await loadTask(taskId, projectId);
-        await authorize(task, projectId, req.user.user_id, req.user.role, true);
+        const access = await authorize(task, projectId, req.user.user_id, req.user.role);
         const attachment = (await pool.query(
-          `SELECT id, file_id, resource_type FROM card_attachments
+          `SELECT id, file_id, resource_type, uploaded_by_id FROM card_attachments
            WHERE id = $1 AND project_id = $2 AND entity_type = 'work_center_task' AND entity_id = $3`,
           [attachmentId, projectId, taskId])).rows[0];
         if (!attachment) throw new HttpError(404, 'Attachment not found.');
+        if (access !== 'leader' && Number(attachment.uploaded_by_id) !== Number(req.user.user_id))
+          throw new HttpError(403, 'You can remove only files you uploaded.');
         if (!cloudinary?.uploader) throw new HttpError(503, 'File storage is unavailable.');
         const result = await cloudinary.uploader.destroy(attachment.file_id, {
           resource_type: attachment.resource_type || 'raw',

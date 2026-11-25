@@ -32,7 +32,9 @@ load() {
            "$HERE/migrations/2026-11-09-verification-shared-evidence.sql" \
            "$HERE/migrations/2026-11-10-verification-read-receipts.sql" \
            "$HERE/migrations/2026-11-11-report-supporting-attachments.sql" \
-           "$HERE/migrations/2026-11-12-activity-report.sql"; do
+           "$HERE/migrations/2026-11-12-wc-report-edit-delete.sql" \
+           "$HERE/migrations/2026-11-12-activity-report.sql" \
+           "$HERE/migrations/2026-11-25-wc-progress-review.sql"; do
     $PSQL -d "$DB" -f "$f" > /dev/null 2>/tmp/run-tests-load.err || { echo "Failed loading $f"; cat /tmp/run-tests-load.err; exit 1; }
   done
 }
@@ -46,7 +48,10 @@ node --test \
   "$HERE/wc-reports-v2.test.js" "$HERE/wc-views.test.js" "$HERE/supportingAttachmentTypes.test.js" \
   "$HERE/notificationTarget.test.js" "$HERE/verificationReminderJob.test.js" \
   "$HERE/pending-list.test.js" "$HERE/consultant-activity-open.test.js" \
-  "$HERE/verificationProjection.test.js" || FAILED=1
+  "$HERE/verificationProjection.test.js" \
+  "$HERE/recordPagination.test.js" "$HERE/record-pagination-dashboard.test.js" \
+  "$HERE/memoryUpload.test.js" "$HERE/requestProtection.test.js" \
+  "$HERE/loginLockout.test.js" || FAILED=1
 for t in activityRoutes reportRoutes verificationRoutes milestoneRoutes activityReportRoutes taskQueryRoutes; do
   $PSQL -d "$ADMIN_DB" -c "DROP DATABASE IF EXISTS $DB" -c "CREATE DATABASE $DB"
   load
