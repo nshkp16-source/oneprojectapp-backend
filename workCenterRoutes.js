@@ -1569,13 +1569,14 @@ const taskCards = (function () {
                     ) ORDER BY ra.created_at, ra.id) FROM work_center_report_attachments ra
                        WHERE ra.report_id = p.id AND ra.project_id = $2), '[]'::json) AS supporting_attachments
              FROM workspace_work_center_progress p
+             JOIN workspace_work_center w ON w.id = p.task_id
              LEFT JOIN team_members tm ON tm.id = p.member_id
              LEFT JOIN LATERAL (
                SELECT name FROM team_member_assignments
                WHERE team_member_id = p.member_id AND project_id = $2
                ORDER BY id DESC LIMIT 1
              ) tma ON true
-             WHERE p.task_id = $1 AND p.project_id = $2
+             WHERE p.task_id = $1 AND w.project_id = $2
                AND ($3 <> 'TeamMember' OR p.member_id = $4)
              ORDER BY p.report_date DESC, p.id DESC`,
             [taskId, projectId, req.user.role, req.user.user_id]),
