@@ -54,6 +54,7 @@ function views() {
   function _wcSetTaskCardMessage() {}
   async function _wcQueueOfflineReport() {}
   window.alert = (message) => window.__wcAlerts.push(message);
+  function opaLocale() { return 'en-GB'; }
   function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
   vm.runInContext(`function expandGrayPart(html) {
     const panel = document.createElement('div'); panel.id = 'grayContent'; panel.innerHTML = html;
@@ -203,6 +204,7 @@ test('leader view: validate buttons only on pending reports, void button only on
   assert.deepEqual(actions(3), []);                                                      // a voided report offers nothing
   assert.match(d.body.textContent, /Void this report/);
   assert.ok(d.getElementById('wc-val-notes-2'));
+  assert.equal(d.querySelector('#wc-val-notes-2').closest('[data-wc-void-form]').hidden, true);
   assert.match(d.querySelector('label[for="wc-val-notes-2"]').textContent, /Reason for voiding \*/);
   assert.doesNotMatch(d.body.textContent, /Correction audit/);
   assert.match(d.body.textContent, /Measured wrongly/);
@@ -706,6 +708,25 @@ test('leader reports do not render obsolete status filter chips', () => {
   assert.equal(withPending.querySelector('[data-report-filter]'), null);
   assert.equal(withPending.querySelector('[data-wc-report-card][data-report-status="pending"]').hidden, false);
   assert.equal(withPending.querySelector('[data-wc-report-card][data-report-status="approved"]').hidden, true);
+});
+
+test('per-report PDF action is delegated and carries its task and report ids', () => {
+  const d = views().tabbed(task, entries, [], true);
+  const button = d.querySelector('[data-action="wc-report-pdf"]');
+  assert.ok(button);
+  assert.equal(button.dataset.taskId, String(task.id));
+  assert.equal(button.dataset.progressId, button.closest('[data-wc-report-card]').dataset.reportId);
+});
+
+test('leader question form starts collapsed behind its ask button', () => {
+  const d = views().tabbed(task, [entries[1]], [{
+    id: 21, report_id: entries[1].id, question: 'Please clarify this report.', status: 'open', created_at: '2026-03-10',
+  }], true);
+  const form = d.querySelector('[data-wc-query-form]');
+  assert.ok(form);
+  assert.equal(form.hidden, true);
+  assert.ok(d.querySelector('[data-wc-query-toggle][aria-expanded="false"]'));
+  assert.equal(form.querySelector('textarea').value, '');
 });
 
 test('questions without a matching report appear in Other questions for leaders and members', () => {
