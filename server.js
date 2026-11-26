@@ -9429,6 +9429,19 @@ app.put('/api/work-center/:taskId', authenticateToken,
     if (status !== undefined && !['ongoing','completed','closed'].includes(status))
       return res.status(400).json({ error: 'status must be ongoing, completed, or closed.' });
 
+    const locationUpdates = {};
+    for (const [field, column] of [
+      ['location_block', 'location_block'], ['location_floor', 'location_floor'],
+      ['location_zone', 'location_zone'], ['location_grid', 'location_grid'],
+      ['location_drawing', 'location_drawing'],
+    ]) {
+      if (req.body[field] === undefined) continue;
+      const value = String(req.body[field] || '').trim();
+      if (value.length > 150)
+        return res.status(400).json({ error: `Location ${field.slice('location_'.length)} cannot exceed 150 characters.` });
+      locationUpdates[column] = value || null;
+    }
+
     let members = null;
     if (assigned_members !== undefined) {
       try { members = JSON.parse(assigned_members); }
@@ -9458,6 +9471,7 @@ app.put('/api/work-center/:taskId', authenticateToken,
     if (status           !== undefined) push('status',           status);
     if (start_date       !== undefined) push('start_date',       start_date);
     if (end_date         !== undefined) push('end_date',         end_date);
+    for (const [column, value] of Object.entries(locationUpdates)) push(column, value);
 
     if (req.file) {
       // The old file is removed only after the new one is saved and the update has committed.
@@ -9486,6 +9500,9 @@ app.put('/api/work-center/:taskId', authenticateToken,
         title: title ?? null, description: description ?? null, work_package: work_package ?? null,
         assigned_members: members, priority: priority ?? null, status: status ?? null,
         start_date: start_date ?? null, end_date: end_date ?? null,
+        location: Object.fromEntries(Object.entries(locationUpdates).map(([field, value]) => [
+          field.replace(/^location_/, ''), value,
+        ])),
       })]);
     await client.query('COMMIT');
     uploads.keepAll();

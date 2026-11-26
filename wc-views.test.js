@@ -212,6 +212,15 @@ test('leader view: validate buttons only on pending reports, void button only on
   assert.match(d.body.textContent, /Share of the activity 50%/);
 });
 
+test('leader task edit form includes all task location fields', () => {
+  const d = views().leader(task, entries);
+  for (const key of ['block', 'floor', 'zone', 'grid', 'drawing']) {
+    const field = d.getElementById(`wc-ed-location-${task.id}-${key}`);
+    assert.ok(field, `missing ${key} location field`);
+    assert.equal(field.maxLength, 150);
+  }
+});
+
 test('leader view: no void button once the task is closed', () => {
   const d = views().leader({ ...task, status: 'closed' }, entries);
   assert.equal([...d.querySelectorAll('[data-validate-action="voided"]')].length, 0);
