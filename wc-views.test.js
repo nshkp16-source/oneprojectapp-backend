@@ -27,6 +27,7 @@ const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadFi
   '_wcEnhanceReports', '_wcOpenReportPanel', '_wcBeginReportEdit', '_wcResetReportEdit', '_wcDeleteReport',
   '_wcHandleSubmitProgress',
   '_wcAutoFillReportWeather',
+  '_weatherDisplayText',
   '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_wcUpdateSupportingAttachmentGroup', '_wcSupportingAttachmentGroupHtml',
   '_wcReportSupportingAttachmentsHtml', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
   '_wcCollectTaskFiles', '_wcInitTaskFiles', '_wcOpenTaskFilesViewer',
@@ -45,6 +46,7 @@ function views() {
   let summaryWeatherData = null;
   let summaryWeatherLocation = null;
   let summaryWeatherLoading = false;
+  let opaLang = 'English';
   window.__wcFetches = [];
   window.__wcAlerts = [];
   window._wcReportLocationByTask = {};
@@ -59,7 +61,13 @@ function views() {
   async function _wcQueueOfflineReport() {}
   window.alert = (message) => window.__wcAlerts.push(message);
   function opaLocale() { return 'en-GB'; }
-  function opaLookup(value) { return value; }
+  function opaLookup(value) {
+    if (opaLang !== 'French') return null;
+    return ({
+      Forecast: 'Prévisions', 'Rain chance': 'Probabilité de pluie', Wind: 'Vent',
+      'Slight rain': 'Pluie faible',
+    })[value] || null;
+  }
   function _weatherCodeLabel(code) { return ({ 61: 'Slight rain' })[code] || 'Unknown'; }
   function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
   vm.runInContext(`function expandGrayPart(html) {
@@ -82,14 +90,20 @@ function views() {
     w: dom.window,
     formatDate: (value) => { dom.window.__date = value; return vm.runInContext('_wcFmtDate(window.__date)', ctx); },
     todayDate: () => vm.runInContext('_wcTodayDate()', ctx),
-    autoFillWeather: (taskId, location, daily) => {
+    autoFillWeather: (taskId, location, daily, current = null) => {
       dom.window.__weatherTaskId = taskId;
       dom.window.__weatherLocation = location;
       dom.window.__weatherDaily = daily;
+      dom.window.__weatherCurrent = current;
       vm.runInContext(`summaryWeatherLocation = window.__weatherLocation;
-        summaryWeatherData = window.__weatherDaily ? { daily: window.__weatherDaily } : null;
+        summaryWeatherData = window.__weatherDaily || window.__weatherCurrent
+          ? { daily: window.__weatherDaily, current: window.__weatherCurrent } : null;
         summaryWeatherLoading = false;
         _wcAutoFillReportWeather(window.__weatherTaskId)`, ctx);
+    },
+    setLanguage: (language) => {
+      dom.window.__language = language;
+      vm.runInContext('opaLang = window.__language', ctx);
     },
     history: (item) => {
       dom.window.__historyItem = item;
@@ -264,6 +278,26 @@ test('report weather auto-fills from the matching forecast and preserves member 
   view.autoFillWeather('6', null, null);
   assert.equal(d.getElementById('wc-pr-weather-6').value, '');
   assert.match(manualWrapper.textContent, /No saved project location is set/);
+});
+
+test('report weather uses summary current conditions for today and follows the selected language', () => {
+  const view = views();
+  const d = view.w.document;
+  const wrapper = d.createElement('div');
+  wrapper.innerHTML = '<input id="wc-pr-weather-5" data-wc-weather-field data-task-id="5"><small data-wc-weather-status></small>';
+  d.body.appendChild(wrapper);
+  const current = {
+    time: `${view.todayDate()}T15:00`,
+    weathercode: 61,
+    temperature: 20,
+    windspeed: 8,
+  };
+  view.autoFillWeather('5', { lat: 1, lng: 2 }, null, current);
+  const field = d.getElementById('wc-pr-weather-5');
+  assert.equal(field.value, '20°C · Slight rain · Wind 8 km/h');
+  view.setLanguage('French');
+  view.autoFillWeather('5', { lat: 1, lng: 2 }, null, current);
+  assert.equal(field.value, '20°C · Pluie faible · Vent 8 km/h');
 });
 
 test('leader view: no void button once the task is closed', () => {
