@@ -1849,16 +1849,13 @@ const taskCards = (function () {
         const projectId = bodyId(req.body, 'projectId');
         if (!taskId || !itemId || !projectId) throw new HttpError(400, 'taskId, itemId and projectId are required.');
         const task = await loadTask(taskId, projectId);
-        const access = await authorize(task, projectId, req.user.user_id, req.user.role);
+        await authorize(task, projectId, req.user.user_id, req.user.role, true);
         const row = (await pool.query(
           `SELECT i.* FROM work_center_checklist_items i
            JOIN work_center_checklists c ON c.id = i.checklist_id
            WHERE i.id=$1 AND c.task_id=$2 AND i.project_id=$3`,
           [itemId, taskId, projectId])).rows[0];
         if (!row) throw new HttpError(404, 'Checklist item not found.');
-        if (access === 'member' && row.assigned_member_id != null
-          && String(row.assigned_member_id) !== String(req.user.user_id))
-          throw new HttpError(403, 'This checklist item is assigned to another member.');
         const complete = Boolean(req.body?.isComplete);
         const updated = await pool.query(
           `UPDATE work_center_checklist_items
@@ -2004,7 +2001,7 @@ const taskCards = (function () {
         const taskData = {
           title: task.title, description: task.description, work_package: task.work_package,
           activity_type: measure.activity_type, target_quantity: task.target_quantity,
-          activity_unit: measure.activity_unit, weight_pct: task.weight_pct,
+          activity_unit: measure.activity_unit,
           stages,
           assigned_members: Array.isArray(task.assigned_members) ? task.assigned_members : [],
           location: {

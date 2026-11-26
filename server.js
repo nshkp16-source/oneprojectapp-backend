@@ -5,6 +5,7 @@ import { normalizeFolderName, canonicalFolder, folderCode, projectCode, formatDo
 import { Pool } from 'pg';
 import nodemailer from 'nodemailer';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import nodemailerSendgrid from 'nodemailer-sendgrid';
 import pkg from 'uuid';
 import bcrypt from 'bcryptjs';
@@ -25,6 +26,7 @@ import { delayDays } from './progressRules.js';
 import { resolveNotificationTarget, sendOverdueVerificationReminders, sendWorkCenterTaskReminders } from './notificationWorkflow.js';
 import { createLoginLockout } from './loginLockout.js';
 import { checkProjectAccess } from './projectAccess.js';
+import { escapeEmailHtml, registerSupportContactRoute } from './supportContactRoutes.js';
 
 const { v4: uuidv4 } = pkg;
 const app = express();
@@ -389,6 +391,21 @@ await ensureDisplayNameColumns();
 const transporter = nodemailer.createTransport(
   nodemailerSendgrid({ apiKey: process.env.SENDGRID_API_KEY })
 );
+
+const supportContactLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many support requests. Please try again later.' },
+});
+
+registerSupportContactRoute(app, {
+  transporter,
+  limiter: supportContactLimiter,
+  from: process.env.SENDGRID_FROM_EMAIL || 'skyprincenkp16@gmail.com',
+  to: process.env.SUPPORT_EMAIL || 'prooject26@gmail.com',
+});
 
 // =============================================================================
 //  CORE HELPERS
@@ -1738,12 +1755,6 @@ async function getProjectRecipientKeys(projectId, excludeUserId, excludeRole, sc
       recipient_role_id: Number(m.role_id),
       user_id:           Number(m.role_id),
     }));
-}
-
-function escapeEmailHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, char => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[char]);
 }
 
 async function verifyClientPassword(clientId, password) {
@@ -9173,6 +9184,37 @@ app.post('/api/fetch-work-center-records', authenticateToken, async (req, res) =
       return res.status(403).json({ error: 'Access denied.' });
     }
 
+    const assignedMemberIds = [...new Set(records.flatMap((record) =>
+      (Array.isArray(record.assigned_members) ? record.assigned_members : [])
+        .map((member) => Number(member.id))
+        .filter((id) => Number.isSafeInteger(id) && id > 0)))];
+    if (assignedMemberIds.length) {
+      const members = await pool.query(
+        `SELECT DISTINCT ON (tma.team_member_id)
+                tma.team_member_id AS id, t.email, tma.name AS title, tma.position
+         FROM team_member_assignments tma
+         JOIN team_members t ON t.id = tma.team_member_id
+         WHERE tma.project_id = $1 AND tma.team_member_id = ANY($2::int[])
+         ORDER BY tma.team_member_id, tma.id DESC`,
+        [projectId, assignedMemberIds]);
+      const memberDetails = new Map(members.rows.map((member) => [String(member.id), member]));
+      records = records.map((record) => ({
+        ...record,
+        assigned_members: (Array.isArray(record.assigned_members) ? record.assigned_members : [])
+          .map((member) => {
+            const details = memberDetails.get(String(member.id));
+            if (!details) return member;
+            return {
+              ...details,
+              ...member,
+              title: member.title || member.name || details.title,
+              email: member.email || details.email,
+              position: member.position || details.position,
+            };
+          }),
+      }));
+    }
+
     return res.json({ records });
   } catch (err) {
     console.error('POST /api/fetch-work-center-records:', err);
@@ -9583,6 +9625,9 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
       const result = await pool.query(
         `SELECT p.*,
                 COALESCE(GREATEST(p.report_date - w.end_date, 0), 0)::int AS schedule_delay_days,
+                t.email AS member_email,
+                tma.position AS member_position,
+                tma.name AS member_title,
         COALESCE((SELECT json_agg(json_build_object(
                   'id', ph.id, 'file_name', ph.file_name, 'file_url', ph.file_url,
                  'uploaded_at', ph.uploaded_at,
@@ -9609,14 +9654,24 @@ app.get('/api/work-center-progress/:taskId', authenticateToken, async (req, res)
                   FROM work_center_report_attachments ra WHERE ra.report_id = p.id AND ra.project_id = w.project_id), '[]'::json) AS supporting_attachments
          FROM workspace_work_center_progress p
          JOIN workspace_work_center w ON w.id = p.task_id
-         WHERE p.task_id = $1 AND p.member_id = $2 ORDER BY p.submitted_at DESC`,
-        [taskId, user_id]
+         JOIN team_members t ON t.id = p.member_id
+         LEFT JOIN LATERAL (
+           SELECT position, name
+           FROM team_member_assignments
+           WHERE team_member_id = p.member_id AND project_id = $2
+           ORDER BY id DESC
+           LIMIT 1
+         ) tma ON true
+         WHERE p.task_id = $1 AND w.project_id = $2
+         ORDER BY p.submitted_at DESC`,
+        [taskId, projectId]
       );
       return res.json({ entries: result.rows });
 
     } else {
       return res.status(403).json({ error: 'Access denied.' });
     }
+
   } catch (err) {
     console.error('GET /api/work-center-progress/:taskId:', err);
     return res.status(500).json({ error: 'Server error.' });

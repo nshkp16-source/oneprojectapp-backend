@@ -336,7 +336,11 @@ test('task card collaboration is visible to assigned members and same-side leade
   const checked = await call('PATCH',
     `/api/work-center/${tA.id}/checklist-items/${checklistItemId}`, m(101),
     { projectId: 1, isComplete: true });
-  assert.equal(checked.status, 200, JSON.stringify(checked.body));
+  assert.equal(checked.status, 403, JSON.stringify(checked.body));
+  const leaderChecked = await call('PATCH',
+    `/api/work-center/${tA.id}/checklist-items/${checklistItemId}`, leader,
+    { projectId: 1, isComplete: true });
+  assert.equal(leaderChecked.status, 200, JSON.stringify(leaderChecked.body));
 
   const location = await call('PATCH', `/api/work-center/${tA.id}/location`, leader, {
     projectId: 1, block: 'B', floor: '2', zone: 'North',
@@ -376,6 +380,8 @@ test('task card collaboration is visible to assigned members and same-side leade
     projectId: 1, taskId: tA.id, name: 'Standard block',
   });
   assert.equal(template.status, 201, JSON.stringify(template.body));
+  assert.equal(template.body.template.task_data.activity_id, undefined);
+  assert.equal(template.body.template.task_data.weight_pct, undefined);
   assert.equal((await call('GET', '/api/work-center/templates?projectId=1', leader)).body.templates.length, 1);
   const completedCard = await call('GET', `/api/work-center/${tA.id}/card?projectId=1`, m(101));
   assert.equal(completedCard.body.location.block, 'B');
