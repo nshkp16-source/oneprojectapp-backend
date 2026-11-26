@@ -26,6 +26,7 @@ const HELPERS = ['_wcFmtDate', '_wcReportDelayDays', '_uiLabelStyle', '_wcReadFi
   '_wcInitReportWizard',
   '_wcEnhanceReports', '_wcOpenReportPanel', '_wcBeginReportEdit', '_wcResetReportEdit', '_wcDeleteReport',
   '_wcHandleSubmitProgress',
+  '_wcAutoFillReportWeather',
   '_supportingAttachmentTypeOptions', '_supportingAttachmentTypeLabel', '_wcUpdateSupportingAttachmentGroup', '_wcSupportingAttachmentGroupHtml',
   '_wcReportSupportingAttachmentsHtml', '_wcFilesHtml', '_wcQueryPanelHtml', '_wcTabifyDetail',
   '_wcCollectTaskFiles', '_wcInitTaskFiles', '_wcOpenTaskFilesViewer',
@@ -41,6 +42,9 @@ function views() {
   vm.runInContext(`const CSS = { escape: (value) => String(value) };
   const API = '/api';
   var recordsCache = {};
+  let summaryWeatherData = null;
+  let summaryWeatherLocation = null;
+  let summaryWeatherLoading = false;
   window.__wcFetches = [];
   window.__wcAlerts = [];
   window._wcReportLocationByTask = {};
@@ -55,6 +59,8 @@ function views() {
   async function _wcQueueOfflineReport() {}
   window.alert = (message) => window.__wcAlerts.push(message);
   function opaLocale() { return 'en-GB'; }
+  function opaLookup(value) { return value; }
+  function _weatherCodeLabel(code) { return ({ 61: 'Slight rain' })[code] || 'Unknown'; }
   function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }`, ctx);
   vm.runInContext(`function expandGrayPart(html) {
     const panel = document.createElement('div'); panel.id = 'grayContent'; panel.innerHTML = html;
@@ -75,6 +81,16 @@ function views() {
   return {
     w: dom.window,
     formatDate: (value) => { dom.window.__date = value; return vm.runInContext('_wcFmtDate(window.__date)', ctx); },
+    todayDate: () => vm.runInContext('_wcTodayDate()', ctx),
+    autoFillWeather: (taskId, location, daily) => {
+      dom.window.__weatherTaskId = taskId;
+      dom.window.__weatherLocation = location;
+      dom.window.__weatherDaily = daily;
+      vm.runInContext(`summaryWeatherLocation = window.__weatherLocation;
+        summaryWeatherData = window.__weatherDaily ? { daily: window.__weatherDaily } : null;
+        summaryWeatherLoading = false;
+        _wcAutoFillReportWeather(window.__weatherTaskId)`, ctx);
+    },
     history: (item) => {
       dom.window.__historyItem = item;
       return vm.runInContext('_wcHistoryText(window.__historyItem)', ctx);
@@ -219,6 +235,35 @@ test('leader task edit form includes all task location fields', () => {
     assert.ok(field, `missing ${key} location field`);
     assert.equal(field.maxLength, 150);
   }
+});
+
+test('report weather auto-fills from the matching forecast and preserves member edits', () => {
+  const view = views();
+  const d = view.w.document;
+  const wrapper = d.createElement('div');
+  wrapper.innerHTML = '<input id="wc-pr-weather-5" data-wc-weather-field data-task-id="5"><small data-wc-weather-status></small>';
+  d.body.appendChild(wrapper);
+  const daily = {
+    time: [view.todayDate()],
+    weathercode: [61],
+    temperature_2m_max: [18],
+    temperature_2m_min: [12],
+    precipitation_probability_max: [40],
+  };
+  view.autoFillWeather('5', { lat: 1, lng: 2 }, daily);
+  const field = d.getElementById('wc-pr-weather-5');
+  assert.equal(field.value, 'Forecast: Slight rain · 18°C / 12°C · rain chance 40%');
+  field.value = 'Observed heavy rain at the site';
+  field.dispatchEvent(new view.w.Event('input', { bubbles: true }));
+  view.autoFillWeather('5', { lat: 1, lng: 2 }, daily);
+  assert.equal(field.value, 'Observed heavy rain at the site');
+
+  const manualWrapper = d.createElement('div');
+  manualWrapper.innerHTML = '<input id="wc-pr-weather-6" data-wc-weather-field data-task-id="6"><small data-wc-weather-status></small>';
+  d.body.appendChild(manualWrapper);
+  view.autoFillWeather('6', null, null);
+  assert.equal(d.getElementById('wc-pr-weather-6').value, '');
+  assert.match(manualWrapper.textContent, /No saved project location is set/);
 });
 
 test('leader view: no void button once the task is closed', () => {
